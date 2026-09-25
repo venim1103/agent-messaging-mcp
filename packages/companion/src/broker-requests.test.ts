@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { handleBrokerRequest } from "./broker-requests.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
+import { MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
 
 test("only an owning facade can create and query pending connections", () => {
   const requests = new PendingConnectionRequests();
@@ -33,4 +33,9 @@ test("only an owning facade can create and query pending connections", () => {
     expiredAt).payload.state, "expired");
   assert.throws(() => handleBrokerRequest({ ...create, kind: "evaluate" }, "facade", firstClient, requests, 1000));
   assert.throws(() => handleBrokerRequest({ ...create, deadlineMs: 1000 }, "facade", firstClient, requests, 1000));
+
+  for (let index = 1; index < MAX_PENDING_REQUESTS; index++) requests.create(firstClient, 1000);
+  assert.deepEqual(handleBrokerRequest(create, "facade", firstClient, requests, 1000), {
+    ...envelope, kind: "error", payload: { code: "TOO_MANY_PENDING" }
+  });
 });

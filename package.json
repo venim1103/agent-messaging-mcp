@@ -18,7 +18,8 @@
     "test:e2e": "node --test tests/e2e/*.test.mjs",
     "register:native": "npm run build:companion && node packages/companion/dist/register-native.js register",
     "restore:native": "npm run build:companion && node packages/companion/dist/register-native.js restore",
-    "unregister:native": "npm run build:companion && node packages/companion/dist/register-native.js unregister"
+    "unregister:native": "npm run build:companion && node packages/companion/dist/register-native.js unregister",
+    "dev:broker": "npm run build:companion && node packages/companion/dist/broker-process.js"
   },
   "devDependencies": {
     "playwright-core": "1.63.0"

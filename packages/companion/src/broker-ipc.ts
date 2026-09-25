@@ -5,7 +5,9 @@ import { authenticateBrokerRole, type BrokerCredentials } from "./broker-roles.j
 import { handleBrokerRequest } from "./broker-requests.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { PendingConnectionRequests } from "./pending-connections.js";
+import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
+
+export const BROKER_IDLE_TIMEOUT_MS = PENDING_REQUEST_TTL_MS * 2 + 30_000;
 
 export async function startBrokerSocket(runtimeDirectory: string, credentials: BrokerCredentials) {
   await mkdir(runtimeDirectory, { mode: 0o700 });
@@ -28,7 +30,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
     socket.on("error", () => socket.destroy());
     const timeout = setTimeout(() => socket.destroy(), 5000);
     socket.once("close", () => clearTimeout(timeout));
-    socket.setTimeout(30_000, () => socket.destroy());
+    socket.setTimeout(BROKER_IDLE_TIMEOUT_MS, () => socket.destroy());
     const decoder = new NativeFrameDecoder();
     let role: "facade" | "relay" | null = null;
 

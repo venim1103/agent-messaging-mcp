@@ -5,10 +5,11 @@ import { connect, type Socket } from "node:net";
 import { endianness, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { startBrokerSocket } from "./broker-ipc.js";
+import { BROKER_IDLE_TIMEOUT_MS, startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials } from "./broker-roles.js";
 import { encodeNativeFrame, MAX_NATIVE_FRAME_BYTES, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
+import { PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
 
 async function exchange(socket: Socket, message: unknown): Promise<unknown> {
   const decoder = new NativeFrameDecoder();
@@ -44,6 +45,7 @@ test("private broker socket authenticates one role and refuses impersonation or 
   const directory = join(home, "broker");
   const credentials = createBrokerCredentials();
   const broker = await startBrokerSocket(directory, credentials);
+  assert.ok(BROKER_IDLE_TIMEOUT_MS > PENDING_REQUEST_TTL_MS * 2);
   const request = {
     kind: "hello", protocolVersion: PROTOCOL_VERSION,
     requestId: "a66b3997-9d43-4554-8399-267d1fe9f75c",
