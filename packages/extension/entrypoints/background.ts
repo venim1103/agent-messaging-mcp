@@ -1,14 +1,16 @@
 import { browser } from "wxt/browser";
+import { geminiDraftText } from "../lib/approved-probe";
 
 const nativeHostName = "com.agent_messaging_mcp.bridge";
 const protocolVersion = 1;
 const richFixtureUrl = "http://127.0.0.1:8787/?editor=rich";
 const fixtureInputText = "Fixture debugger probe \u00e9";
+const geminiOrigin = "https://gemini.google.com";
 
 type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: string };
 type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
 
-let fixtureInputInProgress = false;
+let inputInProgress = false;
 
 function focusFixtureEditor(): boolean {
   if (location.href !== "http://127.0.0.1:8787/?editor=rich"
@@ -26,8 +28,8 @@ function readFixtureEditor(): string | null {
 }
 
 async function probeFixtureInput(tabId: number): Promise<FixtureInputResult> {
-  if (fixtureInputInProgress) return { ok: false, error: "A fixture input probe is already running" };
-  fixtureInputInProgress = true;
+  if (inputInProgress) return { ok: false, error: "An input probe is already running" };
+  inputInProgress = true;
   let attached = false;
   try {
     const [activeTab] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -60,8 +62,81 @@ async function probeFixtureInput(tabId: number): Promise<FixtureInputResult> {
         detachFailed = true;
       }
     }
-    fixtureInputInProgress = false;
+    inputInProgress = false;
     if (detachFailed) throw new Error("Fixture debugger did not detach cleanly");
+  }
+}
+
+function focusGeminiEditor(expectedUrl: string): boolean {
+  if (location.href !== expectedUrl || location.origin !== "https://gemini.google.com") return false;
+  const visible = (element: HTMLElement) => element.getClientRects().length > 0;
+  const main = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);
+  if (main.length !== 1 || [...main[0]!.querySelectorAll<HTMLElement>("infinite-scroller")]
+    .filter((scroller) => visible(scroller) && scroller.querySelector("user-query, model-response")).length !== 1) return false;
+
+  const editors = [...document.querySelectorAll<HTMLElement>("[contenteditable=true]")]
+    .filter((element) => visible(element) && (element.getAttribute("aria-label") === "Enter a prompt for Gemini"
+      || element.getAttribute("placeholder") === "Enter a prompt for Gemini"));
+  const editor = editors.length === 1 ? editors[0] : undefined;
+  if (!editor || !main[0]!.contains(editor) || editor.textContent?.length || editor.innerText.trim()) return false;
+  editor.focus();
+  return document.activeElement === editor && !editor.textContent?.length && !editor.innerText.trim();
+}
+
+function readGeminiEditor(expectedUrl: string): string | null {
+  if (location.href !== expectedUrl || location.origin !== "https://gemini.google.com") return null;
+  const editors = [...document.querySelectorAll<HTMLElement>("[contenteditable=true]")]
+    .filter((element) => element.getClientRects().length > 0
+      && (element.getAttribute("aria-label") === "Enter a prompt for Gemini"
+        || element.getAttribute("placeholder") === "Enter a prompt for Gemini"));
+  return editors.length === 1 ? editors[0]!.innerText.trim() : null;
+}
+
+async function prepareGeminiDraft(tabId: number, expectedUrl: string): Promise<FixtureInputResult> {
+  if (inputInProgress) return { ok: false, error: "An input probe is already running" };
+  inputInProgress = true;
+  let attached = false;
+  try {
+    const [activeTab] = await browser.tabs.query({ active: true, currentWindow: true });
+    const tab = await browser.tabs.get(tabId);
+    if (activeTab?.id !== tabId || !tab.active || tab.url !== expectedUrl) {
+      return { ok: false, error: "The selected Gemini tab changed; no draft was filled" };
+    }
+    const url = new URL(expectedUrl);
+    if (url.origin !== geminiOrigin || url.pathname.split("/").filter(Boolean).length !== 2) {
+      return { ok: false, error: "Open the saved disposable Gemini chat first; no draft was filled" };
+    }
+    await browser.debugger.attach({ tabId }, "1.3");
+    attached = true;
+    const [focused] = await browser.scripting.executeScript({
+      target: { tabId }, func: focusGeminiEditor, args: [expectedUrl]
+    });
+    const [currentTab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (focused?.result !== true || currentTab?.id !== tabId || (await browser.tabs.get(tabId)).url !== expectedUrl) {
+      return { ok: false, error: "The conversation changed, has a draft, or editor is ambiguous; no text was inserted" };
+    }
+
+    await browser.debugger.sendCommand({ tabId }, "Input.insertText", { text: geminiDraftText });
+    const [readback] = await browser.scripting.executeScript({
+      target: { tabId }, func: readGeminiEditor, args: [expectedUrl]
+    });
+    if (readback?.result !== geminiDraftText) {
+      return { ok: false, error: "Gemini draft could not be verified; inspect it before any retry" };
+    }
+    return { ok: true, characters: geminiDraftText.length };
+  } catch {
+    return { ok: false, error: "Gemini draft input unavailable; inspect the composer before any retry" };
+  } finally {
+    let detachFailed = false;
+    if (attached) {
+      try {
+        await browser.debugger.detach({ tabId });
+      } catch {
+        detachFailed = true;
+      }
+    }
+    inputInProgress = false;
+    if (detachFailed) throw new Error("Gemini debugger did not detach cleanly; inspect the draft");
   }
 }
 
@@ -89,6 +164,11 @@ export default defineBackground(() => {
     if (request.kind === "probe_fixture_input" && Object.keys(request).length === 2
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {
       return probeFixtureInput(request.tabId);
+    }
+    if (request.kind === "prepare_gemini_draft" && Object.keys(request).length === 3
+      && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
+      && typeof request.expectedUrl === "string" && request.expectedUrl.length < 4096) {
+      return prepareGeminiDraft(request.tabId, request.expectedUrl);
     }
     if (request.kind !== "probe_native_handshake") return;
 

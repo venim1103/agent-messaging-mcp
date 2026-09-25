@@ -1,4 +1,5 @@
 import { browser } from "wxt/browser";
+import { geminiDraftText } from "../../lib/approved-probe";
 
 type FixturePreview = {
   conversationId: string;
@@ -19,6 +20,9 @@ const richFixtureUrl = `${fixtureOrigin}/?editor=rich`;
 const geminiOrigin = "https://gemini.google.com";
 const inspectButton = document.querySelector<HTMLButtonElement>("#inspect");
 const fixtureInputButton = document.querySelector<HTMLButtonElement>("#test-fixture-input");
+const geminiDraftReview = document.querySelector<HTMLElement>("#gemini-draft-review");
+const geminiDraftPreview = document.querySelector<HTMLElement>("#gemini-draft-text");
+const geminiDraftButton = document.querySelector<HTMLButtonElement>("#prepare-gemini-draft");
 const status = document.querySelector<HTMLElement>("#status");
 const result = document.querySelector<HTMLElement>("#result");
 const conversation = document.querySelector<HTMLElement>("#conversation");
@@ -76,12 +80,43 @@ function inspectGeminiStructure(): GeminiPreview | null {
   };
 }
 
-if (!inspectButton || !fixtureInputButton || !status || !result || !conversation || !messages) {
+if (!inspectButton || !fixtureInputButton || !geminiDraftReview || !geminiDraftPreview || !geminiDraftButton
+  || !status || !result || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
 }
 
+let selectedGeminiTab: { id: number; url: string } | null = null;
 void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   fixtureInputButton.hidden = tab?.url !== richFixtureUrl;
+  const url = tab?.url ? new URL(tab.url) : null;
+  if (tab?.id != null && tab.url && url?.origin === geminiOrigin
+    && url.pathname.split("/").filter(Boolean).length === 2) {
+    selectedGeminiTab = { id: tab.id, url: tab.url };
+    geminiDraftPreview.textContent = geminiDraftText;
+    geminiDraftReview.hidden = false;
+  }
+});
+
+geminiDraftButton.addEventListener("click", async () => {
+  geminiDraftButton.disabled = true;
+  status.textContent = "Filling only the approved Gemini draft. Send will not be clicked...";
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (!selectedGeminiTab || tab?.id !== selectedGeminiTab.id || tab.url !== selectedGeminiTab.url) {
+      status.textContent = "The selected Gemini conversation changed. No draft filled.";
+      return;
+    }
+    const probe = await browser.runtime.sendMessage({
+      kind: "prepare_gemini_draft", tabId: selectedGeminiTab.id, expectedUrl: selectedGeminiTab.url
+    }) as FixtureInputResult;
+    status.textContent = probe.ok
+      ? `Gemini draft matched (${probe.characters} characters). Send was not clicked. Review it in the chat.`
+      : `${probe.error}. Send was not clicked. Review the composer before retrying.`;
+  } catch {
+    status.textContent = "Gemini draft probe unavailable. Inspect the composer before any retry. Send was not clicked.";
+  } finally {
+    geminiDraftButton.disabled = false;
+  }
 });
 
 fixtureInputButton.addEventListener("click", async () => {

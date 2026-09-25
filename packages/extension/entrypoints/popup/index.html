@@ -107,7 +107,12 @@
       </header>
       <button type="button" id="inspect">Inspect this chat</button>
       <button type="button" id="test-fixture-input" hidden>Test fixture input</button>
-      <p id="status" role="status">Gemini: read-only. Rich fixture: optional input test; no Send action.</p>
+      <section id="gemini-draft-review" hidden>
+        <h2>Unsent Gemini draft</h2>
+        <p id="gemini-draft-text"></p>
+        <button type="button" id="prepare-gemini-draft">Fill test draft</button>
+      </section>
+      <p id="status" role="status">Inspect is read-only. Draft tests never click Send.</p>
       <section id="result" hidden>
         <h2 id="conversation"></h2>
         <ol id="messages" aria-label="Inspection results"></ol>
