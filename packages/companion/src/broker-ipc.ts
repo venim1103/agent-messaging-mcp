@@ -1,4 +1,4 @@
-import { chmod, mkdir, rmdir, unlink } from "node:fs/promises";
+import { chmod, mkdir, rmdir, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { authenticateBrokerRole, type BrokerCredentials } from "./broker-roles.js";
@@ -10,6 +10,8 @@ import { PendingConnectionRequests } from "./pending-connections.js";
 export async function startBrokerSocket(runtimeDirectory: string, credentials: BrokerCredentials) {
   await mkdir(runtimeDirectory, { mode: 0o700 });
   const socketPath = join(runtimeDirectory, "broker.sock");
+  const facadeKeyPath = join(runtimeDirectory, "facade.key");
+  const relayKeyPath = join(runtimeDirectory, "relay.key");
   const clients = new Set<Socket>();
   const requests = new PendingConnectionRequests();
   const server = createServer((socket) => {
@@ -60,6 +62,8 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
   });
 
   try {
+    await writeFile(facadeKeyPath, credentials.facade, { flag: "wx", mode: 0o600 });
+    await writeFile(relayKeyPath, credentials.relay, { flag: "wx", mode: 0o600 });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(socketPath, () => {
@@ -71,6 +75,8 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
   } catch (error) {
     if (server.listening) server.close();
     await unlink(socketPath).catch(() => {});
+    await unlink(facadeKeyPath).catch(() => {});
+    await unlink(relayKeyPath).catch(() => {});
     await rmdir(runtimeDirectory);
     throw error;
   }
@@ -80,6 +86,8 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
     async close() {
       for (const client of clients) client.destroy();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await unlink(facadeKeyPath);
+      await unlink(relayKeyPath);
       await rmdir(runtimeDirectory);
     }
   };

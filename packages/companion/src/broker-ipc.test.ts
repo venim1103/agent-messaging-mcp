@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
 import { endianness, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,6 +54,10 @@ test("private broker socket authenticates one role and refuses impersonation or 
   try {
     assert.equal((await stat(directory)).mode & 0o777, 0o700);
     assert.equal((await stat(broker.socketPath)).mode & 0o777, 0o600);
+    assert.equal((await stat(join(directory, "facade.key"))).mode & 0o777, 0o600);
+    assert.equal((await stat(join(directory, "relay.key"))).mode & 0o777, 0o600);
+    assert.equal(await readFile(join(directory, "facade.key"), "utf8"), credentials.facade);
+    assert.equal(await readFile(join(directory, "relay.key"), "utf8"), credentials.relay);
     await assert.rejects(startBrokerSocket(directory, credentials), { code: "EEXIST" });
 
     const facade = connect(broker.socketPath);
