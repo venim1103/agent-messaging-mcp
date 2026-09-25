@@ -10,8 +10,13 @@
   ],
   "scripts": {
     "dev:fixture": "node tests/fixtures/server.mjs",
+    "build": "npm run build:companion && npm run build:extension",
+    "build:companion": "npm run build --workspace @agent-messaging/companion",
     "build:extension": "npm run build --workspace @agent-messaging/extension",
-    "typecheck": "npm run typecheck --workspace @agent-messaging/extension",
-    "test:unit": "node --test tests/fixtures/*.test.mjs"
+    "typecheck": "npm run typecheck --workspace @agent-messaging/companion && npm run typecheck --workspace @agent-messaging/extension",
+    "test:unit": "npm run build:companion && node --test tests/fixtures/*.test.mjs packages/companion/dist/*.test.js",
+    "register:native": "npm run build:companion && node packages/companion/dist/register-native.js register",
+    "restore:native": "npm run build:companion && node packages/companion/dist/register-native.js restore",
+    "unregister:native": "npm run build:companion && node packages/companion/dist/register-native.js unregister"
   }
 }

@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "browserChatFeasibility": {
+      "type": "stdio",
+      "command": "/usr/local/bin/node",
+      "args": ["${workspaceFolder}/packages/companion/dist/mcp-stdio.js"]
+    }
+  }
+}

@@ -15,7 +15,7 @@
     "FIXTURE_HOST": "0.0.0.0",
     "DISPLAY": "${localEnv:DISPLAY}"
   },
-  "postCreateCommand": "npm ci",
+  "postCreateCommand": "npm ci && npm run build && npm run restore:native -- --browser chromium --user-data-dir \"$HOME/.local/share/agent-messaging-mcp/chromium-dev\"",
   "customizations": {
     "vscode": {
       "extensions": ["GitHub.copilot-chat"]

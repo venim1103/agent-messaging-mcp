@@ -4,6 +4,7 @@ type FixturePreview = {
   conversationId: string;
   messages: { id: string; direction: string; text: string }[];
 };
+type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: string };
 
 const fixtureOrigin = "http://127.0.0.1:8787";
 const inspectButton = document.querySelector<HTMLButtonElement>("#inspect");
@@ -56,7 +57,7 @@ inspectButton.addEventListener("click", async () => {
       return;
     }
 
-    conversation.textContent = `Conversation: ${preview.conversationId}`;
+    conversation.textContent = `${fixtureOrigin} / ${preview.conversationId}`;
     for (const message of preview.messages) {
       const row = document.createElement("li");
       const direction = document.createElement("strong");
@@ -67,7 +68,11 @@ inspectButton.addEventListener("click", async () => {
       messages.append(row);
     }
     result.hidden = false;
-    status.textContent = `${preview.messages.length} rendered messages found. Nothing was sent.`;
+    status.textContent = `${preview.messages.length} rendered messages found. Checking local bridge...`;
+    const probe = await browser.runtime.sendMessage({ kind: "probe_native_handshake" }) as ProbeResult;
+    status.textContent = probe.ok
+      ? `Native bridge ready (protocol v${probe.protocolVersion}). Nothing was sent.`
+      : `Native bridge unavailable: ${probe.error}. Nothing was sent.`;
   } catch (error) {
     status.textContent = error instanceof Error ? error.message : "Could not inspect this tab.";
   } finally {

@@ -1,6 +1,7 @@
 node_modules/
 packages/*/.wxt/
 packages/*/.output/
+packages/*/dist/
 test-results/
 playwright-report/
 *.tsbuildinfo
