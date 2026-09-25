@@ -35,6 +35,7 @@ The eventual generic behavior comes from a shared chat model plus reviewed site 
 | Package manager | npm; use the tracked lockfile and `npm ci` inside the container |
 | Podman/devcontainer | Rootless Podman `4.9.3` (`crun`); devcontainer CLI `0.87.0` started the container with `--docker-path podman`, UID 1000, and mounted workspace |
 | Browser validation | Chromium `153.0.8010.52` launched without `--no-sandbox` inside Podman; user confirmed the fixture window is visible on Windows, invoked unpacked extension `ihgoljipfhieipbphdchlghecffbbddo` on the fixture, and saw both messages and `Native bridge ready (protocol v1)` |
+| Rich-editor probe | `playwright-core` `1.63.0` used the container's `/usr/bin/chromium` headlessly with sandboxing intact; `npm run test:e2e` passed for the synthetic `?editor=rich` and existing textarea variants. No extension write path or live-site editor was tested |
 | Container network | Fixture listens on port 8787 inside the container. No fixed WSL host port is published; VS Code can forward it for optional Windows preview |
 | Browser profile | Podman volume `agent-messaging-mcp-chromium-profile` is mounted at the container's development profile path; confirmed writable by UID 1000, but no login persistence across a second rebuild has been tested |
 | Live integration | Only two synthetic fixture messages were inspected; no real chat was read or sent and no Gemini or WhatsApp compatibility has been established |
@@ -153,14 +154,14 @@ tests/
 
 Place unit tests next to the modules they exercise. Reuse the fixture and helpers across phases. Do not create throwaway prototypes that then require a second implementation of the same domain logic; keep experiments small enough to promote or remove deliberately.
 
-Implement and document the following script contract as those components arrive. **`dev:fixture`, `build`, `build:companion`, `typecheck`, `test:unit`, `build:extension`, and native registration/restore work now; the browser handshake and local/VS Code SDK diagnostic calls passed.**
+Implement and document the following script contract as those components arrive. **`dev:fixture`, `build`, `build:companion`, `typecheck`, `test:unit`, fixture-only `test:e2e`, `build:extension`, and native registration/restore work now; the browser handshake and local/VS Code SDK diagnostic calls passed.**
 
 | Planned command | Purpose |
 | --- | --- |
 | `npm run build` | Build the code units present so far |
 | `npm run typecheck` | Typecheck those code units |
 | `npm run test:unit` | Run unit tests once, without a watcher |
-| `npm run test:e2e` | Run local-fixture browser tests, never ordinary personal chats |
+| `npm run test:e2e` | Currently one local-fixture rich-editor/textarea Chromium test; full MCP-to-browser integration tests are still planned. Never ordinary personal chats |
 | `npm run dev:fixture` | Serve the deterministic fixture on an available loopback port |
 | `npm run build:extension` | Build the unpacked extension and report its path |
 | `npm run register:native -- --browser chromium --extension-id "$EXTENSION_ID" --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"` | Register this development build for the selected Chromium profile after `--preview` and validating the actual ID |
@@ -321,10 +322,11 @@ After each completed milestone, update the status below and the setup documentat
 - [x] User invoked the popup on the selected fixture tab: it showed `fixture-alpha`, both rendered messages, and `Native bridge ready (protocol v1). Nothing was sent.` The native host manifest was found in the development Chromium profile.
 - [x] Official `@modelcontextprotocol/server` and `@modelcontextprotocol/client` 2.1.0 with Zod 4.6.5: a local SDK stdio client discovered and called the diagnostic-only tool. The SDK documents MCP `2026-07-28` support; the actual VS Code negotiated protocol version was not observed.
 - [x] In VS Code Chat, `browser_chat_feasibility` was invoked through the workspace [`.vscode/mcp.json`](.vscode/mcp.json) and returned `MCP stdio diagnostic OK. No browser data was read or sent.` This proves a VS Code host tool call, not chat access.
-- [ ] Milestone 0: browser GUI, extension, native handshake, and VS Code MCP feasibility passed; rich-editor and authorized real-site findings remain.
+- [x] `npm run test:e2e` passed one fixture-only Chromium test: synthetic `InputEvent` did not update the contenteditable editor's state; browser-generated input submitted multiline Unicode text; the textarea still worked. `npm ci`, build, native restore, typecheck, and all nine unit tests also passed. This does not prove debugger input, an extension send, or Gemini compatibility.
+- [ ] Milestone 0: browser GUI, extension, native handshake, VS Code MCP, and local rich-editor feasibility passed; authorized real-site findings remain.
 - [ ] Milestone 1: authorized read-only pipeline verified end to end.
 - [ ] Milestone 2: supervised sends and crash/retry safety verified.
 - [ ] Milestone 3: Gemini and generic calibration verified.
 - [ ] Milestone 4: documented local release and supported-host matrix verified.
 
-Next action: use only a local fixture for a bounded rich-editor input experiment, then discuss a disposable Gemini conversation with the user before any live-site inspection or send. Do not treat the diagnostic MCP tool as a chat connector or infer the exact negotiated VS Code protocol version from its successful result.
+Next action: request explicit user permission to inspect a disposable Gemini conversation in the isolated container Chromium; the user handles login/MFA. Any exploratory live-site send needs separate approval of the exact neutral text before it happens. Do not treat the diagnostic MCP tool or the synthetic rich-editor test as proof of chat integration, and do not infer the exact negotiated VS Code protocol version from its successful result.

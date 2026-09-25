@@ -15,8 +15,12 @@
     "build:extension": "npm run build --workspace @agent-messaging/extension",
     "typecheck": "npm run typecheck --workspace @agent-messaging/companion && npm run typecheck --workspace @agent-messaging/extension",
     "test:unit": "npm run build:companion && node --test tests/fixtures/*.test.mjs packages/companion/dist/*.test.js",
+    "test:e2e": "node --test tests/e2e/*.test.mjs",
     "register:native": "npm run build:companion && node packages/companion/dist/register-native.js register",
     "restore:native": "npm run build:companion && node packages/companion/dist/register-native.js restore",
     "unregister:native": "npm run build:companion && node packages/companion/dist/register-native.js unregister"
+  },
+  "devDependencies": {
+    "playwright-core": "1.63.0"
   }
 }

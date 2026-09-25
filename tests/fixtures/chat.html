@@ -67,6 +67,13 @@
         font: inherit;
       }
 
+      #rich-message {
+        min-height: 70px;
+        padding: 8px;
+        border: 1px solid #767676;
+        white-space: pre-wrap;
+      }
+
       button {
         justify-self: end;
         padding: 8px 18px;
@@ -97,19 +104,32 @@
       <form id="composer">
         <label for="message">Message</label>
         <textarea id="message" required></textarea>
+        <div id="rich-message" role="textbox" aria-label="Message" aria-multiline="true" contenteditable="true" hidden></div>
         <button type="submit">Send</button>
       </form>
     </main>
     <script>
       const composer = document.querySelector("#composer");
       const messageInput = document.querySelector("#message");
+      const richEditor = document.querySelector("#rich-message");
       const messages = document.querySelector("#messages");
+      const richMode = new URLSearchParams(location.search).get("editor") === "rich";
       let nextMessageId = 3;
+      let richText = "";
+
+      if (richMode) {
+        messageInput.hidden = true;
+        messageInput.required = false;
+        richEditor.hidden = false;
+        richEditor.addEventListener("input", (event) => {
+          if (event.isTrusted) richText = richEditor.innerText;
+        });
+      }
 
       composer.addEventListener("submit", (event) => {
         event.preventDefault();
-        const text = messageInput.value.trim();
-        if (!text) return;
+        const text = (richMode ? richText : messageInput.value).trim();
+        if (!text || (richMode && richEditor.innerText.trim() !== text)) return;
 
         const row = document.createElement("li");
         row.dataset.messageId = `fixture-${nextMessageId++}`;
@@ -120,7 +140,12 @@
         content.textContent = text;
         row.append(author, content);
         messages.append(row);
-        messageInput.value = "";
+        if (richMode) {
+          richEditor.replaceChildren();
+          richText = "";
+        } else {
+          messageInput.value = "";
+        }
       });
     </script>
   </body>
