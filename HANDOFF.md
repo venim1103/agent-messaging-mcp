@@ -2,7 +2,7 @@
 
 Updated: 2026-09-25.
 
-This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **A fixture server and read-only extension popup exist, but native messaging, the broker, and MCP integration do not.** The Podman devcontainer is prepared; reopen VS Code in it before adding application features.
+This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **The fixture popup read the selected chat and completed a native handshake in Chromium. A diagnostic-only official-SDK MCP stdio tool passed a local client test; VS Code host compatibility, the broker, and chat MCP integration remain unverified or unimplemented.** VS Code tool executions run in the Podman devcontainer, and the user confirmed that its Chromium fixture window is visible on Windows.
 
 ## 1. Start Here
 
@@ -10,7 +10,7 @@ Read this document and [DESIGN.md](DESIGN.md), then inspect the current worktree
 
 Suggested request for the next AI when the user is ready to start:
 
-> Read [HANDOFF.md](HANDOFF.md) and [DESIGN.md](DESIGN.md). Reopen this WSL workspace in the Podman devcontainer, then continue Milestone 0 from the built fixture and read-only extension popup. Node/npm and Chromium are inside the container; browser GUI visibility on Windows, extension loading, and native messaging still need verification. Keep the browser-chat scope and safety constraints. Use local chat fixtures before any real account. Report the exact checks that passed, what needs a human action, and the next milestone; do not implement every phase in one large change.
+> Read [HANDOFF.md](HANDOFF.md) and [DESIGN.md](DESIGN.md). Continue Milestone 0 in the Podman devcontainer: the selected-fixture popup and native handshake passed in Chromium, and the official-SDK diagnostic tool passed a local stdio client call. Verify the tool through the actual VS Code MCP host, then plan a bounded rich-editor experiment; request permission before any real Gemini conversation or send. Keep the browser-chat scope and safety constraints. Report exact checks and human actions; do not implement every phase in one large change.
 
 ### What the user actually wants
 
@@ -24,26 +24,26 @@ The eventual generic behavior comes from a shared chat model plus reviewed site 
 
 | Item | Status at handoff |
 | --- | --- |
-| Repository | Fixture server and unit test, npm workspace, and a fixture-only WXT popup; no native relay, broker, or MCP server |
+| Repository | Fixture server, WXT popup/background, and a handshake-only TypeScript native host with a verified browser handshake; diagnostic-only MCP stdio tool and local client test, but no broker or chat MCP tools |
 | Design | Proposed architecture and phased plan in [DESIGN.md](DESIGN.md) |
-| Workspace location | `/home/vscode/AI/agent-messaging-mcp` |
+| Workspace location | `/workspaces/agent-messaging-mcp` in the devcontainer; the earlier WSL host path was `/home/vscode/AI/agent-messaging-mcp` |
 | Kernel observed | `Linux 6.18.33.2-microsoft-standard-WSL2` |
 | WSL distribution variable | `Ubuntu` |
 | Container browser | `/usr/bin/chromium`; version `153.0.8010.52` on Debian 12 at the time of testing |
 | Display variables | `DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-0` |
-| Toolchain | Node `v24.18.0` and npm installed in the container image; `npm ci` runs on container creation. No WSL/Windows Node, npm, or Chromium installation is required by this project workflow |
+| Toolchain | Node `v24.21.0`, npm `12.1.0` observed in the current container; post-create runs `npm ci`, the package build, and restoration of a previously approved native host. No WSL/Windows Node, npm, or Chromium installation is required by this project workflow |
 | Package manager | npm; use the tracked lockfile and `npm ci` inside the container |
 | Podman/devcontainer | Rootless Podman `4.9.3` (`crun`); devcontainer CLI `0.87.0` started the container with `--docker-path podman`, UID 1000, and mounted workspace |
-| Browser validation | Chromium launched without `--no-sandbox` inside Podman; a process in the container connected to WSLg X11. GUI visibility on Windows, unpacked extension selection, native messaging, and login state still need user confirmation or tests |
+| Browser validation | Chromium `153.0.8010.52` launched without `--no-sandbox` inside Podman; user confirmed the fixture window is visible on Windows, invoked unpacked extension `ihgoljipfhieipbphdchlghecffbbddo` on the fixture, and saw both messages and `Native bridge ready (protocol v1)` |
 | Container network | Fixture listens on port 8787 inside the container. No fixed WSL host port is published; VS Code can forward it for optional Windows preview |
 | Browser profile | Podman volume `agent-messaging-mcp-chromium-profile` is mounted at the container's development profile path; confirmed writable by UID 1000, but no login persistence across a second rebuild has been tested |
-| Live integration | No messages have been read or sent; no Gemini or WhatsApp compatibility has been established |
+| Live integration | Only two synthetic fixture messages were inspected; no real chat was read or sent and no Gemini or WhatsApp compatibility has been established |
 
 Recheck the environment at the beginning of implementation. A future AI may run in a different terminal, container, or remote host. Do not interpret installed Chromium or populated display variables as a successful browser test.
 
 ### Podman devcontainer and browser placement
 
-The active configuration is [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json) and its [Dockerfile](.devcontainer/Dockerfile). The image installs Chromium, Node, and npm; creation runs `npm ci`. It uses rootless Podman, `remoteUser: node`, `--userns=keep-id`, and an X11 socket mount for WSLg. A Podman volume retains the development Chromium profile across container replacement; it contains sensitive login data and must never be copied into Git. The fixture binds `0.0.0.0` *inside the container* via `FIXTURE_HOST`. No port is published on the WSL host; VS Code can forward fixture port 8787 for optional Windows preview. That fixture port is not an authenticated browser-control bridge.
+The active configuration is [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json) and its [Dockerfile](.devcontainer/Dockerfile). The image installs Chromium, Node, and npm; creation runs `npm ci && npm run build && npm run restore:native -- --browser chromium --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"`. Restore does nothing without an existing exact-origin registration in the profile volume; the user must initially choose and register an extension ID. It uses rootless Podman, `remoteUser: node`, `--userns=keep-id`, and an X11 socket mount for WSLg. A Podman volume retains the development Chromium profile across container replacement; it contains sensitive login data and must never be copied into Git. The fixture binds `0.0.0.0` *inside the container* via `FIXTURE_HOST`. No port is published on the WSL host; VS Code can forward fixture port 8787 for optional Windows preview. That fixture port is not an authenticated browser-control bridge.
 
 On a **WSL host terminal**, the following commands were verified:
 
@@ -58,18 +58,18 @@ The last command stays running while the fixture is being tested. In VS Code, op
 
 Earlier CLI and VS Code invocations created separate project containers, both configured to publish WSL port 8787; VS Code could not start its container while the CLI container held that port. The fixed `--publish` option was removed. The failed VS Code container and earlier CLI container were replaced without deleting the named Chromium profile volume. A fresh command-line container started with empty `PortBindings`; if another old project container still appears after reopening, inspect its labels and port bindings rather than removing unrelated containers.
 
-After reopening, run these in a **container terminal**:
+In the current **container terminal**, run these in separate terminals if they are not already running:
 
 ```bash
 npm run dev:fixture
 chromium --user-data-dir="$HOME/.local/share/agent-messaging-mcp/chromium-dev" --no-first-run http://127.0.0.1:8787/
 ```
 
-Run these in separate terminals: both commands stay running. The browser process uses the container's profile volume and WSLg's X11 socket to display a window on Windows. Use `npm run build:extension` inside the container, then in that **container Chromium**, visit `chrome://extensions` and load `/workspaces/agent-messaging-mcp/packages/extension/.output/chrome-mv3`. The popup currently inspects only the fixture origin `http://127.0.0.1:8787`, requires the browser toolbar gesture, and does not persist a grant or send anything. Browsers already open on Windows/WSL are separate; the extension cannot attach to their tabs or use their logins. Log in manually in the container Chromium for any later authorized live-site test.
+Both commands stay running. The browser process uses the container's profile volume and WSLg's X11 socket; its fixture window has been visually confirmed on Windows. Use `npm run build:extension` inside the container, then in that **container Chromium**, visit `chrome://extensions` and load `/workspaces/agent-messaging-mcp/packages/extension/.output/chrome-mv3`. The popup inspects only the fixture origin `http://127.0.0.1:8787`, requires the browser toolbar gesture, shows its origin/conversation and rendered messages, and attempts a native handshake. It does not persist a grant or send anything. Browsers already open on Windows/WSL are separate; the extension cannot attach to their tabs or use their logins. Log in manually in the container Chromium for any later authorized live-site test.
 
-When native messaging is implemented, the browser-spawned host, registration, broker, and MCP facade must all live in **the same container as Chromium**. The extension build is in the mounted workspace. Register the native host for the exact extension ID inside this container; account for registration loss if the container is replaced, since only the Chromium profile volume is currently persistent. The forwarded **fixture** port is not a browser-control interface. Do not mount any external browser profile or expose CDP.
+The handshake-only native host and registration helper run in the container, and the browser handshake passed. The future broker and chat MCP facade must also live in **the same container as Chromium**. The extension build is in the mounted workspace. Its native host is registered for extension ID `ihgoljipfhieipbphdchlghecffbbddo`; post-create restores its launcher if the profile volume retains the matching manifest. If the manifest is lost, explicitly register again after validating the ID. The forwarded **fixture** port is not a browser-control interface. Do not mount any external browser profile or expose CDP.
 
-These checks prove the command-line container, in-container Chromium launch, and X11 socket connection. Windows HTTP access previously worked with a published port; VS Code's replacement forwarding still needs verification after a successful reopen. They do **not** prove that VS Code has reopened in the container or that the Chromium window is visible on the user's Windows desktop; ask for that direct visual confirmation when continuing. VS Code's window and Copilot Chat UI remain on Windows by design; after reopening, the workspace, integrated terminals, agent tool executions, and any workspace extension host run in the container. VS Code chooses whether a particular Copilot extension component runs as a UI or workspace extension. Do not claim the whole chat service or Windows UI runs inside Podman.
+The current VS Code agent tools run inside the container at `/workspaces/agent-messaging-mcp`, and the user confirmed that the container Chromium fixture window is visible on Windows. The user invoked the extension on the fixture and verified selected-tab access and the native handshake. VS Code's window and Copilot Chat UI remain on Windows by design; the workspace, integrated terminals, agent tool executions, and any workspace extension host run in the container. VS Code chooses whether a particular Copilot extension component runs as a UI or workspace extension. Do not claim the whole chat service or Windows UI runs inside Podman.
 
 ## 3. Keep These Decisions
 
@@ -135,7 +135,7 @@ Use a host name such as `com.agent_messaging_mcp.bridge` consistently. The host 
 
 **Environment detail:** the browser-spawned host may not inherit the interactive shell's PATH. Resolve the container's absolute Node executable during registration and use a launcher that invokes the built relay with that executable. Verify it without relying on shell startup files. Never write diagnostic output to native-host stdout.
 
-Do not expand into a complete installer yet. A reversible, container-local registration helper is sufficient. Since the container may be replaced, ensure its registration can be recreated on demand and never overwrite unrelated registrations.
+The current helper builds the companion and previews changes with `npm run register:native -- --browser chromium --extension-id "$EXTENSION_ID" --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev" --preview`. In this container, it registered for the real ID `ihgoljipfhieipbphdchlghecffbbddo`: the profile manifest allows only that origin, and its launcher is executable under `$HOME/.config/agent-messaging-mcp/native-host`. Podman's volume mount leaves `$HOME/.local/share/agent-messaging-mcp` root-owned here, so a launcher placed there failed with `EACCES`; the writable config directory avoids that. The launcher uses the absolute Node executable, and isolated subprocess tests exercise real framing and the launcher without a usable `PATH`. The user confirmed actual browser lookup and a protocol-v1 native round trip. Post-create `restore:native` recreates a missing launcher only for the exact existing profile manifest; a new profile gets no grant, and a changed manifest is rejected. `npm run unregister:native -- --browser chromium --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"` removes only a recognized application registration. Do not expand into a complete installer yet.
 
 ## 5. Proposed Structure and Development Commands
 
@@ -153,7 +153,7 @@ tests/
 
 Place unit tests next to the modules they exercise. Reuse the fixture and helpers across phases. Do not create throwaway prototypes that then require a second implementation of the same domain logic; keep experiments small enough to promote or remove deliberately.
 
-Implement and document the following script contract as those components arrive. **`dev:fixture`, `typecheck`, `test:unit`, and `build:extension` work now; the others are planned.**
+Implement and document the following script contract as those components arrive. **`dev:fixture`, `build`, `build:companion`, `typecheck`, `test:unit`, `build:extension`, and native registration/restore work now; the browser handshake passed. The local SDK diagnostic tool passed, but its VS Code host call is pending.**
 
 | Planned command | Purpose |
 | --- | --- |
@@ -163,8 +163,9 @@ Implement and document the following script contract as those components arrive.
 | `npm run test:e2e` | Run local-fixture browser tests, never ordinary personal chats |
 | `npm run dev:fixture` | Serve the deterministic fixture on an available loopback port |
 | `npm run build:extension` | Build the unpacked extension and report its path |
-| `npm run register:native -- --browser chromium --extension-id <id>` | Register this development build after validating the target |
-| `npm run unregister:native -- --browser chromium` | Remove only this application's registered development host |
+| `npm run register:native -- --browser chromium --extension-id "$EXTENSION_ID" --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"` | Register this development build for the selected Chromium profile after `--preview` and validating the actual ID |
+| `npm run restore:native -- --browser chromium --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"` | Restore a missing launcher only from an existing validated profile registration; post-create runs this automatically |
+| `npm run unregister:native -- --browser chromium --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"` | Remove only this application's registered development host |
 
 Start with a small root workspace configuration, strict TypeScript, and a lockfile. Add dependencies when their phase needs them: SQLite is needed for durable sends, not for the first read-only handshake. Do not add a bundler framework for the companion, a task orchestrator, Docker, or a large UI framework without a concrete need.
 
@@ -313,11 +314,17 @@ After each completed milestone, update the status below and the setup documentat
 - [x] Product design and implementation handoff written.
 - [x] Rootless Podman devcontainer started with Node/npm and Chromium installed inside it; fixture and WXT checks passed inside.
 - [x] Container X11 socket access and Windows access to the container fixture on loopback verified; browser profile volume writable.
-- [ ] VS Code reopened into container and Chromium window visually confirmed on Windows.
+- [x] VS Code agent tools run in the container; user visually confirmed container Chromium's fixture window on Windows.
+- [x] Handshake-only native host, non-overwriting registration and restore helpers, and service worker build; post-create `npm ci && npm run build && npm run restore:native -- --browser chromium --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"` passed in the running container.
+- [x] Load the extension in container Chromium; ID `ihgoljipfhieipbphdchlghecffbbddo`.
+- [x] Register a native host for that ID in the development Chromium profile; manifest and launcher are owner-private.
+- [x] User invoked the popup on the selected fixture tab: it showed `fixture-alpha`, both rendered messages, and `Native bridge ready (protocol v1). Nothing was sent.` The native host manifest was found in the development Chromium profile.
+- [x] Official `@modelcontextprotocol/server` and `@modelcontextprotocol/client` 2.1.0 with Zod 4.6.5: a local SDK stdio client discovered and called the diagnostic-only tool. The SDK documents MCP `2026-07-28`; VS Code host negotiation is not yet verified.
+- [ ] Call `browser_chat_feasibility` through the actual VS Code MCP host via the workspace [`.vscode/mcp.json`](.vscode/mcp.json); it must return the fixed diagnostic result, not chat data.
 - [ ] Milestone 0: visible Chromium, unpacked extension, native handshake, and MCP feasibility verified.
 - [ ] Milestone 1: authorized read-only pipeline verified end to end.
 - [ ] Milestone 2: supervised sends and crash/retry safety verified.
 - [ ] Milestone 3: Gemini and generic calibration verified.
 - [ ] Milestone 4: documented local release and supported-host matrix verified.
 
-Next action after reopening in the devcontainer: visually confirm the container Chromium window, load the built extension, and continue the fixture/extension/native-handshake slice of Milestone 0.
+Next action: start `browserChatFeasibility` from the workspace MCP configuration in VS Code, call `browser_chat_feasibility` in VS Code Chat, and record the actual host result and negotiated protocol support. Rich-editor and live Gemini input remain unverified and require a separate bounded experiment and explicit user approval before any real-site send.
