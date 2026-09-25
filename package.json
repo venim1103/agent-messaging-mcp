@@ -1,0 +1,17 @@
+{
+  "name": "agent-messaging-mcp",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:fixture": "node tests/fixtures/server.mjs",
+    "build:extension": "npm run build --workspace @agent-messaging/extension",
+    "typecheck": "npm run typecheck --workspace @agent-messaging/extension",
+    "test:unit": "node --test tests/fixtures/*.test.mjs"
+  }
+}

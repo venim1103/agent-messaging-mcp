@@ -1,0 +1,15 @@
+{
+  "name": "@agent-messaging/extension",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "build": "wxt build",
+    "prepare": "wxt prepare",
+    "typecheck": "tsc --noEmit --project tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "wxt": "0.21.4"
+  }
+}

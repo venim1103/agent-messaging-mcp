@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Browser Chat Fixture</title>
+    <style>
+      body {
+        margin: 0;
+        background: #f0f3f1;
+        color: #18302d;
+        font: 16px/1.5 sans-serif;
+      }
+
+      main {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr) auto;
+        min-height: 100dvh;
+        max-width: 720px;
+        margin: auto;
+        background: white;
+      }
+
+      header, form {
+        padding: 16px 24px;
+      }
+
+      header {
+        border-bottom: 1px solid #d7e1dd;
+      }
+
+      h1, p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: 1.25rem;
+      }
+
+      ol {
+        margin: 0;
+        padding: 24px;
+        list-style: none;
+      }
+
+      li {
+        margin-bottom: 16px;
+      }
+
+      li[data-direction="outgoing"] {
+        text-align: right;
+      }
+
+      li p {
+        white-space: pre-wrap;
+      }
+
+      form {
+        display: grid;
+        gap: 8px;
+        border-top: 1px solid #d7e1dd;
+      }
+
+      textarea {
+        min-height: 70px;
+        padding: 8px;
+        font: inherit;
+      }
+
+      button {
+        justify-self: end;
+        padding: 8px 18px;
+        border: 0;
+        background: #185849;
+        color: white;
+        font: inherit;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <main data-conversation-id="fixture-alpha">
+      <header>
+        <h1>Fixture chat</h1>
+        <p>Conversation: fixture-alpha</p>
+      </header>
+      <ol id="messages" role="log" aria-label="Messages">
+        <li data-message-id="fixture-1" data-direction="incoming">
+          <strong>Tester</strong>
+          <p>Can you read this message?</p>
+        </li>
+        <li data-message-id="fixture-2" data-direction="outgoing">
+          <strong>Assistant</strong>
+          <p>Yes. This is a local test conversation.</p>
+        </li>
+      </ol>
+      <form id="composer">
+        <label for="message">Message</label>
+        <textarea id="message" required></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </main>
+    <script>
+      const composer = document.querySelector("#composer");
+      const messageInput = document.querySelector("#message");
+      const messages = document.querySelector("#messages");
+      let nextMessageId = 3;
+
+      composer.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const text = messageInput.value.trim();
+        if (!text) return;
+
+        const row = document.createElement("li");
+        row.dataset.messageId = `fixture-${nextMessageId++}`;
+        row.dataset.direction = "outgoing";
+        const author = document.createElement("strong");
+        author.textContent = "Assistant";
+        const content = document.createElement("p");
+        content.textContent = text;
+        row.append(author, content);
+        messages.append(row);
+        messageInput.value = "";
+      });
+    </script>
+  </body>
+</html>

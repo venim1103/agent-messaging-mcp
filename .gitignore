@@ -1,0 +1,9 @@
+node_modules/
+packages/*/.wxt/
+packages/*/.output/
+test-results/
+playwright-report/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Browser Chat Probe</title>
+    <style>
+      :root {
+        font-family: "Trebuchet MS", Verdana, sans-serif;
+        color: #1d302d;
+        background: #f8faf8;
+      }
+
+      body {
+        width: 340px;
+        margin: 0;
+      }
+
+      main {
+        padding: 16px;
+      }
+
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 8px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid #d4dbd7;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 700;
+      }
+
+      .mode {
+        color: #8d571a;
+        font-size: 12px;
+      }
+
+      button {
+        width: 100%;
+        min-height: 36px;
+        margin-top: 16px;
+        border: 0;
+        border-radius: 4px;
+        color: white;
+        background: #185849;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: wait;
+      }
+
+      #status {
+        margin: 12px 0 0;
+        font-size: 13px;
+      }
+
+      #result {
+        margin-top: 16px;
+        border-top: 1px solid #d4dbd7;
+      }
+
+      h2 {
+        margin: 16px 0 8px;
+        font-size: 14px;
+      }
+
+      ol {
+        max-height: 240px;
+        overflow-y: auto;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      li {
+        padding: 8px 0;
+        border-bottom: 1px solid #ebefed;
+      }
+
+      li strong {
+        color: #8d571a;
+        font-size: 12px;
+      }
+
+      li p {
+        margin: 3px 0 0;
+        font-size: 13px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Browser chat</h1>
+        <span class="mode">Fixture probe</span>
+      </header>
+      <button type="button" id="inspect">Inspect this chat</button>
+      <p id="status" role="status">Read-only. Open the local fixture to inspect it.</p>
+      <section id="result" hidden>
+        <h2 id="conversation"></h2>
+        <ol id="messages" aria-label="Recent messages"></ol>
+      </section>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
