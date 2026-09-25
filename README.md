@@ -12,6 +12,8 @@ The fixture has an opt-in contenteditable variant at `http://127.0.0.1:8787/?edi
 
 Inside the devcontainer, post-create runs `npm ci && npm run build && npm run restore:native -- --browser chromium --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"`; `npm run typecheck` and `npm run test:unit` check the current packages. Restore is a no-op until a user registers an extension ID and only recreates a missing launcher from that exact persisted profile registration. `npm run dev:fixture` serves the synthetic chat on port 8787. Open it in container Chromium using the isolated profile described in [HANDOFF.md](HANDOFF.md), then load `packages/extension/.output/chrome-mv3` from `chrome://extensions`.
 
+After a tested VS Code devcontainer rebuild, the extension ID and native manifest persisted in the profile volume, post-create restored the host launcher, and the fixture popup again completed a real native handshake. The fixture server and Chromium processes must be restarted after a rebuild; user login or unsent Gemini draft persistence has not been tested.
+
 After copying that installation's extension ID, register the development native host for this browser profile:
 
 ```bash
