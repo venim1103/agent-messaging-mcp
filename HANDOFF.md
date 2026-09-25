@@ -2,7 +2,7 @@
 
 Updated: 2026-09-25.
 
-This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **The fixture popup read the selected chat and completed a native handshake in Chromium. A diagnostic-only official-SDK MCP stdio tool passed a local client test; VS Code host compatibility, the broker, and chat MCP integration remain unverified or unimplemented.** VS Code tool executions run in the Podman devcontainer, and the user confirmed that its Chromium fixture window is visible on Windows.
+This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **The fixture popup read the selected chat and completed a native handshake in Chromium. A diagnostic-only official-SDK MCP stdio tool passed both a local client test and an actual VS Code host call; the broker and chat MCP integration do not exist yet.** VS Code tool executions run in the Podman devcontainer, and the user confirmed that its Chromium fixture window is visible on Windows.
 
 ## 1. Start Here
 
@@ -10,7 +10,7 @@ Read this document and [DESIGN.md](DESIGN.md), then inspect the current worktree
 
 Suggested request for the next AI when the user is ready to start:
 
-> Read [HANDOFF.md](HANDOFF.md) and [DESIGN.md](DESIGN.md). Continue Milestone 0 in the Podman devcontainer: the selected-fixture popup and native handshake passed in Chromium, and the official-SDK diagnostic tool passed a local stdio client call. Verify the tool through the actual VS Code MCP host, then plan a bounded rich-editor experiment; request permission before any real Gemini conversation or send. Keep the browser-chat scope and safety constraints. Report exact checks and human actions; do not implement every phase in one large change.
+> Read [HANDOFF.md](HANDOFF.md) and [DESIGN.md](DESIGN.md). Continue Milestone 0 in the Podman devcontainer: the selected-fixture popup and native handshake passed in Chromium, and the official-SDK diagnostic tool passed both a local stdio client call and a VS Code MCP host call. Plan a bounded rich-editor experiment; request permission before any real Gemini conversation or send. Keep the browser-chat scope and safety constraints. Report exact checks and human actions; do not implement every phase in one large change.
 
 ### What the user actually wants
 
@@ -24,7 +24,7 @@ The eventual generic behavior comes from a shared chat model plus reviewed site 
 
 | Item | Status at handoff |
 | --- | --- |
-| Repository | Fixture server, WXT popup/background, and a handshake-only TypeScript native host with a verified browser handshake; diagnostic-only MCP stdio tool and local client test, but no broker or chat MCP tools |
+| Repository | Fixture server, WXT popup/background, and a handshake-only TypeScript native host with a verified browser handshake; diagnostic-only MCP stdio tool called through a local client and VS Code Chat, but no broker or chat MCP tools |
 | Design | Proposed architecture and phased plan in [DESIGN.md](DESIGN.md) |
 | Workspace location | `/workspaces/agent-messaging-mcp` in the devcontainer; the earlier WSL host path was `/home/vscode/AI/agent-messaging-mcp` |
 | Kernel observed | `Linux 6.18.33.2-microsoft-standard-WSL2` |
@@ -153,7 +153,7 @@ tests/
 
 Place unit tests next to the modules they exercise. Reuse the fixture and helpers across phases. Do not create throwaway prototypes that then require a second implementation of the same domain logic; keep experiments small enough to promote or remove deliberately.
 
-Implement and document the following script contract as those components arrive. **`dev:fixture`, `build`, `build:companion`, `typecheck`, `test:unit`, `build:extension`, and native registration/restore work now; the browser handshake passed. The local SDK diagnostic tool passed, but its VS Code host call is pending.**
+Implement and document the following script contract as those components arrive. **`dev:fixture`, `build`, `build:companion`, `typecheck`, `test:unit`, `build:extension`, and native registration/restore work now; the browser handshake and local/VS Code SDK diagnostic calls passed.**
 
 | Planned command | Purpose |
 | --- | --- |
@@ -319,12 +319,12 @@ After each completed milestone, update the status below and the setup documentat
 - [x] Load the extension in container Chromium; ID `ihgoljipfhieipbphdchlghecffbbddo`.
 - [x] Register a native host for that ID in the development Chromium profile; manifest and launcher are owner-private.
 - [x] User invoked the popup on the selected fixture tab: it showed `fixture-alpha`, both rendered messages, and `Native bridge ready (protocol v1). Nothing was sent.` The native host manifest was found in the development Chromium profile.
-- [x] Official `@modelcontextprotocol/server` and `@modelcontextprotocol/client` 2.1.0 with Zod 4.6.5: a local SDK stdio client discovered and called the diagnostic-only tool. The SDK documents MCP `2026-07-28`; VS Code host negotiation is not yet verified.
-- [ ] Call `browser_chat_feasibility` through the actual VS Code MCP host via the workspace [`.vscode/mcp.json`](.vscode/mcp.json); it must return the fixed diagnostic result, not chat data.
-- [ ] Milestone 0: visible Chromium, unpacked extension, native handshake, and MCP feasibility verified.
+- [x] Official `@modelcontextprotocol/server` and `@modelcontextprotocol/client` 2.1.0 with Zod 4.6.5: a local SDK stdio client discovered and called the diagnostic-only tool. The SDK documents MCP `2026-07-28` support; the actual VS Code negotiated protocol version was not observed.
+- [x] In VS Code Chat, `browser_chat_feasibility` was invoked through the workspace [`.vscode/mcp.json`](.vscode/mcp.json) and returned `MCP stdio diagnostic OK. No browser data was read or sent.` This proves a VS Code host tool call, not chat access.
+- [ ] Milestone 0: browser GUI, extension, native handshake, and VS Code MCP feasibility passed; rich-editor and authorized real-site findings remain.
 - [ ] Milestone 1: authorized read-only pipeline verified end to end.
 - [ ] Milestone 2: supervised sends and crash/retry safety verified.
 - [ ] Milestone 3: Gemini and generic calibration verified.
 - [ ] Milestone 4: documented local release and supported-host matrix verified.
 
-Next action: start `browserChatFeasibility` from the workspace MCP configuration in VS Code, call `browser_chat_feasibility` in VS Code Chat, and record the actual host result and negotiated protocol support. Rich-editor and live Gemini input remain unverified and require a separate bounded experiment and explicit user approval before any real-site send.
+Next action: use only a local fixture for a bounded rich-editor input experiment, then discuss a disposable Gemini conversation with the user before any live-site inspection or send. Do not treat the diagnostic MCP tool as a chat connector or infer the exact negotiated VS Code protocol version from its successful result.
