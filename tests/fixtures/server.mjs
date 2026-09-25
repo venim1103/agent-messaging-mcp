@@ -29,8 +29,9 @@ export function createFixtureServer() {
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const port = Number(process.env.PORT ?? 8787);
+  const host = process.env.FIXTURE_HOST ?? "127.0.0.1";
   const server = createFixtureServer();
-  server.listen(port, "127.0.0.1", () => {
+  server.listen(port, host, () => {
     console.log(`Fixture chat: http://127.0.0.1:${server.address().port}/`);
   });
 }

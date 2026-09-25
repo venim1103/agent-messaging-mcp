@@ -2,7 +2,7 @@
 
 Updated: 2026-09-25.
 
-This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **No application code has been created.** The current user request was to prepare this handoff, not to begin implementation.
+This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **A fixture server and read-only extension popup exist, but native messaging, the broker, and MCP integration do not.** The Podman devcontainer is prepared; reopen VS Code in it before adding application features.
 
 ## 1. Start Here
 
@@ -10,7 +10,7 @@ Read this document and [DESIGN.md](DESIGN.md), then inspect the current worktree
 
 Suggested request for the next AI when the user is ready to start:
 
-> Read [HANDOFF.md](HANDOFF.md) and [DESIGN.md](DESIGN.md). Start with Milestone 0 and implement the smallest testable feasibility slice. Chromium is installed in WSL, but its GUI, extension loading, and native messaging still need verification. Keep the browser-chat scope and safety constraints. Use local chat fixtures before any real account. Report the exact checks that passed, what needs a human action, and the next milestone; do not implement every phase in one large change.
+> Read [HANDOFF.md](HANDOFF.md) and [DESIGN.md](DESIGN.md). Reopen this WSL workspace in the Podman devcontainer, then continue Milestone 0 from the built fixture and read-only extension popup. Node/npm and Chromium are inside the container; browser GUI visibility on Windows, extension loading, and native messaging still need verification. Keep the browser-chat scope and safety constraints. Use local chat fixtures before any real account. Report the exact checks that passed, what needs a human action, and the next milestone; do not implement every phase in one large change.
 
 ### What the user actually wants
 
@@ -24,20 +24,50 @@ The eventual generic behavior comes from a shared chat model plus reviewed site 
 
 | Item | Status at handoff |
 | --- | --- |
-| Repository | Documentation and license only; no package manifests, application code, extension, tests, or running project server |
+| Repository | Fixture server and unit test, npm workspace, and a fixture-only WXT popup; no native relay, broker, or MCP server |
 | Design | Proposed architecture and phased plan in [DESIGN.md](DESIGN.md) |
 | Workspace location | `/home/vscode/AI/agent-messaging-mcp` |
 | Kernel observed | `Linux 6.18.33.2-microsoft-standard-WSL2` |
 | WSL distribution variable | `Ubuntu` |
-| Chromium executable | `/usr/bin/chromium` is visible in the current shell |
+| Container browser | `/usr/bin/chromium`; version `153.0.8010.52` on Debian 12 at the time of testing |
 | Display variables | `DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-0` |
-| Container indicator | `/.dockerenv` was absent; this alone is not a guarantee about every isolation boundary |
-| JavaScript tools | `node` and `npm` available under the user's nvm installation; executable paths contain `v24.19.0` |
-| pnpm | Not found by the shell check; use npm unless there is a concrete reason to change |
-| Browser validation | Chromium version, GUI startup, unpacked extension support, native messaging, and login state have not been tested |
+| Toolchain | Node `v24.18.0` and npm installed in the container image; `npm ci` runs on container creation. No WSL/Windows Node, npm, or Chromium installation is required by this project workflow |
+| Package manager | npm; use the tracked lockfile and `npm ci` inside the container |
+| Podman/devcontainer | Rootless Podman `4.9.3` (`crun`); devcontainer CLI `0.87.0` started the container with `--docker-path podman`, UID 1000, and mounted workspace |
+| Browser validation | Chromium launched without `--no-sandbox` inside Podman; a process in the container connected to WSLg X11. GUI visibility on Windows, unpacked extension selection, native messaging, and login state still need user confirmation or tests |
+| Container network | Fixture served inside the container; WSL `http://127.0.0.1:8787/` and Windows `http://localhost:8787/` both returned HTTP 200 |
+| Browser profile | Podman volume `agent-messaging-mcp-chromium-profile` is mounted at the container's development profile path; confirmed writable by UID 1000, but no login persistence across a second rebuild has been tested |
 | Live integration | No messages have been read or sent; no Gemini or WhatsApp compatibility has been established |
 
 Recheck the environment at the beginning of implementation. A future AI may run in a different terminal, container, or remote host. Do not interpret installed Chromium or populated display variables as a successful browser test.
+
+### Podman devcontainer and browser placement
+
+The active configuration is [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json) and its [Dockerfile](.devcontainer/Dockerfile). The image installs Chromium, Node, and npm; creation runs `npm ci`. It uses rootless Podman, `remoteUser: node`, `--userns=keep-id`, and an X11 socket mount for WSLg. A Podman volume retains the development Chromium profile across container replacement; it contains sensitive login data and must never be copied into Git. The fixture port is published to **WSL loopback only**. The fixture binds `0.0.0.0` *inside the container* via `FIXTURE_HOST`; other services must not treat this fixture-specific binding or port as an authenticated bridge.
+
+On a **WSL host terminal**, the following commands were verified:
+
+```bash
+devcontainer up --workspace-folder "$PWD" --docker-path podman
+devcontainer exec --workspace-folder "$PWD" --docker-path podman npm run test:unit
+devcontainer exec --workspace-folder "$PWD" --docker-path podman npm run build:extension
+devcontainer exec --workspace-folder "$PWD" --docker-path podman npm run dev:fixture
+```
+
+The last command stays running while the fixture is being tested. WSL `http://127.0.0.1:8787/` and Windows `http://localhost:8787/` both served the fixture in this environment. In VS Code, open the WSL folder and set the **WSL/Dev Containers host** user setting `dev.containers.dockerPath` to `podman`, then use **Dev Containers: Reopen in Container**. Podman 4.9.3 worked with the CLI here even though Microsoft's documentation describes Podman 5+ as mostly Docker-compatible; the actual VS Code GUI reopen still needs validation. A user needs rootless Podman and the devcontainer CLI (plus VS Code's Dev Containers extension and WSLg to view the GUI), not host Node/npm/Chromium or Docker Compose.
+
+After reopening, run these in a **container terminal**:
+
+```bash
+npm run dev:fixture
+chromium --user-data-dir="$HOME/.local/share/agent-messaging-mcp/chromium-dev" --no-first-run http://127.0.0.1:8787/
+```
+
+Run these in separate terminals: both commands stay running. The browser process uses the container's profile volume and WSLg's X11 socket to display a window on Windows. Use `npm run build:extension` inside the container, then in that **container Chromium**, visit `chrome://extensions` and load `/workspaces/agent-messaging-mcp/packages/extension/.output/chrome-mv3`. The popup currently inspects only the fixture origin `http://127.0.0.1:8787`, requires the browser toolbar gesture, and does not persist a grant or send anything. Browsers already open on Windows/WSL are separate; the extension cannot attach to their tabs or use their logins. Log in manually in the container Chromium for any later authorized live-site test.
+
+When native messaging is implemented, the browser-spawned host, registration, broker, and MCP facade must all live in **the same container as Chromium**. The extension build is in the mounted workspace. Register the native host for the exact extension ID inside this container; account for registration loss if the container is replaced, since only the Chromium profile volume is currently persistent. The published **fixture** port is not a browser-control interface. Do not mount any external browser profile or expose CDP.
+
+These checks prove the command-line container, in-container Chromium launch, X11 socket connection, and Windows HTTP path. They do **not** prove that VS Code has reopened in the container or that the Chromium window is visible on the user's Windows desktop; ask for that direct visual confirmation when continuing. VS Code's window and Copilot Chat UI remain on Windows by design; after reopening, the workspace, integrated terminals, agent tool executions, and any workspace extension host run in the container. VS Code chooses whether a particular Copilot extension component runs as a UI or workspace extension. Do not claim the whole chat service or Windows UI runs inside Podman.
 
 ## 3. Keep These Decisions
 
@@ -56,24 +86,24 @@ The debugger permission must be declared as a required permission when adding de
 
 ### 4.1 Verify prerequisites without changing the machine
 
-Run these checks in the terminal that will run the companion:
+Run browser/toolchain checks in a terminal **inside the devcontainer**:
 
 ```bash
 uname -sr
-command -v chromium chromium-browser node npm
+command -v chromium node npm
 chromium --version
 node --version
 npm --version
-printf 'DISPLAY=%s\nWAYLAND_DISPLAY=%s\n' "$DISPLAY" "$WAYLAND_DISPLAY"
+printf 'DISPLAY=%s\n' "$DISPLAY"
 ```
 
-`command -v` may exit nonzero because one alternative name is missing; inspect its output. The current observed browser executable is `chromium`, not `chromium-browser`.
+No host Node/npm/Chromium setup is needed. The container's observed browser executable is `chromium`, not `chromium-browser`. WSLg is a display prerequisite supplied by the WSL host.
 
 Check the published SDK's version, runtime requirements, and documented stdio API before installing dependencies. Use a stable release and a lockfile. If package names or protocol support differ from the design, document the verified choice; do not invent an import or write a replacement MCP protocol implementation.
 
 ### 4.2 Verify a visible browser
 
-For development, use a dedicated browser profile outside the repository, separate from the user's everyday profile. A proposed launch command, to run when browser testing is authorized, is:
+For development, use the dedicated Podman volume-backed browser profile outside the repository, separate from the user's everyday profile. Run inside the container:
 
 ```bash
 chromium --user-data-dir="$HOME/.local/share/agent-messaging-mcp/chromium-dev" --no-first-run
@@ -83,7 +113,7 @@ This command creates profile data on first use. A dedicated profile is a test is
 
 Verify that the window is actually visible through WSLg, a local fixture URL loads, and the extension page can be opened. Do not add `--no-sandbox`, disable web security, export a debugger port, copy cookies, or run Chromium as root to work around a failure. Diagnose the actual failure and ask the user to perform a required OS-level action if needed.
 
-Keep the browser, native host, and broker in the same WSL distribution and OS-user context for this first milestone. Do not silently substitute Windows Chrome: it would require Windows host registration and different executable/IPC paths.
+Keep the browser, native host, and broker in the same container and OS-user context for this first milestone. Do not silently substitute Windows or WSL Chromium: either would require separate native-host registration and a different IPC boundary.
 
 ### 4.3 Load the development extension
 
@@ -101,9 +131,9 @@ The normal per-user Chromium host-manifest location on Linux is under `~/.config
 
 Use a host name such as `com.agent_messaging_mcp.bridge` consistently. The host manifest must use an absolute path to an executable launcher and an exact `chrome-extension://<actual-extension-id>/` allowed origin. The registration helper must preview what it changes and not overwrite unrelated registrations.
 
-**nvm detail:** the browser-spawned host may not inherit the interactive shell's nvm setup. Resolve an absolute Node executable during registration and use a launcher that invokes the built relay with that executable. Verify it without relying on shell startup files. Never write diagnostic output to native-host stdout.
+**Environment detail:** the browser-spawned host may not inherit the interactive shell's PATH. Resolve the container's absolute Node executable during registration and use a launcher that invokes the built relay with that executable. Verify it without relying on shell startup files. Never write diagnostic output to native-host stdout.
 
-Do not expand into a complete installer yet. A reversible, user-level registration helper for this Linux test environment is sufficient. Native-host registration changes files outside the repository; explain those changes before asking the user to approve the test setup.
+Do not expand into a complete installer yet. A reversible, container-local registration helper is sufficient. Since the container may be replaced, ensure its registration can be recreated on demand and never overwrite unrelated registrations.
 
 ## 5. Proposed Structure and Development Commands
 
@@ -121,7 +151,7 @@ tests/
 
 Place unit tests next to the modules they exercise. Reuse the fixture and helpers across phases. Do not create throwaway prototypes that then require a second implementation of the same domain logic; keep experiments small enough to promote or remove deliberately.
 
-Implement and document the following script contract as those components arrive. **These commands do not exist yet.**
+Implement and document the following script contract as those components arrive. **`dev:fixture`, `typecheck`, `test:unit`, and `build:extension` work now; the others are planned.**
 
 | Planned command | Purpose |
 | --- | --- |
@@ -258,7 +288,7 @@ Extend one controllable local fixture instead of relying on a real service for e
 | Buffer overflow, suspension, and reload | Explicit stale/gap/expired-cursor handling |
 | Forged page approval and a second MCP client | Access denied without data leakage |
 
-Use Vitest for contracts/state machines and Playwright's bundled Chromium with a persistent context for automated extension tests. Keep that test profile separate from the manually used WSL Chromium profile.
+Use Vitest for contracts/state machines and Playwright's bundled Chromium with a persistent context for automated extension tests. Keep that test profile separate from the manually used container Chromium profile.
 
 At least one integration test must traverse the public MCP tool -> broker -> real native framing -> extension -> fixture path. Unit mocks and direct content-script calls cannot substitute for this test. Similarly, directly invoking an action handler does not prove that a real browser user gesture granted `activeTab`; manually verify that installation/selection path when browser automation cannot exercise it faithfully.
 
@@ -279,11 +309,13 @@ After each completed milestone, update the status below and the setup documentat
 ### Current Milestone Status
 
 - [x] Product design and implementation handoff written.
-- [x] WSL kernel, browser executable availability, and display-variable presence inspected.
+- [x] Rootless Podman devcontainer started with Node/npm and Chromium installed inside it; fixture and WXT checks passed inside.
+- [x] Container X11 socket access and Windows access to the container fixture on loopback verified; browser profile volume writable.
+- [ ] VS Code reopened into container and Chromium window visually confirmed on Windows.
 - [ ] Milestone 0: visible Chromium, unpacked extension, native handshake, and MCP feasibility verified.
 - [ ] Milestone 1: authorized read-only pipeline verified end to end.
 - [ ] Milestone 2: supervised sends and crash/retry safety verified.
 - [ ] Milestone 3: Gemini and generic calibration verified.
 - [ ] Milestone 4: documented local release and supported-host matrix verified.
 
-Next action after implementation is authorized: verify the browser version and visible WSLg launch, then build the smallest fixture/extension/native-handshake slice described in Milestone 0.
+Next action after reopening in the devcontainer: visually confirm the container Chromium window, load the built extension, and continue the fixture/extension/native-handshake slice of Milestone 0.

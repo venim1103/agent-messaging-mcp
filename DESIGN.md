@@ -72,7 +72,7 @@ Ordinary CDP attachment is not an alternative to obtaining permission. Playwrigh
 3. Add the MCP server to the agent host. The launcher starts or connects to the local broker.
 4. Open and log in to the desired chat website normally.
 
-Installation should ultimately be handled by one companion installer per supported OS. An extension alone cannot install its native host, and an npm package running in a remote container cannot register a host for the user's desktop browser.
+Installation should ultimately be handled by one companion installer per supported OS. An extension alone cannot install its native host. In the current development setup, both the browser and native host will run inside the same Podman devcontainer. A containerized companion cannot register a host for a separate browser running on Windows or WSL.
 
 ### Connect a conversation
 
@@ -321,13 +321,15 @@ On reconnection, establish a fresh document/generation, resnapshot, and report a
 
 ### Local, container, and remote hosts
 
-The extension and native companion run on the machine where the browser runs. A broker inside a container cannot attach to the host's browser just because both machines have an address called `localhost`.
+The extension and native companion run where the browser runs. For this project's Podman devcontainer workflow, that means **Chromium, its installed extension, the native messaging host, the broker, and the MCP facade all run inside the same container**. Node/npm and Chromium are installed in the image; WSLg's X11 socket only carries the browser window to Windows. The container browser has its own persistent profile: users log in there manually; the extension cannot attach to existing tabs in Windows or WSL Chromium.
 
-For a local desktop agent, use stdio and private local IPC with no TCP listener. For an agent in a devcontainer or remote workspace, keep the browser broker on the desktop and expose an **opt-in authenticated Streamable HTTP facade** through a deliberately configured private tunnel. This is an optional deployment profile, not a reason to expose the browser's debugger port.
+For an eventual non-container desktop deployment, run the native companion alongside the user's chosen desktop browser. Container-based development does not change that product requirement. A broker inside a container cannot access a separate host browser just because both have an address called `localhost`.
+
+Use stdio and private local IPC among processes in the container, with no TCP browser-control listener. Only the synthetic fixture port is published to WSL loopback for manual testing. If a future deployment separates the MCP host and browser companion across machines or containers, add an **opt-in authenticated Streamable HTTP facade** through a deliberately configured private tunnel. This is a separate deployment profile, not a reason to expose the browser's debugger port.
 
 The HTTP endpoint must validate Origin and Host, authenticate and authorize every caller, and bind to loopback by default. Use TLS for non-loopback access and the SDK's documented authorization facilities for remote deployments. A tunnel does not replace application authorization; never enable wildcard browser origins or assume CORS alone protects a local control endpoint. [11]
 
-Remote support should move into the MVP only if the first intended agent actually runs remotely. Otherwise defer its packaging and authentication UX.
+With the agent and browser both inside this devcontainer, remote broker access is unnecessary for the MVP. Defer its packaging and authentication UX unless the target deployment later requires separate locations.
 
 ## 13. Security and Privacy
 
