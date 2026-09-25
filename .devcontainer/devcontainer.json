@@ -8,9 +8,9 @@
   "runArgs": [
     "--userns=keep-id",
     "--volume=/tmp/.X11-unix:/tmp/.X11-unix:ro",
-    "--volume=agent-messaging-mcp-chromium-profile:/home/node/.local/share/agent-messaging-mcp/chromium-dev:U",
-    "--publish=127.0.0.1:8787:8787"
+    "--volume=agent-messaging-mcp-chromium-profile:/home/node/.local/share/agent-messaging-mcp/chromium-dev:U"
   ],
+  "forwardPorts": [8787],
   "containerEnv": {
     "FIXTURE_HOST": "0.0.0.0",
     "DISPLAY": "${localEnv:DISPLAY}"
