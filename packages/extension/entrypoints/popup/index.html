@@ -103,13 +103,13 @@
     <main>
       <header>
         <h1>Browser chat</h1>
-        <span class="mode">Fixture probe</span>
+        <span class="mode">Read-only probe</span>
       </header>
       <button type="button" id="inspect">Inspect this chat</button>
-      <p id="status" role="status">Read-only. Open the local fixture to inspect it.</p>
+      <p id="status" role="status">Read-only. Open the local fixture or a disposable Gemini chat.</p>
       <section id="result" hidden>
         <h2 id="conversation"></h2>
-        <ol id="messages" aria-label="Recent messages"></ol>
+        <ol id="messages" aria-label="Inspection results"></ol>
       </section>
     </main>
     <script type="module" src="./main.ts"></script>
