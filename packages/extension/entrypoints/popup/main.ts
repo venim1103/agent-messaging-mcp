@@ -12,10 +12,13 @@ type GeminiPreview = {
   rows: { tag: string; characters: number }[];
 };
 type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: string };
+type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
 
 const fixtureOrigin = "http://127.0.0.1:8787";
+const richFixtureUrl = `${fixtureOrigin}/?editor=rich`;
 const geminiOrigin = "https://gemini.google.com";
 const inspectButton = document.querySelector<HTMLButtonElement>("#inspect");
+const fixtureInputButton = document.querySelector<HTMLButtonElement>("#test-fixture-input");
 const status = document.querySelector<HTMLElement>("#status");
 const result = document.querySelector<HTMLElement>("#result");
 const conversation = document.querySelector<HTMLElement>("#conversation");
@@ -73,9 +76,33 @@ function inspectGeminiStructure(): GeminiPreview | null {
   };
 }
 
-if (!inspectButton || !status || !result || !conversation || !messages) {
+if (!inspectButton || !fixtureInputButton || !status || !result || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
 }
+
+void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+  fixtureInputButton.hidden = tab?.url !== richFixtureUrl;
+});
+
+fixtureInputButton.addEventListener("click", async () => {
+  fixtureInputButton.disabled = true;
+  status.textContent = "Checking debugger input on the local rich fixture...";
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (tab?.id == null || tab.url !== richFixtureUrl) {
+      status.textContent = "Open the local rich fixture to test input. Nothing sent.";
+      return;
+    }
+    const probe = await browser.runtime.sendMessage({ kind: "probe_fixture_input", tabId: tab.id }) as FixtureInputResult;
+    status.textContent = probe.ok
+      ? `Fixture input read back (${probe.characters} characters). Send was not clicked.`
+      : `${probe.error}. Send was not clicked.`;
+  } catch {
+    status.textContent = "Fixture debugger input unavailable. Inspect the draft before retrying.";
+  } finally {
+    fixtureInputButton.disabled = false;
+  }
+});
 
 inspectButton.addEventListener("click", async () => {
   inspectButton.disabled = true;

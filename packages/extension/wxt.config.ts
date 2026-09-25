@@ -2,8 +2,8 @@ import { defineConfig } from "wxt";
 
 export default defineConfig({
   manifest: {
-    name: "Browser Chat MCP (read-only probe)",
-    description: "Inspect a selected local fixture or Gemini chat structure with a read-only popup.",
-    permissions: ["activeTab", "scripting", "nativeMessaging"]
+    name: "Browser Chat MCP (fixture input test)",
+    description: "Inspect a selected chat read-only; test debugger input only on the local rich fixture.",
+    permissions: ["activeTab", "scripting", "nativeMessaging", "debugger"]
   }
 });
