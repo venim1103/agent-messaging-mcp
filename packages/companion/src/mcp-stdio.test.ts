@@ -97,6 +97,8 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.ok(readyContent && typeof readyContent === "object" && !Array.isArray(readyContent));
     assert.equal((readyContent as { state: string }).state, "ready_readonly");
     assert.equal("tabId" in readyContent, false);
+    assert.deepEqual((readyContent as { observation: unknown }).observation,
+      { state: "not_observed", capturedAt: null });
     const connectionId = (readyContent as { connectionId: string }).connectionId;
     const notObserved = await clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId } });
     assert.equal(notObserved.isError, true);
@@ -128,6 +130,11 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.deepEqual((snapshot.structuredContent as { messages: unknown }).messages, messages);
     assert.equal((snapshot.structuredContent as { coverage: string }).coverage, "rendered_only");
     assert.equal((snapshot.structuredContent as { omittedBefore: boolean }).omittedBefore, false);
+    const observedState = await clientOne.callTool({ name: "chat.get_connection", arguments: {
+      requestId: handle.requestId
+    } });
+    assert.deepEqual((observedState.structuredContent as { observation: unknown }).observation,
+      { state: "recent", capturedAt: (snapshot.structuredContent as { capturedAt: number }).capturedAt });
     const cursor = (snapshot.structuredContent as { cursor: { epoch: string; sequence: number } }).cursor;
     const empty = await clientOne.callTool({ name: "chat.wait_for_events", arguments: {
       connectionId, cursor, timeoutMs: 0

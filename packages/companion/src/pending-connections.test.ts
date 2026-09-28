@@ -64,7 +64,8 @@ test("a fixture grant is one-shot, owner-bound, and expires without exposing tab
   assert.equal(granted?.expiresAt, 2000 + READONLY_CONNECTION_TTL_MS);
   assert.equal("tabId" in granted!, false);
   assert.equal("documentId" in granted!, false);
-  assert.deepEqual(requests.get(owner, pending.requestId, 2000), granted);
+  assert.deepEqual(requests.get(owner, pending.requestId, 2000), { ...granted,
+    observation: { state: "not_observed", capturedAt: null } });
   assert.equal(requests.get(stranger, pending.requestId, 2000), null);
   assert.deepEqual(requests.getApprovedTarget(owner, granted!.connectionId, 2000), target);
   assert.equal(requests.getApprovedTarget(stranger, granted!.connectionId, 2000), null);
@@ -93,7 +94,8 @@ test("a changed fixture document or conversation revokes a grant without revivin
   };
   const granted = requests.approve(pending.requestId, target, 2000);
   assert.equal(requests.revokeChangedTab(3, { documentId: target.documentId, conversationId: target.conversationId }), 0);
-  assert.deepEqual(requests.get(owner, pending.requestId, 2000), granted);
+  assert.deepEqual(requests.get(owner, pending.requestId, 2000), { ...granted,
+    observation: { state: "not_observed", capturedAt: null } });
   assert.equal(requests.revokeChangedTab(3, { documentId: "new-document", conversationId: target.conversationId }), 1);
   assert.deepEqual(requests.get(owner, pending.requestId, 2000), { requestId: pending.requestId, state: "stale" });
   assert.equal(requests.getApprovedTarget(owner, granted!.connectionId, 2000), null);
@@ -155,6 +157,12 @@ test("bounded fixture snapshots belong only to live matching grants and retain a
   assert.equal(initial.coverage, "rendered_only");
   assert.equal(initial.capturedAt, 2001);
   assert.equal(initial.cursor.sequence, 1);
+  const recentHealth = requests.get(owner, pending.requestId, 2001);
+  if (recentHealth?.state !== "ready_readonly") throw new Error("Expected a ready recent connection");
+  assert.deepEqual(recentHealth.observation, { state: "recent", capturedAt: 2001 });
+  const oldHealth = requests.get(owner, pending.requestId, 2002 + MAX_FIXTURE_SNAPSHOT_AGE_MS);
+  if (oldHealth?.state !== "ready_readonly") throw new Error("Expected a ready old connection");
+  assert.deepEqual(oldHealth.observation, { state: "old", capturedAt: 2001 });
   const atSnapshot = requests.readFixtureEvents(owner, grant.connectionId, initial.cursor, 1, 2001);
   if (!atSnapshot || atSnapshot === "not_ready" || atSnapshot.state !== "ok") {
     throw new Error("Expected an empty initial event page");

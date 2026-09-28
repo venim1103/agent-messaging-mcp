@@ -44,7 +44,9 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ requestId: z.uuid(), state: z.enum(["pending", "expired"]), expiresAt: z.number().int().safe() }),
       z.strictObject({ requestId: z.uuid(), state: z.literal("ready_readonly"), connectionId: z.uuid(),
         generation: z.literal(1), origin: z.literal("http://127.0.0.1:8787"),
-        conversationId: z.literal("fixture-alpha"), expiresAt: z.number().int().safe() })
+        conversationId: z.literal("fixture-alpha"), expiresAt: z.number().int().safe(),
+        observation: z.strictObject({ state: z.enum(["not_observed", "recent", "old"]),
+          capturedAt: z.number().int().safe().nullable() }) })
     ])
   }),
   z.strictObject({

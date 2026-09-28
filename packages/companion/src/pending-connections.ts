@@ -33,6 +33,9 @@ export type ReadonlyConnection = Readonly<{
   conversationId: FixtureTarget["conversationId"];
   expiresAt: number;
 }>;
+export type ReadonlyConnectionState = ReadonlyConnection & Readonly<{
+  observation: Readonly<{ state: "not_observed" | "recent" | "old"; capturedAt: number | null }>;
+}>;
 
 export type FixtureMessage = Readonly<{ id: string; direction: "incoming" | "outgoing"; text: string }>;
 export type FixtureSnapshot = Readonly<{
@@ -107,7 +110,7 @@ export class PendingConnectionRequests {
     return { requestId, state: "pending", expiresAt };
   }
 
-  get(owner: symbol, requestId: string, now = Date.now()): PendingRequest | ReadonlyConnection
+  get(owner: symbol, requestId: string, now = Date.now()): PendingRequest | ReadonlyConnectionState
     | Readonly<{ requestId: string; state: "stale" }> | null {
     const request = this.requests.get(requestId);
     if (!request || request.owner !== owner) return null;
@@ -117,7 +120,14 @@ export class PendingConnectionRequests {
       return null;
     }
     if (request.grant?.stale && now < expiresAt) return { requestId, state: "stale" };
-    if (request.grant && now < expiresAt) return request.grant.connection;
+    if (request.grant && now < expiresAt) {
+      const capturedAt = request.grant.snapshot?.capturedAt ?? null;
+      return Object.freeze({ ...request.grant.connection, observation: Object.freeze({
+        state: capturedAt === null ? "not_observed" as const
+          : now - capturedAt <= MAX_FIXTURE_SNAPSHOT_AGE_MS ? "recent" as const : "old" as const,
+        capturedAt
+      }) });
+    }
     return {
       requestId,
       state: now >= expiresAt ? "expired" : "pending",

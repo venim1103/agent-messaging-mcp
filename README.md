@@ -16,7 +16,7 @@ There is no network browser-control listener, unrestricted CDP bridge, model-sup
 
 ## What Works Today
 
-- `chat.request_connection` creates a short-lived pending request; `chat.get_connection` reports owner-visible state and, after approval, a read-only connection ID.
+- `chat.request_connection` creates a short-lived pending request; `chat.get_connection` reports owner-visible state and, after approval, a read-only connection ID plus the last snapshot's observation freshness (`not_observed`, `recent`, or `old`). Freshness is not a browser-presence signal.
 - `chat.read_messages` requests a **fresh, rendered-only fixture snapshot** through a bounded browser challenge, then returns its capture time and cursor. It fails without a matching exact-document response; it is not complete chat history or a Gemini transcript.
 - `chat.wait_for_events` waits up to 20 seconds for later fixture snapshots after that cursor, returning at most two per call. Timeouts are explicit; an expired cursor requires another `chat.read_messages` snapshot. A real fixture message appeared through this route in a manual toolbar test. Each event contains the current rendered snapshot, not only newly received rows.
 - `chat.disconnect` lets the owning MCP client revoke its fixture grant without closing the tab. The extension drops tracking and document observers when its native watcher sees that the broker no longer has a live grant. An unchanged reread refreshes capture time without manufacturing an event.
@@ -59,6 +59,6 @@ npm run test:unit
 npm run test:e2e
 ```
 
-Unit and isolated Chromium tests cover role isolation, native framing, read challenges, event cursors, and disconnect cleanup; the real toolbar fixture read and fixture message-to-MCP event routes also passed manual checks. Automated popup navigation does **not** grant Chrome's `activeTab` permission and is not counted as trusted approval coverage. Read challenges fail closed if the browser cannot verify the approved fixture document, but live health/gap reporting and a reviewed real-site adapter are still needed before supporting other conversations. Sending requires a separate supervised approval and recovery path.
+Unit and isolated Chromium tests cover role isolation, native framing, read challenges, event cursors, and disconnect cleanup; the real toolbar fixture read and fixture message-to-MCP event routes also passed manual checks. Automated popup navigation does **not** grant Chrome's `activeTab` permission and is not counted as trusted approval coverage. Read challenges fail closed if the browser cannot verify the approved fixture document, but browser presence/suspension reporting, gaps beyond expired cursors, and a reviewed real-site adapter are still needed before supporting other conversations. Sending requires a separate supervised approval and recovery path.
 
 Read [DESIGN.md](DESIGN.md) for the architecture and intended capabilities, [HANDOFF.md](HANDOFF.md) for setup details and test evidence, and [LICENSE](LICENSE) for licensing.
