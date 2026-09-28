@@ -9,7 +9,8 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativePendingList, PROTOCOL_VERSION } from "./native-protocol.js";
+import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativePendingList, PROTOCOL_VERSION }
+  from "./native-protocol.js";
 
 const origin = `chrome-extension://${"a".repeat(32)}/`;
 const now = 1_750_000_000_000;
@@ -58,6 +59,26 @@ test("native pending list accepts no selectors, transcript fields, or arbitrary 
     { ...listing, tabId: 1 }
   ]) {
     assert.throws(() => parseNativePendingList(invalid, now), /Invalid native pending list request/);
+  }
+});
+
+test("native fixture approval refuses other origins, targets, and arbitrary fields", () => {
+  const approval = { ...request, kind: "approve_fixture", payload: {
+    pendingRequestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+    target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "a66b3997-9d43-4554-8399-267d1fe9f75c" }
+  } };
+  assert.deepEqual(parseNativeFixtureApproval(approval, now), approval);
+  for (const invalid of [
+    { ...approval, kind: "evaluate" },
+    { ...approval, deadlineMs: now },
+    { ...approval, connectionGeneration: 1 },
+    { ...approval, payload: { ...approval.payload, target: { ...approval.payload.target, origin: "https://gemini.google.com" } } },
+    { ...approval, payload: { ...approval.payload, target: { ...approval.payload.target, tabId: 0 } } },
+    { ...approval, payload: { ...approval.payload, target: { ...approval.payload.target, documentId: "unknown" } } },
+    { ...approval, payload: { ...approval.payload, command: "navigate" } }
+  ]) {
+    assert.throws(() => parseNativeFixtureApproval(invalid, now), /Invalid native fixture approval/);
   }
 });
 
@@ -132,6 +153,37 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.deepEqual(reply.payload.requests, [{
       requestId: created.payload.requestId, expiresAt: created.payload.expiresAt
     }]);
+
+    const approvalHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const approvalOutput: Buffer[] = [];
+    const approvalErrors: Buffer[] = [];
+    approvalHost.stdout.on("data", (chunk: Buffer) => approvalOutput.push(chunk));
+    approvalHost.stderr.on("data", (chunk: Buffer) => approvalErrors.push(chunk));
+    const approval = { ...request, kind: "approve_fixture", deadlineMs: Date.now() + 10_000, payload: {
+      pendingRequestId: created.payload.requestId,
+      target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+        documentId: "a66b3997-9d43-4554-8399-267d1fe9f75c" }
+    } };
+    approvalHost.stdin.end(Buffer.concat([encodeNativeFrame(approval), encodeNativeFrame(approval)]));
+    const [approvalExit] = await once(approvalHost, "exit");
+    assert.equal(approvalExit, 0, Buffer.concat(approvalErrors).toString());
+    const responses = new NativeFrameDecoder().push(Buffer.concat(approvalOutput)) as [
+      { kind: string; requestId: string; payload: { requestId: string; expiresAt: number } },
+      { kind: string; payload: { code: string } }
+    ];
+    assert.equal(responses.length, 2);
+    assert.equal(responses[0].kind, "fixture_approved");
+    assert.equal(responses[0].requestId, approval.requestId);
+    assert.equal(responses[0].payload.requestId, created.payload.requestId);
+    assert.deepEqual(responses[1], {
+      kind: "error", protocolVersion: PROTOCOL_VERSION, requestId: approval.requestId,
+      connectionGeneration: 0, deadlineMs: approval.deadlineMs, payload: { code: "APPROVAL_INVALID" }
+    });
+    const granted = await facade.getConnection(created.payload.requestId);
+    if (granted.kind !== "connection_state") throw new Error("Expected owned connection state");
+    assert.equal(granted.payload.state, "ready_readonly");
   } finally {
     facade?.close();
     broker.kill("SIGTERM");

@@ -12,6 +12,29 @@ const pendingListSchema = z.strictObject({
   payload: z.strictObject({})
 });
 
+const fixtureApprovalSchema = z.strictObject({
+  kind: z.literal("approve_fixture"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({
+    pendingRequestId: z.uuid(),
+    target: z.strictObject({
+      origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
+      tabId: z.number().int().safe().positive(), documentId: z.uuid()
+    })
+  })
+});
+
+export function parseNativeFixtureApproval(message: unknown, now = Date.now()) {
+  const result = fixtureApprovalSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture approval");
+  }
+  return result.data;
+}
+
 export function parseNativePendingList(message: unknown, now = Date.now()) {
   const result = pendingListSchema.safeParse(message);
   if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
