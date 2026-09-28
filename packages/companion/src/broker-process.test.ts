@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { connectBroker } from "./broker-client.js";
+import { recoverStaleBrokerRuntime } from "./broker-recovery.js";
 
 test("spawned broker keeps role credentials private and exits cleanly", { timeout: 5000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-home-"));
@@ -61,6 +62,66 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     await assert.rejects(stat(directory), { code: "ENOENT" });
   } finally {
     broker.kill("SIGTERM");
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("broker replaces its own stale runtime after an abrupt exit", { timeout: 6000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-restart-"));
+  const entry = fileURLToPath(new URL("./broker-process.js", import.meta.url));
+  const directory = join(home, ".config/agent-messaging-mcp/broker");
+  const first = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
+  const firstExit = once(first, "exit");
+  let second: ReturnType<typeof spawn> | undefined;
+
+  try {
+    let ready = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      try {
+        ready = (await stat(join(directory, "broker.sock"))).isSocket();
+        if (ready) break;
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      await setTimeout(25);
+    }
+    assert.equal(ready, true, "First broker did not start");
+    const oldKey = await readFile(join(directory, "facade.key"), "utf8");
+    first.kill("SIGKILL");
+    const [, signal] = await firstExit;
+    assert.equal(signal, "SIGKILL");
+    assert.equal((await stat(directory)).isDirectory(), true);
+
+    second = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
+    let refreshed = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      try {
+        refreshed = (await readFile(join(directory, "facade.key"), "utf8")) !== oldKey;
+        if (refreshed) break;
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      await setTimeout(25);
+    }
+    assert.equal(refreshed, true, "Broker did not rotate its stale credential");
+    const client = await connectBroker("facade", directory);
+    client.close();
+  } finally {
+    first.kill("SIGKILL");
+    second?.kill("SIGTERM");
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("stale broker recovery refuses an unrecognized private directory", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-foreign-"));
+  const directory = join(home, "broker");
+  try {
+    await mkdir(directory, { mode: 0o700 });
+    await writeFile(join(directory, "user-file"), "do not remove", { mode: 0o600 });
+    await assert.rejects(recoverStaleBrokerRuntime(home), /unexpected broker runtime files/);
+    assert.equal(await readFile(join(directory, "user-file"), "utf8"), "do not remove");
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

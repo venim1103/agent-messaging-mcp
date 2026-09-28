@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createBrokerCredentials } from "./broker-roles.js";
 import { startBrokerSocket } from "./broker-ipc.js";
+import { recoverStaleBrokerRuntime } from "./broker-recovery.js";
 
 async function main(): Promise<void> {
   const parent = join(homedir(), ".config/agent-messaging-mcp");
@@ -12,6 +13,7 @@ async function main(): Promise<void> {
     throw new Error("Broker runtime parent must be owned by this user and private");
   }
 
+  await recoverStaleBrokerRuntime(parent);
   const broker = await startBrokerSocket(join(parent, "broker"), createBrokerCredentials());
   let stopping = false;
   const stop = () => {
