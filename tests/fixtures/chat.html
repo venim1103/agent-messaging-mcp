@@ -89,7 +89,8 @@
     <main data-conversation-id="fixture-alpha">
       <header>
         <h1>Fixture chat</h1>
-        <p>Conversation: fixture-alpha</p>
+        <p id="conversation-label">Conversation: fixture-alpha</p>
+        <button type="button" id="switch-chat">Switch chat</button>
       </header>
       <ol id="messages" role="log" aria-label="Messages">
         <li data-message-id="fixture-1" data-direction="incoming">
@@ -110,9 +111,13 @@
     </main>
     <script>
       const composer = document.querySelector("#composer");
+      const root = document.querySelector("main[data-conversation-id]");
+      const conversationLabel = document.querySelector("#conversation-label");
+      const switchChat = document.querySelector("#switch-chat");
       const messageInput = document.querySelector("#message");
       const richEditor = document.querySelector("#rich-message");
       const messages = document.querySelector("#messages");
+      const initialRows = [...messages.children].map((row) => row.cloneNode(true));
       const richMode = new URLSearchParams(location.search).get("editor") === "rich";
       let nextMessageId = 3;
       let richText = "";
@@ -125,6 +130,23 @@
           if (event.isTrusted) richText = richEditor.innerText;
         });
       }
+
+      switchChat.addEventListener("click", () => {
+        const next = root.dataset.conversationId === "fixture-alpha" ? "fixture-beta" : "fixture-alpha";
+        root.dataset.conversationId = next;
+        conversationLabel.textContent = `Conversation: ${next}`;
+        if (next === "fixture-alpha") {
+          messages.replaceChildren(...initialRows.map((row) => row.cloneNode(true)));
+        } else {
+          const row = document.createElement("li");
+          row.dataset.messageId = "fixture-beta-1";
+          row.dataset.direction = "incoming";
+          const content = document.createElement("p");
+          content.textContent = "A different local conversation.";
+          row.append(content);
+          messages.replaceChildren(row);
+        }
+      });
 
       composer.addEventListener("submit", (event) => {
         event.preventDefault();

@@ -84,6 +84,27 @@ function readFixtureIdentity(): string | null {
   return fixtures.length === 1 && fixtures[0]?.dataset.conversationId === "fixture-alpha" ? "fixture-alpha" : null;
 }
 
+function observeFixtureIdentity(): boolean {
+  if (location.origin !== "http://127.0.0.1:8787") return false;
+  const root = document.querySelector<HTMLElement>("main[data-conversation-id=fixture-alpha]");
+  const runtime = (globalThis as typeof globalThis & {
+    chrome?: { runtime?: { sendMessage: (message: { kind: string }) => Promise<unknown> } }
+  }).chrome?.runtime;
+  if (!root || !runtime) return false;
+  const workerScope = globalThis as typeof globalThis & { fixtureIdentityObserver?: MutationObserver };
+  if (workerScope.fixtureIdentityObserver) return true;
+  const observer = new MutationObserver(() => {
+    if (root.dataset.conversationId !== "fixture-alpha") {
+      observer.disconnect();
+      delete workerScope.fixtureIdentityObserver;
+      void runtime.sendMessage({ kind: "fixture_identity_changed" }).catch(() => {});
+    }
+  });
+  observer.observe(root, { attributes: true, attributeFilter: ["data-conversation-id"] });
+  workerScope.fixtureIdentityObserver = observer;
+  return true;
+}
+
 async function approveFixture(tabId: number, expectedUrl: string, pendingRequestId: string): Promise<FixtureApprovalResult> {
   try {
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -165,6 +186,10 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
           const stableTab = await browser.tabs.get(tabId);
           if (stillCurrent?.documentId !== documentId || stillCurrent.result !== "fixture-alpha"
             || !stableTab.active || stableTab.url !== expectedUrl) throw new Error();
+          const [observing] = await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: observeFixtureIdentity
+          });
+          if (observing?.documentId !== documentId || observing.result !== true) throw new Error();
           finish({ ok: true, requestId: pendingRequestId, expiresAt: payload.expiresAt });
         })().catch(async () => {
           if (brokerApproved && await revokeFixtureTab(tabId, null)) {
@@ -401,6 +426,17 @@ export default defineBackground(() => {
     if (changeInfo.status === "loading" || changeInfo.url) void revokeTrackedFixture(tabId).catch(() => {});
   });
   browser.runtime.onMessage.addListener((message: unknown, sender) => {
+    if (typeof message === "object" && message !== null && !Array.isArray(message)
+      && Object.keys(message).length === 1 && (message as { kind?: unknown }).kind === "fixture_identity_changed") {
+      if (sender.id !== browser.runtime.id || sender.origin !== "http://127.0.0.1:8787"
+        || sender.frameId !== 0 || sender.tab?.id == null || typeof sender.documentId !== "string") return;
+      const tabId = sender.tab.id;
+      return browser.storage.session.get(fixtureGrantKey(tabId)).then((stored) => {
+        const grant = stored[fixtureGrantKey(tabId)] as StoredFixtureGrant | undefined;
+        if (grant?.documentId !== sender.documentId) return;
+        return revokeTrackedFixture(tabId);
+      });
+    }
     if (sender.id !== browser.runtime.id || sender.url !== browser.runtime.getURL("/popup.html")
       || typeof message !== "object" || message === null || Array.isArray(message)) return;
 

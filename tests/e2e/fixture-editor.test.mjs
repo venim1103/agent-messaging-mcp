@@ -40,6 +40,11 @@ test("browser input reaches the rich editor without accepting synthetic input", 
     await page.getByRole("textbox", { name: "Message" }).fill("Textarea message");
     await page.getByRole("button", { name: "Send" }).click();
     assert.equal(await page.locator('ol[role="log"] > li:last-child p').textContent(), "Textarea message");
+
+    await page.getByRole("button", { name: "Switch chat" }).click();
+    assert.equal(page.url(), url);
+    assert.equal(await page.locator("main").getAttribute("data-conversation-id"), "fixture-beta");
+    assert.equal(await page.locator('ol[role="log"] > li p').textContent(), "A different local conversation.");
   } finally {
     await browser?.close();
     server.close();
