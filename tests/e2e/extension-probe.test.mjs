@@ -27,6 +27,7 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
     const extensionId = new URL(worker.url()).hostname;
     assert.match(extensionId, /^[a-p]{32}$/);
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+    assert.equal(await worker.evaluate(() => typeof chrome.storage.session.get), "function");
 
     const popup = await context.newPage();
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);

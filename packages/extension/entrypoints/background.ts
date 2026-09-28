@@ -15,6 +15,63 @@ type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
 
 let inputInProgress = false;
+const fixtureGrantKey = (tabId: number) => `fixture-grant-${tabId}`;
+type StoredFixtureGrant = { documentId: string; expiresAt: number };
+
+async function revokeTrackedFixture(tabId: number): Promise<void> {
+  const key = fixtureGrantKey(tabId);
+  const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
+  if (!stored || typeof stored.documentId !== "string" || typeof stored.expiresAt !== "number") return;
+  if (stored.expiresAt <= Date.now()) {
+    await browser.storage.session.remove(key);
+    return;
+  }
+  if (await revokeFixtureTab(tabId, null)) await browser.storage.session.remove(key);
+}
+
+async function revokeFixtureTab(tabId: number,
+  observed: { documentId: string; conversationId: string } | null): Promise<boolean> {
+  try {
+    return await new Promise<boolean>((resolve) => {
+      const requestId = crypto.randomUUID();
+      const deadlineMs = Date.now() + 10_000;
+      let port: ReturnType<typeof browser.runtime.connectNative>;
+      try {
+        port = browser.runtime.connectNative(nativeHostName);
+      } catch {
+        resolve(false);
+        return;
+      }
+      let settled = false;
+      const timer = setTimeout(() => finish(false), 10_000);
+
+      function finish(ok: boolean) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok);
+        port.disconnect();
+      }
+
+      port.onMessage.addListener((value: unknown) => {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return finish(false);
+        const reply = value as Record<string, unknown>;
+        const payload = reply.payload;
+        finish(reply.kind === "fixture_revoked" && reply.protocolVersion === protocolVersion
+          && reply.requestId === requestId && reply.connectionGeneration === 0 && reply.deadlineMs === deadlineMs
+          && typeof payload === "object" && payload !== null && !Array.isArray(payload)
+          && Object.keys(payload).length === 1 && typeof (payload as { count?: unknown }).count === "number"
+          && Number.isSafeInteger((payload as { count: number }).count)
+          && (payload as { count: number }).count >= 0);
+      });
+      port.onDisconnect.addListener(() => finish(false));
+      port.postMessage({ kind: "revoke_fixture", protocolVersion, requestId,
+        connectionGeneration: 0, deadlineMs, payload: { tabId, observed } });
+    });
+  } catch {
+    return false;
+  }
+}
 
 function isSelectedFixture(): boolean {
   return location.origin === "http://127.0.0.1:8787"
@@ -73,6 +130,7 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
       }
 
       port.onMessage.addListener((value: unknown) => {
+        let brokerApproved = false;
         void (async () => {
           if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
           const reply = value as Record<string, unknown>;
@@ -91,13 +149,29 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
           if (reply.kind !== "fixture_approved" || Object.keys(payload).length !== 2
             || payload.requestId !== pendingRequestId || typeof payload.expiresAt !== "number"
             || !Number.isSafeInteger(payload.expiresAt)) throw new Error();
+          brokerApproved = true;
           const [current] = await browser.scripting.executeScript({
             target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
           });
+          const currentTab = await browser.tabs.get(tabId);
           if (current?.documentId !== documentId || current.result !== "fixture-alpha"
-            || (await browser.tabs.get(tabId)).url !== expectedUrl) throw new Error();
+            || !currentTab.active || currentTab.url !== expectedUrl) throw new Error();
+          await browser.storage.session.set({ [fixtureGrantKey(tabId)]: {
+            documentId, expiresAt: payload.expiresAt
+          } satisfies StoredFixtureGrant });
+          const [stillCurrent] = await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
+          });
+          const stableTab = await browser.tabs.get(tabId);
+          if (stillCurrent?.documentId !== documentId || stillCurrent.result !== "fixture-alpha"
+            || !stableTab.active || stableTab.url !== expectedUrl) throw new Error();
           finish({ ok: true, requestId: pendingRequestId, expiresAt: payload.expiresAt });
-        })().catch(() => finish({ ok: false, error: "Fixture changed or approval response invalid; reconnect" }));
+        })().catch(async () => {
+          if (brokerApproved && await revokeFixtureTab(tabId, null)) {
+            await browser.storage.session.remove(fixtureGrantKey(tabId)).catch(() => {});
+          }
+          finish({ ok: false, error: "Fixture changed or approval response invalid; reconnect" });
+        });
       });
       port.onDisconnect.addListener(() => finish({ ok: false, error: "Native fixture approval unavailable" }));
       port.postMessage({
@@ -322,6 +396,10 @@ function isHandshakeReply(value: unknown, requestId: string, deadlineMs: number)
 }
 
 export default defineBackground(() => {
+  browser.tabs.onRemoved.addListener((tabId) => { void revokeTrackedFixture(tabId).catch(() => {}); });
+  browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status === "loading" || changeInfo.url) void revokeTrackedFixture(tabId).catch(() => {});
+  });
   browser.runtime.onMessage.addListener((message: unknown, sender) => {
     if (sender.id !== browser.runtime.id || sender.url !== browser.runtime.getURL("/popup.html")
       || typeof message !== "object" || message === null || Array.isArray(message)) return;
