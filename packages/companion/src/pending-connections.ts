@@ -43,6 +43,13 @@ export class PendingConnectionRequests {
     };
   }
 
+  listPending(now = Date.now()): ReadonlyArray<Readonly<{ requestId: string; expiresAt: number }>> {
+    return [...this.requests]
+      .filter(([, request]) => request.expiresAt > now)
+      .slice(0, MAX_PENDING_REQUESTS)
+      .map(([requestId, request]) => Object.freeze({ requestId, expiresAt: request.expiresAt }));
+  }
+
   disconnect(owner: symbol): void {
     for (const [requestId, request] of this.requests) {
       if (request.owner === owner) this.requests.delete(requestId);

@@ -45,9 +45,15 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     const otherState = await otherFacade.getConnection(created.payload.requestId);
     assert.deepEqual(otherState.payload, { state: "unknown" });
     otherFacade.close();
-    facade.close();
     const relay = await connectBroker("relay", directory);
-    assert.throws(() => relay.requestConnection(), /Only the facade/);
+    assert.throws(() => relay.requestConnection(), /Broker role cannot perform/);
+    assert.throws(() => facade.listPending(), /Broker role cannot perform/);
+    const listed = await relay.listPending();
+    assert.equal(listed.kind, "pending_list");
+    if (listed.kind !== "pending_list") throw new Error("Expected a pending list");
+    assert.deepEqual(listed.payload.requests, [{ requestId: created.payload.requestId, expiresAt: created.payload.expiresAt }]);
+    facade.close();
+    assert.deepEqual((await relay.listPending() as typeof listed).payload.requests, []);
     relay.close();
 
     const duplicate = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
@@ -96,7 +102,9 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
     let refreshed = false;
     for (let attempt = 0; attempt < 40; attempt++) {
       try {
-        refreshed = (await readFile(join(directory, "facade.key"), "utf8")) !== oldKey;
+        const rotated = (await readFile(join(directory, "facade.key"), "utf8")) !== oldKey;
+        const socket = await stat(join(directory, "broker.sock"));
+        refreshed = rotated && socket.isSocket() && (socket.mode & 0o077) === 0;
         if (refreshed) break;
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;

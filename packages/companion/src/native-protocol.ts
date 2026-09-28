@@ -1,5 +1,24 @@
+import * as z from "zod/v4";
+
 export const NATIVE_HOST_NAME = "com.agent_messaging_mcp.bridge";
 export const PROTOCOL_VERSION = 1;
+
+const pendingListSchema = z.strictObject({
+  kind: z.literal("list_pending"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({})
+});
+
+export function parseNativePendingList(message: unknown, now = Date.now()) {
+  const result = pendingListSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native pending list request");
+  }
+  return result.data;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

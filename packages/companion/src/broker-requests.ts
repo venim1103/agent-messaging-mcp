@@ -12,7 +12,8 @@ const envelope = {
 
 const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("request_connection"), payload: z.strictObject({}) }),
-  z.strictObject({ ...envelope, kind: z.literal("get_connection"), payload: z.strictObject({ requestId: z.uuid() }) })
+  z.strictObject({ ...envelope, kind: z.literal("get_connection"), payload: z.strictObject({ requestId: z.uuid() }) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_pending"), payload: z.strictObject({}) })
 ]);
 
 export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: symbol,
@@ -25,6 +26,11 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     connectionGeneration: 0,
     deadlineMs: request.deadlineMs
   };
+  if (request.kind === "list_pending") {
+    return role === "relay"
+      ? { ...response, kind: "pending_list" as const, payload: { requests: requests.listPending(now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
   if (role !== "facade") {
     return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }

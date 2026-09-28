@@ -12,12 +12,15 @@ test("pending requests remain private to their broker-owned client", () => {
   assert.deepEqual(created, { requestId: created.requestId, state: "pending", expiresAt: 1000 + PENDING_REQUEST_TTL_MS });
   assert.equal(requests.get(secondClient, created.requestId, 1000), null);
   assert.deepEqual(requests.get(firstClient, created.requestId, 1000), created);
+  assert.deepEqual(requests.listPending(1000), [{ requestId: created.requestId, expiresAt: created.expiresAt }]);
+  assert.deepEqual(requests.listPending(created.expiresAt), []);
   assert.deepEqual(requests.get(firstClient, created.requestId, created.expiresAt), { ...created, state: "expired" });
 
   requests.disconnect(secondClient);
   assert.deepEqual(requests.get(firstClient, created.requestId, 1000), created);
   requests.disconnect(firstClient);
   assert.equal(requests.get(firstClient, created.requestId, 1000), null);
+  assert.deepEqual(requests.listPending(1000), []);
 });
 
 test("bounds pending requests and releases expired records before accepting another", () => {

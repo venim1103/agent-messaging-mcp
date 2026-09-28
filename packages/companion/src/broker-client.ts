@@ -7,6 +7,7 @@ import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
+import { MAX_PENDING_REQUESTS } from "./pending-connections.js";
 
 const helloResult = z.strictObject({
   kind: z.literal("hello_result"),
@@ -30,6 +31,14 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ state: z.literal("unknown") }),
       z.strictObject({ requestId: z.uuid(), state: z.enum(["pending", "expired"]), expiresAt: z.number().int().safe() })
     ])
+  }),
+  z.strictObject({
+    kind: z.literal("pending_list"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({
+      requests: z.array(z.strictObject({ requestId: z.uuid(), expiresAt: z.number().int().safe() }))
+        .max(MAX_PENDING_REQUESTS)
+    })
   }),
   z.strictObject({
     kind: z.literal("error"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -92,8 +101,10 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       throw new Error("Broker returned a mismatched hello");
     }
     let nextRequest: Promise<void> = Promise.resolve();
-    const request = (kind: "request_connection" | "get_connection", payload: object) => {
-      if (role !== "facade") throw new Error("Only the facade can request a connection");
+    const request = (kind: "request_connection" | "get_connection" | "list_pending", payload: object) => {
+      if (kind === "list_pending" ? role !== "relay" : role !== "facade") {
+        throw new Error("Broker role cannot perform this operation");
+      }
       const operation = nextRequest.then(async () => {
         if (socket.destroyed) throw new Error("Broker connection closed");
         const requestId = randomUUID();
@@ -136,6 +147,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       role,
       requestConnection: () => request("request_connection", {}),
       getConnection: (requestId: string) => request("get_connection", { requestId }),
+      listPending: () => request("list_pending", {}),
       close: () => socket.destroy()
     };
   } catch (error) {

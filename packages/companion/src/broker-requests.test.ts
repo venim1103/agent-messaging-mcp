@@ -23,6 +23,17 @@ test("only an owning facade can create and query pending connections", () => {
   assert.equal(created.kind, "connection_requested");
   if (created.kind !== "connection_requested") throw new Error("Expected a pending request");
   const get = { ...envelope, kind: "get_connection", payload: { requestId: created.payload.requestId } };
+  const list = { ...envelope, kind: "list_pending", payload: {} };
+  assert.deepEqual(handleBrokerRequest(list, "facade", firstClient, requests, 1000), {
+    ...envelope, kind: "error", payload: { code: "PERMISSION_DENIED" }
+  });
+  assert.deepEqual(handleBrokerRequest(list, "relay", secondClient, requests, 1000), {
+    ...envelope, kind: "pending_list", payload: { requests: [{
+      requestId: created.payload.requestId, expiresAt: created.payload.expiresAt
+    }] }
+  });
+  assert.deepEqual(handleBrokerRequest({ ...list, deadlineMs: 1000 + PENDING_REQUEST_TTL_MS + 5000 },
+    "relay", secondClient, requests, 1000 + PENDING_REQUEST_TTL_MS).payload, { requests: [] });
 
   assert.deepEqual(handleBrokerRequest(get, "facade", secondClient, requests, 1000), {
     ...envelope, kind: "connection_state", payload: { state: "unknown" }
