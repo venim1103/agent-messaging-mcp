@@ -106,6 +106,7 @@
         <span class="mode">Fixture input test</span>
       </header>
       <button type="button" id="inspect">Inspect this chat</button>
+      <button type="button" id="view-pending" hidden>View pending requests</button>
       <button type="button" id="test-fixture-input" hidden>Test fixture input</button>
       <section id="gemini-draft-review" hidden>
         <h2>Unsent Gemini draft</h2>
@@ -116,6 +117,10 @@
       <section id="result" hidden>
         <h2 id="conversation"></h2>
         <ol id="messages" aria-label="Inspection results"></ol>
+      </section>
+      <section id="pending-result" hidden>
+        <h2>Pending connections</h2>
+        <ol id="pending-requests" aria-label="Pending request IDs"></ol>
       </section>
     </main>
     <script type="module" src="./main.ts"></script>

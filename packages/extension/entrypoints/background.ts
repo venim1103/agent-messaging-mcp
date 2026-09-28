@@ -9,8 +9,81 @@ const geminiOrigin = "https://gemini.google.com";
 
 type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: string };
 type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
+type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: number }[] }
+  | { ok: false; error: string };
 
 let inputInProgress = false;
+
+function isSelectedFixture(): boolean {
+  return location.origin === "http://127.0.0.1:8787"
+    && document.querySelector("main[data-conversation-id=fixture-alpha]") !== null;
+}
+
+async function listFixturePending(tabId: number): Promise<PendingListResult> {
+  try {
+    const [active] = await browser.tabs.query({ active: true, currentWindow: true });
+    const tab = await browser.tabs.get(tabId);
+    if (active?.id !== tabId || !tab.active || !tab.url
+      || new URL(tab.url).origin !== "http://127.0.0.1:8787") {
+      return { ok: false, error: "Select the local fixture tab first" };
+    }
+    const [fixture] = await browser.scripting.executeScript({ target: { tabId }, func: isSelectedFixture });
+    if (fixture?.result !== true) return { ok: false, error: "Fixture conversation not found" };
+    const selectedUrl = tab.url;
+
+    return await new Promise<PendingListResult>((resolve) => {
+      const requestId = crypto.randomUUID();
+      const deadlineMs = Date.now() + 10_000;
+      let port: ReturnType<typeof browser.runtime.connectNative>;
+      try {
+        port = browser.runtime.connectNative(nativeHostName);
+      } catch {
+        resolve({ ok: false, error: "Native pending list unavailable" });
+        return;
+      }
+      let settled = false;
+      const timer = setTimeout(() => finish({ ok: false, error: "Native pending list timed out" }), 10_000);
+
+      function finish(result: PendingListResult) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+        port.disconnect();
+      }
+
+      port.onMessage.addListener((value: unknown) => {
+        void (async () => {
+          if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+          const reply = value as Record<string, unknown>;
+          if (reply.kind !== "pending_list" || reply.protocolVersion !== protocolVersion
+            || reply.requestId !== requestId || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
+            || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) {
+            throw new Error();
+          }
+          const requests = (reply.payload as { requests?: unknown }).requests;
+          if (!Array.isArray(requests) || requests.length > 100 || !requests.every((item: unknown) => {
+            if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
+            const entry = item as Record<string, unknown>;
+            return Object.keys(entry).length === 2 && typeof entry.requestId === "string"
+              && /^[0-9a-f-]{36}$/.test(entry.requestId)
+              && typeof entry.expiresAt === "number" && Number.isSafeInteger(entry.expiresAt);
+          })) throw new Error();
+          const current = await browser.tabs.get(tabId);
+          if (!current.active || current.url !== selectedUrl) throw new Error();
+          finish({ ok: true, requests: requests as { requestId: string; expiresAt: number }[] });
+        })().catch(() => finish({ ok: false, error: "Pending list invalid or fixture tab changed" }));
+      });
+      port.onDisconnect.addListener(() => finish({ ok: false, error: "Native pending list unavailable" }));
+      port.postMessage({
+        kind: "list_pending", protocolVersion, requestId, connectionGeneration: 0,
+        deadlineMs, payload: {}
+      });
+    });
+  } catch {
+    return { ok: false, error: "Fixture pending list unavailable" };
+  }
+}
 
 function focusFixtureEditor(): boolean {
   if (location.href !== "http://127.0.0.1:8787/?editor=rich"
@@ -161,6 +234,10 @@ export default defineBackground(() => {
       || typeof message !== "object" || message === null || Array.isArray(message)) return;
 
     const request = message as Record<string, unknown>;
+    if (request.kind === "list_fixture_pending" && Object.keys(request).length === 2
+      && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {
+      return listFixturePending(request.tabId);
+    }
     if (request.kind === "probe_fixture_input" && Object.keys(request).length === 2
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {
       return probeFixtureInput(request.tabId);

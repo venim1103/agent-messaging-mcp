@@ -14,17 +14,22 @@ type GeminiPreview = {
 };
 type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: string };
 type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
+type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: number }[] }
+  | { ok: false; error: string };
 
 const fixtureOrigin = "http://127.0.0.1:8787";
 const richFixtureUrl = `${fixtureOrigin}/?editor=rich`;
 const geminiOrigin = "https://gemini.google.com";
 const inspectButton = document.querySelector<HTMLButtonElement>("#inspect");
+const pendingButton = document.querySelector<HTMLButtonElement>("#view-pending");
 const fixtureInputButton = document.querySelector<HTMLButtonElement>("#test-fixture-input");
 const geminiDraftReview = document.querySelector<HTMLElement>("#gemini-draft-review");
 const geminiDraftPreview = document.querySelector<HTMLElement>("#gemini-draft-text");
 const geminiDraftButton = document.querySelector<HTMLButtonElement>("#prepare-gemini-draft");
 const status = document.querySelector<HTMLElement>("#status");
 const result = document.querySelector<HTMLElement>("#result");
+const pendingResult = document.querySelector<HTMLElement>("#pending-result");
+const pendingRequests = document.querySelector<HTMLOListElement>("#pending-requests");
 const conversation = document.querySelector<HTMLElement>("#conversation");
 const messages = document.querySelector<HTMLOListElement>("#messages");
 
@@ -80,13 +85,14 @@ function inspectGeminiStructure(): GeminiPreview | null {
   };
 }
 
-if (!inspectButton || !fixtureInputButton || !geminiDraftReview || !geminiDraftPreview || !geminiDraftButton
-  || !status || !result || !conversation || !messages) {
+if (!inspectButton || !pendingButton || !fixtureInputButton || !geminiDraftReview || !geminiDraftPreview || !geminiDraftButton
+  || !status || !result || !pendingResult || !pendingRequests || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
 }
 
 let selectedGeminiTab: { id: number; url: string } | null = null;
 void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+  pendingButton.hidden = !tab?.url || new URL(tab.url).origin !== fixtureOrigin;
   fixtureInputButton.hidden = tab?.url !== richFixtureUrl;
   const url = tab?.url ? new URL(tab.url) : null;
   if (tab?.id != null && tab.url && url?.origin === geminiOrigin
@@ -94,6 +100,42 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
     selectedGeminiTab = { id: tab.id, url: tab.url };
     geminiDraftPreview.textContent = geminiDraftText;
     geminiDraftReview.hidden = false;
+  }
+});
+
+pendingButton.addEventListener("click", async () => {
+  pendingButton.disabled = true;
+  pendingResult.hidden = true;
+  pendingRequests.replaceChildren();
+  status.textContent = "Checking pending IDs for the local fixture...";
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (tab?.id == null || !tab.url || new URL(tab.url).origin !== fixtureOrigin) {
+      status.textContent = "Select the local fixture tab first.";
+      return;
+    }
+    const response = await browser.runtime.sendMessage({ kind: "list_fixture_pending", tabId: tab.id }) as PendingListResult;
+    if (!response.ok) {
+      status.textContent = response.error;
+      return;
+    }
+    for (const request of response.requests) {
+      const row = document.createElement("li");
+      const label = document.createElement("strong");
+      label.textContent = request.requestId;
+      const expiry = document.createElement("p");
+      expiry.textContent = `${Math.max(0, Math.ceil((request.expiresAt - Date.now()) / 1000))} seconds remaining`;
+      row.append(label, expiry);
+      pendingRequests.append(row);
+    }
+    pendingResult.hidden = false;
+    status.textContent = response.requests.length
+      ? `${response.requests.length} pending ID(s). No connection approved or chat data read.`
+      : "No pending requests. No connection approved or chat data read.";
+  } catch {
+    status.textContent = "Pending list unavailable. No chat data read.";
+  } finally {
+    pendingButton.disabled = false;
   }
 });
 
