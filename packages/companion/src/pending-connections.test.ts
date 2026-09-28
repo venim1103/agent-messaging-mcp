@@ -294,3 +294,37 @@ test("owner disconnect revokes one fixture grant and cancels its pending reads",
   assert.deepEqual(requests.listActiveFixtureTabIds(2002), []);
   assert.equal(requests.getApprovedTarget(other, secondGrant.connectionId, 2002), null);
 });
+
+test("worker wake marks an exact fixture observation gap without revoking its owner", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("returning reader");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42" };
+  const grant = requests.approve(pending.requestId, target, 2000)!;
+  const rows = [{ id: "fixture-1", direction: "incoming" as const, text: "Before suspension" }];
+  assert.equal(requests.publishFixtureSnapshot(target, rows, 2001), 1);
+  const before = requests.getFixtureSnapshot(owner, grant.connectionId, 2001);
+  if (!before || before === "not_ready") throw new Error("Expected the old cursor");
+  const reading = requests.requestFreshFixtureRead(owner, grant.connectionId, 2002);
+  if (!reading || reading === "busy") throw new Error("Expected a pending read");
+  assert.equal(requests.markFixtureObservationGap({ ...target, documentId: "other" }, 2003), 0);
+  assert.equal(requests.markFixtureObservationGap(target, 2003), 1);
+  assert.equal(await reading.result, "not_ready");
+  assert.equal(requests.getFixtureSnapshot(owner, grant.connectionId, 2003), "not_ready");
+  assert.deepEqual(requests.readFixtureEvents(owner, grant.connectionId, before.cursor, 1, 2003),
+    { state: "expired", resnapshot: true });
+  const retry = requests.requestFreshFixtureRead(owner, grant.connectionId, 2003);
+  if (!retry || retry === "busy") throw new Error("Expected a post-gap read challenge");
+  assert.equal(requests.markFixtureObservationGap(target, 2004), 0);
+  assert.equal(requests.listFixtureReadChallenges(2004).length, 1);
+  assert.deepEqual(requests.get(owner, pending.requestId, 2003), { ...grant,
+    observation: { state: "not_observed", capturedAt: null } });
+  assert.equal(requests.publishFixtureSnapshot(target, rows, 2004, retry.challengeId), 1);
+  assert.notEqual(await retry.result, "not_ready");
+  const after = requests.getFixtureSnapshot(owner, grant.connectionId, 2004);
+  if (!after || after === "not_ready") throw new Error("Expected a new snapshot epoch");
+  assert.notEqual(after.cursor.epoch, before.cursor.epoch);
+  assert.equal(after.cursor.sequence, 1);
+  assert.equal(requests.markFixtureObservationGap(target, grant.expiresAt), 0);
+});

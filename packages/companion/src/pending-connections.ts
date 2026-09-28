@@ -191,6 +191,24 @@ export class PendingConnectionRequests {
     return true;
   }
 
+  markFixtureObservationGap(target: FixtureTarget, now = Date.now()): number {
+    let marked = 0;
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (!grant || grant.stale || now >= grant.connection.expiresAt
+        || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
+        || grant.target.tabId !== target.tabId || grant.target.documentId !== target.documentId) continue;
+      if (!grant.snapshot && (!grant.observations || grant.observations.bookmark().sequence === 0)) continue;
+      grant.snapshot = undefined;
+      grant.observations = new ObservationBuffer({ maxEvents: 32, maxBytes: 256 * 1024 });
+      for (const [challengeId, pending] of this.fixtureReads) {
+        if (pending.connectionId === grant.connection.connectionId) this.finishFixtureRead(challengeId, "not_ready");
+      }
+      marked++;
+    }
+    return marked;
+  }
+
   publishFixtureSnapshot(target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>,
     now = Date.now(), challengeId?: string): number {
     if (messages.length > MAX_FIXTURE_SNAPSHOT_MESSAGES

@@ -65,7 +65,7 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
   }
 });
 
-test("worker wake preserves a grant; reload, tab close, denied reads, and disconnect revoke grants", { timeout: 30000 }, async () => {
+test("worker wake marks a gap; reload, tab close, denied reads, and disconnect revoke grants", { timeout: 30000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-restart-test-"));
   const directory = join(profile, ".config/agent-messaging-mcp/broker");
   const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
@@ -141,6 +141,30 @@ test("worker wake preserves a grant; reload, tab close, denied reads, and discon
     }
 
     const beforeReload = await grant(3);
+    const beforeWake = await facade.getConnection(beforeReload);
+    if (beforeWake.kind !== "connection_state" || beforeWake.payload.state !== "ready_readonly") {
+      throw new Error("Expected a seeded worker-wake grant");
+    }
+    const wakeTarget = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "CHROME-doc_3" };
+    const wakeRows = [{ id: "fixture-1", direction: "incoming", text: "Before worker wake" }];
+    assert.deepEqual((await relay.publishFixtureSnapshot(wakeTarget, wakeRows)).payload, { count: 1 });
+    const initialRead = facade.readFixtureSnapshot(beforeWake.payload.connectionId);
+    let initialChallenge;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const listing = await relay.listFixtureReadChallenges();
+      if (listing.kind !== "fixture_read_challenges") throw new Error("Expected seeded read challenges");
+      initialChallenge = listing.payload.challenges[0]?.challengeId;
+      if (initialChallenge) break;
+      await setTimeout(10);
+    }
+    assert.ok(initialChallenge, "Broker did not challenge the seeded snapshot read");
+    assert.deepEqual((await relay.publishFixtureSnapshot(wakeTarget, wakeRows, initialChallenge)).payload, { count: 1 });
+    const initialSnapshot = await initialRead;
+    if (initialSnapshot.kind !== "fixture_snapshot") throw new Error("Expected old event cursor");
+    await worker.evaluate(() => chrome.storage.session.set({
+      "fixture-grant-3": { documentId: "CHROME-doc_3", expiresAt: Date.now() + 30_000 }
+    }));
     const serviceWorkers = await context.newCDPSession(manager);
     let confirmStopped;
     const stopped = new Promise((resolve) => { confirmStopped = resolve; });
@@ -160,7 +184,17 @@ test("worker wake preserves a grant; reload, tab close, denied reads, and discon
     const wakeResponse = await awake.evaluate(() => chrome.runtime.sendMessage({ kind: "list_fixture_pending", tabId: 1 }));
     assert.equal(wakeResponse?.ok, false, JSON.stringify(wakeResponse));
     assert.notEqual(wakeResponse?.error, "Fixture grant reset unavailable; try again");
-    assert.equal((await facade.getConnection(beforeReload)).payload.state, "ready_readonly");
+    let gapMarked = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const state = await facade.getConnection(beforeReload);
+      if (state.kind === "connection_state" && state.payload.state === "ready_readonly"
+        && state.payload.observation.state === "not_observed") { gapMarked = true; break; }
+      await setTimeout(50);
+    }
+    assert.equal(gapMarked, true, "Worker wake did not mark an observation gap");
+    const oldEvents = await facade.readFixtureEvents(beforeWake.payload.connectionId, initialSnapshot.payload.cursor);
+    assert.equal(oldEvents.kind, "fixture_events");
+    assert.deepEqual(oldEvents.payload, { state: "expired", resnapshot: true });
     await awake.close();
     await serviceWorkers.detach();
 
@@ -204,7 +238,7 @@ test("worker wake preserves a grant; reload, tab close, denied reads, and discon
       throw new Error("Expected a seeded read handle");
     }
     await worker.evaluate(({ tabId }) => chrome.storage.session.set({
-      [`fixture-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, expiresAt: Date.now() + 10_000 }
+      [`fixture-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, expiresAt: Date.now() + 30_000 }
     }), { tabId: unapprovedTab.id });
     const disconnectedTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
     const beforeDisconnect = await grant(disconnectedTab.id);
@@ -215,6 +249,9 @@ test("worker wake preserves a grant; reload, tab close, denied reads, and discon
     await worker.evaluate(({ tabId }) => chrome.storage.session.set({
       [`fixture-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, expiresAt: Date.now() + 30_000 }
     }), { tabId: disconnectedTab.id });
+    await worker.evaluate(() => chrome.storage.session.set({
+      "fixture-grant-9999": { documentId: "CHROME-doc_orphan", expiresAt: Date.now() + 30_000 }
+    }));
     const resumedManager = await context.newPage();
     await resumedManager.goto("chrome://extensions/");
     const readerWorkers = await context.newCDPSession(resumedManager);
@@ -236,6 +273,9 @@ test("worker wake preserves a grant; reload, tab close, denied reads, and discon
     const resumedPopup = await context.newPage();
     await resumedPopup.goto(`chrome-extension://${extensionId}/popup.html`);
     await resumedPopup.evaluate(() => chrome.runtime.sendMessage({ kind: "list_fixture_pending", tabId: 1 }));
+    await resumedPopup.waitForFunction(async () =>
+      (await chrome.storage.session.get("fixture-grant-9999"))["fixture-grant-9999"] === undefined,
+    undefined, { timeout: 8000 });
     const denied = await facade.readFixtureSnapshot(deniedState.payload.connectionId);
     assert.equal(denied.kind, "error");
     assert.deepEqual(denied.payload, { code: "CONNECTION_NOT_FOUND" });

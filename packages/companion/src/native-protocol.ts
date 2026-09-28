@@ -30,6 +30,11 @@ export function parseNativeFixtureReadChallenges(message: unknown, now = Date.no
   return result.data;
 }
 
+const fixtureTargetSchema = z.strictObject({
+  origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
+  tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
+});
+
 const fixtureApprovalSchema = z.strictObject({
   kind: z.literal("approve_fixture"),
   protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -38,12 +43,26 @@ const fixtureApprovalSchema = z.strictObject({
   deadlineMs: z.number().int().safe(),
   payload: z.strictObject({
     pendingRequestId: z.uuid(),
-    target: z.strictObject({
-      origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
-      tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
-    })
+    target: fixtureTargetSchema
   })
 });
+
+const fixtureGapSchema = z.strictObject({
+  kind: z.literal("mark_fixture_observation_gap"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({ target: fixtureTargetSchema })
+});
+
+export function parseNativeFixtureGap(message: unknown, now = Date.now()) {
+  const result = fixtureGapSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture gap");
+  }
+  return result.data;
+}
 
 const fixtureSnapshotSchema = z.strictObject({
   kind: z.literal("publish_fixture_snapshot"),
@@ -52,10 +71,7 @@ const fixtureSnapshotSchema = z.strictObject({
   connectionGeneration: z.literal(0),
   deadlineMs: z.number().int().safe(),
   payload: z.strictObject({
-    target: z.strictObject({
-      origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
-      tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
-    }),
+    target: fixtureTargetSchema,
     messages: z.array(z.strictObject({
       id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
       direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)

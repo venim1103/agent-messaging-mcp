@@ -86,6 +86,11 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ disconnected: z.boolean() })
   }),
   z.strictObject({
+    kind: z.literal("fixture_gap_marked"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
+  }),
+  z.strictObject({
     kind: z.literal("fixture_snapshot"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({
@@ -171,10 +176,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "disconnect_fixture"
       | "list_pending" | "list_fixture_read_challenges" | "approve_fixture" | "publish_fixture_snapshot"
-      | "revoke_fixture" | "revoke_all_fixture", payload: object) => {
+      | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap", payload: object) => {
       if (kind === "list_pending" || kind === "list_fixture_read_challenges"
         || kind === "approve_fixture" || kind === "revoke_fixture"
         || kind === "revoke_all_fixture" || kind === "publish_fixture_snapshot"
+        || kind === "mark_fixture_observation_gap"
         ? role !== "relay" : role !== "facade") {
         throw new Error("Broker role cannot perform this operation");
       }
@@ -232,6 +238,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       publishFixtureSnapshot: (target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>, challengeId?: string) =>
         request("publish_fixture_snapshot", { target, messages,
           ...(challengeId === undefined ? {} : { challengeId }) }),
+      markFixtureObservationGap: (target: FixtureTarget) => request("mark_fixture_observation_gap", { target }),
       revokeFixture: (tabId: number, observed: { documentId: string; conversationId: string } | null) =>
         request("revoke_fixture", { tabId, observed }),
       revokeAllFixtures: () => request("revoke_all_fixture", {}),

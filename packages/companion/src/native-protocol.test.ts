@@ -9,8 +9,9 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReadChallenges,
-  parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
+import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
+  parseNativeFixtureReadChallenges, parseNativeFixtureReset, parseNativeFixtureRevocation,
+  parseNativeFixtureSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
   from "./native-protocol.js";
 
@@ -98,6 +99,24 @@ test("native fixture approval refuses other origins, targets, and arbitrary fiel
     { ...approval, payload: { ...approval.payload, command: "navigate" } }
   ]) {
     assert.throws(() => parseNativeFixtureApproval(invalid, now), /Invalid native fixture approval/);
+  }
+});
+
+test("native fixture gap accepts only an exact approved browser target", () => {
+  const gap = { ...request, kind: "mark_fixture_observation_gap", payload: { target: {
+    origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+    documentId: "CHROME-doc_opaque-42"
+  } } };
+  assert.deepEqual(parseNativeFixtureGap(gap, now), gap);
+  for (const invalid of [
+    { ...gap, kind: "evaluate" },
+    { ...gap, deadlineMs: now },
+    { ...gap, payload: { ...gap.payload, selector: "*" } },
+    { ...gap, payload: { target: { ...gap.payload.target, origin: "https://gemini.google.com" } } },
+    { ...gap, payload: { target: { ...gap.payload.target, documentId: "" } } },
+    { ...gap, payload: { target: { ...gap.payload.target, tabId: 0 } } }
+  ]) {
+    assert.throws(() => parseNativeFixtureGap(invalid, now), /Invalid native fixture gap/);
   }
 });
 
@@ -346,6 +365,32 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const snapshot = await reading;
     if (snapshot.kind !== "fixture_snapshot") throw new Error("Expected a published fixture snapshot");
     assert.deepEqual(snapshot.payload.messages, publication.payload.messages);
+
+    const gapHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const gapOutput: Buffer[] = [];
+    const gapErrors: Buffer[] = [];
+    gapHost.stdout.on("data", (chunk: Buffer) => gapOutput.push(chunk));
+    gapHost.stderr.on("data", (chunk: Buffer) => gapErrors.push(chunk));
+    const gap = { ...request, kind: "mark_fixture_observation_gap", deadlineMs: Date.now() + 10_000,
+      payload: { target: publication.payload.target } };
+    gapHost.stdin.end(encodeNativeFrame(gap));
+    const [gapExit] = await once(gapHost, "exit");
+    assert.equal(gapExit, 0, Buffer.concat(gapErrors).toString());
+    const [gapReply] = new NativeFrameDecoder().push(Buffer.concat(gapOutput)) as [{
+      kind: string; requestId: string; payload: { count: number }
+    }];
+    assert.equal(gapReply.kind, "fixture_gap_marked");
+    assert.equal(gapReply.requestId, gap.requestId);
+    assert.deepEqual(gapReply.payload, { count: 1 });
+    assert.deepEqual((await facade.readFixtureEvents(granted.payload.connectionId, snapshot.payload.cursor)).payload,
+      { state: "expired", resnapshot: true });
+    const afterGap = await facade.getConnection(created.payload.requestId);
+    if (afterGap.kind !== "connection_state" || afterGap.payload.state !== "ready_readonly") {
+      throw new Error("Expected a live connection after a native gap");
+    }
+    assert.deepEqual(afterGap.payload.observation, { state: "not_observed", capturedAt: null });
 
     const revokeHost = spawn(process.execPath, [relayEntry, origin, origin], {
       stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }

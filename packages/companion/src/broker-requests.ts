@@ -43,6 +43,9 @@ const requestSchema = z.discriminatedUnion("kind", [
     target: fixtureTarget, messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES),
     challengeId: z.uuid().optional()
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("mark_fixture_observation_gap"), payload: z.strictObject({
+    target: fixtureTarget
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("revoke_fixture"), payload: z.strictObject({
     tabId: z.number().int().safe().positive(),
     observed: z.union([z.null(), z.strictObject({
@@ -86,6 +89,12 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       ? { ...response, kind: "fixture_snapshot_published" as const,
         payload: { count: requests.publishFixtureSnapshot(request.payload.target, request.payload.messages,
           now, request.payload.challengeId) } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "mark_fixture_observation_gap") {
+    return role === "relay"
+      ? { ...response, kind: "fixture_gap_marked" as const,
+        payload: { count: requests.markFixtureObservationGap(request.payload.target, now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "revoke_fixture") {

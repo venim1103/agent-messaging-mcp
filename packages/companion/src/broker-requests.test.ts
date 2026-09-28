@@ -222,3 +222,31 @@ test("only the owning facade disconnects an approved fixture without exposing it
   assert.throws(() => handleBrokerRequest({ ...disconnect, payload: { ...disconnect.payload, tabId: 3 } },
     "facade", owner, requests, 2001));
 });
+
+test("only an authenticated relay can mark an exact fixture observation gap", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("owner");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42" };
+  const grant = requests.approve(pending.requestId, target, 2000)!;
+  const rows = [{ id: "fixture-1", direction: "incoming" as const, text: "Observed" }];
+  requests.publishFixtureSnapshot(target, rows, 2001);
+  const old = requests.getFixtureSnapshot(owner, grant.connectionId, 2001);
+  if (!old || old === "not_ready") throw new Error("Expected old snapshot cursor");
+  const envelope = { protocolVersion: PROTOCOL_VERSION,
+    requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+  const gap = { ...envelope, kind: "mark_fixture_observation_gap", payload: { target } };
+  assert.deepEqual(handleBrokerRequest(gap, "facade", owner, requests, 2002).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest({ ...gap, payload: { target: { ...target, tabId: 4 } } },
+    "relay", Symbol("relay"), requests, 2002).payload, { count: 0 });
+  assert.deepEqual(handleBrokerRequest(gap, "relay", Symbol("relay"), requests, 2002), {
+    ...envelope, kind: "fixture_gap_marked", payload: { count: 1 }
+  });
+  assert.deepEqual(requests.readFixtureEvents(owner, grant.connectionId, old.cursor, 1, 2002),
+    { state: "expired", resnapshot: true });
+  assert.equal(requests.get(owner, pending.requestId, 2002)?.state, "ready_readonly");
+  assert.throws(() => handleBrokerRequest({ ...gap, payload: { ...gap.payload, selector: "*" } },
+    "relay", Symbol("relay"), requests, 2002));
+});

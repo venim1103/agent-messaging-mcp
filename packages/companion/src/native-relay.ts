@@ -2,7 +2,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReadChallenges,
+import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
+  parseNativeFixtureReadChallenges,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
   from "./native-protocol.js";
@@ -35,12 +36,14 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 && message.kind === "publish_fixture_snapshot" ? parseNativeFixtureSnapshot(message)
                 : typeof message === "object" && message !== null && "kind" in message
                   && message.kind === "list_fixture_read_challenges" ? parseNativeFixtureReadChallenges(message)
+                    : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "mark_fixture_observation_gap" ? parseNativeFixtureGap(message)
               : parseNativePendingList(message);
         nativeReply = nativeReply.then(async () => {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
           let kind: "pending_list" | "fixture_read_challenges" | "fixture_approved" | "fixture_revoked"
-            | "fixture_snapshot_published" | "error";
+            | "fixture_snapshot_published" | "fixture_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
               origin: string; conversationId: string; tabId: number; documentId: string
@@ -76,6 +79,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               const result = await client.revokeAllFixtures();
               if (result.kind !== "fixture_revoked") throw new Error("Broker refused fixture reset");
               kind = "fixture_revoked";
+              payload = result.payload;
+            } else if (request.kind === "mark_fixture_observation_gap") {
+              const result = await client.markFixtureObservationGap(request.payload.target);
+              if (result.kind !== "fixture_gap_marked") throw new Error("Broker refused fixture gap");
+              kind = "fixture_gap_marked";
               payload = result.payload;
             } else {
               const result = await client.publishFixtureSnapshot(request.payload.target, request.payload.messages,

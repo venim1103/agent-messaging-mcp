@@ -127,6 +127,18 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.deepEqual((await facade.readFixtureEvents(connectionId, {
       epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 2
     })).payload, { state: "expired", resnapshot: true });
+    assert.throws(() => facade.markFixtureObservationGap(target), /Broker role cannot perform/);
+    assert.deepEqual((await relay.markFixtureObservationGap({ ...target, documentId: "other" })).payload,
+      { count: 0 });
+    assert.deepEqual((await relay.markFixtureObservationGap(target)).payload, { count: 1 });
+    const afterGap = await facade.readFixtureEvents(connectionId, snapshot.payload.cursor);
+    assert.equal(afterGap.kind, "fixture_events");
+    assert.deepEqual(afterGap.payload, { state: "expired", resnapshot: true });
+    const readyAfterGap = await facade.getConnection(another.payload.requestId);
+    if (readyAfterGap.kind !== "connection_state" || readyAfterGap.payload.state !== "ready_readonly") {
+      throw new Error("Expected live owner after observation gap");
+    }
+    assert.deepEqual(readyAfterGap.payload.observation, { state: "not_observed", capturedAt: null });
     assert.throws(() => facade.revokeAllFixtures(), /Broker role cannot perform/);
     const reset = await relay.revokeAllFixtures();
     assert.equal(reset.kind, "fixture_revoked");
