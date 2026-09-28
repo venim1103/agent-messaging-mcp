@@ -24,6 +24,14 @@ test("only an owning facade can create and query pending connections", () => {
   if (created.kind !== "connection_requested") throw new Error("Expected a pending request");
   const get = { ...envelope, kind: "get_connection", payload: { requestId: created.payload.requestId } };
   const list = { ...envelope, kind: "list_pending", payload: {} };
+  const approval = { ...envelope, kind: "approve_fixture", payload: {
+    pendingRequestId: created.payload.requestId,
+    target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "a66b3997-9d43-4554-8399-267d1fe9f75c" }
+  } };
+  assert.deepEqual(handleBrokerRequest(approval, "facade", firstClient, requests, 1000), {
+    ...envelope, kind: "error", payload: { code: "PERMISSION_DENIED" }
+  });
   assert.deepEqual(handleBrokerRequest(list, "facade", firstClient, requests, 1000), {
     ...envelope, kind: "error", payload: { code: "PERMISSION_DENIED" }
   });
@@ -48,5 +56,34 @@ test("only an owning facade can create and query pending connections", () => {
   for (let index = 1; index < MAX_PENDING_REQUESTS; index++) requests.create(firstClient, 1000);
   assert.deepEqual(handleBrokerRequest(create, "facade", firstClient, requests, 1000), {
     ...envelope, kind: "error", payload: { code: "TOO_MANY_PENDING" }
+  });
+});
+
+test("authenticated relay alone approves a selected fixture and only its MCP owner sees the grant", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("MCP owner");
+  const stranger = Symbol("other client");
+  const pending = requests.create(owner, 1000);
+  const envelope = {
+    protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+    connectionGeneration: 0, deadlineMs: 10_000
+  };
+  const approval = { ...envelope, kind: "approve_fixture", payload: {
+    pendingRequestId: pending.requestId,
+    target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "a66b3997-9d43-4554-8399-267d1fe9f75c" }
+  } };
+
+  assert.equal(handleBrokerRequest(approval, "relay", stranger, requests, 2000).kind, "fixture_approved");
+  assert.deepEqual(handleBrokerRequest(approval, "relay", stranger, requests, 2000), {
+    ...envelope, kind: "error", payload: { code: "APPROVAL_INVALID" }
+  });
+  const lookup = { ...envelope, kind: "get_connection", payload: { requestId: pending.requestId } };
+  assert.deepEqual(handleBrokerRequest(lookup, "facade", stranger, requests, 2000).payload, { state: "unknown" });
+  const own = handleBrokerRequest(lookup, "facade", owner, requests, 2000);
+  assert.equal(own.payload.state, "ready_readonly");
+  assert.equal("tabId" in own.payload, false);
+  assert.deepEqual(handleBrokerRequest({ ...approval, deadlineMs: 70_000 }, "relay", stranger, requests, 61_000), {
+    ...envelope, deadlineMs: 70_000, kind: "error", payload: { code: "APPROVAL_INVALID" }
   });
 });

@@ -5,6 +5,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
+import type { FixtureTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_PENDING_REQUESTS } from "./pending-connections.js";
@@ -29,7 +30,10 @@ const replySchema = z.discriminatedUnion("kind", [
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.union([
       z.strictObject({ state: z.literal("unknown") }),
-      z.strictObject({ requestId: z.uuid(), state: z.enum(["pending", "expired"]), expiresAt: z.number().int().safe() })
+      z.strictObject({ requestId: z.uuid(), state: z.enum(["pending", "expired"]), expiresAt: z.number().int().safe() }),
+      z.strictObject({ requestId: z.uuid(), state: z.literal("ready_readonly"), connectionId: z.uuid(),
+        generation: z.literal(1), origin: z.literal("http://127.0.0.1:8787"),
+        conversationId: z.literal("fixture-alpha"), expiresAt: z.number().int().safe() })
     ])
   }),
   z.strictObject({
@@ -41,9 +45,14 @@ const replySchema = z.discriminatedUnion("kind", [
     })
   }),
   z.strictObject({
+    kind: z.literal("fixture_approved"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ requestId: z.uuid(), expiresAt: z.number().int().safe() })
+  }),
+  z.strictObject({
     kind: z.literal("error"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
-    payload: z.strictObject({ code: z.enum(["PERMISSION_DENIED", "TOO_MANY_PENDING"]) })
+    payload: z.strictObject({ code: z.enum(["PERMISSION_DENIED", "TOO_MANY_PENDING", "APPROVAL_INVALID"]) })
   })
 ]);
 
@@ -101,8 +110,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       throw new Error("Broker returned a mismatched hello");
     }
     let nextRequest: Promise<void> = Promise.resolve();
-    const request = (kind: "request_connection" | "get_connection" | "list_pending", payload: object) => {
-      if (kind === "list_pending" ? role !== "relay" : role !== "facade") {
+    const request = (kind: "request_connection" | "get_connection" | "list_pending" | "approve_fixture", payload: object) => {
+      if (kind === "list_pending" || kind === "approve_fixture" ? role !== "relay" : role !== "facade") {
         throw new Error("Broker role cannot perform this operation");
       }
       const operation = nextRequest.then(async () => {
@@ -148,6 +157,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       requestConnection: () => request("request_connection", {}),
       getConnection: (requestId: string) => request("get_connection", { requestId }),
       listPending: () => request("list_pending", {}),
+      approveFixture: (pendingRequestId: string, target: FixtureTarget) =>
+        request("approve_fixture", { pendingRequestId, target }),
       close: () => socket.destroy()
     };
   } catch (error) {

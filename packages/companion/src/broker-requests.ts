@@ -13,7 +13,14 @@ const envelope = {
 const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("request_connection"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("get_connection"), payload: z.strictObject({ requestId: z.uuid() }) }),
-  z.strictObject({ ...envelope, kind: z.literal("list_pending"), payload: z.strictObject({}) })
+  z.strictObject({ ...envelope, kind: z.literal("list_pending"), payload: z.strictObject({}) }),
+  z.strictObject({ ...envelope, kind: z.literal("approve_fixture"), payload: z.strictObject({
+    pendingRequestId: z.uuid(),
+    target: z.strictObject({
+      origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
+      tabId: z.number().int().safe().positive(), documentId: z.uuid()
+    })
+  }) })
 ]);
 
 export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: symbol,
@@ -30,6 +37,13 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return role === "relay"
       ? { ...response, kind: "pending_list" as const, payload: { requests: requests.listPending(now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "approve_fixture") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    const grant = requests.approve(request.payload.pendingRequestId, request.payload.target, now);
+    return grant
+      ? { ...response, kind: "fixture_approved" as const, payload: { requestId: grant.requestId, expiresAt: grant.expiresAt } }
+      : { ...response, kind: "error" as const, payload: { code: "APPROVAL_INVALID" } };
   }
   if (role !== "facade") {
     return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };

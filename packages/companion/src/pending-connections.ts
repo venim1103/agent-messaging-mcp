@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 export const PENDING_REQUEST_TTL_MS = 60_000;
 export const MAX_PENDING_REQUESTS = 100;
+export const READONLY_CONNECTION_TTL_MS = 5 * 60_000;
 
 export type PendingRequest = Readonly<{
   requestId: string;
@@ -9,7 +10,24 @@ export type PendingRequest = Readonly<{
   expiresAt: number;
 }>;
 
-type RequestRecord = { owner: symbol; expiresAt: number };
+export type FixtureTarget = Readonly<{
+  origin: "http://127.0.0.1:8787";
+  conversationId: "fixture-alpha";
+  tabId: number;
+  documentId: string;
+}>;
+
+export type ReadonlyConnection = Readonly<{
+  requestId: string;
+  state: "ready_readonly";
+  connectionId: string;
+  generation: 1;
+  origin: FixtureTarget["origin"];
+  conversationId: FixtureTarget["conversationId"];
+  expiresAt: number;
+}>;
+
+type RequestRecord = { owner: symbol; expiresAt: number; grant?: { connection: ReadonlyConnection; target: FixtureTarget } };
 
 export class PendingConnectionRequests {
   private readonly requests = new Map<string, RequestRecord>();
@@ -18,8 +36,9 @@ export class PendingConnectionRequests {
     if (typeof owner !== "symbol") throw new TypeError("Caller identity must be broker-owned");
     let pendingCount = 0;
     for (const [requestId, request] of this.requests) {
-      if (request.expiresAt + PENDING_REQUEST_TTL_MS <= now) this.requests.delete(requestId);
-      else if (request.expiresAt > now) pendingCount++;
+      if ((request.grant?.connection.expiresAt ?? request.expiresAt) + PENDING_REQUEST_TTL_MS <= now) {
+        this.requests.delete(requestId);
+      } else if (!request.grant && request.expiresAt > now) pendingCount++;
     }
     if (pendingCount >= MAX_PENDING_REQUESTS) throw new Error("Too many pending connections");
 
@@ -29,23 +48,45 @@ export class PendingConnectionRequests {
     return { requestId, state: "pending", expiresAt };
   }
 
-  get(owner: symbol, requestId: string, now = Date.now()): PendingRequest | null {
+  get(owner: symbol, requestId: string, now = Date.now()): PendingRequest | ReadonlyConnection | null {
     const request = this.requests.get(requestId);
     if (!request || request.owner !== owner) return null;
-    if (request.expiresAt + PENDING_REQUEST_TTL_MS <= now) {
+    const expiresAt = request.grant?.connection.expiresAt ?? request.expiresAt;
+    if (expiresAt + PENDING_REQUEST_TTL_MS <= now) {
       this.requests.delete(requestId);
       return null;
     }
+    if (request.grant && now < expiresAt) return request.grant.connection;
     return {
       requestId,
-      state: now >= request.expiresAt ? "expired" : "pending",
-      expiresAt: request.expiresAt
+      state: now >= expiresAt ? "expired" : "pending",
+      expiresAt
     };
+  }
+
+  approve(requestId: string, target: FixtureTarget, now = Date.now()): ReadonlyConnection | null {
+    const request = this.requests.get(requestId);
+    if (!request || request.grant || now >= request.expiresAt
+      || target.origin !== "http://127.0.0.1:8787" || target.conversationId !== "fixture-alpha"
+      || !Number.isSafeInteger(target.tabId) || target.tabId < 1
+      || !/^[0-9a-f-]{36}$/.test(target.documentId)) return null;
+
+    const connection = Object.freeze({
+      requestId,
+      state: "ready_readonly" as const,
+      connectionId: randomUUID(),
+      generation: 1 as const,
+      origin: target.origin,
+      conversationId: target.conversationId,
+      expiresAt: now + READONLY_CONNECTION_TTL_MS
+    });
+    request.grant = { connection, target: Object.freeze({ ...target }) };
+    return connection;
   }
 
   listPending(now = Date.now()): ReadonlyArray<Readonly<{ requestId: string; expiresAt: number }>> {
     return [...this.requests]
-      .filter(([, request]) => request.expiresAt > now)
+      .filter(([, request]) => !request.grant && request.expiresAt > now)
       .slice(0, MAX_PENDING_REQUESTS)
       .map(([requestId, request]) => Object.freeze({ requestId, expiresAt: request.expiresAt }));
   }

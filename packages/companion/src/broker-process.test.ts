@@ -44,7 +44,6 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     const otherFacade = await connectBroker("facade", directory);
     const otherState = await otherFacade.getConnection(created.payload.requestId);
     assert.deepEqual(otherState.payload, { state: "unknown" });
-    otherFacade.close();
     const relay = await connectBroker("relay", directory);
     assert.throws(() => relay.requestConnection(), /Broker role cannot perform/);
     assert.throws(() => facade.listPending(), /Broker role cannot perform/);
@@ -52,6 +51,20 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.equal(listed.kind, "pending_list");
     if (listed.kind !== "pending_list") throw new Error("Expected a pending list");
     assert.deepEqual(listed.payload.requests, [{ requestId: created.payload.requestId, expiresAt: created.payload.expiresAt }]);
+    const approved = await relay.approveFixture(created.payload.requestId, {
+      origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "a66b3997-9d43-4554-8399-267d1fe9f75c"
+    });
+    assert.equal(approved.kind, "fixture_approved");
+    assert.throws(() => facade.approveFixture(created.payload.requestId, {
+      origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "a66b3997-9d43-4554-8399-267d1fe9f75c"
+    }), /Broker role cannot perform/);
+    const readyState = await facade.getConnection(created.payload.requestId);
+    assert.equal(readyState.kind, "connection_state");
+    assert.equal(readyState.payload.state, "ready_readonly");
+    assert.deepEqual((await otherFacade.getConnection(created.payload.requestId)).payload, { state: "unknown" });
+    otherFacade.close();
     facade.close();
     assert.deepEqual((await relay.listPending() as typeof listed).payload.requests, []);
     relay.close();

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
+import { MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS }
+  from "./pending-connections.js";
 
 test("pending requests remain private to their broker-owned client", () => {
   const requests = new PendingConnectionRequests();
@@ -36,4 +37,38 @@ test("bounds pending requests and releases expired records before accepting anot
   assert.equal(requests.get(owner, first.requestId, next.expiresAt - 1)?.state, "expired");
   assert.equal(requests.get(Symbol("another client"), first.requestId, next.expiresAt - 1), null);
   assert.equal(requests.get(owner, first.requestId, next.expiresAt), null);
+});
+
+test("a fixture grant is one-shot, owner-bound, and expires without exposing tab metadata", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("request owner");
+  const stranger = Symbol("another MCP client");
+  const pending = requests.create(owner, 1000);
+  const target = {
+    origin: "http://127.0.0.1:8787" as const,
+    conversationId: "fixture-alpha" as const,
+    tabId: 3,
+    documentId: "a66b3997-9d43-4554-8399-267d1fe9f75c"
+  };
+
+  assert.equal(requests.approve(pending.requestId, { ...target, tabId: 0 }, 2000), null);
+  assert.equal(requests.approve(pending.requestId, { ...target, documentId: "unknown" }, 2000), null);
+  assert.equal(requests.approve("unknown", target, 2000), null);
+  assert.equal(requests.get(stranger, pending.requestId, 2000), null);
+  const granted = requests.approve(pending.requestId, target, 2000);
+  assert.equal(granted?.state, "ready_readonly");
+  assert.match(granted?.connectionId ?? "", /^[0-9a-f-]{36}$/);
+  assert.equal(granted?.expiresAt, 2000 + READONLY_CONNECTION_TTL_MS);
+  assert.equal("tabId" in granted!, false);
+  assert.equal("documentId" in granted!, false);
+  assert.deepEqual(requests.get(owner, pending.requestId, 2000), granted);
+  assert.equal(requests.get(stranger, pending.requestId, 2000), null);
+  assert.deepEqual(requests.listPending(2000), []);
+  assert.equal(requests.approve(pending.requestId, target, 2001), null);
+  assert.equal(requests.get(owner, pending.requestId, granted!.expiresAt)?.state, "expired");
+  requests.disconnect(owner);
+  assert.equal(requests.get(owner, pending.requestId, 2000), null);
+
+  const expired = requests.create(owner, 1000);
+  assert.equal(requests.approve(expired.requestId, target, expired.expiresAt), null);
 });
