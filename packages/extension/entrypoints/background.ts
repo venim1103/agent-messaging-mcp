@@ -24,6 +24,7 @@ type FixtureRevocation = { kind: "revoke_fixture"; payload: {
 } } | { kind: "revoke_all_fixture"; payload: Record<string, never> };
 let fixtureResetPromise: Promise<boolean> | undefined;
 const fixtureSnapshotJobs = new Map<number, Promise<boolean>>();
+let fixtureReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 
 async function revokeTrackedFixture(tabId: number): Promise<void> {
   const key = fixtureGrantKey(tabId);
@@ -132,7 +133,17 @@ function observeFixtureIdentity(): boolean {
   return true;
 }
 
-async function publishFixtureSnapshot(tabId: number, documentId: string): Promise<boolean> {
+function stopFixtureObservation(): void {
+  const scope = globalThis as typeof globalThis & {
+    fixtureIdentityObserver?: MutationObserver; fixtureMessagesObserver?: MutationObserver
+  };
+  scope.fixtureIdentityObserver?.disconnect();
+  scope.fixtureMessagesObserver?.disconnect();
+  delete scope.fixtureIdentityObserver;
+  delete scope.fixtureMessagesObserver;
+}
+
+async function publishFixtureSnapshot(tabId: number, documentId: string, challengeId?: string): Promise<boolean> {
   try {
     const key = fixtureGrantKey(tabId);
     const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
@@ -184,7 +195,7 @@ async function publishFixtureSnapshot(tabId: number, documentId: string): Promis
         kind: "publish_fixture_snapshot", protocolVersion, requestId, connectionGeneration: 0,
         deadlineMs, payload: { target: {
           origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId
-        }, messages }
+        }, messages, ...(challengeId === undefined ? {} : { challengeId }) }
       });
     });
     if (!published) return false;
@@ -200,15 +211,138 @@ async function publishFixtureSnapshot(tabId: number, documentId: string): Promis
   }
 }
 
-function queueFixtureSnapshot(tabId: number, documentId: string): Promise<boolean> {
+function queueFixtureSnapshot(tabId: number, documentId: string, challengeId?: string): Promise<boolean> {
   const previous = fixtureSnapshotJobs.get(tabId) ?? Promise.resolve(true);
-  const job = previous.then(() => publishFixtureSnapshot(tabId, documentId),
-    () => publishFixtureSnapshot(tabId, documentId));
+  const job = previous.then(() => publishFixtureSnapshot(tabId, documentId, challengeId),
+    () => publishFixtureSnapshot(tabId, documentId, challengeId));
   fixtureSnapshotJobs.set(tabId, job);
   void job.finally(() => {
     if (fixtureSnapshotJobs.get(tabId) === job) fixtureSnapshotJobs.delete(tabId);
   });
   return job;
+}
+
+async function hasTrackedFixtureGrant(): Promise<boolean> {
+  const stored = await browser.storage.session.get(null);
+  return Object.entries(stored).some(([key, value]) => {
+    if (!/^fixture-grant-[1-9]\d*$/.test(key) || typeof value !== "object" || value === null) return false;
+    const grant = value as Partial<StoredFixtureGrant>;
+    return typeof grant.documentId === "string" && /^[!-~]{1,128}$/.test(grant.documentId)
+      && typeof grant.expiresAt === "number" && Number.isSafeInteger(grant.expiresAt)
+      && grant.expiresAt > Date.now();
+  });
+}
+
+async function releaseDisconnectedFixtures(activeTabIds: number[]): Promise<void> {
+  const active = new Set(activeTabIds);
+  const stored = await browser.storage.session.get(null);
+  for (const [key, value] of Object.entries(stored)) {
+    if (!/^fixture-grant-[1-9]\d*$/.test(key)) continue;
+    const tabId = Number(key.slice("fixture-grant-".length));
+    if (!Number.isSafeInteger(tabId) || active.has(tabId)) continue;
+    await browser.storage.session.remove(key);
+    const grant = value as StoredFixtureGrant | undefined;
+    if (typeof grant?.documentId !== "string" || !/^[!-~]{1,128}$/.test(grant.documentId)) continue;
+    await browser.scripting.executeScript({ target: { tabId, documentIds: [grant.documentId] },
+      func: stopFixtureObservation }).catch(() => {});
+  }
+}
+
+function parseFixtureReadChallenges(value: unknown, requestId: string, deadlineMs: number) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+  const reply = value as Record<string, unknown>;
+  if (Object.keys(reply).length !== 6 || reply.kind !== "fixture_read_challenges"
+    || reply.protocolVersion !== protocolVersion || reply.requestId !== requestId
+    || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
+    || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) throw new Error();
+  const payload = reply.payload as Record<string, unknown>;
+  if (Object.keys(payload).length !== 2 || !Array.isArray(payload.challenges)
+    || payload.challenges.length > 16 || !Array.isArray(payload.activeTabIds)
+    || payload.activeTabIds.length > 100 || !payload.activeTabIds.every((tabId: unknown) =>
+      typeof tabId === "number" && Number.isSafeInteger(tabId) && tabId > 0)
+    || new Set(payload.activeTabIds).size !== payload.activeTabIds.length) throw new Error();
+
+  const challenges = payload.challenges.map((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error();
+    const challenge = entry as Record<string, unknown>;
+    if (Object.keys(challenge).length !== 3 || typeof challenge.challengeId !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(challenge.challengeId)
+      || typeof challenge.expiresAt !== "number" || !Number.isSafeInteger(challenge.expiresAt)
+      || typeof challenge.target !== "object" || challenge.target === null || Array.isArray(challenge.target)) throw new Error();
+    const target = challenge.target as Record<string, unknown>;
+    if (Object.keys(target).length !== 4 || target.origin !== "http://127.0.0.1:8787"
+      || target.conversationId !== "fixture-alpha" || typeof target.tabId !== "number"
+      || !Number.isSafeInteger(target.tabId) || target.tabId < 1
+      || typeof target.documentId !== "string" || !/^[!-~]{1,128}$/.test(target.documentId)) throw new Error();
+    return { challengeId: challenge.challengeId, expiresAt: challenge.expiresAt,
+      tabId: target.tabId, documentId: target.documentId };
+  });
+  return { challenges, activeTabIds: payload.activeTabIds as number[] };
+}
+
+function startFixtureReadWatch(): boolean {
+  if (fixtureReadWatch) return true;
+  let port: ReturnType<typeof browser.runtime.connectNative>;
+  try {
+    port = browser.runtime.connectNative(nativeHostName);
+  } catch {
+    return false;
+  }
+  fixtureReadWatch = port;
+  let requestId: string | null = null;
+  let deadlineMs = 0;
+  let responseTimer: ReturnType<typeof setTimeout> | undefined;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function stop() {
+    if (fixtureReadWatch !== port) return;
+    fixtureReadWatch = undefined;
+    clearTimeout(responseTimer);
+    clearTimeout(pollTimer);
+    port.disconnect();
+  }
+
+  async function poll() {
+    try {
+      if (!await hasTrackedFixtureGrant()) return stop();
+      if (fixtureReadWatch !== port) return;
+      requestId = crypto.randomUUID();
+      deadlineMs = Date.now() + 5_000;
+      responseTimer = setTimeout(stop, 5_000);
+      port.postMessage({ kind: "list_fixture_read_challenges", protocolVersion,
+        requestId, connectionGeneration: 0, deadlineMs, payload: {} });
+    } catch {
+      stop();
+    }
+  }
+
+  port.onMessage.addListener((value: unknown) => {
+    if (!requestId) return stop();
+    clearTimeout(responseTimer);
+    const listing = (() => {
+      try { return parseFixtureReadChallenges(value, requestId, deadlineMs); }
+      catch { stop(); return null; }
+    })();
+    requestId = null;
+    if (!listing) return;
+    void (async () => {
+      await releaseDisconnectedFixtures(listing.activeTabIds);
+      for (const challenge of listing.challenges) {
+        if (challenge.expiresAt <= Date.now()) continue;
+        const key = fixtureGrantKey(challenge.tabId);
+        const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
+        if (!grant || grant.documentId !== challenge.documentId || typeof grant.expiresAt !== "number"
+          || grant.expiresAt <= Date.now()) continue;
+        if (!await queueFixtureSnapshot(challenge.tabId, challenge.documentId, challenge.challengeId)) {
+          await revokeTrackedFixture(challenge.tabId);
+        }
+      }
+      if (fixtureReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
+    })().catch(stop);
+  });
+  port.onDisconnect.addListener(stop);
+  void poll();
+  return true;
 }
 
 async function approveFixture(tabId: number, expectedUrl: string, pendingRequestId: string): Promise<FixtureApprovalResult> {
@@ -302,6 +436,7 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
           });
           if (watchingMessages?.frameId !== 0 || watchingMessages.documentId !== documentId
             || watchingMessages.result !== true || !await queueFixtureSnapshot(tabId, documentId)) throw new Error();
+          if (!startFixtureReadWatch()) throw new Error();
           finish({ ok: true, requestId: pendingRequestId, expiresAt: payload.expiresAt });
         })().catch(async () => {
           if (brokerApproved && await revokeFixtureTab(tabId, null)) {
@@ -534,7 +669,9 @@ function isHandshakeReply(value: unknown, requestId: string, deadlineMs: number)
 }
 
 export default defineBackground(() => {
-  void ensureFixtureReset();
+  void ensureFixtureReset().then(async (ready) => {
+    if (ready && await hasTrackedFixtureGrant()) startFixtureReadWatch();
+  }).catch(() => {});
   browser.tabs.onRemoved.addListener((tabId) => { void revokeTrackedFixture(tabId).catch(() => {}); });
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (changeInfo.status === "loading" || changeInfo.url) void revokeTrackedFixture(tabId).catch(() => {});

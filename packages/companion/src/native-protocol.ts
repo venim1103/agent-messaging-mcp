@@ -13,6 +13,23 @@ const pendingListSchema = z.strictObject({
   payload: z.strictObject({})
 });
 
+const fixtureReadChallengesSchema = z.strictObject({
+  kind: z.literal("list_fixture_read_challenges"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({})
+});
+
+export function parseNativeFixtureReadChallenges(message: unknown, now = Date.now()) {
+  const result = fixtureReadChallengesSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture read challenge list");
+  }
+  return result.data;
+}
+
 const fixtureApprovalSchema = z.strictObject({
   kind: z.literal("approve_fixture"),
   protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -42,7 +59,8 @@ const fixtureSnapshotSchema = z.strictObject({
     messages: z.array(z.strictObject({
       id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
       direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
-    })).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
+    })).max(MAX_FIXTURE_SNAPSHOT_MESSAGES),
+    challengeId: z.uuid().optional()
   })
 });
 

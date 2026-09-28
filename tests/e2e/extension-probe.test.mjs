@@ -65,7 +65,7 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
   }
 });
 
-test("worker wake preserves a grant; reload, restart, and tab close revoke grants", { timeout: 30000 }, async () => {
+test("worker wake preserves a grant; reload, tab close, denied reads, and disconnect revoke grants", { timeout: 30000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-restart-test-"));
   const directory = join(profile, ".config/agent-messaging-mcp/broker");
   const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
@@ -196,6 +196,61 @@ test("worker wake preserves a grant; reload, restart, and tab close revoke grant
     }), { tabId: trackedTab.id });
     await worker.evaluate((tabId) => chrome.tabs.remove(tabId), trackedTab.id);
     await waitForStale(beforeTabClose);
+
+    const unapprovedTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
+    const beforeDeniedRead = await grant(unapprovedTab.id);
+    const deniedState = await facade.getConnection(beforeDeniedRead);
+    if (deniedState.kind !== "connection_state" || deniedState.payload.state !== "ready_readonly") {
+      throw new Error("Expected a seeded read handle");
+    }
+    await worker.evaluate(({ tabId }) => chrome.storage.session.set({
+      [`fixture-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, expiresAt: Date.now() + 10_000 }
+    }), { tabId: unapprovedTab.id });
+    const disconnectedTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
+    const beforeDisconnect = await grant(disconnectedTab.id);
+    const disconnectState = await facade.getConnection(beforeDisconnect);
+    if (disconnectState.kind !== "connection_state" || disconnectState.payload.state !== "ready_readonly") {
+      throw new Error("Expected a disconnectable seeded handle");
+    }
+    await worker.evaluate(({ tabId }) => chrome.storage.session.set({
+      [`fixture-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, expiresAt: Date.now() + 30_000 }
+    }), { tabId: disconnectedTab.id });
+    const resumedManager = await context.newPage();
+    await resumedManager.goto("chrome://extensions/");
+    const readerWorkers = await context.newCDPSession(resumedManager);
+    let confirmReadWorkerStopped;
+    const readWorkerStopped = new Promise((resolve) => { confirmReadWorkerStopped = resolve; });
+    const readWorkerVersion = new Promise((resolve) => readerWorkers.on("ServiceWorker.workerVersionUpdated", (event) => {
+      const version = event.versions.find((entry) => entry.scriptURL === worker.url());
+      if (version) resolve(version.versionId);
+      if (version?.runningStatus === "stopped") confirmReadWorkerStopped();
+    }));
+    await readerWorkers.send("ServiceWorker.enable");
+    const readVersionId = await Promise.race([readWorkerVersion, setTimeout(3000).then(() => {
+      throw new Error("Read worker version not found");
+    })]);
+    await readerWorkers.send("ServiceWorker.stopWorker", { versionId: readVersionId });
+    await Promise.race([readWorkerStopped, setTimeout(5000).then(() => {
+      throw new Error("Read worker did not stop");
+    })]);
+    const resumedPopup = await context.newPage();
+    await resumedPopup.goto(`chrome-extension://${extensionId}/popup.html`);
+    await resumedPopup.evaluate(() => chrome.runtime.sendMessage({ kind: "list_fixture_pending", tabId: 1 }));
+    const denied = await facade.readFixtureSnapshot(deniedState.payload.connectionId);
+    assert.equal(denied.kind, "error");
+    assert.deepEqual(denied.payload, { code: "CONNECTION_NOT_FOUND" });
+    await waitForStale(beforeDeniedRead);
+    assert.deepEqual((await facade.disconnectFixture(disconnectState.payload.connectionId)).payload,
+      { disconnected: true });
+    await resumedPopup.waitForFunction(async (tabId) => {
+      const key = `fixture-grant-${tabId}`;
+      return (await chrome.storage.session.get(key))[key] === undefined;
+    }, disconnectedTab.id, { timeout: 4000 });
+    assert.equal(await resumedPopup.evaluate(async (tabId) => !!await chrome.tabs.get(tabId), disconnectedTab.id), true);
+    assert.deepEqual((await facade.getConnection(beforeDisconnect)).payload,
+      { requestId: beforeDisconnect, state: "stale" });
+    await resumedPopup.close();
+    await readerWorkers.detach();
   } finally {
     await context?.close();
     facade?.close();

@@ -8,7 +8,8 @@ import type { BrokerRole } from "./broker-roles.js";
 import type { FixtureMessage, FixtureTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_PENDING_REQUESTS } from "./pending-connections.js";
+import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_PENDING_FIXTURE_READS, MAX_PENDING_REQUESTS }
+  from "./pending-connections.js";
 
 const helloResult = z.strictObject({
   kind: z.literal("hello_result"),
@@ -22,6 +23,11 @@ const fixtureMessage = z.strictObject({
   id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
   direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
 });
+const fixtureTarget = z.strictObject({
+  origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
+  tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
+});
+const fixtureCursor = z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() });
 
 const replySchema = z.discriminatedUnion("kind", [
   z.strictObject({
@@ -65,13 +71,38 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
   }),
   z.strictObject({
+    kind: z.literal("fixture_read_challenges"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ challenges: z.array(z.strictObject({
+      challengeId: z.uuid(), target: fixtureTarget, expiresAt: z.number().int().safe()
+    })).max(MAX_PENDING_FIXTURE_READS),
+    activeTabIds: z.array(z.number().int().safe().positive()).max(MAX_PENDING_REQUESTS) })
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_disconnected"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ disconnected: z.boolean() })
+  }),
+  z.strictObject({
     kind: z.literal("fixture_snapshot"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({
       coverage: z.literal("rendered_only"), generation: z.literal(1), capturedAt: z.number().int().safe(),
-      cursor: z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() }),
+      cursor: fixtureCursor,
       messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES), omittedBefore: z.boolean()
     })
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_events"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.discriminatedUnion("state", [
+      z.strictObject({ state: z.literal("expired"), resnapshot: z.literal(true) }),
+      z.strictObject({ state: z.literal("ok"), cursor: fixtureCursor,
+        events: z.array(z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().positive(),
+          payload: z.strictObject({ kind: z.literal("fixture_snapshot"),
+            messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES) })
+        })).max(MAX_FIXTURE_EVENTS_PER_READ) })
+    ])
   }),
   z.strictObject({
     kind: z.literal("error"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -135,10 +166,12 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       throw new Error("Broker returned a mismatched hello");
     }
     let nextRequest: Promise<void> = Promise.resolve();
-    const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot"
-      | "list_pending" | "approve_fixture" | "publish_fixture_snapshot"
+    const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
+      | "disconnect_fixture"
+      | "list_pending" | "list_fixture_read_challenges" | "approve_fixture" | "publish_fixture_snapshot"
       | "revoke_fixture" | "revoke_all_fixture", payload: object) => {
-      if (kind === "list_pending" || kind === "approve_fixture" || kind === "revoke_fixture"
+      if (kind === "list_pending" || kind === "list_fixture_read_challenges"
+        || kind === "approve_fixture" || kind === "revoke_fixture"
         || kind === "revoke_all_fixture" || kind === "publish_fixture_snapshot"
         ? role !== "relay" : role !== "facade") {
         throw new Error("Broker role cannot perform this operation");
@@ -187,11 +220,16 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       getConnection: (requestId: string) => request("get_connection", { requestId }),
       readFixtureSnapshot: (connectionId: string, limit?: number) =>
         request("read_fixture_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
+      readFixtureEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>
+        request("read_fixture_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }) }),
+      disconnectFixture: (connectionId: string) => request("disconnect_fixture", { connectionId }),
       listPending: () => request("list_pending", {}),
+      listFixtureReadChallenges: () => request("list_fixture_read_challenges", {}),
       approveFixture: (pendingRequestId: string, target: FixtureTarget) =>
         request("approve_fixture", { pendingRequestId, target }),
-      publishFixtureSnapshot: (target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>) =>
-        request("publish_fixture_snapshot", { target, messages }),
+      publishFixtureSnapshot: (target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>, challengeId?: string) =>
+        request("publish_fixture_snapshot", { target, messages,
+          ...(challengeId === undefined ? {} : { challengeId }) }),
       revokeFixture: (tabId: number, observed: { documentId: string; conversationId: string } | null) =>
         request("revoke_fixture", { tabId, observed }),
       revokeAllFixtures: () => request("revoke_all_fixture", {}),

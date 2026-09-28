@@ -23,6 +23,15 @@ function blocked(code: string) {
   return { isError: true, content: [{ type: "text" as const, text: `${code}: No chat was accessed.` }] };
 }
 
+function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); };
+    signal.addEventListener("abort", finish, { once: true });
+    const timer = setTimeout(finish, milliseconds);
+    if (signal.aborted) finish();
+  });
+}
+
 server.registerTool("browser_chat_feasibility", {
   description: "Check MCP stdio compatibility without accessing any browser tab or conversation.",
   inputSchema: z.object({}),
@@ -61,7 +70,7 @@ server.registerTool("chat.get_connection", {
 });
 
 server.registerTool("chat.read_messages", {
-  description: "Read the latest rendered-only local fixture snapshot for an owned connection. This is a cached observation, not a live Gemini read or complete chat history.",
+  description: "Read a fresh rendered-only local fixture snapshot for an owned connection after a bounded browser challenge. This does not read Gemini or complete chat history.",
   inputSchema: z.object({ connectionId: z.uuid(), limit: z.number().int().min(1).max(32).optional() }).strict(),
   annotations: { readOnlyHint: true }
 }, async ({ connectionId, limit }) => {
@@ -69,6 +78,54 @@ server.registerTool("chat.read_messages", {
     const result = await (await pendingBroker()).readFixtureSnapshot(connectionId, limit);
     if (result.kind === "error") return blocked(result.payload.code);
     if (result.kind !== "fixture_snapshot") return unavailable();
+    return { content: [{ type: "text", text: JSON.stringify(result.payload) }], structuredContent: result.payload };
+  } catch {
+    return unavailable();
+  }
+});
+
+server.registerTool("chat.wait_for_events", {
+  description: "Wait for later rendered-only observations from an owned local fixture cursor, with a bounded timeout and explicit resnapshot on cursor expiry.",
+  inputSchema: z.object({
+    connectionId: z.uuid(),
+    cursor: z.object({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() }).strict(),
+    timeoutMs: z.number().int().min(0).max(20_000).optional(),
+    limit: z.number().int().min(1).max(2).optional()
+  }).strict(),
+  annotations: { readOnlyHint: true }
+}, async ({ connectionId, cursor, timeoutMs, limit }, extra) => {
+  const deadline = Date.now() + (timeoutMs ?? 20_000);
+  try {
+    while (true) {
+      if (extra.mcpReq.signal.aborted) return blocked("CANCELLED");
+      const result = await (await pendingBroker()).readFixtureEvents(connectionId, cursor, limit);
+      if (result.kind === "error") return blocked(result.payload.code);
+      if (result.kind !== "fixture_events") return unavailable();
+      if (result.payload.state === "expired") return {
+        isError: true,
+        content: [{ type: "text" as const, text: "CURSOR_EXPIRED: Call chat.read_messages for a new snapshot." }],
+        structuredContent: { code: "CURSOR_EXPIRED", resnapshot: true }
+      };
+      const timedOut = result.payload.events.length === 0 && Date.now() >= deadline;
+      if (result.payload.events.length || timedOut) {
+        const payload = { ...result.payload, timedOut };
+        return { content: [{ type: "text" as const, text: JSON.stringify(payload) }], structuredContent: payload };
+      }
+      await waitForPoll(Math.min(200, deadline - Date.now()), extra.mcpReq.signal);
+    }
+  } catch {
+    return unavailable();
+  }
+});
+
+server.registerTool("chat.disconnect", {
+  description: "Revoke an owned local fixture connection without closing its browser tab. Pending reads are cancelled and subsequent access is denied.",
+  inputSchema: z.object({ connectionId: z.uuid() }).strict()
+}, async ({ connectionId }) => {
+  try {
+    const result = await (await pendingBroker()).disconnectFixture(connectionId);
+    if (result.kind === "error") return blocked(result.payload.code);
+    if (result.kind !== "fixture_disconnected") return unavailable();
     return { content: [{ type: "text", text: JSON.stringify(result.payload) }], structuredContent: result.payload };
   } catch {
     return unavailable();

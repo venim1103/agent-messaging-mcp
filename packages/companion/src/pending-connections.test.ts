@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS }
+import { FIXTURE_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests,
+  PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS }
   from "./pending-connections.js";
 
 test("pending requests remain private to their broker-owned client", () => {
@@ -154,7 +155,21 @@ test("bounded fixture snapshots belong only to live matching grants and retain a
   assert.equal(initial.coverage, "rendered_only");
   assert.equal(initial.capturedAt, 2001);
   assert.equal(initial.cursor.sequence, 1);
+  const atSnapshot = requests.readFixtureEvents(owner, grant.connectionId, initial.cursor, 1, 2001);
+  if (!atSnapshot || atSnapshot === "not_ready" || atSnapshot.state !== "ok") {
+    throw new Error("Expected an empty initial event page");
+  }
+  assert.deepEqual(atSnapshot.events, []);
+  assert.equal(requests.readFixtureEvents(stranger, grant.connectionId, initial.cursor, 1, 2001), null);
   assert.equal(requests.getFixtureSnapshot(stranger, grant.connectionId, 2001), null);
+  assert.equal(requests.getFixtureSnapshot(owner, grant.connectionId, 2001 + MAX_FIXTURE_SNAPSHOT_AGE_MS), initial);
+  assert.equal(requests.publishFixtureSnapshot(target, messages, 2002), 1);
+  const refreshed = requests.getFixtureSnapshot(owner, grant.connectionId, 2002);
+  if (!refreshed || refreshed === "not_ready") throw new Error("Expected refreshed snapshot metadata");
+  assert.equal(refreshed.cursor.sequence, initial.cursor.sequence);
+  assert.equal(refreshed.capturedAt, 2002);
+  assert.deepEqual(requests.readFixtureEvents(owner, grant.connectionId, initial.cursor, 1, 2002), atSnapshot);
+  assert.equal(requests.getFixtureSnapshot(owner, grant.connectionId, 2003 + MAX_FIXTURE_SNAPSHOT_AGE_MS), "not_ready");
   assert.throws(() => requests.publishFixtureSnapshot(target, [...messages, messages[0]!], 2002), /Invalid fixture snapshot/);
   messages[0]!.text = "Changed after publication";
   assert.equal(initial.messages[0]?.text, "One");
@@ -164,8 +179,110 @@ test("bounded fixture snapshots belong only to live matching grants and retain a
   assert.equal(updated.cursor.epoch, initial.cursor.epoch);
   assert.equal(updated.cursor.sequence, 2);
   assert.equal(updated.messages[0]?.text, "Changed after publication");
+  const events = requests.readFixtureEvents(owner, grant.connectionId, initial.cursor, 1, 2002);
+  if (!events || events === "not_ready" || events.state !== "ok") throw new Error("Expected one later observation");
+  assert.equal(events.events.length, 1);
+  assert.equal(events.cursor.sequence, 2);
+  assert.deepEqual(events.events[0]?.payload, { kind: "fixture_snapshot", messages });
+  assert.deepEqual(requests.readFixtureEvents(owner, grant.connectionId, { epoch: "other", sequence: 1 }, 1, 2002),
+    { state: "expired", resnapshot: true });
   assert.equal(requests.getFixtureSnapshot(owner, grant.connectionId, grant.expiresAt), null);
   assert.equal(requests.revokeChangedTab(3, null), 1);
   assert.equal(requests.getFixtureSnapshot(owner, grant.connectionId, 2003), null);
+  assert.equal(requests.readFixtureEvents(owner, grant.connectionId, initial.cursor, 1, 2003), null);
   assert.equal(requests.publishFixtureSnapshot(target, messages, 2003), 0);
+});
+
+test("fresh fixture read challenges belong to a live owner and expire or cancel without exposing rows", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("reader");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42" };
+  assert.equal(requests.requestFreshFixtureRead(owner, pending.requestId, 2000), null);
+  const grant = requests.approve(pending.requestId, target, 2000)!;
+  assert.equal(requests.requestFreshFixtureRead(Symbol("stranger"), grant.connectionId, 2001), null);
+  const first = requests.requestFreshFixtureRead(owner, grant.connectionId, 2001);
+  if (!first || first === "busy") throw new Error("Expected a read challenge");
+  assert.deepEqual(requests.listFixtureReadChallenges(2001), [{
+    challengeId: first.challengeId, target, expiresAt: 2001 + FIXTURE_READ_TIMEOUT_MS
+  }]);
+  assert.deepEqual(requests.listFixtureReadChallenges(2001 + FIXTURE_READ_TIMEOUT_MS), []);
+  assert.equal(await first.result, "not_ready");
+
+  const second = requests.requestFreshFixtureRead(owner, grant.connectionId, 2002);
+  if (!second || second === "busy") throw new Error("Expected another challenge");
+  assert.equal(requests.revokeChangedTab(3, null), 1);
+  assert.equal(await second.result, null);
+  assert.deepEqual(requests.listFixtureReadChallenges(2002), []);
+  assert.equal(requests.requestFreshFixtureRead(owner, grant.connectionId, 2002), null);
+
+  const another = requests.create(owner, 1000);
+  const anotherGrant = requests.approve(another.requestId, target, 2000)!;
+  const third = requests.requestFreshFixtureRead(owner, anotherGrant.connectionId, 2002);
+  if (!third || third === "busy") throw new Error("Expected an owned challenge");
+  requests.disconnect(owner);
+  assert.equal(await third.result, null);
+  assert.deepEqual(requests.listFixtureReadChallenges(2002), []);
+});
+
+test("only a new exact-target publication completes its read challenge once", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("reader");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42" };
+  const grant = requests.approve(pending.requestId, target, 2000)!;
+  const messages = [{ id: "fixture-1", direction: "incoming" as const, text: "Old row" }];
+  assert.equal(requests.publishFixtureSnapshot(target, messages, 2001), 1);
+  const challenge = requests.requestFreshFixtureRead(owner, grant.connectionId, 2002);
+  if (!challenge || challenge === "busy") throw new Error("Expected a fresh-read challenge");
+  assert.equal(requests.publishFixtureSnapshot({ ...target, documentId: "other" }, messages, 2003,
+    challenge.challengeId), 0);
+  assert.equal(requests.publishFixtureSnapshot(target, messages, 2003, "a66b3997-9d43-4554-8399-267d1fe9f75c"), 0);
+  assert.equal(requests.listFixtureReadChallenges(2003).length, 1);
+  const updated = [{ ...messages[0]!, text: "Current row" }];
+  assert.equal(requests.publishFixtureSnapshot(target, updated, 2004, challenge.challengeId), 1);
+  const observed = await challenge.result;
+  if (!observed || observed === "not_ready") throw new Error("Expected the challenged snapshot");
+  assert.equal(observed.messages[0]?.text, "Current row");
+  assert.equal(observed.capturedAt, 2004);
+  assert.deepEqual(requests.listFixtureReadChallenges(2004), []);
+  assert.equal(requests.publishFixtureSnapshot(target, updated, 2005, challenge.challengeId), 0);
+  const unchangedRead = requests.requestFreshFixtureRead(owner, grant.connectionId, 2005);
+  if (!unchangedRead || unchangedRead === "busy") throw new Error("Expected a second read challenge");
+  assert.equal(requests.publishFixtureSnapshot(target, updated, 2006, unchangedRead.challengeId), 1);
+  const unchanged = await unchangedRead.result;
+  if (!unchanged || unchanged === "not_ready") throw new Error("Expected a refreshed read");
+  assert.equal(unchanged.capturedAt, 2006);
+  assert.equal(unchanged.cursor.sequence, observed.cursor.sequence);
+  const events = requests.readFixtureEvents(owner, grant.connectionId, observed.cursor, 1, 2006);
+  if (!events || events === "not_ready" || events.state !== "ok") throw new Error("Expected an empty event page");
+  assert.deepEqual(events.events, []);
+});
+
+test("owner disconnect revokes one fixture grant and cancels its pending reads", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("disconnecting client");
+  const other = Symbol("other owner");
+  const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42" };
+  const first = requests.create(owner, 1000);
+  const second = requests.create(other, 1000);
+  const firstGrant = requests.approve(first.requestId, target, 2000)!;
+  const secondGrant = requests.approve(second.requestId, { ...target, tabId: 4 }, 2000)!;
+  assert.deepEqual(requests.listActiveFixtureTabIds(2001), [3, 4]);
+  assert.equal(requests.disconnectFixture(other, firstGrant.connectionId, 2001), false);
+  const reading = requests.requestFreshFixtureRead(owner, firstGrant.connectionId, 2001);
+  if (!reading || reading === "busy") throw new Error("Expected a pending read");
+  assert.equal(requests.disconnectFixture(owner, firstGrant.connectionId, 2002), true);
+  assert.equal(await reading.result, null);
+  assert.equal(requests.disconnectFixture(owner, firstGrant.connectionId, 2002), false);
+  assert.deepEqual(requests.get(owner, first.requestId, 2002), { requestId: first.requestId, state: "stale" });
+  assert.equal(requests.getApprovedTarget(owner, firstGrant.connectionId, 2002), null);
+  assert.deepEqual(requests.listActiveFixtureTabIds(2002), [4]);
+  assert.equal(requests.get(other, second.requestId, 2002)?.state, "ready_readonly");
+  requests.disconnect(other);
+  assert.deepEqual(requests.listActiveFixtureTabIds(2002), []);
+  assert.equal(requests.getApprovedTarget(other, secondGrant.connectionId, 2002), null);
 });

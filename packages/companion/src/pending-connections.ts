@@ -6,6 +6,10 @@ export const MAX_PENDING_REQUESTS = 100;
 export const READONLY_CONNECTION_TTL_MS = 5 * 60_000;
 export const MAX_FIXTURE_SNAPSHOT_MESSAGES = 32;
 export const MAX_FIXTURE_SNAPSHOT_BYTES = 64 * 1024;
+export const MAX_FIXTURE_SNAPSHOT_AGE_MS = 30_000;
+export const MAX_FIXTURE_EVENTS_PER_READ = 2;
+export const FIXTURE_READ_TIMEOUT_MS = 4_000;
+export const MAX_PENDING_FIXTURE_READS = 16;
 
 export type PendingRequest = Readonly<{
   requestId: string;
@@ -47,9 +51,35 @@ type FixtureGrant = {
   snapshot?: FixtureSnapshot;
 };
 type RequestRecord = { owner: symbol; expiresAt: number; grant?: FixtureGrant };
+type PendingFixtureRead = {
+  owner: symbol;
+  connectionId: string;
+  target: FixtureTarget;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+  resolve: (snapshot: FixtureSnapshot | "not_ready" | null) => void;
+};
 
 export class PendingConnectionRequests {
   private readonly requests = new Map<string, RequestRecord>();
+  private readonly fixtureReads = new Map<string, PendingFixtureRead>();
+
+  private finishFixtureRead(challengeId: string, result: FixtureSnapshot | "not_ready" | null): void {
+    const pending = this.fixtureReads.get(challengeId);
+    if (!pending) return;
+    this.fixtureReads.delete(challengeId);
+    clearTimeout(pending.timer);
+    pending.resolve(result);
+  }
+
+  private revokeGrant(grant: FixtureGrant): void {
+    grant.stale = true;
+    grant.snapshot = undefined;
+    grant.observations = undefined;
+    for (const [challengeId, pending] of this.fixtureReads) {
+      if (pending.connectionId === grant.connection.connectionId) this.finishFixtureRead(challengeId, null);
+    }
+  }
 
   private liveGrant(owner: symbol, connectionId: string, now: number): FixtureGrant | null {
     for (const request of this.requests.values()) {
@@ -101,15 +131,68 @@ export class PendingConnectionRequests {
 
   getFixtureSnapshot(owner: symbol, connectionId: string, now = Date.now()): FixtureSnapshot | "not_ready" | null {
     const grant = this.liveGrant(owner, connectionId, now);
-    return grant ? grant.snapshot ?? "not_ready" : null;
+    if (!grant) return null;
+    return grant.snapshot && now - grant.snapshot.capturedAt <= MAX_FIXTURE_SNAPSHOT_AGE_MS
+      ? grant.snapshot : "not_ready";
   }
 
-  publishFixtureSnapshot(target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>, now = Date.now()): number {
+  readFixtureEvents(owner: symbol, connectionId: string,
+    cursor: { epoch: string; sequence: number }, limit = MAX_FIXTURE_EVENTS_PER_READ, now = Date.now()) {
+    const grant = this.liveGrant(owner, connectionId, now);
+    if (!grant) return null;
+    return grant.observations?.read(cursor, limit) ?? "not_ready";
+  }
+
+  requestFreshFixtureRead(owner: symbol, connectionId: string, now = Date.now()) {
+    const grant = this.liveGrant(owner, connectionId, now);
+    if (!grant) return null;
+    if (this.fixtureReads.size >= MAX_PENDING_FIXTURE_READS) return "busy" as const;
+    const challengeId = randomUUID();
+    const expiresAt = now + FIXTURE_READ_TIMEOUT_MS;
+    let resolve!: PendingFixtureRead["resolve"];
+    const result = new Promise<FixtureSnapshot | "not_ready" | null>((done) => { resolve = done; });
+    const timer = setTimeout(() => this.finishFixtureRead(challengeId, "not_ready"), FIXTURE_READ_TIMEOUT_MS);
+    this.fixtureReads.set(challengeId, { owner, connectionId, target: grant.target, expiresAt, timer, resolve });
+    return { challengeId, result };
+  }
+
+  listFixtureReadChallenges(now = Date.now()) {
+    for (const [challengeId, pending] of this.fixtureReads) {
+      if (pending.expiresAt <= now) this.finishFixtureRead(challengeId, "not_ready");
+    }
+    return [...this.fixtureReads].map(([challengeId, pending]) => ({
+      challengeId, target: pending.target, expiresAt: pending.expiresAt
+    }));
+  }
+
+  listActiveFixtureTabIds(now = Date.now()): number[] {
+    const tabs = new Set<number>();
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (grant && !grant.stale && now < grant.connection.expiresAt) tabs.add(grant.target.tabId);
+    }
+    return [...tabs].sort((first, second) => first - second);
+  }
+
+  disconnectFixture(owner: symbol, connectionId: string, now = Date.now()): boolean {
+    const grant = this.liveGrant(owner, connectionId, now);
+    if (!grant) return false;
+    this.revokeGrant(grant);
+    return true;
+  }
+
+  publishFixtureSnapshot(target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>,
+    now = Date.now(), challengeId?: string): number {
     if (messages.length > MAX_FIXTURE_SNAPSHOT_MESSAGES
       || Buffer.byteLength(JSON.stringify(messages), "utf8") > MAX_FIXTURE_SNAPSHOT_BYTES
       || new Set(messages.map((message) => message.id)).size !== messages.length) {
       throw new Error("Invalid fixture snapshot");
     }
+    const pending = challengeId ? this.fixtureReads.get(challengeId) : undefined;
+    if (challengeId && (!pending || pending.expiresAt <= now
+      || pending.target.origin !== target.origin || pending.target.conversationId !== target.conversationId
+      || pending.target.tabId !== target.tabId || pending.target.documentId !== target.documentId
+      || !this.liveGrant(pending.owner, pending.connectionId, now))) return 0;
     let published = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
@@ -117,13 +200,21 @@ export class PendingConnectionRequests {
         || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
         || grant.target.tabId !== target.tabId || grant.target.documentId !== target.documentId) continue;
       grant.observations ??= new ObservationBuffer({ maxEvents: 32, maxBytes: 256 * 1024 });
-      grant.observations.append({ kind: "fixture_snapshot", messages });
+      const previous = grant.snapshot?.messages;
+      if (!previous || previous.length !== messages.length || messages.some((message, index) =>
+        message.id !== previous[index]?.id || message.direction !== previous[index]?.direction
+          || message.text !== previous[index]?.text)) {
+        grant.observations.append({ kind: "fixture_snapshot", messages });
+      }
       grant.snapshot = Object.freeze({
         coverage: "rendered_only", generation: 1, capturedAt: now,
         cursor: grant.observations.bookmark(),
         messages: Object.freeze(messages.map((message) => Object.freeze({ ...message })))
       });
       published++;
+    }
+    if (pending && challengeId) {
+      this.finishFixtureRead(challengeId, this.getFixtureSnapshot(pending.owner, pending.connectionId, now));
     }
     return published;
   }
@@ -155,9 +246,7 @@ export class PendingConnectionRequests {
       if (grant && grant.target.tabId === tabId && !grant.stale
         && (!observed || grant.target.documentId !== observed.documentId
           || grant.target.conversationId !== observed.conversationId)) {
-        grant.stale = true;
-        grant.snapshot = undefined;
-        grant.observations = undefined;
+        this.revokeGrant(grant);
         revoked++;
       }
     }
@@ -168,9 +257,7 @@ export class PendingConnectionRequests {
     let revoked = 0;
     for (const request of this.requests.values()) {
       if (request.grant && !request.grant.stale) {
-        request.grant.stale = true;
-        request.grant.snapshot = undefined;
-        request.grant.observations = undefined;
+        this.revokeGrant(request.grant);
         revoked++;
       }
     }
@@ -185,6 +272,9 @@ export class PendingConnectionRequests {
   }
 
   disconnect(owner: symbol): void {
+    for (const [challengeId, pending] of this.fixtureReads) {
+      if (pending.owner === owner) this.finishFixtureRead(challengeId, null);
+    }
     for (const [requestId, request] of this.requests) {
       if (request.owner === owner) this.requests.delete(requestId);
     }

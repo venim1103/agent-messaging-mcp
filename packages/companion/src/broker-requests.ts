@@ -1,7 +1,8 @@
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests } from "./pending-connections.js";
+import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests }
+  from "./pending-connections.js";
 
 const envelope = {
   protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -24,13 +25,23 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("read_fixture_snapshot"), payload: z.strictObject({
     connectionId: z.uuid(), limit: z.number().int().min(1).max(MAX_FIXTURE_SNAPSHOT_MESSAGES).optional()
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("read_fixture_events"), payload: z.strictObject({
+    connectionId: z.uuid(), cursor: z.strictObject({
+      epoch: z.uuid(), sequence: z.number().int().safe().nonnegative()
+    }), limit: z.number().int().min(1).max(MAX_FIXTURE_EVENTS_PER_READ).optional()
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("disconnect_fixture"), payload: z.strictObject({
+    connectionId: z.uuid()
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_fixture_read_challenges"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("list_pending"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("approve_fixture"), payload: z.strictObject({
     pendingRequestId: z.uuid(),
     target: fixtureTarget
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("publish_fixture_snapshot"), payload: z.strictObject({
-    target: fixtureTarget, messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
+    target: fixtureTarget, messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES),
+    challengeId: z.uuid().optional()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("revoke_fixture"), payload: z.strictObject({
     tabId: z.number().int().safe().positive(),
@@ -56,6 +67,13 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       ? { ...response, kind: "pending_list" as const, payload: { requests: requests.listPending(now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
+  if (request.kind === "list_fixture_read_challenges") {
+    return role === "relay"
+      ? { ...response, kind: "fixture_read_challenges" as const,
+        payload: { challenges: requests.listFixtureReadChallenges(now),
+          activeTabIds: requests.listActiveFixtureTabIds(now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
   if (request.kind === "approve_fixture") {
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
     const grant = requests.approve(request.payload.pendingRequestId, request.payload.target, now);
@@ -66,7 +84,8 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   if (request.kind === "publish_fixture_snapshot") {
     return role === "relay"
       ? { ...response, kind: "fixture_snapshot_published" as const,
-        payload: { count: requests.publishFixtureSnapshot(request.payload.target, request.payload.messages, now) } }
+        payload: { count: requests.publishFixtureSnapshot(request.payload.target, request.payload.messages,
+          now, request.payload.challengeId) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "revoke_fixture") {
@@ -84,13 +103,23 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "read_fixture_snapshot") {
-    const snapshot = requests.getFixtureSnapshot(owner, request.payload.connectionId, now);
-    if (!snapshot || snapshot === "not_ready") return { ...response, kind: "error" as const,
-      payload: { code: snapshot === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } };
-    const limit = request.payload.limit ?? MAX_FIXTURE_SNAPSHOT_MESSAGES;
-    return { ...response, kind: "fixture_snapshot" as const, payload: {
-      ...snapshot, messages: snapshot.messages.slice(-limit), omittedBefore: snapshot.messages.length > limit
-    } };
+    return requests.getApprovedTarget(owner, request.payload.connectionId, now)
+      ? { ...response, kind: "fixture_read_authorized" as const, payload: {
+        connectionId: request.payload.connectionId, limit: request.payload.limit ?? MAX_FIXTURE_SNAPSHOT_MESSAGES
+      } }
+      : { ...response, kind: "error" as const, payload: { code: "CONNECTION_NOT_FOUND" } };
+  }
+  if (request.kind === "read_fixture_events") {
+    const events = requests.readFixtureEvents(owner, request.payload.connectionId,
+      request.payload.cursor, request.payload.limit ?? MAX_FIXTURE_EVENTS_PER_READ, now);
+    return events && events !== "not_ready"
+      ? { ...response, kind: "fixture_events" as const, payload: events }
+      : { ...response, kind: "error" as const,
+        payload: { code: events === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } };
+  }
+  if (request.kind === "disconnect_fixture") {
+    return { ...response, kind: "fixture_disconnected" as const,
+      payload: { disconnected: requests.disconnectFixture(owner, request.payload.connectionId, now) } };
   }
   if (request.kind === "request_connection") {
     try {

@@ -9,8 +9,9 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReset,
-  parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList, PROTOCOL_VERSION }
+import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReadChallenges,
+  parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
+  PROTOCOL_VERSION }
   from "./native-protocol.js";
 
 const origin = `chrome-extension://${"a".repeat(32)}/`;
@@ -60,6 +61,21 @@ test("native pending list accepts no selectors, transcript fields, or arbitrary 
     { ...listing, tabId: 1 }
   ]) {
     assert.throws(() => parseNativePendingList(invalid, now), /Invalid native pending list request/);
+  }
+});
+
+test("native read challenge listing accepts no selectors or browser-control fields", () => {
+  const listing = { ...request, kind: "list_fixture_read_challenges" };
+  assert.deepEqual(parseNativeFixtureReadChallenges(listing, now), listing);
+  for (const invalid of [
+    { ...listing, kind: "evaluate" },
+    { ...listing, connectionGeneration: 1 },
+    { ...listing, deadlineMs: now },
+    { ...listing, deadlineMs: now + 30_001 },
+    { ...listing, payload: { selector: "*" } },
+    { ...listing, tabId: 3 }
+  ]) {
+    assert.throws(() => parseNativeFixtureReadChallenges(invalid, now), /Invalid native fixture read challenge list/);
   }
 });
 
@@ -126,10 +142,14 @@ test("native fixture snapshots accept only bounded rows from the exact local fix
     messages: [{ id: "fixture-1", direction: "incoming", text: "First" }]
   } };
   assert.deepEqual(parseNativeFixtureSnapshot(snapshot, now), snapshot);
+  const challenged = { ...snapshot, payload: { ...snapshot.payload,
+    challengeId: "a66b3997-9d43-4554-8399-267d1fe9f75c" } };
+  assert.deepEqual(parseNativeFixtureSnapshot(challenged, now), challenged);
   for (const invalid of [
     { ...snapshot, kind: "evaluate" },
     { ...snapshot, deadlineMs: now },
     { ...snapshot, payload: { ...snapshot.payload, selector: "*" } },
+    { ...snapshot, payload: { ...snapshot.payload, challengeId: "not-a-uuid" } },
     { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target,
       origin: "https://gemini.google.com" } } },
     { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target, documentId: "" } } },
@@ -268,7 +288,62 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(published.kind, "fixture_snapshot_published");
     assert.equal(published.requestId, publication.requestId);
     assert.deepEqual(published.payload, { count: 1 });
-    const snapshot = await facade.readFixtureSnapshot(granted.payload.connectionId);
+
+    const reading = facade.readFixtureSnapshot(granted.payload.connectionId);
+    const challengeObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
+    try {
+      let found = false;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const listed = await challengeObserver.listFixtureReadChallenges();
+        if (listed.kind !== "fixture_read_challenges") throw new Error("Expected read challenges");
+        if (listed.payload.challenges.length) { found = true; break; }
+        await setTimeout(10);
+      }
+      assert.equal(found, true, "Broker did not queue a native fixture read challenge");
+    } finally {
+      challengeObserver.close();
+    }
+    const challengeHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const challengeOutput: Buffer[] = [];
+    const challengeErrors: Buffer[] = [];
+    challengeHost.stdout.on("data", (chunk: Buffer) => challengeOutput.push(chunk));
+    challengeHost.stderr.on("data", (chunk: Buffer) => challengeErrors.push(chunk));
+    const challengeList = { ...request, kind: "list_fixture_read_challenges", deadlineMs: Date.now() + 10_000 };
+    challengeHost.stdin.end(encodeNativeFrame(challengeList));
+    const [challengeExit] = await once(challengeHost, "exit");
+    assert.equal(challengeExit, 0, Buffer.concat(challengeErrors).toString());
+    const [challengeReply] = new NativeFrameDecoder().push(Buffer.concat(challengeOutput)) as [{
+      kind: string; requestId: string; payload: {
+        challenges: { challengeId: string; target: unknown }[]; activeTabIds: number[]
+      }
+    }];
+    assert.equal(challengeReply.kind, "fixture_read_challenges");
+    assert.equal(challengeReply.requestId, challengeList.requestId);
+    assert.deepEqual(challengeReply.payload.activeTabIds, [3]);
+    const [challenge] = challengeReply.payload.challenges;
+    assert.ok(challenge?.challengeId);
+    assert.deepEqual(challenge.target, publication.payload.target);
+
+    const responseHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const responseOutput: Buffer[] = [];
+    const responseErrors: Buffer[] = [];
+    responseHost.stdout.on("data", (chunk: Buffer) => responseOutput.push(chunk));
+    responseHost.stderr.on("data", (chunk: Buffer) => responseErrors.push(chunk));
+    responseHost.stdin.end(encodeNativeFrame({ ...publication, payload: {
+      ...publication.payload, challengeId: challenge.challengeId
+    } }));
+    const [responseExit] = await once(responseHost, "exit");
+    assert.equal(responseExit, 0, Buffer.concat(responseErrors).toString());
+    const [confirmed] = new NativeFrameDecoder().push(Buffer.concat(responseOutput)) as [{
+      kind: string; payload: { count: number }
+    }];
+    assert.equal(confirmed.kind, "fixture_snapshot_published");
+    assert.deepEqual(confirmed.payload, { count: 1 });
+    const snapshot = await reading;
     if (snapshot.kind !== "fixture_snapshot") throw new Error("Expected a published fixture snapshot");
     assert.deepEqual(snapshot.payload.messages, publication.payload.messages);
 

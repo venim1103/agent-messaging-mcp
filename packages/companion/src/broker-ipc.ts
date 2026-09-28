@@ -33,12 +33,37 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
     socket.setTimeout(BROKER_IDLE_TIMEOUT_MS, () => socket.destroy());
     const decoder = new NativeFrameDecoder();
     let role: "facade" | "relay" | null = null;
+    let responses: Promise<void> = Promise.resolve();
 
     socket.on("data", (chunk: Buffer) => {
       try {
         for (const message of decoder.push(chunk)) {
           if (role) {
-            socket.write(encodeNativeFrame(handleBrokerRequest(message, role, owner, requests)));
+            const authenticatedRole = role;
+            responses = responses.then(async () => {
+              if (socket.destroyed) return;
+              const reply = handleBrokerRequest(message, authenticatedRole, owner, requests);
+              if (reply.kind !== "fixture_read_authorized") {
+                socket.write(encodeNativeFrame(reply));
+                return;
+              }
+              const pending = requests.requestFreshFixtureRead(owner, reply.payload.connectionId);
+              if (!pending || pending === "busy") {
+                socket.write(encodeNativeFrame({ ...reply, kind: "error",
+                  payload: { code: pending === "busy" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } }));
+                return;
+              }
+              const snapshot = await pending.result;
+              if (socket.destroyed) return;
+              socket.write(encodeNativeFrame(snapshot && snapshot !== "not_ready"
+                ? { ...reply, kind: "fixture_snapshot", payload: {
+                  ...snapshot, messages: snapshot.messages.slice(-reply.payload.limit),
+                  omittedBefore: snapshot.messages.length > reply.payload.limit
+                } }
+                : { ...reply, kind: "error", payload: {
+                  code: snapshot === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND"
+                } }));
+            }).catch(() => { socket.destroy(); });
             continue;
           }
           const hello = authenticateBrokerRole(message, credentials);

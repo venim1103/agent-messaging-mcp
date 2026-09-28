@@ -134,27 +134,91 @@ test("a relay publishes bounded fixture rows but only the owning facade reads an
   assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2000).payload, { count: 0 });
   const grant = requests.approve(pending.requestId, target, 2000)!;
   const read = { ...envelope, kind: "read_fixture_snapshot", payload: { connectionId: grant.connectionId } };
-  assert.deepEqual(handleBrokerRequest(read, "facade", owner, requests, 2000).payload,
-    { code: "OBSERVATION_UNAVAILABLE" });
+  assert.deepEqual(handleBrokerRequest(read, "facade", owner, requests, 2000), {
+    ...envelope, kind: "fixture_read_authorized", payload: { connectionId: grant.connectionId, limit: 32 }
+  });
   assert.deepEqual(handleBrokerRequest(read, "relay", stranger, requests, 2000).payload,
     { code: "PERMISSION_DENIED" });
   assert.deepEqual(handleBrokerRequest(read, "facade", stranger, requests, 2000).payload,
     { code: "CONNECTION_NOT_FOUND" });
+  const challenges = { ...envelope, kind: "list_fixture_read_challenges", payload: {} };
+  assert.deepEqual(handleBrokerRequest(challenges, "facade", owner, requests, 2000).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest(challenges, "relay", stranger, requests, 2000).payload,
+    { challenges: [], activeTabIds: [3] });
   assert.deepEqual(handleBrokerRequest({ ...publish, payload: { ...publish.payload, target: { ...target, tabId: 4 } } },
     "relay", stranger, requests, 2001).payload, { count: 0 });
   assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2001).payload, { count: 1 });
-  const snapshot = handleBrokerRequest({ ...read, payload: { ...read.payload, limit: 1 } }, "facade", owner, requests, 2001);
-  assert.equal(snapshot.kind, "fixture_snapshot");
-  if (snapshot.kind !== "fixture_snapshot") throw new Error("Expected a fixture snapshot");
-  assert.deepEqual(snapshot.payload.messages, [messages[1]]);
-  assert.equal(snapshot.payload.omittedBefore, true);
-  assert.equal(snapshot.payload.coverage, "rendered_only");
-  assert.equal(snapshot.payload.capturedAt, 2001);
+  assert.deepEqual(handleBrokerRequest({ ...read, payload: { ...read.payload, limit: 1 } },
+    "facade", owner, requests, 2001), {
+    ...envelope, kind: "fixture_read_authorized", payload: { connectionId: grant.connectionId, limit: 1 }
+  });
+  const initial = requests.getFixtureSnapshot(owner, grant.connectionId, 2001);
+  if (!initial || initial === "not_ready") throw new Error("Expected an event cursor");
+  const eventRead = { ...envelope, kind: "read_fixture_events", payload: {
+    connectionId: grant.connectionId, cursor: initial.cursor, limit: 2
+  } };
+  assert.deepEqual(handleBrokerRequest(eventRead, "relay", stranger, requests, 2001).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest(eventRead, "facade", stranger, requests, 2001).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+  const emptyPage = handleBrokerRequest(eventRead, "facade", owner, requests, 2001);
+  if (emptyPage.kind !== "fixture_events" || emptyPage.payload.state !== "ok") {
+    throw new Error("Expected an empty event page");
+  }
+  assert.deepEqual(emptyPage.payload.events, []);
+  const later = [{ id: "fixture-3", direction: "incoming", text: "Later" }];
+  assert.deepEqual(handleBrokerRequest({ ...publish, payload: { target, messages: later } },
+    "relay", stranger, requests, 2002).payload, { count: 1 });
+  const observed = handleBrokerRequest(eventRead, "facade", owner, requests, 2002);
+  assert.equal(observed.kind, "fixture_events");
+  if (observed.kind !== "fixture_events" || observed.payload.state !== "ok") throw new Error("Expected a later event");
+  assert.deepEqual(observed.payload.events[0]?.payload, { kind: "fixture_snapshot", messages: later });
+  assert.equal(observed.payload.cursor.sequence, 2);
+  assert.deepEqual(handleBrokerRequest({ ...eventRead, payload: { ...eventRead.payload,
+    cursor: { epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 } } },
+  "facade", owner, requests, 2002).payload, { state: "expired", resnapshot: true });
   assert.throws(() => handleBrokerRequest({ ...publish, payload: { ...publish.payload, selector: "*" } },
+    "relay", stranger, requests, 2001));
+  assert.throws(() => handleBrokerRequest({ ...eventRead, payload: { ...eventRead.payload, limit: 3 } },
+    "facade", owner, requests, 2002));
+  assert.throws(() => handleBrokerRequest({ ...challenges, payload: { selector: "*" } },
     "relay", stranger, requests, 2001));
   assert.throws(() => handleBrokerRequest({ ...read, payload: { ...read.payload, limit: 33 } },
     "facade", owner, requests, 2001));
   requests.revokeAllFixtures();
   assert.deepEqual(handleBrokerRequest(read, "facade", owner, requests, 2002).payload,
     { code: "CONNECTION_NOT_FOUND" });
+  assert.deepEqual(handleBrokerRequest(eventRead, "facade", owner, requests, 2002).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+});
+
+test("only the owning facade disconnects an approved fixture without exposing its tab", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("owner");
+  const stranger = Symbol("stranger");
+  const pending = requests.create(owner, 1000);
+  const grant = requests.approve(pending.requestId, {
+    origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+    tabId: 3, documentId: "CHROME-doc_opaque-42"
+  }, 2000)!;
+  const envelope = { protocolVersion: PROTOCOL_VERSION,
+    requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+  const disconnect = { ...envelope, kind: "disconnect_fixture", payload: { connectionId: grant.connectionId } };
+  assert.deepEqual(handleBrokerRequest(disconnect, "relay", stranger, requests, 2001).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest(disconnect, "facade", stranger, requests, 2001).payload,
+    { disconnected: false });
+  assert.deepEqual(handleBrokerRequest(disconnect, "facade", owner, requests, 2001), {
+    ...envelope, kind: "fixture_disconnected", payload: { disconnected: true }
+  });
+  assert.deepEqual(handleBrokerRequest(disconnect, "facade", owner, requests, 2001).payload,
+    { disconnected: false });
+  assert.deepEqual(handleBrokerRequest({ ...envelope, kind: "get_connection",
+    payload: { requestId: pending.requestId } }, "facade", owner, requests, 2001).payload,
+    { requestId: pending.requestId, state: "stale" });
+  assert.deepEqual(handleBrokerRequest({ ...envelope, kind: "list_fixture_read_challenges", payload: {} },
+    "relay", stranger, requests, 2001).payload, { challenges: [], activeTabIds: [] });
+  assert.throws(() => handleBrokerRequest({ ...disconnect, payload: { ...disconnect.payload, tabId: 3 } },
+    "facade", owner, requests, 2001));
 });

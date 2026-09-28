@@ -2,8 +2,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReset,
-  parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList, PROTOCOL_VERSION }
+import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReadChallenges,
+  parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
+  PROTOCOL_VERSION }
   from "./native-protocol.js";
 
 const expectedOrigin = process.argv[2] ?? "";
@@ -32,12 +33,18 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               && message.kind === "revoke_all_fixture" ? parseNativeFixtureReset(message)
               : typeof message === "object" && message !== null && "kind" in message
                 && message.kind === "publish_fixture_snapshot" ? parseNativeFixtureSnapshot(message)
+                : typeof message === "object" && message !== null && "kind" in message
+                  && message.kind === "list_fixture_read_challenges" ? parseNativeFixtureReadChallenges(message)
               : parseNativePendingList(message);
         nativeReply = nativeReply.then(async () => {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
-          let kind: "pending_list" | "fixture_approved" | "fixture_revoked" | "fixture_snapshot_published" | "error";
+          let kind: "pending_list" | "fixture_read_challenges" | "fixture_approved" | "fixture_revoked"
+            | "fixture_snapshot_published" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
+            | { challenges: ReadonlyArray<{ challengeId: string; target: {
+              origin: string; conversationId: string; tabId: number; documentId: string
+            }; expiresAt: number }>; activeTabIds: ReadonlyArray<number> }
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"));
@@ -45,6 +52,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               const result = await client.listPending();
               if (result.kind !== "pending_list") throw new Error("Broker refused pending list");
               kind = "pending_list";
+              payload = result.payload;
+            } else if (request.kind === "list_fixture_read_challenges") {
+              const result = await client.listFixtureReadChallenges();
+              if (result.kind !== "fixture_read_challenges") throw new Error("Broker refused read challenges");
+              kind = "fixture_read_challenges";
               payload = result.payload;
             } else if (request.kind === "approve_fixture") {
               const result = await client.approveFixture(request.payload.pendingRequestId, request.payload.target);
@@ -66,7 +78,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               kind = "fixture_revoked";
               payload = result.payload;
             } else {
-              const result = await client.publishFixtureSnapshot(request.payload.target, request.payload.messages);
+              const result = await client.publishFixtureSnapshot(request.payload.target, request.payload.messages,
+                request.payload.challengeId);
               if (result.kind !== "fixture_snapshot_published") throw new Error("Broker refused fixture snapshot");
               kind = "fixture_snapshot_published";
               payload = result.payload;

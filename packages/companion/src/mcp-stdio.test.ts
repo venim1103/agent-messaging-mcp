@@ -22,7 +22,8 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     await client.connect(transport);
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
-      "browser_chat_feasibility", "chat.request_connection", "chat.get_connection", "chat.read_messages"
+      "browser_chat_feasibility", "chat.request_connection", "chat.get_connection", "chat.read_messages",
+      "chat.wait_for_events", "chat.disconnect"
     ]);
 
     const result = await client.callTool({ name: "browser_chat_feasibility", arguments: {} });
@@ -36,7 +37,7 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
   }
 });
 
-test("two real MCP clients cannot reuse each other's pending handles", { timeout: 8000 }, async () => {
+test("two real MCP clients cannot reuse each other's pending handles", { timeout: 15000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-home-"));
   const entry = fileURLToPath(new URL("./mcp-stdio.js", import.meta.url));
   const brokerEntry = fileURLToPath(new URL("./broker-process.js", import.meta.url));
@@ -106,16 +107,98 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.match(hiddenRead.content[0]?.type === "text" ? hiddenRead.content[0].text : "", /CONNECTION_NOT_FOUND/);
     const messages = [{ id: "fixture-1", direction: "incoming" as const, text: "Synthetic fixture message" }];
     assert.deepEqual((await relay.publishFixtureSnapshot(target, messages)).payload, { count: 1 });
-    const snapshot = await clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId, limit: 1 } });
+    const reading = clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId, limit: 1 } });
+    let challengeId: string | undefined;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const listed = await relay.listFixtureReadChallenges();
+      if (listed.kind !== "fixture_read_challenges") throw new Error("Expected read challenges");
+      const [challenge] = listed.payload.challenges;
+      if (challenge) {
+        assert.deepEqual(challenge.target, target);
+        challengeId = challenge.challengeId;
+        break;
+      }
+      await setTimeout(10);
+    }
+    assert.ok(challengeId, "MCP read did not issue a fixture browser challenge");
+    assert.deepEqual((await relay.publishFixtureSnapshot(target, messages, challengeId)).payload, { count: 1 });
+    const snapshot = await reading;
     assert.equal(snapshot.isError, undefined);
     assert.ok(snapshot.structuredContent && typeof snapshot.structuredContent === "object");
     assert.deepEqual((snapshot.structuredContent as { messages: unknown }).messages, messages);
     assert.equal((snapshot.structuredContent as { coverage: string }).coverage, "rendered_only");
     assert.equal((snapshot.structuredContent as { omittedBefore: boolean }).omittedBefore, false);
+    const cursor = (snapshot.structuredContent as { cursor: { epoch: string; sequence: number } }).cursor;
+    const empty = await clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+      connectionId, cursor, timeoutMs: 0
+    } });
+    assert.deepEqual((empty.structuredContent as { events: unknown[]; timedOut: boolean }).events, []);
+    assert.equal((empty.structuredContent as { timedOut: boolean }).timedOut, true);
+    const hiddenEvents = await clientTwo.callTool({ name: "chat.wait_for_events", arguments: {
+      connectionId, cursor, timeoutMs: 0
+    } });
+    assert.equal(hiddenEvents.isError, true);
+    const cancelledRequest = new AbortController();
+    const cancelled = clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+      connectionId, cursor, timeoutMs: 20_000
+    } }, { signal: cancelledRequest.signal });
+    await setTimeout(25);
+    cancelledRequest.abort();
+    await assert.rejects(cancelled, { name: "SdkError", message: /AbortError/ });
+    const afterCancellation = await clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+      connectionId, cursor, timeoutMs: 0
+    } });
+    assert.deepEqual((afterCancellation.structuredContent as { events: unknown[] }).events, []);
+    const waiting = clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+      connectionId, cursor, timeoutMs: 2000, limit: 1
+    } });
+    await setTimeout(25);
+    const later = [{ ...messages[0]!, text: "Later synthetic fixture message" }];
+    assert.deepEqual((await relay.publishFixtureSnapshot(target, later)).payload, { count: 1 });
+    const observed = await waiting;
+    assert.equal(observed.isError, undefined);
+    const eventPage = observed.structuredContent as { events: { payload: unknown }[]; cursor: {
+      epoch: string; sequence: number
+    }; timedOut: boolean };
+    assert.equal(eventPage.timedOut, false);
+    assert.deepEqual(eventPage.events[0]?.payload, { kind: "fixture_snapshot", messages: later });
+    assert.equal(eventPage.cursor.sequence, cursor.sequence + 1);
+    const expired = await clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+      connectionId, cursor: { epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 }, timeoutMs: 0
+    } });
+    assert.equal(expired.isError, true);
+    assert.deepEqual(expired.structuredContent, { code: "CURSOR_EXPIRED", resnapshot: true });
     assert.deepEqual((await relay.revokeFixture(3, null)).payload, { count: 1 });
     const staleRead = await clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId } });
     assert.equal(staleRead.isError, true);
     assert.match(staleRead.content[0]?.type === "text" ? staleRead.content[0].text : "", /CONNECTION_NOT_FOUND/);
+    const staleEvents = await clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+      connectionId, cursor, timeoutMs: 0
+    } });
+    assert.equal(staleEvents.isError, true);
+    const next = await clientOne.callTool({ name: "chat.request_connection", arguments: {} });
+    const pendingDisconnect = next.structuredContent as { requestId: string };
+    await relay.approveFixture(pendingDisconnect.requestId, { ...target, tabId: 4 });
+    const readyDisconnect = await clientOne.callTool({ name: "chat.get_connection", arguments: {
+      requestId: pendingDisconnect.requestId
+    } });
+    const disconnectId = (readyDisconnect.structuredContent as { connectionId: string }).connectionId;
+    assert.deepEqual((await clientTwo.callTool({ name: "chat.disconnect", arguments: {
+      connectionId: disconnectId
+    } })).structuredContent, { disconnected: false });
+    assert.deepEqual((await clientOne.callTool({ name: "chat.disconnect", arguments: {
+      connectionId: disconnectId
+    } })).structuredContent, { disconnected: true });
+    assert.deepEqual((await clientOne.callTool({ name: "chat.disconnect", arguments: {
+      connectionId: disconnectId
+    } })).structuredContent, { disconnected: false });
+    assert.deepEqual((await clientOne.callTool({ name: "chat.get_connection", arguments: {
+      requestId: pendingDisconnect.requestId
+    } })).structuredContent, { requestId: pendingDisconnect.requestId, state: "stale" });
+    const disconnectedRead = await clientOne.callTool({ name: "chat.read_messages", arguments: {
+      connectionId: disconnectId
+    } });
+    assert.equal(disconnectedRead.isError, true);
     relay.close();
     assert.deepEqual((await clientTwo.callTool({
       name: "chat.get_connection", arguments: { requestId: handle.requestId }

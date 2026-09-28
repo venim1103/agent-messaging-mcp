@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { connectBroker } from "./broker-client.js";
 import { recoverStaleBrokerRuntime } from "./broker-recovery.js";
 
-test("spawned broker keeps role credentials private and exits cleanly", { timeout: 5000 }, async () => {
+test("spawned broker keeps role credentials private and exits cleanly", { timeout: 10000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-home-"));
   const entry = fileURLToPath(new URL("./broker-process.js", import.meta.url));
   const broker = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: ["ignore", "pipe", "pipe"] });
@@ -94,11 +94,39 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     const published = await relay.publishFixtureSnapshot(target, messages);
     assert.equal(published.kind, "fixture_snapshot_published");
     assert.deepEqual(published.payload, { count: 1 });
-    const snapshot = await facade.readFixtureSnapshot(connectionId);
+    const reading = facade.readFixtureSnapshot(connectionId);
+    let challengeId: string | undefined;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const listing = await relay.listFixtureReadChallenges();
+      if (listing.kind !== "fixture_read_challenges") throw new Error("Expected read challenges");
+      const [challenge] = listing.payload.challenges;
+      if (challenge) {
+        assert.deepEqual(challenge.target, target);
+        challengeId = challenge.challengeId;
+        break;
+      }
+      await setTimeout(10);
+    }
+    assert.ok(challengeId, "Broker did not issue an owned fixture read challenge");
+    assert.deepEqual((await relay.publishFixtureSnapshot({ ...target, documentId: "other" },
+      messages, challengeId)).payload, { count: 0 });
+    assert.deepEqual((await relay.publishFixtureSnapshot(target, messages, challengeId)).payload, { count: 1 });
+    const snapshot = await reading;
     if (snapshot.kind !== "fixture_snapshot") throw new Error("Expected a fixture snapshot");
     assert.deepEqual(snapshot.payload.messages, messages);
     assert.equal(snapshot.payload.coverage, "rendered_only");
     assert.equal(snapshot.payload.cursor.sequence, 1);
+    const later = [{ ...messages[0]!, text: "Later fixture row" }];
+    assert.deepEqual((await relay.publishFixtureSnapshot(target, later)).payload, { count: 1 });
+    assert.deepEqual((await otherFacade.readFixtureEvents(connectionId, snapshot.payload.cursor)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    const events = await facade.readFixtureEvents(connectionId, snapshot.payload.cursor, 1);
+    if (events.kind !== "fixture_events" || events.payload.state !== "ok") throw new Error("Expected fixture events");
+    assert.equal(events.payload.cursor.sequence, 2);
+    assert.deepEqual(events.payload.events[0]?.payload, { kind: "fixture_snapshot", messages: later });
+    assert.deepEqual((await facade.readFixtureEvents(connectionId, {
+      epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 2
+    })).payload, { state: "expired", resnapshot: true });
     assert.throws(() => facade.revokeAllFixtures(), /Broker role cannot perform/);
     const reset = await relay.revokeAllFixtures();
     assert.equal(reset.kind, "fixture_revoked");
@@ -107,6 +135,29 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
       { requestId: another.payload.requestId, state: "stale" });
     assert.deepEqual((await facade.readFixtureSnapshot(connectionId)).payload,
       { code: "CONNECTION_NOT_FOUND" });
+    assert.deepEqual((await facade.readFixtureEvents(connectionId, snapshot.payload.cursor)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+
+    const last = await facade.requestConnection();
+    if (last.kind !== "connection_requested") throw new Error("Expected a disconnectable request");
+    await relay.approveFixture(last.payload.requestId, { ...target, tabId: 5 });
+    const lastState = await facade.getConnection(last.payload.requestId);
+    if (lastState.kind !== "connection_state" || lastState.payload.state !== "ready_readonly") {
+      throw new Error("Expected a disconnectable fixture handle");
+    }
+    const lastId = lastState.payload.connectionId;
+    assert.throws(() => relay.disconnectFixture(lastId), /Broker role cannot perform/);
+    assert.deepEqual((await otherFacade.disconnectFixture(lastId)).payload, { disconnected: false });
+    const active = await relay.listFixtureReadChallenges();
+    if (active.kind !== "fixture_read_challenges") throw new Error("Expected active fixture tabs");
+    assert.deepEqual(active.payload.activeTabIds, [5]);
+    assert.deepEqual((await facade.disconnectFixture(lastId)).payload, { disconnected: true });
+    assert.deepEqual((await facade.disconnectFixture(lastId)).payload, { disconnected: false });
+    const afterDisconnect = await relay.listFixtureReadChallenges();
+    if (afterDisconnect.kind !== "fixture_read_challenges") throw new Error("Expected cleared fixture tabs");
+    assert.deepEqual(afterDisconnect.payload.activeTabIds, []);
+    assert.deepEqual((await facade.getConnection(last.payload.requestId)).payload,
+      { requestId: last.payload.requestId, state: "stale" });
     otherFacade.close();
     facade.close();
     assert.deepEqual((await relay.listPending() as typeof listed).payload.requests, []);
