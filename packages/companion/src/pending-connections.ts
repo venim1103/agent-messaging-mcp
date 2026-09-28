@@ -27,7 +27,9 @@ export type ReadonlyConnection = Readonly<{
   expiresAt: number;
 }>;
 
-type RequestRecord = { owner: symbol; expiresAt: number; grant?: { connection: ReadonlyConnection; target: FixtureTarget } };
+type RequestRecord = { owner: symbol; expiresAt: number; grant?: {
+  connection: ReadonlyConnection; target: FixtureTarget; stale: boolean
+} };
 
 export class PendingConnectionRequests {
   private readonly requests = new Map<string, RequestRecord>();
@@ -48,7 +50,8 @@ export class PendingConnectionRequests {
     return { requestId, state: "pending", expiresAt };
   }
 
-  get(owner: symbol, requestId: string, now = Date.now()): PendingRequest | ReadonlyConnection | null {
+  get(owner: symbol, requestId: string, now = Date.now()): PendingRequest | ReadonlyConnection
+    | Readonly<{ requestId: string; state: "stale" }> | null {
     const request = this.requests.get(requestId);
     if (!request || request.owner !== owner) return null;
     const expiresAt = request.grant?.connection.expiresAt ?? request.expiresAt;
@@ -56,6 +59,7 @@ export class PendingConnectionRequests {
       this.requests.delete(requestId);
       return null;
     }
+    if (request.grant?.stale && now < expiresAt) return { requestId, state: "stale" };
     if (request.grant && now < expiresAt) return request.grant.connection;
     return {
       requestId,
@@ -80,8 +84,22 @@ export class PendingConnectionRequests {
       conversationId: target.conversationId,
       expiresAt: now + READONLY_CONNECTION_TTL_MS
     });
-    request.grant = { connection, target: Object.freeze({ ...target }) };
+    request.grant = { connection, target: Object.freeze({ ...target }), stale: false };
     return connection;
+  }
+
+  revokeChangedTab(tabId: number, observed: { documentId: string; conversationId: string } | null): number {
+    let revoked = 0;
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (grant && grant.target.tabId === tabId && !grant.stale
+        && (!observed || grant.target.documentId !== observed.documentId
+          || grant.target.conversationId !== observed.conversationId)) {
+        grant.stale = true;
+        revoked++;
+      }
+    }
+    return revoked;
   }
 
   listPending(now = Date.now()): ReadonlyArray<Readonly<{ requestId: string; expiresAt: number }>> {

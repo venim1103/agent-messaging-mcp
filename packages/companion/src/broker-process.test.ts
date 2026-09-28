@@ -63,6 +63,12 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     const readyState = await facade.getConnection(created.payload.requestId);
     assert.equal(readyState.kind, "connection_state");
     assert.equal(readyState.payload.state, "ready_readonly");
+    assert.throws(() => facade.revokeFixture(3, null), /Broker role cannot perform/);
+    const revoked = await relay.revokeFixture(3, { documentId: "next-document", conversationId: "fixture-alpha" });
+    assert.equal(revoked.kind, "fixture_revoked");
+    assert.deepEqual(revoked.payload, { count: 1 });
+    assert.deepEqual((await facade.getConnection(created.payload.requestId)).payload,
+      { requestId: created.payload.requestId, state: "stale" });
     assert.deepEqual((await otherFacade.getConnection(created.payload.requestId)).payload, { state: "unknown" });
     otherFacade.close();
     facade.close();

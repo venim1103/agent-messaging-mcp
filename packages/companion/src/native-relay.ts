@@ -2,7 +2,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativePendingList, PROTOCOL_VERSION }
+import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureRevocation,
+  parseNativePendingList, PROTOCOL_VERSION }
   from "./native-protocol.js";
 
 const expectedOrigin = process.argv[2] ?? "";
@@ -24,13 +25,15 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           continue;
         }
         const request = typeof message === "object" && message !== null && "kind" in message
-          && message.kind === "approve_fixture" ? parseNativeFixtureApproval(message) : parseNativePendingList(message);
+          && message.kind === "approve_fixture" ? parseNativeFixtureApproval(message)
+          : typeof message === "object" && message !== null && "kind" in message
+            && message.kind === "revoke_fixture" ? parseNativeFixtureRevocation(message) : parseNativePendingList(message);
         nativeReply = nativeReply.then(async () => {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
-          let kind: "pending_list" | "fixture_approved" | "error";
+          let kind: "pending_list" | "fixture_approved" | "fixture_revoked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
-            | { requestId: string; expiresAt: number } | { code: string };
+            | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"));
             if (request.kind === "list_pending") {
@@ -38,7 +41,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               if (result.kind !== "pending_list") throw new Error("Broker refused pending list");
               kind = "pending_list";
               payload = result.payload;
-            } else {
+            } else if (request.kind === "approve_fixture") {
               const result = await client.approveFixture(request.payload.pendingRequestId, request.payload.target);
               if (result.kind === "fixture_approved") {
                 kind = "fixture_approved";
@@ -47,6 +50,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 kind = "error";
                 payload = { code: "APPROVAL_INVALID" };
               } else throw new Error("Broker refused fixture approval");
+            } else {
+              const result = await client.revokeFixture(request.payload.tabId, request.payload.observed);
+              if (result.kind !== "fixture_revoked") throw new Error("Broker refused fixture revocation");
+              kind = "fixture_revoked";
+              payload = result.payload;
             }
           } catch {
             kind = "error";

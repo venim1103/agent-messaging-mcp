@@ -76,3 +76,30 @@ test("a fixture grant is one-shot, owner-bound, and expires without exposing tab
   const expired = requests.create(owner, 1000);
   assert.equal(requests.approve(expired.requestId, target, expired.expiresAt), null);
 });
+
+test("a changed fixture document or conversation revokes a grant without reviving its handle", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("MCP client");
+  const pending = requests.create(owner, 1000);
+  const target = {
+    origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42"
+  };
+  const granted = requests.approve(pending.requestId, target, 2000);
+  assert.equal(requests.revokeChangedTab(3, { documentId: target.documentId, conversationId: target.conversationId }), 0);
+  assert.deepEqual(requests.get(owner, pending.requestId, 2000), granted);
+  assert.equal(requests.revokeChangedTab(3, { documentId: "new-document", conversationId: target.conversationId }), 1);
+  assert.deepEqual(requests.get(owner, pending.requestId, 2000), { requestId: pending.requestId, state: "stale" });
+  assert.equal(requests.revokeChangedTab(3, { documentId: target.documentId, conversationId: target.conversationId }), 0);
+  assert.equal(requests.approve(pending.requestId, target, 2000), null);
+  assert.equal(requests.get(Symbol("another client"), pending.requestId, 2000), null);
+
+  const second = requests.create(owner, 1000);
+  requests.approve(second.requestId, target, 2000);
+  assert.equal(requests.revokeChangedTab(3, { documentId: target.documentId, conversationId: "fixture-beta" }), 1);
+  assert.equal(requests.get(owner, second.requestId, 2000)?.state, "stale");
+  const third = requests.create(owner, 1000);
+  requests.approve(third.requestId, target, 2000);
+  assert.equal(requests.revokeChangedTab(3, null), 1);
+  assert.equal(requests.get(owner, third.requestId, 2000)?.state, "stale");
+});

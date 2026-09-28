@@ -83,6 +83,18 @@ test("authenticated relay alone approves a selected fixture and only its MCP own
   const own = handleBrokerRequest(lookup, "facade", owner, requests, 2000);
   assert.equal(own.payload.state, "ready_readonly");
   assert.equal("tabId" in own.payload, false);
+  const revoke = { ...envelope, kind: "revoke_fixture", payload: {
+    tabId: 3, observed: { documentId: "different-document", conversationId: "fixture-alpha" }
+  } };
+  assert.deepEqual(handleBrokerRequest(revoke, "facade", owner, requests, 2000), {
+    ...envelope, kind: "error", payload: { code: "PERMISSION_DENIED" }
+  });
+  assert.deepEqual(handleBrokerRequest(revoke, "relay", stranger, requests, 2000), {
+    ...envelope, kind: "fixture_revoked", payload: { count: 1 }
+  });
+  assert.deepEqual(handleBrokerRequest(lookup, "facade", owner, requests, 2000).payload,
+    { requestId: pending.requestId, state: "stale" });
+  assert.deepEqual(handleBrokerRequest(revoke, "relay", stranger, requests, 2000).payload, { count: 0 });
   assert.deepEqual(handleBrokerRequest({ ...approval, deadlineMs: 70_000 }, "relay", stranger, requests, 61_000), {
     ...envelope, deadlineMs: 70_000, kind: "error", payload: { code: "APPROVAL_INVALID" }
   });

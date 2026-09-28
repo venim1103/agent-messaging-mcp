@@ -9,7 +9,8 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativePendingList, PROTOCOL_VERSION }
+import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureRevocation,
+  parseNativePendingList, PROTOCOL_VERSION }
   from "./native-protocol.js";
 
 const origin = `chrome-extension://${"a".repeat(32)}/`;
@@ -81,6 +82,25 @@ test("native fixture approval refuses other origins, targets, and arbitrary fiel
     { ...approval, payload: { ...approval.payload, command: "navigate" } }
   ]) {
     assert.throws(() => parseNativeFixtureApproval(invalid, now), /Invalid native fixture approval/);
+  }
+});
+
+test("native fixture revocation accepts only bounded browser identity or tab closure", () => {
+  const revoke = { ...request, kind: "revoke_fixture", payload: {
+    tabId: 3, observed: { documentId: "CHROME-doc_opaque-42", conversationId: "fixture-alpha" }
+  } };
+  assert.deepEqual(parseNativeFixtureRevocation(revoke, now), revoke);
+  assert.deepEqual(parseNativeFixtureRevocation({ ...revoke, payload: { tabId: 3, observed: null } }, now),
+    { ...revoke, payload: { tabId: 3, observed: null } });
+  for (const invalid of [
+    { ...revoke, kind: "evaluate" },
+    { ...revoke, deadlineMs: now },
+    { ...revoke, payload: { tabId: 0, observed: null } },
+    { ...revoke, payload: { tabId: 3, observed: { documentId: "", conversationId: "fixture-alpha" } } },
+    { ...revoke, payload: { tabId: 3, observed: { documentId: "CHROME-doc_opaque-42", conversationId: "" } } },
+    { ...revoke, payload: { ...revoke.payload, selector: "*" } }
+  ]) {
+    assert.throws(() => parseNativeFixtureRevocation(invalid, now), /Invalid native fixture revocation/);
   }
 });
 
@@ -186,6 +206,28 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const granted = await facade.getConnection(created.payload.requestId);
     if (granted.kind !== "connection_state") throw new Error("Expected owned connection state");
     assert.equal(granted.payload.state, "ready_readonly");
+
+    const revokeHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const revokeOutput: Buffer[] = [];
+    const revokeErrors: Buffer[] = [];
+    revokeHost.stdout.on("data", (chunk: Buffer) => revokeOutput.push(chunk));
+    revokeHost.stderr.on("data", (chunk: Buffer) => revokeErrors.push(chunk));
+    const revoke = { ...request, kind: "revoke_fixture", deadlineMs: Date.now() + 10_000,
+      payload: { tabId: 3, observed: { documentId: "next-document", conversationId: "fixture-alpha" } } };
+    revokeHost.stdin.end(encodeNativeFrame(revoke));
+    const [revokeExit] = await once(revokeHost, "exit");
+    assert.equal(revokeExit, 0, Buffer.concat(revokeErrors).toString());
+    const [revoked] = new NativeFrameDecoder().push(Buffer.concat(revokeOutput)) as [{
+      kind: string; requestId: string; payload: { count: number }
+    }];
+    assert.equal(revoked.kind, "fixture_revoked");
+    assert.equal(revoked.requestId, revoke.requestId);
+    assert.deepEqual(revoked.payload, { count: 1 });
+    const stale = await facade.getConnection(created.payload.requestId);
+    if (stale.kind !== "connection_state") throw new Error("Expected revoked connection state");
+    assert.deepEqual(stale.payload, { requestId: created.payload.requestId, state: "stale" });
   } finally {
     facade?.close();
     broker.kill("SIGTERM");

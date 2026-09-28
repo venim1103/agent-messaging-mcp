@@ -27,6 +27,28 @@ const fixtureApprovalSchema = z.strictObject({
   })
 });
 
+const fixtureRevocationSchema = z.strictObject({
+  kind: z.literal("revoke_fixture"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({
+    tabId: z.number().int().safe().positive(),
+    observed: z.union([z.null(), z.strictObject({
+      documentId: z.string().regex(/^[!-~]{1,128}$/), conversationId: z.string().min(1).max(128)
+    })])
+  })
+});
+
+export function parseNativeFixtureRevocation(message: unknown, now = Date.now()) {
+  const result = fixtureRevocationSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture revocation");
+  }
+  return result.data;
+}
+
 export function parseNativeFixtureApproval(message: unknown, now = Date.now()) {
   const result = fixtureApprovalSchema.safeParse(message);
   if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
