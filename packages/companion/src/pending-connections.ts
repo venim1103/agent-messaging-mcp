@@ -102,6 +102,17 @@ export class PendingConnectionRequests {
     return revoked;
   }
 
+  revokeAllFixtures(): number {
+    let revoked = 0;
+    for (const request of this.requests.values()) {
+      if (request.grant && !request.grant.stale) {
+        request.grant.stale = true;
+        revoked++;
+      }
+    }
+    return revoked;
+  }
+
   listPending(now = Date.now()): ReadonlyArray<Readonly<{ requestId: string; expiresAt: number }>> {
     return [...this.requests]
       .filter(([, request]) => !request.grant && request.expiresAt > now)

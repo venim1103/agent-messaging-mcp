@@ -103,3 +103,24 @@ test("a changed fixture document or conversation revokes a grant without revivin
   assert.equal(requests.revokeChangedTab(3, null), 1);
   assert.equal(requests.get(owner, third.requestId, 2000)?.state, "stale");
 });
+
+test("a new extension instance revokes all grants but leaves unapproved requests pending", () => {
+  const requests = new PendingConnectionRequests();
+  const first = Symbol("first client");
+  const second = Symbol("second client");
+  const target = {
+    origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42"
+  };
+  const firstRequest = requests.create(first, 1000);
+  const secondRequest = requests.create(second, 1000);
+  const stillPending = requests.create(first, 1000);
+  requests.approve(firstRequest.requestId, target, 2000);
+  requests.approve(secondRequest.requestId, { ...target, tabId: 4 }, 2000);
+
+  assert.equal(requests.revokeAllFixtures(), 2);
+  assert.deepEqual(requests.get(first, firstRequest.requestId, 2000), { requestId: firstRequest.requestId, state: "stale" });
+  assert.deepEqual(requests.get(second, secondRequest.requestId, 2000), { requestId: secondRequest.requestId, state: "stale" });
+  assert.equal(requests.get(first, stillPending.requestId, 2000)?.state, "pending");
+  assert.equal(requests.revokeAllFixtures(), 0);
+});

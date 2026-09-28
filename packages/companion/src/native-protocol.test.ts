@@ -9,8 +9,8 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureRevocation,
-  parseNativePendingList, PROTOCOL_VERSION }
+import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReset,
+  parseNativeFixtureRevocation, parseNativePendingList, PROTOCOL_VERSION }
   from "./native-protocol.js";
 
 const origin = `chrome-extension://${"a".repeat(32)}/`;
@@ -101,6 +101,21 @@ test("native fixture revocation accepts only bounded browser identity or tab clo
     { ...revoke, payload: { ...revoke.payload, selector: "*" } }
   ]) {
     assert.throws(() => parseNativeFixtureRevocation(invalid, now), /Invalid native fixture revocation/);
+  }
+});
+
+test("native fixture reset accepts only a bounded empty-payload command", () => {
+  const reset = { ...request, kind: "revoke_all_fixture" };
+  assert.deepEqual(parseNativeFixtureReset(reset, now), reset);
+  for (const invalid of [
+    { ...reset, kind: "evaluate" },
+    { ...reset, connectionGeneration: 1 },
+    { ...reset, deadlineMs: now },
+    { ...reset, deadlineMs: now + 30_001 },
+    { ...reset, payload: { selector: "*" } },
+    { ...reset, tabId: 1 }
+  ]) {
+    assert.throws(() => parseNativeFixtureReset(invalid, now), /Invalid native fixture reset/);
   }
 });
 
@@ -228,6 +243,43 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const stale = await facade.getConnection(created.payload.requestId);
     if (stale.kind !== "connection_state") throw new Error("Expected revoked connection state");
     assert.deepEqual(stale.payload, { requestId: created.payload.requestId, state: "stale" });
+
+    const fresh = await facade.requestConnection();
+    if (fresh.kind !== "connection_requested") throw new Error("Expected new pending request");
+    const brokerRelay = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
+    try {
+      const approved = await brokerRelay.approveFixture(fresh.payload.requestId, {
+        origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 4,
+        documentId: "CHROME-doc_opaque-42"
+      });
+      assert.equal(approved.kind, "fixture_approved");
+    } finally {
+      brokerRelay.close();
+    }
+    const freshState = await facade.getConnection(fresh.payload.requestId);
+    if (freshState.kind !== "connection_state") throw new Error("Expected new owned connection state");
+    assert.equal(freshState.payload.state, "ready_readonly");
+
+    const resetHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const resetOutput: Buffer[] = [];
+    const resetErrors: Buffer[] = [];
+    resetHost.stdout.on("data", (chunk: Buffer) => resetOutput.push(chunk));
+    resetHost.stderr.on("data", (chunk: Buffer) => resetErrors.push(chunk));
+    const reset = { ...request, kind: "revoke_all_fixture", deadlineMs: Date.now() + 10_000 };
+    resetHost.stdin.end(encodeNativeFrame(reset));
+    const [resetExit] = await once(resetHost, "exit");
+    assert.equal(resetExit, 0, Buffer.concat(resetErrors).toString());
+    const [resetReply] = new NativeFrameDecoder().push(Buffer.concat(resetOutput)) as [{
+      kind: string; requestId: string; payload: { count: number }
+    }];
+    assert.equal(resetReply.kind, "fixture_revoked");
+    assert.equal(resetReply.requestId, reset.requestId);
+    assert.deepEqual(resetReply.payload, { count: 1 });
+    const resetState = await facade.getConnection(fresh.payload.requestId);
+    if (resetState.kind !== "connection_state") throw new Error("Expected reset connection state");
+    assert.deepEqual(resetState.payload, { requestId: fresh.payload.requestId, state: "stale" });
   } finally {
     facade?.close();
     broker.kill("SIGTERM");

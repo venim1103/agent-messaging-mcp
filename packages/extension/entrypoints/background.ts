@@ -15,8 +15,13 @@ type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
 
 let inputInProgress = false;
+const fixtureResetKey = "fixture-reset-done";
 const fixtureGrantKey = (tabId: number) => `fixture-grant-${tabId}`;
 type StoredFixtureGrant = { documentId: string; expiresAt: number };
+type FixtureRevocation = { kind: "revoke_fixture"; payload: {
+  tabId: number; observed: { documentId: string; conversationId: string } | null
+} } | { kind: "revoke_all_fixture"; payload: Record<string, never> };
+let fixtureResetPromise: Promise<boolean> | undefined;
 
 async function revokeTrackedFixture(tabId: number): Promise<void> {
   const key = fixtureGrantKey(tabId);
@@ -31,6 +36,10 @@ async function revokeTrackedFixture(tabId: number): Promise<void> {
 
 async function revokeFixtureTab(tabId: number,
   observed: { documentId: string; conversationId: string } | null): Promise<boolean> {
+  return revokeFixtures({ kind: "revoke_fixture", payload: { tabId, observed } });
+}
+
+async function revokeFixtures(revocation: FixtureRevocation): Promise<boolean> {
   try {
     return await new Promise<boolean>((resolve) => {
       const requestId = crypto.randomUUID();
@@ -65,12 +74,28 @@ async function revokeFixtureTab(tabId: number,
           && (payload as { count: number }).count >= 0);
       });
       port.onDisconnect.addListener(() => finish(false));
-      port.postMessage({ kind: "revoke_fixture", protocolVersion, requestId,
-        connectionGeneration: 0, deadlineMs, payload: { tabId, observed } });
+      port.postMessage({ ...revocation, protocolVersion, requestId,
+        connectionGeneration: 0, deadlineMs });
     });
   } catch {
     return false;
   }
+}
+
+function ensureFixtureReset(): Promise<boolean> {
+  if (!fixtureResetPromise) {
+    fixtureResetPromise = (async () => {
+      const stored = await browser.storage.session.get(fixtureResetKey);
+      if (stored[fixtureResetKey] === true) return true;
+      if (!await revokeFixtures({ kind: "revoke_all_fixture", payload: {} })) return false;
+      await browser.storage.session.set({ [fixtureResetKey]: true });
+      return true;
+    })().catch(() => false).then((ready) => {
+      if (!ready) fixtureResetPromise = undefined;
+      return ready;
+    });
+  }
+  return fixtureResetPromise;
 }
 
 function isSelectedFixture(): boolean {
@@ -107,6 +132,7 @@ function observeFixtureIdentity(): boolean {
 
 async function approveFixture(tabId: number, expectedUrl: string, pendingRequestId: string): Promise<FixtureApprovalResult> {
   try {
+    if (!await ensureFixtureReset()) return { ok: false, error: "Fixture grant reset unavailable; try again" };
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
     const tab = await browser.tabs.get(tabId);
     if (active?.id !== tabId || !tab.active || tab.url !== expectedUrl
@@ -213,6 +239,7 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
 
 async function listFixturePending(tabId: number): Promise<PendingListResult> {
   try {
+    if (!await ensureFixtureReset()) return { ok: false, error: "Fixture grant reset unavailable; try again" };
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
     const tab = await browser.tabs.get(tabId);
     if (active?.id !== tabId || !tab.active || !tab.url
@@ -421,6 +448,7 @@ function isHandshakeReply(value: unknown, requestId: string, deadlineMs: number)
 }
 
 export default defineBackground(() => {
+  void ensureFixtureReset();
   browser.tabs.onRemoved.addListener((tabId) => { void revokeTrackedFixture(tabId).catch(() => {}); });
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (changeInfo.status === "loading" || changeInfo.url) void revokeTrackedFixture(tabId).catch(() => {});

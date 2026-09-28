@@ -2,8 +2,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureRevocation,
-  parseNativePendingList, PROTOCOL_VERSION }
+import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReset,
+  parseNativeFixtureRevocation, parseNativePendingList, PROTOCOL_VERSION }
   from "./native-protocol.js";
 
 const expectedOrigin = process.argv[2] ?? "";
@@ -27,7 +27,10 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
         const request = typeof message === "object" && message !== null && "kind" in message
           && message.kind === "approve_fixture" ? parseNativeFixtureApproval(message)
           : typeof message === "object" && message !== null && "kind" in message
-            && message.kind === "revoke_fixture" ? parseNativeFixtureRevocation(message) : parseNativePendingList(message);
+            && message.kind === "revoke_fixture" ? parseNativeFixtureRevocation(message)
+            : typeof message === "object" && message !== null && "kind" in message
+              && message.kind === "revoke_all_fixture" ? parseNativeFixtureReset(message)
+              : parseNativePendingList(message);
         nativeReply = nativeReply.then(async () => {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
@@ -50,9 +53,14 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 kind = "error";
                 payload = { code: "APPROVAL_INVALID" };
               } else throw new Error("Broker refused fixture approval");
-            } else {
+            } else if (request.kind === "revoke_fixture") {
               const result = await client.revokeFixture(request.payload.tabId, request.payload.observed);
               if (result.kind !== "fixture_revoked") throw new Error("Broker refused fixture revocation");
+              kind = "fixture_revoked";
+              payload = result.payload;
+            } else {
+              const result = await client.revokeAllFixtures();
+              if (result.kind !== "fixture_revoked") throw new Error("Broker refused fixture reset");
               kind = "fixture_revoked";
               payload = result.payload;
             }

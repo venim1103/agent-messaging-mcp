@@ -26,7 +26,8 @@ const requestSchema = z.discriminatedUnion("kind", [
     observed: z.union([z.null(), z.strictObject({
       documentId: z.string().regex(/^[!-~]{1,128}$/), conversationId: z.string().min(1).max(128)
     })])
-  }) })
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("revoke_all_fixture"), payload: z.strictObject({}) })
 ]);
 
 export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: symbol,
@@ -55,6 +56,11 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return role === "relay"
       ? { ...response, kind: "fixture_revoked" as const,
         payload: { count: requests.revokeChangedTab(request.payload.tabId, request.payload.observed) } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "revoke_all_fixture") {
+    return role === "relay"
+      ? { ...response, kind: "fixture_revoked" as const, payload: { count: requests.revokeAllFixtures() } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (role !== "facade") {

@@ -70,6 +70,22 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.deepEqual((await facade.getConnection(created.payload.requestId)).payload,
       { requestId: created.payload.requestId, state: "stale" });
     assert.deepEqual((await otherFacade.getConnection(created.payload.requestId)).payload, { state: "unknown" });
+
+    const another = await facade.requestConnection();
+    if (another.kind !== "connection_requested") throw new Error("Expected another pending request");
+    await relay.approveFixture(another.payload.requestId, {
+      origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 4,
+      documentId: "CHROME-doc_opaque-42"
+    });
+    const anotherState = await facade.getConnection(another.payload.requestId);
+    if (anotherState.kind !== "connection_state") throw new Error("Expected another owned connection");
+    assert.equal(anotherState.payload.state, "ready_readonly");
+    assert.throws(() => facade.revokeAllFixtures(), /Broker role cannot perform/);
+    const reset = await relay.revokeAllFixtures();
+    assert.equal(reset.kind, "fixture_revoked");
+    assert.deepEqual(reset.payload, { count: 1 });
+    assert.deepEqual((await facade.getConnection(another.payload.requestId)).payload,
+      { requestId: another.payload.requestId, state: "stale" });
     otherFacade.close();
     facade.close();
     assert.deepEqual((await relay.listPending() as typeof listed).payload.requests, []);

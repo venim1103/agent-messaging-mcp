@@ -117,8 +117,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     }
     let nextRequest: Promise<void> = Promise.resolve();
     const request = (kind: "request_connection" | "get_connection" | "list_pending" | "approve_fixture"
-      | "revoke_fixture", payload: object) => {
+      | "revoke_fixture" | "revoke_all_fixture", payload: object) => {
       if (kind === "list_pending" || kind === "approve_fixture" || kind === "revoke_fixture"
+        || kind === "revoke_all_fixture"
         ? role !== "relay" : role !== "facade") {
         throw new Error("Broker role cannot perform this operation");
       }
@@ -169,6 +170,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
         request("approve_fixture", { pendingRequestId, target }),
       revokeFixture: (tabId: number, observed: { documentId: string; conversationId: string } | null) =>
         request("revoke_fixture", { tabId, observed }),
+      revokeAllFixtures: () => request("revoke_all_fixture", {}),
       close: () => socket.destroy()
     };
   } catch (error) {
