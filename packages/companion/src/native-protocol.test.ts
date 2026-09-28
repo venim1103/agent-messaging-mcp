@@ -66,7 +66,7 @@ test("native fixture approval refuses other origins, targets, and arbitrary fiel
   const approval = { ...request, kind: "approve_fixture", payload: {
     pendingRequestId: "c783ef76-d6cd-4898-8c43-204543943bac",
     target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
-      documentId: "a66b3997-9d43-4554-8399-267d1fe9f75c" }
+      documentId: "CHROME-doc_opaque-42" }
   } };
   assert.deepEqual(parseNativeFixtureApproval(approval, now), approval);
   for (const invalid of [
@@ -75,7 +75,9 @@ test("native fixture approval refuses other origins, targets, and arbitrary fiel
     { ...approval, connectionGeneration: 1 },
     { ...approval, payload: { ...approval.payload, target: { ...approval.payload.target, origin: "https://gemini.google.com" } } },
     { ...approval, payload: { ...approval.payload, target: { ...approval.payload.target, tabId: 0 } } },
-    { ...approval, payload: { ...approval.payload, target: { ...approval.payload.target, documentId: "unknown" } } },
+    { ...approval, payload: { ...approval.payload, target: { ...approval.payload.target, documentId: "" } } },
+    { ...approval, payload: { ...approval.payload, target: { ...approval.payload.target, documentId: "x".repeat(129) } } },
+    { ...approval, payload: { ...approval.payload, target: { ...approval.payload.target, documentId: "line\nbreak" } } },
     { ...approval, payload: { ...approval.payload, command: "navigate" } }
   ]) {
     assert.throws(() => parseNativeFixtureApproval(invalid, now), /Invalid native fixture approval/);

@@ -52,7 +52,8 @@ test("a fixture grant is one-shot, owner-bound, and expires without exposing tab
   };
 
   assert.equal(requests.approve(pending.requestId, { ...target, tabId: 0 }, 2000), null);
-  assert.equal(requests.approve(pending.requestId, { ...target, documentId: "unknown" }, 2000), null);
+  assert.equal(requests.approve(pending.requestId, { ...target, documentId: "" }, 2000), null);
+  assert.equal(requests.approve(pending.requestId, { ...target, documentId: "x".repeat(129) }, 2000), null);
   assert.equal(requests.approve("unknown", target, 2000), null);
   assert.equal(requests.get(stranger, pending.requestId, 2000), null);
   const granted = requests.approve(pending.requestId, target, 2000);
@@ -69,6 +70,9 @@ test("a fixture grant is one-shot, owner-bound, and expires without exposing tab
   requests.disconnect(owner);
   assert.equal(requests.get(owner, pending.requestId, 2000), null);
 
+  const upper = requests.create(owner, 1000);
+  assert.equal(requests.approve(upper.requestId, { ...target, documentId: "CHROME-doc_opaque-42" }, 2000)?.state,
+    "ready_readonly");
   const expired = requests.create(owner, 1000);
   assert.equal(requests.approve(expired.requestId, target, expired.expiresAt), null);
 });

@@ -16,6 +16,8 @@ type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: s
 type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
 type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: number }[] }
   | { ok: false; error: string };
+type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
+  | { ok: false; error: string };
 
 const fixtureOrigin = "http://127.0.0.1:8787";
 const richFixtureUrl = `${fixtureOrigin}/?editor=rich`;
@@ -28,6 +30,7 @@ const geminiDraftPreview = document.querySelector<HTMLElement>("#gemini-draft-te
 const geminiDraftButton = document.querySelector<HTMLButtonElement>("#prepare-gemini-draft");
 const status = document.querySelector<HTMLElement>("#status");
 const result = document.querySelector<HTMLElement>("#result");
+const fixtureDocumentStatus = document.querySelector<HTMLElement>("#fixture-document-status");
 const pendingResult = document.querySelector<HTMLElement>("#pending-result");
 const pendingRequests = document.querySelector<HTMLOListElement>("#pending-requests");
 const conversation = document.querySelector<HTMLElement>("#conversation");
@@ -86,7 +89,7 @@ function inspectGeminiStructure(): GeminiPreview | null {
 }
 
 if (!inspectButton || !pendingButton || !fixtureInputButton || !geminiDraftReview || !geminiDraftPreview || !geminiDraftButton
-  || !status || !result || !pendingResult || !pendingRequests || !conversation || !messages) {
+  || !status || !result || !fixtureDocumentStatus || !pendingResult || !pendingRequests || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
 }
 
@@ -125,7 +128,35 @@ pendingButton.addEventListener("click", async () => {
       label.textContent = request.requestId;
       const expiry = document.createElement("p");
       expiry.textContent = `${Math.max(0, Math.ceil((request.expiresAt - Date.now()) / 1000))} seconds remaining`;
-      row.append(label, expiry);
+      const approve = document.createElement("button");
+      approve.type = "button";
+      approve.textContent = "Approve read-only fixture";
+      approve.addEventListener("click", async () => {
+        approve.disabled = true;
+        status.textContent = "Checking the selected fixture and pending request...";
+        try {
+          const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+          if (tab?.id == null || !tab.url || new URL(tab.url).origin !== fixtureOrigin
+            || Date.now() >= request.expiresAt) {
+            status.textContent = "Fixture changed or request expired. No approval sent.";
+            return;
+          }
+          const result = await browser.runtime.sendMessage({
+            kind: "approve_fixture", tabId: tab.id, expectedUrl: tab.url, pendingRequestId: request.requestId
+          }) as FixtureApprovalResult;
+          if (!result.ok) {
+            status.textContent = `${result.error}. No chat data read.`;
+            return;
+          }
+          row.remove();
+          status.textContent = `Approved ${result.requestId} for fixture-alpha (read only). No chat data read.`;
+        } catch {
+          status.textContent = "Fixture approval unavailable; check the selected tab. No chat data read.";
+        } finally {
+          approve.disabled = false;
+        }
+      });
+      row.append(label, expiry, approve);
       pendingRequests.append(row);
     }
     pendingResult.hidden = false;
@@ -184,6 +215,7 @@ fixtureInputButton.addEventListener("click", async () => {
 inspectButton.addEventListener("click", async () => {
   inspectButton.disabled = true;
   result.hidden = true;
+  fixtureDocumentStatus.hidden = true;
   messages.replaceChildren();
   status.textContent = "Inspecting selected tab...";
 
@@ -245,6 +277,25 @@ inspectButton.addEventListener("click", async () => {
     }
 
     conversation.textContent = `${fixtureOrigin} / ${preview.conversationId}`;
+    const documentId = injection?.documentId;
+    fixtureDocumentStatus.hidden = false;
+    if (typeof documentId !== "string") {
+      fixtureDocumentStatus.textContent = "Chrome document ID missing. No approval sent.";
+    } else if (!/^[!-~]{1,128}$/.test(documentId)) {
+      fixtureDocumentStatus.textContent = `Chrome document ID shape unsupported (${documentId.length} characters). No approval sent.`;
+    } else {
+      try {
+        const [targeted] = await browser.scripting.executeScript({
+          target: { tabId: tab.id, documentIds: [documentId] }, func: inspectFixture
+        });
+        fixtureDocumentStatus.textContent = targeted?.frameId === 0 && targeted.documentId === documentId
+          && targeted.result?.conversationId === preview.conversationId
+          ? `Chrome document targeting matched (${documentId.length} characters). No approval sent.`
+          : "Chrome document targeting changed. No approval sent.";
+      } catch {
+        fixtureDocumentStatus.textContent = "Chrome document targeting unavailable. No approval sent.";
+      }
+    }
     for (const message of preview.messages) {
       const row = document.createElement("li");
       const direction = document.createElement("strong");

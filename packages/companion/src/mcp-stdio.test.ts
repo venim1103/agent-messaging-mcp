@@ -9,6 +9,7 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { connectBroker } from "./broker-client.js";
 
 test("official SDK stdio client discovers and calls the diagnostic tool", async () => {
   const client = new Client({ name: "browser-chat-test", version: "0.0.1" });
@@ -76,6 +77,23 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.deepEqual(hidden.structuredContent, { state: "unknown" });
     const own = await clientOne.callTool({ name: "chat.get_connection", arguments: { requestId: handle.requestId } });
     assert.deepEqual(own.structuredContent, handle);
+
+    const relay = await connectBroker("relay", brokerDirectory);
+    const approved = await relay.approveFixture(handle.requestId, {
+      origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "CHROME-doc_opaque-42"
+    });
+    assert.equal(approved.kind, "fixture_approved");
+    relay.close();
+    const readyState = await clientOne.callTool({ name: "chat.get_connection", arguments: { requestId: handle.requestId } });
+    assert.equal(readyState.isError, undefined);
+    const readyContent = readyState.structuredContent;
+    assert.ok(readyContent && typeof readyContent === "object" && !Array.isArray(readyContent));
+    assert.equal((readyContent as { state: string }).state, "ready_readonly");
+    assert.equal("tabId" in readyContent, false);
+    assert.deepEqual((await clientTwo.callTool({
+      name: "chat.get_connection", arguments: { requestId: handle.requestId }
+    })).structuredContent, { state: "unknown" });
     await clientOne.close();
     const disconnected = await clientTwo.callTool({ name: "chat.get_connection", arguments: { requestId: handle.requestId } });
     assert.deepEqual(disconnected.structuredContent, { state: "unknown" });

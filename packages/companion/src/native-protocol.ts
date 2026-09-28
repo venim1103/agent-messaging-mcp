@@ -22,7 +22,7 @@ const fixtureApprovalSchema = z.strictObject({
     pendingRequestId: z.uuid(),
     target: z.strictObject({
       origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
-      tabId: z.number().int().safe().positive(), documentId: z.uuid()
+      tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
     })
   })
 });

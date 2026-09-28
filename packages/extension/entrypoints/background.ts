@@ -11,12 +11,105 @@ type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: s
 type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
 type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: number }[] }
   | { ok: false; error: string };
+type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
+  | { ok: false; error: string };
 
 let inputInProgress = false;
 
 function isSelectedFixture(): boolean {
   return location.origin === "http://127.0.0.1:8787"
     && document.querySelector("main[data-conversation-id=fixture-alpha]") !== null;
+}
+
+function readFixtureIdentity(): string | null {
+  if (location.origin !== "http://127.0.0.1:8787") return null;
+  const fixtures = document.querySelectorAll<HTMLElement>("main[data-conversation-id]");
+  return fixtures.length === 1 && fixtures[0]?.dataset.conversationId === "fixture-alpha" ? "fixture-alpha" : null;
+}
+
+async function approveFixture(tabId: number, expectedUrl: string, pendingRequestId: string): Promise<FixtureApprovalResult> {
+  try {
+    const [active] = await browser.tabs.query({ active: true, currentWindow: true });
+    const tab = await browser.tabs.get(tabId);
+    if (active?.id !== tabId || !tab.active || tab.url !== expectedUrl
+      || new URL(expectedUrl).origin !== "http://127.0.0.1:8787") {
+      return { ok: false, error: "Fixture tab changed; no approval sent" };
+    }
+    const [identity] = await browser.scripting.executeScript({ target: { tabId }, func: readFixtureIdentity });
+    if (!identity || identity.frameId !== 0) return { ok: false, error: "Fixture main frame unavailable; no approval sent" };
+    if (identity.result !== "fixture-alpha") return { ok: false, error: "Fixture identity changed; no approval sent" };
+    if (typeof identity.documentId !== "string") return { ok: false, error: "Chrome document ID missing; no approval sent" };
+    if (!/^[!-~]{1,128}$/.test(identity.documentId)) {
+      return { ok: false, error: "Chrome document ID format unrecognized; no approval sent" };
+    }
+    const documentId = identity.documentId;
+    const [fresh] = await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
+    });
+    if (fresh?.documentId !== documentId || fresh.result !== "fixture-alpha"
+      || (await browser.tabs.get(tabId)).url !== expectedUrl) {
+      return { ok: false, error: "Fixture changed; no approval sent" };
+    }
+
+    return await new Promise<FixtureApprovalResult>((resolve) => {
+      const requestId = crypto.randomUUID();
+      const deadlineMs = Date.now() + 10_000;
+      let port: ReturnType<typeof browser.runtime.connectNative>;
+      try {
+        port = browser.runtime.connectNative(nativeHostName);
+      } catch {
+        resolve({ ok: false, error: "Native fixture approval unavailable" });
+        return;
+      }
+      let settled = false;
+      const timer = setTimeout(() => finish({ ok: false, error: "Fixture approval timed out" }), 10_000);
+
+      function finish(result: FixtureApprovalResult) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+        port.disconnect();
+      }
+
+      port.onMessage.addListener((value: unknown) => {
+        void (async () => {
+          if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+          const reply = value as Record<string, unknown>;
+          if (reply.protocolVersion !== protocolVersion || reply.requestId !== requestId
+            || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
+            || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) throw new Error();
+          const payload = reply.payload as Record<string, unknown>;
+          if (reply.kind === "error" && payload.code === "APPROVAL_INVALID") {
+            finish({ ok: false, error: "Request expired or already approved" });
+            return;
+          }
+          if (reply.kind === "error" && payload.code === "BROKER_UNAVAILABLE") {
+            finish({ ok: false, error: "Broker unavailable; no approval" });
+            return;
+          }
+          if (reply.kind !== "fixture_approved" || Object.keys(payload).length !== 2
+            || payload.requestId !== pendingRequestId || typeof payload.expiresAt !== "number"
+            || !Number.isSafeInteger(payload.expiresAt)) throw new Error();
+          const [current] = await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
+          });
+          if (current?.documentId !== documentId || current.result !== "fixture-alpha"
+            || (await browser.tabs.get(tabId)).url !== expectedUrl) throw new Error();
+          finish({ ok: true, requestId: pendingRequestId, expiresAt: payload.expiresAt });
+        })().catch(() => finish({ ok: false, error: "Fixture changed or approval response invalid; reconnect" }));
+      });
+      port.onDisconnect.addListener(() => finish({ ok: false, error: "Native fixture approval unavailable" }));
+      port.postMessage({
+        kind: "approve_fixture", protocolVersion, requestId, connectionGeneration: 0, deadlineMs,
+        payload: { pendingRequestId, target: {
+          origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId
+        } }
+      });
+    });
+  } catch {
+    return { ok: false, error: "Fixture changed or approval unavailable; reconnect" };
+  }
 }
 
 async function listFixturePending(tabId: number): Promise<PendingListResult> {
@@ -237,6 +330,12 @@ export default defineBackground(() => {
     if (request.kind === "list_fixture_pending" && Object.keys(request).length === 2
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {
       return listFixturePending(request.tabId);
+    }
+    if (request.kind === "approve_fixture" && Object.keys(request).length === 4
+      && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
+      && typeof request.expectedUrl === "string" && request.expectedUrl.length < 2048
+      && typeof request.pendingRequestId === "string" && /^[0-9a-f-]{36}$/.test(request.pendingRequestId)) {
+      return approveFixture(request.tabId, request.expectedUrl, request.pendingRequestId);
     }
     if (request.kind === "probe_fixture_input" && Object.keys(request).length === 2
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {

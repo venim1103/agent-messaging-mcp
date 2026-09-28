@@ -71,7 +71,7 @@ test("authenticated relay alone approves a selected fixture and only its MCP own
   const approval = { ...envelope, kind: "approve_fixture", payload: {
     pendingRequestId: pending.requestId,
     target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
-      documentId: "a66b3997-9d43-4554-8399-267d1fe9f75c" }
+      documentId: "CHROME-doc_opaque-42" }
   } };
 
   assert.equal(handleBrokerRequest(approval, "relay", stranger, requests, 2000).kind, "fixture_approved");

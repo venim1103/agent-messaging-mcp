@@ -69,7 +69,7 @@ export class PendingConnectionRequests {
     if (!request || request.grant || now >= request.expiresAt
       || target.origin !== "http://127.0.0.1:8787" || target.conversationId !== "fixture-alpha"
       || !Number.isSafeInteger(target.tabId) || target.tabId < 1
-      || !/^[0-9a-f-]{36}$/.test(target.documentId)) return null;
+      || !/^[!-~]{1,128}$/.test(target.documentId)) return null;
 
     const connection = Object.freeze({
       requestId,
