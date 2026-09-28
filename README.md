@@ -1,38 +1,62 @@
-# agent-messaging-mcp
-Small repo for setting up generic access for agents trough MCP to messaging platforms (chat windows).
+# Browser Chat MCP
 
-## Planning Documents
+Connect an MCP agent to a browser chat that a person opens and approves through an extension. The intended experience uses the person's existing browser login and the chat website itself, not a provider API or exported credentials.
 
-- [DESIGN.md](DESIGN.md): architecture, scope, safety model, and phased plan.
-- [HANDOFF.md](HANDOFF.md): implementation work order, WSL/Chromium setup, acceptance checks, and current progress for the next AI.
+> **Status: early local prototype.** The approved read path is implemented only for the synthetic chat fixture; its full toolbar-to-MCP flow still needs a manual browser check. Gemini is not connected through MCP, and there is no message-send tool. Do not use this build to grant access to personal conversations.
 
-Milestone 0 established a synthetic chat fixture, a WXT popup, a Native Messaging handshake, and an official-SDK MCP stdio diagnostic. In container Chromium, the user inspected `fixture-alpha` and both rendered messages through the popup and saw `Native bridge ready (protocol v1)`; no message was sent. A local MCP client and VS Code Chat both called the diagnostic tool successfully. A separate user-approved probe of one disposable Gemini chat identified the user/model row structure and matching displayed text; the popup now reports only row lengths. Milestone 1 has a fixture-only approved connection, but no authorized chat MCP read path, supported Gemini adapter, or real-site send capability yet.
+## How It Works
 
-Milestone 1 has an opt-in private Unix broker process and pending-only `chat.request_connection`/`chat.get_connection` MCP tools. Separate facade clients cannot reuse each other's pending handles, and the relay role cannot use those tools. Start it for local tests with `npm run dev:broker`; the devcontainer builds but does not auto-start it. The browser-spawned native host can fetch unexpired pending IDs/deadlines through an authenticated relay role. The trusted extension popup can approve one selected fixture request, but no messages can be read through MCP.
-The broker's relay-only fixture grant binds one unexpired request to an exact tab/document and exposes a read-only handle only to its MCP owner. The popup approval and owner-visible `ready_readonly` result passed after restarting a stale VS Code MCP process. The extension uses memory-only `storage.session` for approved fixture target identity: a real fixture tab reload and an in-place conversation switch each made the owner-visible state `stale` with no handle. A fresh extension/browser instance requires an acknowledged relay-only reset before fixture listing or approval; failure blocks both and is retried. An ordinary MV3 worker wake retains the session marker and the grant.
-On the selected local fixture tab, **View pending requests** in the extension popup was manually verified both empty and with one matching VS Code-created pending ID. It lists only opaque IDs and relative expiry, not tab or message data. Viewing the list does not approve a request.
-An internal in-memory observation buffer has bounded immutable events, independent cursors, and explicit expiry on overflow/restart. It is not fed by the extension, bound to an approved conversation, or exposed through an MCP read tool yet.
-If the broker ends abruptly and leaves a dead socket, its next startup recovers only the exact owner-private broker runtime after confirming the socket refuses connections. A live broker or unrecognized files block recovery. No browser window or fixture server is required to test pending-only MCP tools.
-Both pending-only tools were invoked through the actual VS Code MCP host: a request returned a pending ID and expiry, and lookup returned the same pending state without a tab or chat data. This is not connection approval.
+An agent requests a connection through MCP. The user selects the local fixture tab and approves the pending request in the extension popup. A browser-spawned Native Messaging host relays bounded observations to a private local broker; only the MCP client that owns the approved connection can read them.
 
-After changing MCP tool definitions, use **MCP: List Servers** in VS Code to restart `browserChatFeasibility` (and **MCP: Reset Cached Tools** if they remain stale). The private broker must be running separately. A discovered pending request is not an approved chat connection.
+```text
+MCP client <-> stdio facade <-> private Unix broker <-> native relay <-> extension <-> approved tab
+```
 
-The fixture has an opt-in contenteditable variant at `http://127.0.0.1:8787/?editor=rich`. `npm run test:e2e` uses pinned Playwright Core and container Chromium to verify real multiline/Unicode browser input and that synthetic input cannot submit a draft. It also loads the built extension in a disposable persistent profile and checks a real Native Messaging handshake through a test-only host registration. A separate disposable developer-mode profile and real broker verify that a stopped/woken worker preserves a grant, while extension reload, browser restart, and tracked tab closure revoke it. These lifecycle checks seed broker grants and a tracked tab record for the close case; they do not prove a toolbar `activeTab` gesture or a trusted popup approval click. They never attach to the manually used browser profile or certify Gemini compatibility. The devcontainer image supplies Chromium and post-create `npm ci` restores Playwright Core.
-The synthetic fixture also has **Switch chat**, which changes the conversation ID and rendered rows in place without navigating. After a user-approved fixture connection, the extension's document-scoped watcher made this MCP client's state `stale` with no handle when the user switched chats. An installed-profile manual tab-close/restart check remains separate from the disposable automated lifecycle test; no MCP message read tool is exposed.
+There is no network browser-control listener, unrestricted CDP bridge, model-supplied selector, or provider API key. Approval binds one fixture conversation to its browser tab and document. Reloading the tab, switching the fixture conversation, or restarting the extension invalidates that grant.
 
-Inside the devcontainer, post-create runs `npm ci && npm run build && npm run restore:native -- --browser chromium --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"`; `npm run typecheck` and `npm run test:unit` check the current packages. Restore is a no-op until a user registers an extension ID and only recreates a missing launcher from that exact persisted profile registration. `npm run dev:fixture` serves the synthetic chat on port 8787. Open it in container Chromium using the isolated profile described in [HANDOFF.md](HANDOFF.md), then load `packages/extension/.output/chrome-mv3` from `chrome://extensions`.
+## What Works Today
 
-After a tested VS Code devcontainer rebuild, the extension ID and native manifest persisted in the profile volume, post-create restored the host launcher, and the fixture popup again completed a real native handshake. The fixture server and Chromium processes must be restarted after a rebuild; user login or unsent Gemini draft persistence has not been tested.
+- `chat.request_connection` creates a short-lived pending request; `chat.get_connection` reports owner-visible state and, after approval, a read-only connection ID.
+- `chat.read_messages` returns the latest **cached, rendered-only fixture snapshot** with a capture time and cursor. It is not a live query on every call, complete chat history, or a Gemini transcript.
+- The extension observes the approved fixture's message list and publishes bounded updates. Reads are denied for other MCP clients and for revoked or expired grants.
+- The popup has separate structure-only Gemini diagnostics and explicitly approved draft-input probes. They do not create a Gemini MCP connection or click Send.
 
-After copying that installation's extension ID, register the development native host for this browser profile:
+The full toolbar-approval-to-MCP-read flow with the new snapshot code still needs a manual check in the installed development browser. See [HANDOFF.md](HANDOFF.md) for verified tests, remaining risks, and the current next step.
+
+## Try the Local Fixture
+
+Work inside the supplied devcontainer with Node.js 24+ and Chromium. Its post-create step installs dependencies and builds the packages; for an existing checkout, run:
+
+```bash
+npm ci
+npm run build
+```
+
+Start the fixture and broker in separate terminals, then open the fixture in **container Chromium**:
+
+```bash
+npm run dev:fixture
+npm run dev:broker
+chromium --user-data-dir="$HOME/.local/share/agent-messaging-mcp/chromium-dev" --no-first-run http://127.0.0.1:8787/
+```
+
+In `chrome://extensions`, enable Developer Mode and load the unpacked build at `packages/extension/.output/chrome-mv3`. Note its extension ID, then register the exact-origin native host for that browser profile:
 
 ```bash
 npm run register:native -- --browser chromium --extension-id "$EXTENSION_ID" --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev" --preview
 npm run register:native -- --browser chromium --extension-id "$EXTENSION_ID" --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"
 ```
 
-Set `EXTENSION_ID` from container Chromium's `chrome://extensions` first. Preview makes no changes; registration refuses to replace unrelated files. Initial registration stays manual because it needs this browser's extension ID. The manifest goes in the chosen Chromium profile and its launcher in the writable `$HOME/.config/agent-messaging-mcp` directory. Post-create restores the launcher if that exact manifest survives a container rebuild; if the manifest is lost, re-register after verifying the ID. After the browser test, remove only this application's registration with `npm run unregister:native -- --browser chromium --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"`. The fixture popup confirmed that Chromium found the manifest in the development profile and completed the native handshake.
+The workspace [MCP configuration](.vscode/mcp.json) registers `browserChatFeasibility` in VS Code. Restart that server with **MCP: List Servers** after rebuilding. Call `chat.request_connection`, use the extension's toolbar popup on the selected fixture tab to **View pending requests** and **Approve read-only fixture**, then call `chat.get_connection` with the request ID and `chat.read_messages` with the returned connection ID. A pending request expires after 60 seconds; an approved fixture grant lasts at most five minutes.
 
-VS Code's workspace [MCP configuration](.vscode/mcp.json) starts the diagnostic server with the container's Node executable and built companion entry point. The `browser_chat_feasibility` tool returned `MCP stdio diagnostic OK. No browser data was read or sent.` in VS Code Chat. This verifies VS Code MCP stdio tool invocation, not browser-chat integration.
+## Verification and Limits
 
-The Gemini popup inspects only the user-selected tab and returns fixed structural indicators and bounded message character counts; it does not return transcript text, draft contents, or conversation identifiers. It is safe to share its complete output for diagnostics, but it does not grant a persistent chat connection or send anything. The development extension declares Chrome's powerful `debugger` permission as required. User-clicked input probes can fill the exact empty local rich fixture or one explicitly approved fixed draft in the selected disposable Gemini conversation. They compare read-back, detach, and never click Send. The Gemini draft matched in the visible composer in one test, but submission, service acceptance, and delivery remain unverified; any send needs separate approval.
+```bash
+npm run typecheck
+npm run test:unit
+npm run test:e2e
+```
+
+Unit and isolated Chromium tests cover role isolation, native framing, fixture snapshots, and revocation. Automated popup navigation does **not** grant Chrome's `activeTab` permission, so those tests do not replace the real toolbar approval check. Cached reads can outlive a tab change if the browser cannot deliver revocation; a fresh browser challenge on every read and event waiting are still needed before supporting real-site conversations. Sending requires a separate supervised approval and recovery path.
+
+Read [DESIGN.md](DESIGN.md) for the architecture and intended capabilities, [HANDOFF.md](HANDOFF.md) for setup details and test evidence, and [LICENSE](LICENSE) for licensing.

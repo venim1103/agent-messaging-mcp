@@ -56,6 +56,7 @@ test("a fixture grant is one-shot, owner-bound, and expires without exposing tab
   assert.equal(requests.approve(pending.requestId, { ...target, documentId: "x".repeat(129) }, 2000), null);
   assert.equal(requests.approve("unknown", target, 2000), null);
   assert.equal(requests.get(stranger, pending.requestId, 2000), null);
+  assert.equal(requests.getApprovedTarget(owner, pending.requestId, 2000), null);
   const granted = requests.approve(pending.requestId, target, 2000);
   assert.equal(granted?.state, "ready_readonly");
   assert.match(granted?.connectionId ?? "", /^[0-9a-f-]{36}$/);
@@ -64,11 +65,15 @@ test("a fixture grant is one-shot, owner-bound, and expires without exposing tab
   assert.equal("documentId" in granted!, false);
   assert.deepEqual(requests.get(owner, pending.requestId, 2000), granted);
   assert.equal(requests.get(stranger, pending.requestId, 2000), null);
+  assert.deepEqual(requests.getApprovedTarget(owner, granted!.connectionId, 2000), target);
+  assert.equal(requests.getApprovedTarget(stranger, granted!.connectionId, 2000), null);
   assert.deepEqual(requests.listPending(2000), []);
   assert.equal(requests.approve(pending.requestId, target, 2001), null);
   assert.equal(requests.get(owner, pending.requestId, granted!.expiresAt)?.state, "expired");
+  assert.equal(requests.getApprovedTarget(owner, granted!.connectionId, granted!.expiresAt), null);
   requests.disconnect(owner);
   assert.equal(requests.get(owner, pending.requestId, 2000), null);
+  assert.equal(requests.getApprovedTarget(owner, granted!.connectionId, 2000), null);
 
   const upper = requests.create(owner, 1000);
   assert.equal(requests.approve(upper.requestId, { ...target, documentId: "CHROME-doc_opaque-42" }, 2000)?.state,
@@ -90,6 +95,7 @@ test("a changed fixture document or conversation revokes a grant without revivin
   assert.deepEqual(requests.get(owner, pending.requestId, 2000), granted);
   assert.equal(requests.revokeChangedTab(3, { documentId: "new-document", conversationId: target.conversationId }), 1);
   assert.deepEqual(requests.get(owner, pending.requestId, 2000), { requestId: pending.requestId, state: "stale" });
+  assert.equal(requests.getApprovedTarget(owner, granted!.connectionId, 2000), null);
   assert.equal(requests.revokeChangedTab(3, { documentId: target.documentId, conversationId: target.conversationId }), 0);
   assert.equal(requests.approve(pending.requestId, target, 2000), null);
   assert.equal(requests.get(Symbol("another client"), pending.requestId, 2000), null);
@@ -123,4 +129,43 @@ test("a new extension instance revokes all grants but leaves unapproved requests
   assert.deepEqual(requests.get(second, secondRequest.requestId, 2000), { requestId: secondRequest.requestId, state: "stale" });
   assert.equal(requests.get(first, stillPending.requestId, 2000)?.state, "pending");
   assert.equal(requests.revokeAllFixtures(), 0);
+});
+
+test("bounded fixture snapshots belong only to live matching grants and retain a cursor", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("approved reader");
+  const stranger = Symbol("other reader");
+  const pending = requests.create(owner, 1000);
+  const target = {
+    origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42"
+  };
+  const messages = [{ id: "fixture-1", direction: "incoming" as const, text: "One" }];
+  assert.equal(requests.publishFixtureSnapshot(target, messages, 1000), 0);
+  const grant = requests.approve(pending.requestId, target, 2000)!;
+  assert.equal(requests.getFixtureSnapshot(owner, grant.connectionId, 2000), "not_ready");
+  assert.equal(requests.publishFixtureSnapshot({ ...target, documentId: "other" }, messages, 2001), 0);
+  assert.equal(requests.publishFixtureSnapshot(target, messages, 2001), 1);
+  const initial = requests.getFixtureSnapshot(owner, grant.connectionId, 2001);
+  assert.notEqual(initial, null);
+  assert.notEqual(initial, "not_ready");
+  if (!initial || initial === "not_ready") throw new Error("Expected a fixture snapshot");
+  assert.deepEqual(initial.messages, messages);
+  assert.equal(initial.coverage, "rendered_only");
+  assert.equal(initial.capturedAt, 2001);
+  assert.equal(initial.cursor.sequence, 1);
+  assert.equal(requests.getFixtureSnapshot(stranger, grant.connectionId, 2001), null);
+  assert.throws(() => requests.publishFixtureSnapshot(target, [...messages, messages[0]!], 2002), /Invalid fixture snapshot/);
+  messages[0]!.text = "Changed after publication";
+  assert.equal(initial.messages[0]?.text, "One");
+  assert.equal(requests.publishFixtureSnapshot(target, messages, 2002), 1);
+  const updated = requests.getFixtureSnapshot(owner, grant.connectionId, 2002);
+  if (!updated || updated === "not_ready") throw new Error("Expected a newer snapshot");
+  assert.equal(updated.cursor.epoch, initial.cursor.epoch);
+  assert.equal(updated.cursor.sequence, 2);
+  assert.equal(updated.messages[0]?.text, "Changed after publication");
+  assert.equal(requests.getFixtureSnapshot(owner, grant.connectionId, grant.expiresAt), null);
+  assert.equal(requests.revokeChangedTab(3, null), 1);
+  assert.equal(requests.getFixtureSnapshot(owner, grant.connectionId, 2003), null);
+  assert.equal(requests.publishFixtureSnapshot(target, messages, 2003), 0);
 });

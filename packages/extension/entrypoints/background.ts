@@ -1,5 +1,6 @@
 import { browser } from "wxt/browser";
 import { geminiDraftText } from "../lib/approved-probe";
+import { captureFixtureSnapshot, observeFixtureMessages } from "../lib/fixture-observation";
 
 const nativeHostName = "com.agent_messaging_mcp.bridge";
 const protocolVersion = 1;
@@ -22,6 +23,7 @@ type FixtureRevocation = { kind: "revoke_fixture"; payload: {
   tabId: number; observed: { documentId: string; conversationId: string } | null
 } } | { kind: "revoke_all_fixture"; payload: Record<string, never> };
 let fixtureResetPromise: Promise<boolean> | undefined;
+const fixtureSnapshotJobs = new Map<number, Promise<boolean>>();
 
 async function revokeTrackedFixture(tabId: number): Promise<void> {
   const key = fixtureGrantKey(tabId);
@@ -130,6 +132,85 @@ function observeFixtureIdentity(): boolean {
   return true;
 }
 
+async function publishFixtureSnapshot(tabId: number, documentId: string): Promise<boolean> {
+  try {
+    const key = fixtureGrantKey(tabId);
+    const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
+    if (stored?.documentId !== documentId || typeof stored.expiresAt !== "number"
+      || stored.expiresAt <= Date.now()) return false;
+    const [captured] = await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: captureFixtureSnapshot
+    });
+    const tab = await browser.tabs.get(tabId);
+    if (captured?.frameId !== 0 || captured.documentId !== documentId || !captured.result
+      || !tab.url || new URL(tab.url).origin !== "http://127.0.0.1:8787") return false;
+    const messages = captured.result.messages;
+
+    const published = await new Promise<boolean>((resolve) => {
+      const requestId = crypto.randomUUID();
+      const deadlineMs = Date.now() + 10_000;
+      let port: ReturnType<typeof browser.runtime.connectNative>;
+      try {
+        port = browser.runtime.connectNative(nativeHostName);
+      } catch {
+        resolve(false);
+        return;
+      }
+      let settled = false;
+      const timer = setTimeout(() => finish(false), 10_000);
+
+      function finish(ok: boolean) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok);
+        port.disconnect();
+      }
+
+      port.onMessage.addListener((value: unknown) => {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return finish(false);
+        const reply = value as Record<string, unknown>;
+        const payload = reply.payload;
+        finish(Object.keys(reply).length === 6 && reply.kind === "fixture_snapshot_published"
+          && reply.protocolVersion === protocolVersion && reply.requestId === requestId
+          && reply.connectionGeneration === 0 && reply.deadlineMs === deadlineMs
+          && typeof payload === "object" && payload !== null && !Array.isArray(payload)
+          && Object.keys(payload).length === 1 && typeof (payload as { count?: unknown }).count === "number"
+          && Number.isSafeInteger((payload as { count: number }).count)
+          && (payload as { count: number }).count > 0);
+      });
+      port.onDisconnect.addListener(() => finish(false));
+      port.postMessage({
+        kind: "publish_fixture_snapshot", protocolVersion, requestId, connectionGeneration: 0,
+        deadlineMs, payload: { target: {
+          origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId
+        }, messages }
+      });
+    });
+    if (!published) return false;
+    const [stillCurrent] = await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
+    });
+    const currentTab = await browser.tabs.get(tabId);
+    return stillCurrent?.frameId === 0 && stillCurrent.documentId === documentId
+      && stillCurrent.result === "fixture-alpha" && !!currentTab.url
+      && new URL(currentTab.url).origin === "http://127.0.0.1:8787";
+  } catch {
+    return false;
+  }
+}
+
+function queueFixtureSnapshot(tabId: number, documentId: string): Promise<boolean> {
+  const previous = fixtureSnapshotJobs.get(tabId) ?? Promise.resolve(true);
+  const job = previous.then(() => publishFixtureSnapshot(tabId, documentId),
+    () => publishFixtureSnapshot(tabId, documentId));
+  fixtureSnapshotJobs.set(tabId, job);
+  void job.finally(() => {
+    if (fixtureSnapshotJobs.get(tabId) === job) fixtureSnapshotJobs.delete(tabId);
+  });
+  return job;
+}
+
 async function approveFixture(tabId: number, expectedUrl: string, pendingRequestId: string): Promise<FixtureApprovalResult> {
   try {
     if (!await ensureFixtureReset()) return { ok: false, error: "Fixture grant reset unavailable; try again" };
@@ -216,6 +297,11 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
             target: { tabId, documentIds: [documentId] }, func: observeFixtureIdentity
           });
           if (observing?.documentId !== documentId || observing.result !== true) throw new Error();
+          const [watchingMessages] = await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: observeFixtureMessages
+          });
+          if (watchingMessages?.frameId !== 0 || watchingMessages.documentId !== documentId
+            || watchingMessages.result !== true || !await queueFixtureSnapshot(tabId, documentId)) throw new Error();
           finish({ ok: true, requestId: pendingRequestId, expiresAt: payload.expiresAt });
         })().catch(async () => {
           if (brokerApproved && await revokeFixtureTab(tabId, null)) {
@@ -454,6 +540,19 @@ export default defineBackground(() => {
     if (changeInfo.status === "loading" || changeInfo.url) void revokeTrackedFixture(tabId).catch(() => {});
   });
   browser.runtime.onMessage.addListener((message: unknown, sender) => {
+    if (typeof message === "object" && message !== null && !Array.isArray(message)
+      && Object.keys(message).length === 1 && (message as { kind?: unknown }).kind === "fixture_messages_changed") {
+      if (sender.id !== browser.runtime.id || sender.origin !== "http://127.0.0.1:8787"
+        || sender.frameId !== 0 || sender.tab?.id == null || typeof sender.documentId !== "string") return;
+      const tabId = sender.tab.id;
+      const documentId = sender.documentId;
+      return browser.storage.session.get(fixtureGrantKey(tabId)).then(async (stored) => {
+        const grant = stored[fixtureGrantKey(tabId)] as StoredFixtureGrant | undefined;
+        if (!grant || grant.documentId !== documentId || typeof grant.expiresAt !== "number"
+          || grant.expiresAt <= Date.now()) return;
+        if (!await queueFixtureSnapshot(tabId, documentId)) await revokeTrackedFixture(tabId);
+      }).catch(() => {});
+    }
     if (typeof message === "object" && message !== null && !Array.isArray(message)
       && Object.keys(message).length === 1 && (message as { kind?: unknown }).kind === "fixture_identity_changed") {
       if (sender.id !== browser.runtime.id || sender.origin !== "http://127.0.0.1:8787"

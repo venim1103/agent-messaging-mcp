@@ -5,10 +5,10 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
-import type { FixtureTarget } from "./pending-connections.js";
+import type { FixtureMessage, FixtureTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { MAX_PENDING_REQUESTS } from "./pending-connections.js";
+import { MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_PENDING_REQUESTS } from "./pending-connections.js";
 
 const helloResult = z.strictObject({
   kind: z.literal("hello_result"),
@@ -17,6 +17,10 @@ const helloResult = z.strictObject({
   connectionGeneration: z.literal(0),
   deadlineMs: z.number().int().safe(),
   payload: z.strictObject({ role: z.enum(["facade", "relay"]) })
+});
+const fixtureMessage = z.strictObject({
+  id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+  direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
 });
 
 const replySchema = z.discriminatedUnion("kind", [
@@ -56,9 +60,24 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
   }),
   z.strictObject({
+    kind: z.literal("fixture_snapshot_published"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_snapshot"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({
+      coverage: z.literal("rendered_only"), generation: z.literal(1), capturedAt: z.number().int().safe(),
+      cursor: z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() }),
+      messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES), omittedBefore: z.boolean()
+    })
+  }),
+  z.strictObject({
     kind: z.literal("error"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
-    payload: z.strictObject({ code: z.enum(["PERMISSION_DENIED", "TOO_MANY_PENDING", "APPROVAL_INVALID"]) })
+    payload: z.strictObject({ code: z.enum(["PERMISSION_DENIED", "TOO_MANY_PENDING", "APPROVAL_INVALID",
+      "OBSERVATION_UNAVAILABLE", "CONNECTION_NOT_FOUND"]) })
   })
 ]);
 
@@ -116,10 +135,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       throw new Error("Broker returned a mismatched hello");
     }
     let nextRequest: Promise<void> = Promise.resolve();
-    const request = (kind: "request_connection" | "get_connection" | "list_pending" | "approve_fixture"
+    const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot"
+      | "list_pending" | "approve_fixture" | "publish_fixture_snapshot"
       | "revoke_fixture" | "revoke_all_fixture", payload: object) => {
       if (kind === "list_pending" || kind === "approve_fixture" || kind === "revoke_fixture"
-        || kind === "revoke_all_fixture"
+        || kind === "revoke_all_fixture" || kind === "publish_fixture_snapshot"
         ? role !== "relay" : role !== "facade") {
         throw new Error("Broker role cannot perform this operation");
       }
@@ -165,9 +185,13 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       role,
       requestConnection: () => request("request_connection", {}),
       getConnection: (requestId: string) => request("get_connection", { requestId }),
+      readFixtureSnapshot: (connectionId: string, limit?: number) =>
+        request("read_fixture_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
       listPending: () => request("list_pending", {}),
       approveFixture: (pendingRequestId: string, target: FixtureTarget) =>
         request("approve_fixture", { pendingRequestId, target }),
+      publishFixtureSnapshot: (target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>) =>
+        request("publish_fixture_snapshot", { target, messages }),
       revokeFixture: (tabId: number, observed: { documentId: string; conversationId: string } | null) =>
         request("revoke_fixture", { tabId, observed }),
       revokeAllFixtures: () => request("revoke_all_fixture", {}),

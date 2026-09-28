@@ -145,13 +145,13 @@ pendingButton.addEventListener("click", async () => {
             kind: "approve_fixture", tabId: tab.id, expectedUrl: tab.url, pendingRequestId: request.requestId
           }) as FixtureApprovalResult;
           if (!result.ok) {
-            status.textContent = `${result.error}. No chat data read.`;
+            status.textContent = `${result.error}.`;
             return;
           }
           row.remove();
-          status.textContent = `Approved ${result.requestId} for fixture-alpha (read only). No chat data read.`;
+          status.textContent = `Approved ${result.requestId} for fixture-alpha (read only). Fixture snapshot captured for the MCP client.`;
         } catch {
-          status.textContent = "Fixture approval unavailable; check the selected tab. No chat data read.";
+          status.textContent = "Fixture approval unavailable; check the selected tab.";
         } finally {
           approve.disabled = false;
         }
@@ -161,10 +161,10 @@ pendingButton.addEventListener("click", async () => {
     }
     pendingResult.hidden = false;
     status.textContent = response.requests.length
-      ? `${response.requests.length} pending ID(s). No connection approved or chat data read.`
-      : "No pending requests. No connection approved or chat data read.";
+      ? `${response.requests.length} pending ID(s). Listing alone does not approve or read messages.`
+      : "No pending requests. Listing alone does not approve or read messages.";
   } catch {
-    status.textContent = "Pending list unavailable. No chat data read.";
+    status.textContent = "Pending list unavailable.";
   } finally {
     pendingButton.disabled = false;
   }

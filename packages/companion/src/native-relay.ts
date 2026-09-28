@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReset,
-  parseNativeFixtureRevocation, parseNativePendingList, PROTOCOL_VERSION }
+  parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList, PROTOCOL_VERSION }
   from "./native-protocol.js";
 
 const expectedOrigin = process.argv[2] ?? "";
@@ -30,11 +30,13 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             && message.kind === "revoke_fixture" ? parseNativeFixtureRevocation(message)
             : typeof message === "object" && message !== null && "kind" in message
               && message.kind === "revoke_all_fixture" ? parseNativeFixtureReset(message)
+              : typeof message === "object" && message !== null && "kind" in message
+                && message.kind === "publish_fixture_snapshot" ? parseNativeFixtureSnapshot(message)
               : parseNativePendingList(message);
         nativeReply = nativeReply.then(async () => {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
-          let kind: "pending_list" | "fixture_approved" | "fixture_revoked" | "error";
+          let kind: "pending_list" | "fixture_approved" | "fixture_revoked" | "fixture_snapshot_published" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
@@ -58,10 +60,15 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               if (result.kind !== "fixture_revoked") throw new Error("Broker refused fixture revocation");
               kind = "fixture_revoked";
               payload = result.payload;
-            } else {
+            } else if (request.kind === "revoke_all_fixture") {
               const result = await client.revokeAllFixtures();
               if (result.kind !== "fixture_revoked") throw new Error("Broker refused fixture reset");
               kind = "fixture_revoked";
+              payload = result.payload;
+            } else {
+              const result = await client.publishFixtureSnapshot(request.payload.target, request.payload.messages);
+              if (result.kind !== "fixture_snapshot_published") throw new Error("Broker refused fixture snapshot");
+              kind = "fixture_snapshot_published";
               payload = result.payload;
             }
           } catch {

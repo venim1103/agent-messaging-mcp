@@ -110,3 +110,51 @@ test("authenticated relay alone approves a selected fixture and only its MCP own
     ...envelope, deadlineMs: 70_000, kind: "error", payload: { code: "APPROVAL_INVALID" }
   });
 });
+
+test("a relay publishes bounded fixture rows but only the owning facade reads an approved snapshot", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("approved client");
+  const stranger = Symbol("other client");
+  const pending = requests.create(owner, 1000);
+  const target = {
+    origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42"
+  };
+  const envelope = {
+    protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+    connectionGeneration: 0, deadlineMs: 10_000
+  };
+  const messages = [
+    { id: "fixture-1", direction: "incoming", text: "First" },
+    { id: "fixture-2", direction: "outgoing", text: "Second" }
+  ];
+  const publish = { ...envelope, kind: "publish_fixture_snapshot", payload: { target, messages } };
+  assert.deepEqual(handleBrokerRequest(publish, "facade", owner, requests, 2000).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2000).payload, { count: 0 });
+  const grant = requests.approve(pending.requestId, target, 2000)!;
+  const read = { ...envelope, kind: "read_fixture_snapshot", payload: { connectionId: grant.connectionId } };
+  assert.deepEqual(handleBrokerRequest(read, "facade", owner, requests, 2000).payload,
+    { code: "OBSERVATION_UNAVAILABLE" });
+  assert.deepEqual(handleBrokerRequest(read, "relay", stranger, requests, 2000).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest(read, "facade", stranger, requests, 2000).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+  assert.deepEqual(handleBrokerRequest({ ...publish, payload: { ...publish.payload, target: { ...target, tabId: 4 } } },
+    "relay", stranger, requests, 2001).payload, { count: 0 });
+  assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2001).payload, { count: 1 });
+  const snapshot = handleBrokerRequest({ ...read, payload: { ...read.payload, limit: 1 } }, "facade", owner, requests, 2001);
+  assert.equal(snapshot.kind, "fixture_snapshot");
+  if (snapshot.kind !== "fixture_snapshot") throw new Error("Expected a fixture snapshot");
+  assert.deepEqual(snapshot.payload.messages, [messages[1]]);
+  assert.equal(snapshot.payload.omittedBefore, true);
+  assert.equal(snapshot.payload.coverage, "rendered_only");
+  assert.equal(snapshot.payload.capturedAt, 2001);
+  assert.throws(() => handleBrokerRequest({ ...publish, payload: { ...publish.payload, selector: "*" } },
+    "relay", stranger, requests, 2001));
+  assert.throws(() => handleBrokerRequest({ ...read, payload: { ...read.payload, limit: 33 } },
+    "facade", owner, requests, 2001));
+  requests.revokeAllFixtures();
+  assert.deepEqual(handleBrokerRequest(read, "facade", owner, requests, 2002).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+});

@@ -22,7 +22,7 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     await client.connect(transport);
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
-      "browser_chat_feasibility", "chat.request_connection", "chat.get_connection"
+      "browser_chat_feasibility", "chat.request_connection", "chat.get_connection", "chat.read_messages"
     ]);
 
     const result = await client.callTool({ name: "browser_chat_feasibility", arguments: {} });
@@ -71,6 +71,11 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal(created.isError, undefined);
     const handle = created.structuredContent as { requestId: string; state: string; expiresAt: number };
     assert.equal(handle.state, "pending");
+    const pendingRead = await clientOne.callTool({ name: "chat.read_messages", arguments: {
+      connectionId: "a66b3997-9d43-4554-8399-267d1fe9f75c"
+    } });
+    assert.equal(pendingRead.isError, true);
+    assert.match(pendingRead.content[0]?.type === "text" ? pendingRead.content[0].text : "", /CONNECTION_NOT_FOUND/);
 
     await clientTwo.connect(new StdioClientTransport(options));
     const hidden = await clientTwo.callTool({ name: "chat.get_connection", arguments: { requestId: handle.requestId } });
@@ -79,18 +84,39 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.deepEqual(own.structuredContent, handle);
 
     const relay = await connectBroker("relay", brokerDirectory);
-    const approved = await relay.approveFixture(handle.requestId, {
+    const target = {
       origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
       documentId: "CHROME-doc_opaque-42"
-    });
+    } as const;
+    const approved = await relay.approveFixture(handle.requestId, target);
     assert.equal(approved.kind, "fixture_approved");
-    relay.close();
     const readyState = await clientOne.callTool({ name: "chat.get_connection", arguments: { requestId: handle.requestId } });
     assert.equal(readyState.isError, undefined);
     const readyContent = readyState.structuredContent;
     assert.ok(readyContent && typeof readyContent === "object" && !Array.isArray(readyContent));
     assert.equal((readyContent as { state: string }).state, "ready_readonly");
     assert.equal("tabId" in readyContent, false);
+    const connectionId = (readyContent as { connectionId: string }).connectionId;
+    const notObserved = await clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId } });
+    assert.equal(notObserved.isError, true);
+    assert.match(notObserved.content[0]?.type === "text" ? notObserved.content[0].text : "",
+      /OBSERVATION_UNAVAILABLE/);
+    const hiddenRead = await clientTwo.callTool({ name: "chat.read_messages", arguments: { connectionId } });
+    assert.equal(hiddenRead.isError, true);
+    assert.match(hiddenRead.content[0]?.type === "text" ? hiddenRead.content[0].text : "", /CONNECTION_NOT_FOUND/);
+    const messages = [{ id: "fixture-1", direction: "incoming" as const, text: "Synthetic fixture message" }];
+    assert.deepEqual((await relay.publishFixtureSnapshot(target, messages)).payload, { count: 1 });
+    const snapshot = await clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId, limit: 1 } });
+    assert.equal(snapshot.isError, undefined);
+    assert.ok(snapshot.structuredContent && typeof snapshot.structuredContent === "object");
+    assert.deepEqual((snapshot.structuredContent as { messages: unknown }).messages, messages);
+    assert.equal((snapshot.structuredContent as { coverage: string }).coverage, "rendered_only");
+    assert.equal((snapshot.structuredContent as { omittedBefore: boolean }).omittedBefore, false);
+    assert.deepEqual((await relay.revokeFixture(3, null)).payload, { count: 1 });
+    const staleRead = await clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId } });
+    assert.equal(staleRead.isError, true);
+    assert.match(staleRead.content[0]?.type === "text" ? staleRead.content[0].text : "", /CONNECTION_NOT_FOUND/);
+    relay.close();
     assert.deepEqual((await clientTwo.callTool({
       name: "chat.get_connection", arguments: { requestId: handle.requestId }
     })).structuredContent, { state: "unknown" });

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
+import { captureFixtureSnapshot, observeFixtureMessages } from "../../packages/extension/lib/fixture-observation.ts";
 import { createFixtureServer } from "../fixtures/server.mjs";
 
 test("browser input reaches the rich editor without accepting synthetic input", async () => {
@@ -49,5 +51,47 @@ test("browser input reaches the rich editor without accepting synthetic input", 
     await browser?.close();
     server.close();
     await once(server, "close");
+  }
+});
+
+test("fixture observation captures bounded rows and notices changes without reading another chat", async () => {
+  const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
+      status: 200, contentType: "text/html", body: html
+    }));
+    await page.goto("http://127.0.0.1:8787/");
+    assert.deepEqual(await page.evaluate(captureFixtureSnapshot), { messages: [
+      { id: "fixture-1", direction: "incoming", text: "Can you read this message?" },
+      { id: "fixture-2", direction: "outgoing", text: "Yes. This is a local test conversation." }
+    ] });
+    await page.evaluate(() => {
+      window.fixtureNotifications = [];
+      window.chrome = { runtime: { sendMessage: (message) => {
+        window.fixtureNotifications.push(message);
+        return Promise.resolve();
+      } } };
+    });
+    assert.equal(await page.evaluate(observeFixtureMessages), true);
+    await page.getByRole("textbox", { name: "Message" }).fill("Third message");
+    await page.getByRole("button", { name: "Send" }).click();
+    await page.waitForFunction(() => window.fixtureNotifications.length > 0);
+    assert.equal((await page.evaluate(captureFixtureSnapshot)).messages[2].text, "Third message");
+    await page.locator('li[data-message-id="fixture-3"]').evaluate((row) => {
+      row.dataset.messageId = "fixture-2";
+    });
+    assert.equal(await page.evaluate(captureFixtureSnapshot), null);
+    await page.getByRole("button", { name: "Switch chat" }).click();
+    assert.equal(await page.evaluate(captureFixtureSnapshot), null);
+    await page.goto("http://127.0.0.1:8787/");
+    await page.locator("ol#messages").evaluate((timeline) => timeline.insertAdjacentHTML("beforeend",
+      '<li data-message-id="large" data-direction="incoming"><p>' + "x".repeat(2049) + "</p></li>"));
+    assert.equal(await page.evaluate(captureFixtureSnapshot), null);
+    await page.goto("about:blank");
+    assert.equal(await page.evaluate(captureFixtureSnapshot), null);
+  } finally {
+    await browser.close();
   }
 });

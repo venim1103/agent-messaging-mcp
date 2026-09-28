@@ -80,12 +80,33 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     const anotherState = await facade.getConnection(another.payload.requestId);
     if (anotherState.kind !== "connection_state") throw new Error("Expected another owned connection");
     assert.equal(anotherState.payload.state, "ready_readonly");
+    if (anotherState.payload.state !== "ready_readonly") throw new Error("Expected an approved fixture handle");
+    const connectionId = anotherState.payload.connectionId;
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 4, documentId: "CHROME-doc_opaque-42" };
+    const messages = [{ id: "fixture-1", direction: "incoming" as const, text: "Fixture row" }];
+    assert.throws(() => facade.publishFixtureSnapshot(target, messages), /Broker role cannot perform/);
+    assert.throws(() => relay.readFixtureSnapshot(connectionId), /Broker role cannot perform/);
+    assert.deepEqual((await facade.readFixtureSnapshot(connectionId)).payload,
+      { code: "OBSERVATION_UNAVAILABLE" });
+    assert.deepEqual((await otherFacade.readFixtureSnapshot(connectionId)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    const published = await relay.publishFixtureSnapshot(target, messages);
+    assert.equal(published.kind, "fixture_snapshot_published");
+    assert.deepEqual(published.payload, { count: 1 });
+    const snapshot = await facade.readFixtureSnapshot(connectionId);
+    if (snapshot.kind !== "fixture_snapshot") throw new Error("Expected a fixture snapshot");
+    assert.deepEqual(snapshot.payload.messages, messages);
+    assert.equal(snapshot.payload.coverage, "rendered_only");
+    assert.equal(snapshot.payload.cursor.sequence, 1);
     assert.throws(() => facade.revokeAllFixtures(), /Broker role cannot perform/);
     const reset = await relay.revokeAllFixtures();
     assert.equal(reset.kind, "fixture_revoked");
     assert.deepEqual(reset.payload, { count: 1 });
     assert.deepEqual((await facade.getConnection(another.payload.requestId)).payload,
       { requestId: another.payload.requestId, state: "stale" });
+    assert.deepEqual((await facade.readFixtureSnapshot(connectionId)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
     otherFacade.close();
     facade.close();
     assert.deepEqual((await relay.listPending() as typeof listed).payload.requests, []);

@@ -1,4 +1,5 @@
 import * as z from "zod/v4";
+import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES } from "./pending-connections.js";
 
 export const NATIVE_HOST_NAME = "com.agent_messaging_mcp.bridge";
 export const PROTOCOL_VERSION = 1;
@@ -26,6 +27,34 @@ const fixtureApprovalSchema = z.strictObject({
     })
   })
 });
+
+const fixtureSnapshotSchema = z.strictObject({
+  kind: z.literal("publish_fixture_snapshot"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({
+    target: z.strictObject({
+      origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
+      tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
+    }),
+    messages: z.array(z.strictObject({
+      id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+      direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
+    })).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
+  })
+});
+
+export function parseNativeFixtureSnapshot(message: unknown, now = Date.now()) {
+  const result = fixtureSnapshotSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || Buffer.byteLength(JSON.stringify(result.data.payload.messages), "utf8") > MAX_FIXTURE_SNAPSHOT_BYTES
+    || new Set(result.data.payload.messages.map((entry) => entry.id)).size !== result.data.payload.messages.length) {
+    throw new Error("Invalid native fixture snapshot");
+  }
+  return result.data;
+}
 
 const fixtureRevocationSchema = z.strictObject({
   kind: z.literal("revoke_fixture"),

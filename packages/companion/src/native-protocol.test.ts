@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureReset,
-  parseNativeFixtureRevocation, parseNativePendingList, PROTOCOL_VERSION }
+  parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList, PROTOCOL_VERSION }
   from "./native-protocol.js";
 
 const origin = `chrome-extension://${"a".repeat(32)}/`;
@@ -119,6 +119,31 @@ test("native fixture reset accepts only a bounded empty-payload command", () => 
   }
 });
 
+test("native fixture snapshots accept only bounded rows from the exact local fixture", () => {
+  const snapshot = { ...request, kind: "publish_fixture_snapshot", payload: {
+    target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "CHROME-doc_opaque-42" },
+    messages: [{ id: "fixture-1", direction: "incoming", text: "First" }]
+  } };
+  assert.deepEqual(parseNativeFixtureSnapshot(snapshot, now), snapshot);
+  for (const invalid of [
+    { ...snapshot, kind: "evaluate" },
+    { ...snapshot, deadlineMs: now },
+    { ...snapshot, payload: { ...snapshot.payload, selector: "*" } },
+    { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target,
+      origin: "https://gemini.google.com" } } },
+    { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target, documentId: "" } } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [...snapshot.payload.messages, snapshot.payload.messages[0]] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ ...snapshot.payload.messages[0], text: "x".repeat(2049) }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ id: "fixture-1", direction: "system", text: "No" }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: Array.from({ length: 32 }, (_, index) => ({
+      id: `fixture-${index}`, direction: "incoming", text: "é".repeat(2048)
+    })) } }
+  ]) {
+    assert.throws(() => parseNativeFixtureSnapshot(invalid, now), /Invalid native fixture snapshot/);
+  }
+});
+
 test("spawned native relay replies with a framed version and no other stdout", async () => {
   const host = spawn(process.execPath, [new URL("./native-relay.js", import.meta.url).pathname, origin, origin], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -221,6 +246,31 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const granted = await facade.getConnection(created.payload.requestId);
     if (granted.kind !== "connection_state") throw new Error("Expected owned connection state");
     assert.equal(granted.payload.state, "ready_readonly");
+    if (granted.payload.state !== "ready_readonly") throw new Error("Expected approved fixture handle");
+
+    const publicationHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const publicationOutput: Buffer[] = [];
+    const publicationErrors: Buffer[] = [];
+    publicationHost.stdout.on("data", (chunk: Buffer) => publicationOutput.push(chunk));
+    publicationHost.stderr.on("data", (chunk: Buffer) => publicationErrors.push(chunk));
+    const publication = { ...request, kind: "publish_fixture_snapshot", deadlineMs: Date.now() + 10_000, payload: {
+      target: approval.payload.target,
+      messages: [{ id: "fixture-1", direction: "incoming", text: "Can you read this message?" }]
+    } };
+    publicationHost.stdin.end(encodeNativeFrame(publication));
+    const [publicationExit] = await once(publicationHost, "exit");
+    assert.equal(publicationExit, 0, Buffer.concat(publicationErrors).toString());
+    const [published] = new NativeFrameDecoder().push(Buffer.concat(publicationOutput)) as [{
+      kind: string; requestId: string; payload: { count: number }
+    }];
+    assert.equal(published.kind, "fixture_snapshot_published");
+    assert.equal(published.requestId, publication.requestId);
+    assert.deepEqual(published.payload, { count: 1 });
+    const snapshot = await facade.readFixtureSnapshot(granted.payload.connectionId);
+    if (snapshot.kind !== "fixture_snapshot") throw new Error("Expected a published fixture snapshot");
+    assert.deepEqual(snapshot.payload.messages, publication.payload.messages);
 
     const revokeHost = spawn(process.execPath, [relayEntry, origin, origin], {
       stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
@@ -243,6 +293,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const stale = await facade.getConnection(created.payload.requestId);
     if (stale.kind !== "connection_state") throw new Error("Expected revoked connection state");
     assert.deepEqual(stale.payload, { requestId: created.payload.requestId, state: "stale" });
+    assert.deepEqual((await facade.readFixtureSnapshot(granted.payload.connectionId)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
 
     const fresh = await facade.requestConnection();
     if (fresh.kind !== "connection_requested") throw new Error("Expected new pending request");

@@ -60,6 +60,21 @@ server.registerTool("chat.get_connection", {
   }
 });
 
+server.registerTool("chat.read_messages", {
+  description: "Read the latest rendered-only local fixture snapshot for an owned connection. This is a cached observation, not a live Gemini read or complete chat history.",
+  inputSchema: z.object({ connectionId: z.uuid(), limit: z.number().int().min(1).max(32).optional() }).strict(),
+  annotations: { readOnlyHint: true }
+}, async ({ connectionId, limit }) => {
+  try {
+    const result = await (await pendingBroker()).readFixtureSnapshot(connectionId, limit);
+    if (result.kind === "error") return blocked(result.payload.code);
+    if (result.kind !== "fixture_snapshot") return unavailable();
+    return { content: [{ type: "text", text: JSON.stringify(result.payload) }], structuredContent: result.payload };
+  } catch {
+    return unavailable();
+  }
+});
+
 server.connect(new StdioServerTransport()).catch((error: unknown) => {
   process.stderr.write(`${error instanceof Error ? error.message : "MCP stdio connection failed"}\n`);
   process.exitCode = 1;
