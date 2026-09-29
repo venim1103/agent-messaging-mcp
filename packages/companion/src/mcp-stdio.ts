@@ -119,7 +119,7 @@ server.registerTool("chat.wait_for_events", {
 });
 
 server.registerTool("chat.disconnect", {
-  description: "Revoke an owned local fixture connection without closing its browser tab. Pending reads are cancelled and subsequent access is denied.",
+  description: "Revoke an owned read-only browser-chat connection without closing its tab. Pending reads are cancelled and subsequent access is denied.",
   inputSchema: z.object({ connectionId: z.uuid() }).strict()
 }, async ({ connectionId }) => {
   try {
