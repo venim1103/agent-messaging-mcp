@@ -109,13 +109,19 @@ test("native Gemini approval accepts only one exact saved chat target", () => {
       url: "https://gemini.google.com/app/disposable-chat", tabId: 3, documentId: "CHROME-doc_gemini-42" }
   } };
   assert.deepEqual(parseNativeGeminiApproval(approval, now), approval);
+  const queryApproval = { ...approval, payload: { ...approval.payload, target: {
+    ...approval.payload.target, url: `${approval.payload.target.url}?hl=en`
+  } } };
+  assert.deepEqual(parseNativeGeminiApproval(queryApproval, now), queryApproval);
   for (const invalid of [
     { ...approval, kind: "evaluate" },
     { ...approval, deadlineMs: now },
     { ...approval, payload: { ...approval.payload, selector: "*" } },
     { ...approval, payload: { target: { ...approval.payload.target, origin: "http://127.0.0.1:8787" } } },
     { ...approval, payload: { target: { ...approval.payload.target, url: "https://gemini.google.com/app/other" } } },
-    { ...approval, payload: { target: { ...approval.payload.target, url: `${approval.payload.target.url}?hl=en` } } },
+    { ...approval, payload: { target: { ...approval.payload.target, url: `${approval.payload.target.url}#reply` } } },
+    { ...approval, payload: { target: { ...approval.payload.target,
+      url: `${approval.payload.target.url}?hl=${"x".repeat(512)}` } } },
     { ...approval, payload: { target: { ...approval.payload.target, documentId: "" } } },
     { ...approval, payload: { target: { ...approval.payload.target, tabId: 0 } } },
     { ...approval, payload: { target: { ...approval.payload.target, selector: "*" } } }
@@ -487,7 +493,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const geminiApproval = { ...request, kind: "approve_gemini", deadlineMs: Date.now() + 10_000, payload: {
       pendingRequestId: geminiPending.payload.requestId,
       target: { origin: "https://gemini.google.com", conversationId: "disposable-chat",
-        url: "https://gemini.google.com/app/disposable-chat", tabId: 6, documentId: "CHROME-doc_gemini-42" }
+        url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 6, documentId: "CHROME-doc_gemini-42" }
     } };
     geminiHost.stdin.end(Buffer.concat([encodeNativeFrame(geminiApproval), encodeNativeFrame(geminiApproval)]));
     const [geminiExit] = await once(geminiHost, "exit");

@@ -270,7 +270,7 @@ export class PendingConnectionRequests {
     try {
       const url = new URL(target.url);
       const route = url.pathname.split("/").filter(Boolean);
-      if (url.origin !== target.origin || url.username || url.password || url.search || url.hash
+      if (url.origin !== target.origin || url.username || url.password || url.hash
         || url.href !== target.url || route.length !== 2
         || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))
         || route[1] !== target.conversationId) return null;

@@ -1,10 +1,22 @@
 export type GeminiRenderedMessage = { direction: "incoming" | "outgoing"; text: string };
 
+export function isEligibleGeminiUrl(href: string): boolean {
+  try {
+    const url = new URL(href);
+    const route = url.pathname.split("/").filter(Boolean);
+    return url.href === href && url.origin === "https://gemini.google.com"
+      && url.href.length <= 512 && !url.username && !url.password && !url.hash
+      && route.length === 2 && route.every((segment) => /^[A-Za-z0-9_-]{1,128}$/.test(segment));
+  } catch {
+    return false;
+  }
+}
+
 export function identifyGeminiConversation(): { conversationId: string; url: string } | null {
   if (location.origin !== "https://gemini.google.com") return null;
   const url = new URL(location.href);
   const route = url.pathname.split("/").filter(Boolean);
-  if (url.search || url.hash || route.length !== 2
+  if (url.href.length > 512 || url.username || url.password || url.hash || route.length !== 2
     || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return null;
   const visible = (element: HTMLElement) => element.getClientRects().length > 0;
   const regions = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);

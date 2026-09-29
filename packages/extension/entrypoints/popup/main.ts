@@ -1,6 +1,6 @@
 import { browser } from "wxt/browser";
 import { geminiDraftText } from "../../lib/approved-probe";
-import { captureGeminiSnapshot } from "../../lib/gemini-observation";
+import { captureGeminiSnapshot, isEligibleGeminiUrl } from "../../lib/gemini-observation";
 
 type FixturePreview = {
   conversationId: string;
@@ -99,9 +99,7 @@ if (!inspectButton || !pendingButton || !fixtureInputButton || !geminiDraftRevie
 let selectedGeminiTab: { id: number; url: string } | null = null;
 void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   const url = tab?.url ? new URL(tab.url) : null;
-  const route = url?.pathname.split("/").filter(Boolean) ?? [];
-  const selectedSavedGemini = url?.origin === geminiOrigin && !url.search && !url.hash
-    && route.length === 2 && route.every((segment) => /^[A-Za-z0-9_-]{1,128}$/.test(segment));
+  const selectedSavedGemini = tab?.url ? isEligibleGeminiUrl(tab.url) : false;
   pendingButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
   pendingTarget.textContent = selectedSavedGemini
     ? "Read-only target: selected Gemini conversation" : "Read-only target: local fixture / fixture-alpha";
@@ -271,8 +269,19 @@ inspectButton.addEventListener("click", async () => {
       }
 
       conversation.textContent = "Gemini structure (not connected)";
+      const selectedUrl = new URL(tab.url);
+      const selectedRoute = selectedUrl.pathname.split("/").filter(Boolean);
+      const approvalRouteIssues = [
+        selectedUrl.href.length > 512 ? "URL too long" : null,
+        selectedUrl.username || selectedUrl.password ? "embedded credentials unsupported" : null,
+        selectedUrl.hash ? "fragment present" : null,
+        selectedRoute.length !== 2 ? "not a saved-chat route" : null,
+        selectedRoute.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment)) ? "route shape unsupported" : null
+      ].filter((issue): issue is string => issue !== null);
       const details: [string, string][] = [
         ["Route", `${preview.routeDepth} path segments (values omitted)`],
+        ["Approval route", approvalRouteIssues.length ? approvalRouteIssues.join(", ")
+          : selectedUrl.search ? "Eligible saved-chat URL (query bound exactly)" : "Eligible saved-chat URL"],
         ["Regions", `${preview.mainRegions} main, ${preview.timelineCount} candidate chat timelines`],
         ["Editors", preview.editors.map((editor) => `${editor.tag}: ${editor.isPrompt ? "Gemini prompt" : "other editor"}`).join("\n") || "None visible"],
         ["Rendered rows", preview.timelineCount === 1

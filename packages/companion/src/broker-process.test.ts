@@ -173,7 +173,7 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     const geminiPending = await facade.requestConnection();
     if (geminiPending.kind !== "connection_requested") throw new Error("Expected a Gemini pending request");
     const geminiTarget = { origin: "https://gemini.google.com" as const,
-      conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat",
+      conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat?hl=en",
       tabId: 6, documentId: "CHROME-doc_gemini-42" };
     assert.throws(() => facade.approveGemini(geminiPending.payload.requestId, geminiTarget),
       /Broker role cannot perform/);

@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
-import { captureGeminiSnapshot, identifyGeminiConversation, observeGeminiIdentity }
+import { captureGeminiSnapshot, identifyGeminiConversation, isEligibleGeminiUrl, observeGeminiIdentity }
   from "../../packages/extension/lib/gemini-observation.ts";
+
+test("Gemini URL eligibility accepts bounded saved chats and rejects unsupported shapes", () => {
+  const saved = "https://gemini.google.com/app/disposable-chat";
+  assert.equal(isEligibleGeminiUrl(saved), true);
+  assert.equal(isEligibleGeminiUrl(`${saved}?hl=en`), true);
+  assert.equal(isEligibleGeminiUrl(`${saved}#reply`), false);
+  assert.equal(isEligibleGeminiUrl(`${saved}?hl=${"x".repeat(512)}`), false);
+  assert.equal(isEligibleGeminiUrl("https://gemini.google.com/app/other?hl=en"), true);
+  assert.equal(isEligibleGeminiUrl("https://gemini.google.com/app?hl=en"), false);
+  assert.equal(isEligibleGeminiUrl("https://example.com/app/disposable-chat?hl=en"), false);
+});
 
 test("reviewed Gemini parser captures only bounded visible message content", async () => {
   const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
@@ -55,7 +66,22 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
     assert.equal(await page.evaluate(captureGeminiSnapshot), null);
     assert.equal(await page.evaluate(identifyGeminiConversation), null);
     await page.goto("https://gemini.google.com/app/disposable-chat?hl=en");
-    assert.equal(await page.evaluate(identifyGeminiConversation), null);
+    assert.deepEqual(await page.evaluate(identifyGeminiConversation), {
+      conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat?hl=en"
+    });
+    await page.evaluate(() => {
+      window.identityNotifications = [];
+      window.chrome = { runtime: { sendMessage: (message) => {
+        window.identityNotifications.push(message);
+        return Promise.resolve();
+      } } };
+    });
+    assert.equal(await page.evaluate(observeGeminiIdentity,
+      "https://gemini.google.com/app/disposable-chat?hl=en"), true);
+    await page.evaluate(() => history.replaceState({}, "", "?hl=fr"));
+    await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = "Updated"; });
+    await page.waitForFunction(() => window.identityNotifications.length === 1);
+    assert.deepEqual(await page.evaluate(() => window.identityNotifications), [{ kind: "gemini_identity_changed" }]);
     await page.goto("https://gemini.google.com/app/disposable-chat#reply");
     assert.equal(await page.evaluate(identifyGeminiConversation), null);
     await page.goto("https://gemini.google.com/app/disposable-chat");

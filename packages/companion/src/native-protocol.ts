@@ -75,7 +75,7 @@ export function parseNativeGeminiApproval(message: unknown, now = Date.now()) {
     const url = new URL(target.url);
     const route = url.pathname.split("/").filter(Boolean);
     if (url.href !== target.url || url.origin !== target.origin || url.username || url.password
-      || url.search || url.hash || route.length !== 2 || route[1] !== target.conversationId
+      || url.hash || route.length !== 2 || route[1] !== target.conversationId
       || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) {
       throw new Error("Invalid native Gemini approval");
     }

@@ -304,7 +304,8 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
     conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat",
     tabId: 4, documentId: "CHROME-doc_gemini-42" };
   assert.equal(requests.approveGemini(pending.requestId, { ...target, origin: "http://127.0.0.1:8787" as never }, 2000), null);
-  assert.equal(requests.approveGemini(pending.requestId, { ...target, url: `${target.url}?hl=en` }, 2000), null);
+  assert.equal(requests.approveGemini(pending.requestId, { ...target,
+    url: `${target.url}?hl=${"x".repeat(512)}` }, 2000), null);
   assert.equal(requests.approveGemini(pending.requestId, { ...target, url: `${target.url}#conversation` }, 2000), null);
   assert.equal(requests.approveGemini(pending.requestId, { ...target, conversationId: "another-chat" }, 2000), null);
   assert.equal(requests.approveGemini(pending.requestId, { ...target, documentId: "" }, 2000), null);
@@ -324,6 +325,12 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   assert.equal(requests.approveGemini(pending.requestId, target, 2000), null);
   assert.equal(requests.revokeChangedTab(4, { documentId: "another-document", conversationId: target.conversationId }), 1);
   assert.deepEqual(requests.get(owner, pending.requestId, 2001), { requestId: pending.requestId, state: "stale" });
+  const queryPending = requests.create(owner, 1000);
+  const queryTarget = { ...target, url: `${target.url}?hl=en` };
+  const queryGrant = requests.approveGemini(queryPending.requestId, queryTarget, 2000);
+  assert.equal(queryGrant?.state, "ready_readonly");
+  assert.equal("url" in queryGrant!, false);
+  assert.deepEqual(requests.get(owner, queryPending.requestId, 2000)?.state, "ready_readonly");
   assert.equal(requests.approveGemini(requests.create(owner, 1000).requestId, target, 61_000), null);
 });
 
