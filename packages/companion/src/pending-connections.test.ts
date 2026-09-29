@@ -388,6 +388,8 @@ test("fresh Gemini challenges require the exact owner, URL and document and cann
   assert.equal(requests.requestFreshGeminiRead(owner, pending.requestId, 2000), null);
   const grant = requests.approveGemini(pending.requestId, target, 2000)!;
   assert.equal(requests.requestFreshGeminiRead(stranger, grant.connectionId, 2001), null);
+  assert.deepEqual(requests.listActiveGeminiTabIds(2001), [4]);
+  assert.deepEqual(requests.listActiveFixtureTabIds(2001), []);
   assert.equal(requests.publishGeminiSnapshot(target, rows, 2001), 1);
   const reading = requests.requestFreshGeminiRead(owner, grant.connectionId, 2002);
   if (!reading || reading === "busy") throw new Error("Expected a Gemini read challenge");
@@ -418,6 +420,7 @@ test("fresh Gemini challenges require the exact owner, URL and document and cann
   if (!cancelled || cancelled === "busy") throw new Error("Expected a cancellable Gemini challenge");
   assert.equal(requests.disconnectFixture(owner, grant.connectionId, 2007), true);
   assert.equal(await cancelled.result, null);
+  assert.deepEqual(requests.listActiveGeminiTabIds(2007), []);
   assert.equal(requests.getGeminiSnapshot(owner, grant.connectionId, 2007), null);
   assert.equal(requests.requestFreshGeminiRead(owner, grant.connectionId, 2007), null);
 });

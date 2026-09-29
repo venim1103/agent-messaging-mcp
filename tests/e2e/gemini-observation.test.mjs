@@ -69,6 +69,8 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
     assert.deepEqual(await page.evaluate(identifyGeminiConversation), {
       conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat?hl=en"
     });
+    const exactUrl = page.url();
+    assert.equal((await page.evaluate(captureGeminiSnapshot, exactUrl))?.messages.length, 3);
     await page.evaluate(() => {
       window.identityNotifications = [];
       window.chrome = { runtime: { sendMessage: (message) => {
@@ -79,11 +81,13 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
     assert.equal(await page.evaluate(observeGeminiIdentity,
       "https://gemini.google.com/app/disposable-chat?hl=en"), true);
     await page.evaluate(() => history.replaceState({}, "", "?hl=fr"));
+    assert.equal(await page.evaluate(captureGeminiSnapshot, exactUrl), null);
     await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = "Updated"; });
     await page.waitForFunction(() => window.identityNotifications.length === 1);
     assert.deepEqual(await page.evaluate(() => window.identityNotifications), [{ kind: "gemini_identity_changed" }]);
     await page.goto("https://gemini.google.com/app/disposable-chat#reply");
     assert.equal(await page.evaluate(identifyGeminiConversation), null);
+    assert.equal(await page.evaluate(captureGeminiSnapshot), null);
     await page.goto("https://gemini.google.com/app/disposable-chat");
     await page.reload();
     await page.locator("model-response-content p").evaluate((paragraph) => {

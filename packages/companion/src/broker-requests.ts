@@ -38,6 +38,9 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("read_gemini_snapshot"), payload: z.strictObject({
     connectionId: z.uuid(), limit: z.number().int().min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES).optional()
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("read_approved_snapshot"), payload: z.strictObject({
+    connectionId: z.uuid(), limit: z.number().int().min(1).max(32).optional()
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("read_fixture_events"), payload: z.strictObject({
     connectionId: z.uuid(), cursor: z.strictObject({
       epoch: z.uuid(), sequence: z.number().int().safe().nonnegative()
@@ -101,7 +104,8 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   if (request.kind === "list_gemini_read_challenges") {
     return role === "relay"
       ? { ...response, kind: "gemini_read_challenges" as const,
-        payload: { challenges: requests.listGeminiReadChallenges(now) } }
+        payload: { challenges: requests.listGeminiReadChallenges(now),
+          activeTabIds: requests.listActiveGeminiTabIds(now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "approve_fixture") {
@@ -165,6 +169,15 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       ? { ...response, kind: "gemini_read_authorized" as const, payload: {
         connectionId: request.payload.connectionId, limit: request.payload.limit ?? MAX_GEMINI_SNAPSHOT_MESSAGES
       } }
+      : { ...response, kind: "error" as const, payload: { code: "CONNECTION_NOT_FOUND" } };
+  }
+  if (request.kind === "read_approved_snapshot") {
+    const target = requests.getApprovedTarget(owner, request.payload.connectionId, now)
+      ?? requests.getGeminiTarget(owner, request.payload.connectionId, now);
+    return target
+      ? { ...response, kind: target.origin === "http://127.0.0.1:8787"
+        ? "fixture_read_authorized" as const : "gemini_read_authorized" as const,
+        payload: { connectionId: request.payload.connectionId, limit: request.payload.limit ?? 32 } }
       : { ...response, kind: "error" as const, payload: { code: "CONNECTION_NOT_FOUND" } };
   }
   if (request.kind === "read_fixture_events") {

@@ -618,9 +618,10 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const [geminiChallengeExit] = await once(geminiChallengeHost, "exit");
     assert.equal(geminiChallengeExit, 0, Buffer.concat(geminiChallengeErrors).toString());
     const [geminiChallengeReply] = new NativeFrameDecoder().push(Buffer.concat(geminiChallengeOutput)) as [{
-      kind: string; payload: { challenges: { challengeId: string; target: unknown }[] }
+      kind: string; payload: { challenges: { challengeId: string; target: unknown }[]; activeTabIds: number[] }
     }];
     assert.equal(geminiChallengeReply.kind, "gemini_read_challenges");
+    assert.deepEqual(geminiChallengeReply.payload.activeTabIds, [6]);
     const [geminiChallenge] = geminiChallengeReply.payload.challenges;
     assert.ok(geminiChallenge?.challengeId);
     assert.deepEqual(geminiChallenge.target, geminiPublication.payload.target);

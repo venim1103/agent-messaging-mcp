@@ -183,6 +183,61 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
       connectionId, cursor, timeoutMs: 0
     } });
     assert.equal(staleEvents.isError, true);
+
+    const geminiRequested = await clientOne.callTool({ name: "chat.request_connection", arguments: {} });
+    const geminiHandle = geminiRequested.structuredContent as { requestId: string };
+    const geminiTarget = { origin: "https://gemini.google.com" as const,
+      conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat?hl=en",
+      tabId: 5, documentId: "CHROME-doc_gemini-42" };
+    assert.equal((await relay.approveGemini(geminiHandle.requestId, geminiTarget)).kind, "gemini_approved");
+    const geminiReady = await clientOne.callTool({ name: "chat.get_connection", arguments: {
+      requestId: geminiHandle.requestId
+    } });
+    const geminiConnection = geminiReady.structuredContent as { connectionId: string; origin: string };
+    assert.equal(geminiConnection.origin, "https://gemini.google.com");
+    assert.equal("url" in geminiConnection, false);
+    const hiddenGemini = await clientTwo.callTool({ name: "chat.read_messages", arguments: {
+      connectionId: geminiConnection.connectionId
+    } });
+    assert.equal(hiddenGemini.isError, true);
+    const geminiReading = clientOne.callTool({ name: "chat.read_messages", arguments: {
+      connectionId: geminiConnection.connectionId, limit: 1
+    } });
+    let geminiChallengeId: string | undefined;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const listed = await relay.listGeminiReadChallenges();
+      if (listed.kind !== "gemini_read_challenges") throw new Error("Expected Gemini read challenges");
+      const [challenge] = listed.payload.challenges;
+      if (challenge) {
+        assert.deepEqual(challenge.target, geminiTarget);
+        geminiChallengeId = challenge.challengeId;
+        break;
+      }
+      await setTimeout(10);
+    }
+    assert.ok(geminiChallengeId, "MCP Gemini read did not issue an owner-bound challenge");
+    const geminiRows = [{ direction: "outgoing" as const, text: "Synthetic question" },
+      { direction: "incoming" as const, text: "Synthetic answer" }];
+    assert.deepEqual((await relay.publishGeminiSnapshot({ ...geminiTarget, url: `${geminiTarget.url}&changed=1` },
+      geminiRows, geminiChallengeId)).payload, { count: 0 });
+    assert.deepEqual((await relay.publishGeminiSnapshot(geminiTarget, geminiRows, geminiChallengeId)).payload,
+      { count: 1 });
+    const geminiSnapshot = await geminiReading;
+    assert.equal(geminiSnapshot.isError, undefined);
+    assert.deepEqual((geminiSnapshot.structuredContent as { messages: unknown }).messages, [{
+      direction: "incoming", text: "Synthetic answer", identityQuality: "uncertain", generationState: "unknown"
+    }]);
+    assert.equal((geminiSnapshot.structuredContent as { coverage: string }).coverage, "rendered_only");
+    assert.equal((geminiSnapshot.structuredContent as { omittedBefore: boolean }).omittedBefore, true);
+    assert.equal("url" in (geminiSnapshot.structuredContent as object), false);
+    assert.deepEqual((await clientOne.callTool({ name: "chat.disconnect", arguments: {
+      connectionId: geminiConnection.connectionId
+    } })).structuredContent, { disconnected: true });
+    const afterGeminiDisconnect = await clientOne.callTool({ name: "chat.read_messages", arguments: {
+      connectionId: geminiConnection.connectionId
+    } });
+    assert.equal(afterGeminiDisconnect.isError, true);
+
     const next = await clientOne.callTool({ name: "chat.request_connection", arguments: {} });
     const pendingDisconnect = next.structuredContent as { requestId: string };
     await relay.approveFixture(pendingDisconnect.requestId, { ...target, tabId: 4 });

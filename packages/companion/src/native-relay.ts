@@ -61,7 +61,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             }; expiresAt: number }>; activeTabIds: ReadonlyArray<number> }
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
               origin: string; conversationId: string; url: string; tabId: number; documentId: string
-            }; expiresAt: number }> }
+            }; expiresAt: number }>; activeTabIds: ReadonlyArray<number> }
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"));

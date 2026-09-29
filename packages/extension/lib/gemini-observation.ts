@@ -48,9 +48,12 @@ export function observeGeminiIdentity(expectedUrl: string): boolean {
   return true;
 }
 
-export function captureGeminiSnapshot(): { messages: GeminiRenderedMessage[] } | null {
-  if (location.origin !== "https://gemini.google.com") return null;
-  const route = location.pathname.split("/").filter(Boolean);
+export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiRenderedMessage[] } | null {
+  if (location.origin !== "https://gemini.google.com"
+    || (expectedUrl !== undefined && location.href !== expectedUrl)) return null;
+  const url = new URL(location.href);
+  if (url.href.length > 512 || url.username || url.password || url.hash) return null;
+  const route = url.pathname.split("/").filter(Boolean);
   if (route.length !== 2 || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return null;
 
   const visible = (element: HTMLElement) => element.getClientRects().length > 0;

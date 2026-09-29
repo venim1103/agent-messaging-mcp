@@ -135,6 +135,12 @@ test("a relay publishes bounded fixture rows but only the owning facade reads an
   assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2000).payload, { count: 0 });
   const grant = requests.approve(pending.requestId, target, 2000)!;
   const read = { ...envelope, kind: "read_fixture_snapshot", payload: { connectionId: grant.connectionId } };
+  const genericRead = { ...envelope, kind: "read_approved_snapshot", payload: { connectionId: grant.connectionId } };
+  assert.deepEqual(handleBrokerRequest(genericRead, "facade", owner, requests, 2000), {
+    ...envelope, kind: "fixture_read_authorized", payload: { connectionId: grant.connectionId, limit: 32 }
+  });
+  assert.deepEqual(handleBrokerRequest(genericRead, "facade", stranger, requests, 2000).payload,
+    { code: "CONNECTION_NOT_FOUND" });
   assert.deepEqual(handleBrokerRequest(read, "facade", owner, requests, 2000), {
     ...envelope, kind: "fixture_read_authorized", payload: { connectionId: grant.connectionId, limit: 32 }
   });
@@ -189,6 +195,8 @@ test("a relay publishes bounded fixture rows but only the owning facade reads an
     "facade", owner, requests, 2001));
   requests.revokeAllFixtures();
   assert.deepEqual(handleBrokerRequest(read, "facade", owner, requests, 2002).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+  assert.deepEqual(handleBrokerRequest(genericRead, "facade", owner, requests, 2002).payload,
     { code: "CONNECTION_NOT_FOUND" });
   assert.deepEqual(handleBrokerRequest(eventRead, "facade", owner, requests, 2002).payload,
     { code: "CONNECTION_NOT_FOUND" });
@@ -291,7 +299,7 @@ test("only a relay approves one exact Gemini chat and its MCP owner sees no brow
   assert.deepEqual(handleBrokerRequest(challenges, "facade", owner, requests, 2001).payload,
     { code: "PERMISSION_DENIED" });
   assert.deepEqual(handleBrokerRequest(challenges, "relay", stranger, requests, 2001).payload,
-    { challenges: [] });
+    { challenges: [], activeTabIds: [4] });
   assert.deepEqual(handleBrokerRequest(publish, "facade", owner, requests, 2001).payload,
     { code: "PERMISSION_DENIED" });
   assert.deepEqual(handleBrokerRequest({ ...publish, payload: {
@@ -308,6 +316,14 @@ test("only a relay approves one exact Gemini chat and its MCP owner sees no brow
   const geminiRead = { ...envelope, kind: "read_gemini_snapshot", payload: {
     connectionId: connection.connectionId, limit: 1
   } };
+  const genericRead = { ...envelope, kind: "read_approved_snapshot", payload: {
+    connectionId: connection.connectionId, limit: 1
+  } };
+  assert.deepEqual(handleBrokerRequest(genericRead, "facade", owner, requests, 2001), {
+    ...envelope, kind: "gemini_read_authorized", payload: { connectionId: connection.connectionId, limit: 1 }
+  });
+  assert.deepEqual(handleBrokerRequest(genericRead, "facade", stranger, requests, 2001).payload,
+    { code: "CONNECTION_NOT_FOUND" });
   assert.deepEqual(handleBrokerRequest(geminiRead, "relay", stranger, requests, 2001).payload,
     { code: "PERMISSION_DENIED" });
   assert.deepEqual(handleBrokerRequest(geminiRead, "facade", stranger, requests, 2001).payload,
@@ -327,7 +343,8 @@ test("only a relay approves one exact Gemini chat and its MCP owner sees no brow
   const reading = requests.requestFreshGeminiRead(owner, connection.connectionId, 2002);
   if (!reading || reading === "busy") throw new Error("Expected a Gemini read challenge");
   assert.deepEqual(handleBrokerRequest(challenges, "relay", stranger, requests, 2002).payload, {
-    challenges: [{ challengeId: reading.challengeId, target, expiresAt: 2002 + GEMINI_READ_TIMEOUT_MS }]
+    challenges: [{ challengeId: reading.challengeId, target, expiresAt: 2002 + GEMINI_READ_TIMEOUT_MS }],
+    activeTabIds: [4]
   });
   assert.deepEqual(handleBrokerRequest({ ...publish, payload: { ...publish.payload,
     target: { ...target, url: `${target.url}?hl=en` }, challengeId: reading.challengeId } },
@@ -338,7 +355,7 @@ test("only a relay approves one exact Gemini chat and its MCP owner sees no brow
   if (!challenged || challenged === "not_ready") throw new Error("Expected challenged Gemini snapshot");
   assert.deepEqual(challenged.messages.map(({ direction, text }) => ({ direction, text })), rows);
   assert.deepEqual(handleBrokerRequest(challenges, "relay", stranger, requests, 2003).payload,
-    { challenges: [] });
+    { challenges: [], activeTabIds: [4] });
   assert.equal("messages" in handleBrokerRequest(lookup, "facade", owner, requests, 2001).payload, false);
   assert.throws(() => handleBrokerRequest({ ...challenges, payload: { tabId: 4 } },
     "relay", stranger, requests, 2003));
@@ -347,9 +364,13 @@ test("only a relay approves one exact Gemini chat and its MCP owner sees no brow
   assert.throws(() => handleBrokerRequest({ ...publish, payload: { ...publish.payload, selector: "*" } },
     "relay", stranger, requests, 2001));
   assert.equal(requests.revokeChangedTab(4, null), 1);
+  assert.deepEqual(handleBrokerRequest(challenges, "relay", stranger, requests, 2003).payload,
+    { challenges: [], activeTabIds: [] });
   assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2002).payload, { count: 0 });
   assert.equal(requests.getGeminiSnapshot(owner, connection.connectionId, 2002), null);
   assert.deepEqual(handleBrokerRequest(geminiRead, "facade", owner, requests, 2002).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+  assert.deepEqual(handleBrokerRequest(genericRead, "facade", owner, requests, 2002).payload,
     { code: "CONNECTION_NOT_FOUND" });
   assert.throws(() => handleBrokerRequest({ ...approval, payload: {
     ...approval.payload, target: { ...target, selector: "*" }

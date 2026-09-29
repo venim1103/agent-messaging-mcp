@@ -222,6 +222,16 @@ export class PendingConnectionRequests {
     }));
   }
 
+  listActiveGeminiTabIds(now = Date.now()): number[] {
+    const tabs = new Set<number>();
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (grant?.target.origin === "https://gemini.google.com"
+        && !grant.stale && now < grant.connection.expiresAt) tabs.add(grant.target.tabId);
+    }
+    return [...tabs].sort((first, second) => first - second);
+  }
+
   publishGeminiSnapshot(target: GeminiTarget, messages: ReadonlyArray<GeminiRenderedMessage>,
     now = Date.now(), challengeId?: string): number {
     if (!messages.length || messages.length > MAX_GEMINI_SNAPSHOT_MESSAGES

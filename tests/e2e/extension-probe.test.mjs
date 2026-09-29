@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -282,6 +282,19 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await worker.evaluate(({ tabId }) => chrome.storage.session.set({
       [`fixture-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, expiresAt: Date.now() + 30_000 }
     }), { tabId: unapprovedTab.id });
+    const unapprovedGeminiTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
+    const unapprovedGemini = await facade.requestConnection();
+    if (unapprovedGemini.kind !== "connection_requested") throw new Error("Expected a Gemini read request");
+    const geminiTarget = { origin: "https://gemini.google.com", conversationId: "disposable-chat",
+      url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: unapprovedGeminiTab.id,
+      documentId: `CHROME-doc_${unapprovedGeminiTab.id}` };
+    assert.equal((await relay.approveGemini(unapprovedGemini.payload.requestId, geminiTarget)).kind, "gemini_approved");
+    const unapprovedGeminiState = await facade.getConnection(unapprovedGemini.payload.requestId);
+    if (unapprovedGeminiState.kind !== "connection_state"
+      || unapprovedGeminiState.payload.state !== "ready_readonly") throw new Error("Expected a Gemini read handle");
+    await worker.evaluate(({ tabId, url }) => chrome.storage.session.set({
+      [`gemini-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, url, expiresAt: Date.now() + 30_000 }
+    }), { tabId: unapprovedGeminiTab.id, url: geminiTarget.url });
     const disconnectedTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
     const beforeDisconnect = await grant(disconnectedTab.id);
     const disconnectState = await facade.getConnection(beforeDisconnect);
@@ -293,6 +306,10 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     }), { tabId: disconnectedTab.id });
     await worker.evaluate(() => chrome.storage.session.set({
       "fixture-grant-9999": { documentId: "CHROME-doc_orphan", expiresAt: Date.now() + 30_000 }
+    }));
+    await worker.evaluate(() => chrome.storage.session.set({
+      "gemini-grant-9999": { documentId: "CHROME-doc_orphan",
+        url: "https://gemini.google.com/app/disposable-chat?hl=en", expiresAt: Date.now() + 30_000 }
     }));
     const resumedManager = await context.newPage();
     await resumedManager.goto("chrome://extensions/");
@@ -318,10 +335,17 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await resumedPopup.waitForFunction(async () =>
       (await chrome.storage.session.get("fixture-grant-9999"))["fixture-grant-9999"] === undefined,
     undefined, { timeout: 8000 });
+    await resumedPopup.waitForFunction(async () =>
+      (await chrome.storage.session.get("gemini-grant-9999"))["gemini-grant-9999"] === undefined,
+    undefined, { timeout: 8000 });
     const denied = await facade.readFixtureSnapshot(deniedState.payload.connectionId);
     assert.equal(denied.kind, "error");
     assert.deepEqual(denied.payload, { code: "CONNECTION_NOT_FOUND" });
     await waitForStale(beforeDeniedRead);
+    const deniedGeminiRead = await facade.readGeminiSnapshot(unapprovedGeminiState.payload.connectionId);
+    assert.equal(deniedGeminiRead.kind, "error");
+    assert.deepEqual(deniedGeminiRead.payload, { code: "CONNECTION_NOT_FOUND" });
+    await waitForStale(unapprovedGemini.payload.requestId);
     assert.deepEqual((await facade.disconnectFixture(disconnectState.payload.connectionId)).payload,
       { disconnected: true });
     await resumedPopup.waitForFunction(async (tabId) => {
@@ -337,6 +361,100 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await context?.close();
     facade?.close();
     relay?.close();
+    broker?.kill("SIGTERM");
+    if (brokerExit) await brokerExit;
+    await rm(profile, { recursive: true, force: true });
+  }
+});
+
+test("test-only Gemini host access carries exact synthetic rows through challenged read", { timeout: 20000 }, async () => {
+  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-read-test-"));
+  const unpacked = join(profile, "unpacked-extension");
+  await cp(extensionDirectory, unpacked, { recursive: true });
+  const manifestPath = join(unpacked, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.host_permissions = ["https://gemini.google.com/*"];
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const brokerDirectory = join(profile, ".config/agent-messaging-mcp/broker");
+  const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
+  let context;
+  let broker;
+  let brokerExit;
+  let facade;
+  try {
+    context = await chromium.launchPersistentContext(profile, {
+      executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+      args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`]
+    });
+    const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+    const extensionId = new URL(worker.url()).hostname;
+    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+    brokerExit = once(broker, "exit");
+    let ready = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      try {
+        ready = (await stat(join(brokerDirectory, "broker.sock"))).isSocket();
+        if (ready) break;
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      await setTimeout(25);
+    }
+    assert.equal(ready, true, "Broker did not start");
+    facade = await connectBroker("facade", brokerDirectory);
+
+    const url = "https://gemini.google.com/app/disposable-chat?hl=en";
+    const page = await context.newPage();
+    await page.route("https://gemini.google.com/**", (route) => route.fulfill({
+      contentType: "text/html; charset=utf-8", body: `<!doctype html><html><head><meta charset="utf-8"><style>
+        main, infinite-scroller, user-query, user-query-content, model-response, model-response-content { display:block }
+      </style></head><body><main><div contenteditable="true" aria-label="Enter a prompt for Gemini">Private draft</div>
+        <infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic question</p>
+          </user-query-content></user-query><model-response><model-response-content><p>Synthetic answer</p>
+          </model-response-content></model-response></infinite-scroller></main></body></html>`
+    }));
+    await page.goto(url);
+    const selected = await worker.evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const [injection] = await chrome.scripting.executeScript({ target: { tabId: tab.id },
+        func: () => location.href });
+      return { tabId: tab.id, documentId: injection.documentId, url: injection.result };
+    });
+    assert.equal(selected.url, url);
+    assert.match(selected.documentId, /^[!-~]{1,128}$/);
+
+    const created = await facade.requestConnection();
+    if (created.kind !== "connection_requested") throw new Error("Expected synthetic Gemini request");
+    const popup = await context.newPage();
+    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+    await page.bringToFront();
+    const approved = await popup.evaluate(({ tabId, expectedUrl, pendingRequestId }) => chrome.runtime.sendMessage({
+      kind: "approve_gemini", tabId, expectedUrl, pendingRequestId
+    }), { tabId: selected.tabId, expectedUrl: url, pendingRequestId: created.payload.requestId });
+    assert.equal(approved?.ok, true, JSON.stringify(approved));
+    const state = await facade.getConnection(created.payload.requestId);
+    if (state.kind !== "connection_state" || state.payload.state !== "ready_readonly") {
+      throw new Error("Expected a seeded Gemini owner handle");
+    }
+    assert.equal(state.payload.observation.state, "not_observed");
+    const read = await facade.readApprovedSnapshot(state.payload.connectionId);
+    if (read.kind !== "gemini_snapshot") throw new Error(`Expected a challenged Gemini snapshot, got ${read.kind}`);
+    assert.deepEqual(read.payload.messages, [
+      { direction: "outgoing", text: "Synthetic question", identityQuality: "uncertain", generationState: "unknown" },
+      { direction: "incoming", text: "Synthetic answer", identityQuality: "uncertain", generationState: "unknown" }
+    ]);
+    assert.equal("url" in read.payload, false);
+    assert.equal(JSON.stringify(read.payload).includes("Private draft"), false);
+    assert.deepEqual((await facade.disconnectFixture(state.payload.connectionId)).payload, { disconnected: true });
+    await popup.waitForFunction(async (tabId) => {
+      const key = `gemini-grant-${tabId}`;
+      return (await chrome.storage.session.get(key))[key] === undefined;
+    }, selected.tabId, { timeout: 4000 });
+    assert.equal(page.isClosed(), false);
+  } finally {
+    facade?.close();
+    await context?.close();
     broker?.kill("SIGTERM");
     if (brokerExit) await brokerExit;
     await rm(profile, { recursive: true, force: true });

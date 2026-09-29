@@ -1,7 +1,8 @@
 import { browser } from "wxt/browser";
 import { geminiDraftText } from "../lib/approved-probe";
 import { captureFixtureSnapshot, observeFixtureMessages } from "../lib/fixture-observation";
-import { identifyGeminiConversation, observeGeminiIdentity } from "../lib/gemini-observation";
+import { captureGeminiSnapshot, identifyGeminiConversation, isEligibleGeminiUrl, observeGeminiIdentity }
+  from "../lib/gemini-observation";
 
 const nativeHostName = "com.agent_messaging_mcp.bridge";
 const protocolVersion = 1;
@@ -32,6 +33,7 @@ type FixtureCountRequest = { kind: "revoke_fixture"; payload: {
 let fixtureResetPromise: Promise<boolean> | undefined;
 const fixtureSnapshotJobs = new Map<number, Promise<boolean>>();
 let fixtureReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
+let geminiReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 
 async function revokeTrackedFixture(tabId: number): Promise<void> {
   const keys = [fixtureGrantKey(tabId), geminiGrantKey(tabId)];
@@ -235,6 +237,79 @@ function queueFixtureSnapshot(tabId: number, documentId: string, challengeId?: s
   return job;
 }
 
+async function publishGeminiSnapshot(tabId: number, expectedUrl: string,
+  documentId: string, challengeId: string): Promise<boolean> {
+  try {
+    if (!isEligibleGeminiUrl(expectedUrl)
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(challengeId)) {
+      return false;
+    }
+    const key = geminiGrantKey(tabId);
+    const stored = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
+    if (stored?.documentId !== documentId || stored.url !== expectedUrl
+      || typeof stored.expiresAt !== "number" || !Number.isSafeInteger(stored.expiresAt)
+      || stored.expiresAt <= Date.now()) return false;
+    const [captured] = await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: captureGeminiSnapshot, args: [expectedUrl]
+    });
+    const tab = await browser.tabs.get(tabId);
+    if (captured?.frameId !== 0 || captured.documentId !== documentId || !captured.result
+      || tab.url !== expectedUrl) return false;
+    const messages = captured.result.messages;
+    const conversationId = new URL(expectedUrl).pathname.split("/").filter(Boolean)[1]!;
+
+    const published = await new Promise<boolean>((resolve) => {
+      const requestId = crypto.randomUUID();
+      const deadlineMs = Date.now() + 10_000;
+      let port: ReturnType<typeof browser.runtime.connectNative>;
+      try {
+        port = browser.runtime.connectNative(nativeHostName);
+      } catch {
+        resolve(false);
+        return;
+      }
+      let settled = false;
+      const timer = setTimeout(() => finish(false), 10_000);
+
+      function finish(ok: boolean) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok);
+        port.disconnect();
+      }
+
+      port.onMessage.addListener((value: unknown) => {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return finish(false);
+        const reply = value as Record<string, unknown>;
+        const payload = reply.payload;
+        finish(Object.keys(reply).length === 6 && reply.kind === "gemini_snapshot_published"
+          && reply.protocolVersion === protocolVersion && reply.requestId === requestId
+          && reply.connectionGeneration === 0 && reply.deadlineMs === deadlineMs
+          && typeof payload === "object" && payload !== null && !Array.isArray(payload)
+          && Object.keys(payload).length === 1 && typeof (payload as { count?: unknown }).count === "number"
+          && Number.isSafeInteger((payload as { count: number }).count)
+          && (payload as { count: number }).count > 0);
+      });
+      port.onDisconnect.addListener(() => { void browser.runtime.lastError; finish(false); });
+      port.postMessage({ kind: "publish_gemini_snapshot", protocolVersion, requestId,
+        connectionGeneration: 0, deadlineMs, payload: { target: {
+          origin: geminiOrigin, conversationId, url: expectedUrl, tabId, documentId
+        }, messages, challengeId } });
+    });
+    if (!published) return false;
+    const [current] = await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+    });
+    const currentTab = await browser.tabs.get(tabId);
+    return current?.frameId === 0 && current.documentId === documentId
+      && current.result?.url === expectedUrl && current.result.conversationId === conversationId
+      && currentTab.url === expectedUrl;
+  } catch {
+    return false;
+  }
+}
+
 async function hasTrackedFixtureGrant(): Promise<boolean> {
   const stored = await browser.storage.session.get(null);
   return Object.entries(stored).some(([key, value]) => {
@@ -244,6 +319,39 @@ async function hasTrackedFixtureGrant(): Promise<boolean> {
       && typeof grant.expiresAt === "number" && Number.isSafeInteger(grant.expiresAt)
       && grant.expiresAt > Date.now();
   });
+}
+
+async function hasTrackedGeminiGrant(): Promise<boolean> {
+  const stored = await browser.storage.session.get(null);
+  return Object.entries(stored).some(([key, value]) => {
+    if (!/^gemini-grant-[1-9]\d*$/.test(key) || typeof value !== "object" || value === null) return false;
+    const grant = value as Partial<StoredGeminiGrant>;
+    return typeof grant.documentId === "string" && /^[!-~]{1,128}$/.test(grant.documentId)
+      && typeof grant.url === "string" && isEligibleGeminiUrl(grant.url)
+      && typeof grant.expiresAt === "number" && Number.isSafeInteger(grant.expiresAt)
+      && grant.expiresAt > Date.now();
+  });
+}
+
+function stopGeminiObservation(): void {
+  const scope = globalThis as typeof globalThis & { geminiIdentityObserver?: MutationObserver };
+  scope.geminiIdentityObserver?.disconnect();
+  delete scope.geminiIdentityObserver;
+}
+
+async function releaseDisconnectedGemini(activeTabIds: number[]): Promise<void> {
+  const active = new Set(activeTabIds);
+  const stored = await browser.storage.session.get(null);
+  for (const [key, value] of Object.entries(stored)) {
+    if (!/^gemini-grant-[1-9]\d*$/.test(key)) continue;
+    const tabId = Number(key.slice("gemini-grant-".length));
+    if (!Number.isSafeInteger(tabId) || active.has(tabId)) continue;
+    await browser.storage.session.remove(key);
+    const grant = value as StoredGeminiGrant | undefined;
+    if (typeof grant?.documentId !== "string" || !/^[!-~]{1,128}$/.test(grant.documentId)) continue;
+    void browser.scripting.executeScript({ target: { tabId, documentIds: [grant.documentId] },
+      func: stopGeminiObservation }).catch(() => {});
+  }
 }
 
 async function markTrackedFixtureGaps(): Promise<boolean> {
@@ -310,6 +418,40 @@ function parseFixtureReadChallenges(value: unknown, requestId: string, deadlineM
   return { challenges, activeTabIds: payload.activeTabIds as number[] };
 }
 
+function parseGeminiReadChallenges(value: unknown, requestId: string, deadlineMs: number) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+  const reply = value as Record<string, unknown>;
+  if (Object.keys(reply).length !== 6 || reply.kind !== "gemini_read_challenges"
+    || reply.protocolVersion !== protocolVersion || reply.requestId !== requestId
+    || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
+    || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) throw new Error();
+  const payload = reply.payload as Record<string, unknown>;
+  if (Object.keys(payload).length !== 2 || !Array.isArray(payload.challenges)
+    || payload.challenges.length > 16 || !Array.isArray(payload.activeTabIds)
+    || payload.activeTabIds.length > 100 || !payload.activeTabIds.every((tabId: unknown) =>
+      typeof tabId === "number" && Number.isSafeInteger(tabId) && tabId > 0)
+    || new Set(payload.activeTabIds).size !== payload.activeTabIds.length) throw new Error();
+
+  const challenges = payload.challenges.map((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error();
+    const challenge = entry as Record<string, unknown>;
+    if (Object.keys(challenge).length !== 3 || typeof challenge.challengeId !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(challenge.challengeId)
+      || typeof challenge.expiresAt !== "number" || !Number.isSafeInteger(challenge.expiresAt)
+      || typeof challenge.target !== "object" || challenge.target === null || Array.isArray(challenge.target)) throw new Error();
+    const target = challenge.target as Record<string, unknown>;
+    if (Object.keys(target).length !== 5 || target.origin !== geminiOrigin
+      || typeof target.conversationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(target.conversationId)
+      || typeof target.url !== "string" || !isEligibleGeminiUrl(target.url)
+      || new URL(target.url).pathname.split("/").filter(Boolean)[1] !== target.conversationId
+      || typeof target.tabId !== "number" || !Number.isSafeInteger(target.tabId) || target.tabId < 1
+      || typeof target.documentId !== "string" || !/^[!-~]{1,128}$/.test(target.documentId)) throw new Error();
+    return { challengeId: challenge.challengeId, expiresAt: challenge.expiresAt,
+      url: target.url, tabId: target.tabId, documentId: target.documentId };
+  });
+  return { challenges, activeTabIds: payload.activeTabIds as number[] };
+}
+
 function startFixtureReadWatch(): boolean {
   if (fixtureReadWatch) return true;
   let port: ReturnType<typeof browser.runtime.connectNative>;
@@ -368,6 +510,70 @@ function startFixtureReadWatch(): boolean {
         }
       }
       if (fixtureReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
+    })().catch(stop);
+  });
+  port.onDisconnect.addListener(() => { void browser.runtime.lastError; stop(); });
+  void poll();
+  return true;
+}
+
+function startGeminiReadWatch(): boolean {
+  if (geminiReadWatch) return true;
+  let port: ReturnType<typeof browser.runtime.connectNative>;
+  try {
+    port = browser.runtime.connectNative(nativeHostName);
+  } catch {
+    return false;
+  }
+  geminiReadWatch = port;
+  let requestId: string | null = null;
+  let deadlineMs = 0;
+  let responseTimer: ReturnType<typeof setTimeout> | undefined;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function stop() {
+    if (geminiReadWatch !== port) return;
+    geminiReadWatch = undefined;
+    clearTimeout(responseTimer);
+    clearTimeout(pollTimer);
+    port.disconnect();
+  }
+
+  async function poll() {
+    try {
+      if (!await hasTrackedGeminiGrant()) return stop();
+      if (geminiReadWatch !== port) return;
+      requestId = crypto.randomUUID();
+      deadlineMs = Date.now() + 5_000;
+      responseTimer = setTimeout(stop, 5_000);
+      port.postMessage({ kind: "list_gemini_read_challenges", protocolVersion,
+        requestId, connectionGeneration: 0, deadlineMs, payload: {} });
+    } catch {
+      stop();
+    }
+  }
+
+  port.onMessage.addListener((value: unknown) => {
+    if (!requestId) return stop();
+    clearTimeout(responseTimer);
+    const listing = (() => {
+      try { return parseGeminiReadChallenges(value, requestId, deadlineMs); }
+      catch { stop(); return null; }
+    })();
+    requestId = null;
+    if (!listing) return;
+    void (async () => {
+      await releaseDisconnectedGemini(listing.activeTabIds);
+      for (const challenge of listing.challenges) {
+        if (challenge.expiresAt <= Date.now()) continue;
+        const key = geminiGrantKey(challenge.tabId);
+        const grant = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
+        if (!grant || grant.documentId !== challenge.documentId || grant.url !== challenge.url
+          || typeof grant.expiresAt !== "number" || grant.expiresAt <= Date.now()) continue;
+        if (!await publishGeminiSnapshot(challenge.tabId, challenge.url,
+          challenge.documentId, challenge.challengeId)) await revokeTrackedFixture(challenge.tabId);
+      }
+      if (geminiReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
     })().catch(stop);
   });
   port.onDisconnect.addListener(() => { void browser.runtime.lastError; stop(); });
@@ -579,6 +785,7 @@ async function approveGemini(tabId: number, expectedUrl: string, pendingRequestI
             target: { tabId, documentIds: [documentId] }, func: observeGeminiIdentity, args: [expectedUrl]
           });
           if (observing?.frameId !== 0 || observing.documentId !== documentId || observing.result !== true) throw new Error();
+          if (!startGeminiReadWatch()) throw new Error();
           finish({ ok: true, requestId: pendingRequestId, expiresAt: payload.expiresAt });
         })().catch(async () => {
           if (brokerApproved && await revokeFixtureTab(tabId, null)) {
@@ -832,6 +1039,7 @@ function isHandshakeReply(value: unknown, requestId: string, deadlineMs: number)
 export default defineBackground(() => {
   void ensureFixtureReset().then(async (ready) => {
     if (ready && await hasTrackedFixtureGrant() && await markTrackedFixtureGaps()) startFixtureReadWatch();
+    if (ready && await hasTrackedGeminiGrant()) startGeminiReadWatch();
   }).catch(() => {});
   browser.tabs.onRemoved.addListener((tabId) => { void revokeTrackedFixture(tabId).catch(() => {}); });
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {

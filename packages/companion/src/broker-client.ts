@@ -110,7 +110,8 @@ const replySchema = z.discriminatedUnion("kind", [
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ challenges: z.array(z.strictObject({
       challengeId: z.uuid(), target: geminiTarget, expiresAt: z.number().int().safe()
-    })).max(MAX_PENDING_GEMINI_READS) })
+    })).max(MAX_PENDING_GEMINI_READS),
+    activeTabIds: z.array(z.number().int().safe().positive()).max(MAX_PENDING_REQUESTS) })
   }),
   z.strictObject({
     kind: z.literal("fixture_disconnected"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -215,7 +216,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     }
     let nextRequest: Promise<void> = Promise.resolve();
     const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
-      | "read_gemini_snapshot"
+      | "read_gemini_snapshot" | "read_approved_snapshot"
       | "disconnect_fixture"
       | "list_pending" | "list_fixture_read_challenges" | "list_gemini_read_challenges"
       | "approve_fixture" | "approve_gemini"
@@ -276,6 +277,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
         request("read_fixture_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
       readGeminiSnapshot: (connectionId: string, limit?: number) =>
         request("read_gemini_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
+      readApprovedSnapshot: (connectionId: string, limit?: number) =>
+        request("read_approved_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
       readFixtureEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>
         request("read_fixture_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }) }),
       disconnectFixture: (connectionId: string) => request("disconnect_fixture", { connectionId }),

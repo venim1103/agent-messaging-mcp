@@ -70,14 +70,14 @@ server.registerTool("chat.get_connection", {
 });
 
 server.registerTool("chat.read_messages", {
-  description: "Read a fresh rendered-only local fixture snapshot for an owned connection after a bounded browser challenge. This does not read Gemini or complete chat history.",
+  description: "Read a fresh rendered-only snapshot from an owned, toolbar-approved fixture or Gemini chat after an exact-document browser challenge. Gemini results contain the selected chat's visible message text, not complete history.",
   inputSchema: z.object({ connectionId: z.uuid(), limit: z.number().int().min(1).max(32).optional() }).strict(),
   annotations: { readOnlyHint: true }
 }, async ({ connectionId, limit }) => {
   try {
-    const result = await (await pendingBroker()).readFixtureSnapshot(connectionId, limit);
+    const result = await (await pendingBroker()).readApprovedSnapshot(connectionId, limit);
     if (result.kind === "error") return blocked(result.payload.code);
-    if (result.kind !== "fixture_snapshot") return unavailable();
+    if (result.kind !== "fixture_snapshot" && result.kind !== "gemini_snapshot") return unavailable();
     return { content: [{ type: "text", text: JSON.stringify(result.payload) }], structuredContent: result.payload };
   } catch {
     return unavailable();
