@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { FIXTURE_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests,
+import { FIXTURE_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_GEMINI_SNAPSHOT_AGE_MS,
+  MAX_PENDING_REQUESTS, PendingConnectionRequests,
   PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS }
   from "./pending-connections.js";
 
@@ -68,6 +69,7 @@ test("a fixture grant is one-shot, owner-bound, and expires without exposing tab
     observation: { state: "not_observed", capturedAt: null } });
   assert.equal(requests.get(stranger, pending.requestId, 2000), null);
   assert.deepEqual(requests.getApprovedTarget(owner, granted!.connectionId, 2000), target);
+  assert.equal(requests.getGeminiTarget(owner, granted!.connectionId, 2000), null);
   assert.equal(requests.getApprovedTarget(stranger, granted!.connectionId, 2000), null);
   assert.deepEqual(requests.listPending(2000), []);
   assert.equal(requests.approve(pending.requestId, target, 2001), null);
@@ -310,6 +312,7 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   assert.equal(requests.approveGemini(pending.requestId, { ...target, conversationId: "another-chat" }, 2000), null);
   assert.equal(requests.approveGemini(pending.requestId, { ...target, documentId: "" }, 2000), null);
   assert.equal(requests.approveGemini(pending.requestId, { ...target, tabId: 0 }, 2000), null);
+  assert.equal(requests.getGeminiTarget(owner, pending.requestId, 2000), null);
   const granted = requests.approveGemini(pending.requestId, target, 2000);
   assert.equal(granted?.state, "ready_readonly");
   assert.equal(granted?.origin, "https://gemini.google.com");
@@ -318,6 +321,41 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   assert.equal("documentId" in granted!, false);
   assert.equal(requests.get(stranger, pending.requestId, 2000), null);
   assert.equal(requests.get(owner, pending.requestId, 2000)?.state, "ready_readonly");
+  assert.deepEqual(requests.getGeminiTarget(owner, granted!.connectionId, 2000), target);
+  assert.equal(requests.getGeminiTarget(stranger, granted!.connectionId, 2000), null);
+  assert.equal(requests.getGeminiTarget(owner, granted!.connectionId, granted!.expiresAt), null);
+  const messages = [
+    { direction: "outgoing" as const, text: "OK" },
+    { direction: "outgoing" as const, text: "OK" },
+    { direction: "incoming" as const, text: "Reply" }
+  ];
+  assert.equal(requests.getGeminiSnapshot(owner, granted!.connectionId, 2000), "not_ready");
+  assert.equal(requests.getGeminiSnapshot(stranger, granted!.connectionId, 2000), null);
+  assert.equal(requests.publishGeminiSnapshot({ ...target, url: `${target.url}?hl=en` }, messages, 2001), 0);
+  assert.equal(requests.publishGeminiSnapshot({ ...target, documentId: "other" }, messages, 2001), 0);
+  assert.equal(requests.publishGeminiSnapshot(target, messages, 2001), 1);
+  const snapshot = requests.getGeminiSnapshot(owner, granted!.connectionId, 2001);
+  if (!snapshot || snapshot === "not_ready") throw new Error("Expected a private Gemini snapshot");
+  assert.deepEqual(snapshot.messages, messages.map((message) => ({ ...message,
+    identityQuality: "uncertain", generationState: "unknown" })));
+  assert.equal(snapshot.coverage, "rendered_only");
+  assert.equal(snapshot.cursor.sequence, 1);
+  assert.deepEqual((requests.get(owner, pending.requestId, 2001) as { observation: unknown }).observation,
+    { state: "recent", capturedAt: 2001 });
+  assert.equal(requests.publishGeminiSnapshot(target, messages, 2002), 1);
+  const refreshed = requests.getGeminiSnapshot(owner, granted!.connectionId, 2002);
+  if (!refreshed || refreshed === "not_ready") throw new Error("Expected refreshed Gemini capture");
+  assert.equal(refreshed.capturedAt, 2002);
+  assert.equal(refreshed.cursor.sequence, snapshot.cursor.sequence);
+  assert.equal(requests.getGeminiSnapshot(owner, granted!.connectionId, 2002 + MAX_GEMINI_SNAPSHOT_AGE_MS + 1),
+    "not_ready");
+  assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "x".repeat(2049) }], 2002),
+    /Invalid Gemini snapshot/);
+  assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: 0 as never }], 2002),
+    /Invalid Gemini snapshot/);
+  assert.throws(() => requests.publishGeminiSnapshot(target, Array.from({ length: 32 }, () => ({
+    direction: "incoming", text: "é".repeat(2048)
+  })), 2002), /Invalid Gemini snapshot/);
   assert.equal(requests.getApprovedTarget(owner, granted!.connectionId, 2000), null);
   assert.equal(requests.getFixtureSnapshot(owner, granted!.connectionId, 2000), null);
   assert.equal(requests.requestFreshFixtureRead(owner, granted!.connectionId, 2000), null);
@@ -325,13 +363,18 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   assert.equal(requests.approveGemini(pending.requestId, target, 2000), null);
   assert.equal(requests.revokeChangedTab(4, { documentId: "another-document", conversationId: target.conversationId }), 1);
   assert.deepEqual(requests.get(owner, pending.requestId, 2001), { requestId: pending.requestId, state: "stale" });
+  assert.equal(requests.getGeminiTarget(owner, granted!.connectionId, 2001), null);
+  assert.equal(requests.getGeminiSnapshot(owner, granted!.connectionId, 2001), null);
   const queryPending = requests.create(owner, 1000);
   const queryTarget = { ...target, url: `${target.url}?hl=en` };
   const queryGrant = requests.approveGemini(queryPending.requestId, queryTarget, 2000);
   assert.equal(queryGrant?.state, "ready_readonly");
   assert.equal("url" in queryGrant!, false);
   assert.deepEqual(requests.get(owner, queryPending.requestId, 2000)?.state, "ready_readonly");
+  assert.deepEqual(requests.getGeminiTarget(owner, queryGrant!.connectionId, 2000), queryTarget);
   assert.equal(requests.approveGemini(requests.create(owner, 1000).requestId, target, 61_000), null);
+  assert.equal(requests.revokeAllFixtures(), 1);
+  assert.equal(requests.getGeminiTarget(owner, queryGrant!.connectionId, 2001), null);
 });
 
 test("worker wake marks an exact fixture observation gap without revoking its owner", async () => {
