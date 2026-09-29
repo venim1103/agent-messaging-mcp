@@ -183,6 +183,7 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     if (geminiState.kind !== "connection_state" || geminiState.payload.state !== "ready_readonly") {
       throw new Error("Expected a Gemini owner connection");
     }
+    const geminiConnectionId = geminiState.payload.connectionId;
     assert.equal(geminiState.payload.origin, geminiTarget.origin);
     assert.equal(geminiState.payload.conversationId, geminiTarget.conversationId);
     assert.equal("tabId" in geminiState.payload, false);
@@ -208,12 +209,43 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.equal(observedGemini.payload.observation.state, "recent");
     assert.equal("messages" in observedGemini.payload, false);
     assert.equal("url" in observedGemini.payload, false);
+    assert.throws(() => relay.readGeminiSnapshot(geminiConnectionId), /Broker role cannot perform/);
+    assert.deepEqual((await otherFacade.readGeminiSnapshot(geminiConnectionId)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    const readingGemini = facade.readGeminiSnapshot(geminiConnectionId, 1);
+    let geminiChallengeId: string | undefined;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const listing = await relay.listGeminiReadChallenges();
+      if (listing.kind !== "gemini_read_challenges") throw new Error("Expected Gemini read challenges");
+      const [challenge] = listing.payload.challenges;
+      if (challenge) {
+        assert.deepEqual(challenge.target, geminiTarget);
+        geminiChallengeId = challenge.challengeId;
+        break;
+      }
+      await setTimeout(10);
+    }
+    assert.ok(geminiChallengeId, "Broker did not issue an owned Gemini challenge");
+    assert.deepEqual((await relay.publishGeminiSnapshot({ ...geminiTarget, url: `${geminiTarget.url}&other=1` },
+      geminiRows, geminiChallengeId)).payload, { count: 0 });
+    const freshRows = [{ ...geminiRows[0]!, text: "Fresh synthetic question" }, geminiRows[1]!];
+    assert.deepEqual((await relay.publishGeminiSnapshot(geminiTarget, freshRows, geminiChallengeId)).payload,
+      { count: 1 });
+    const freshGemini = await readingGemini;
+    if (freshGemini.kind !== "gemini_snapshot") throw new Error("Expected challenged Gemini rows");
+    assert.deepEqual(freshGemini.payload.messages, [{ ...freshRows[1],
+      identityQuality: "uncertain", generationState: "unknown" }]);
+    assert.equal(freshGemini.payload.omittedBefore, true);
+    assert.equal("url" in freshGemini.payload, false);
+    assert.equal("tabId" in freshGemini.payload, false);
     assert.deepEqual((await facade.readFixtureSnapshot(geminiState.payload.connectionId)).payload,
       { code: "CONNECTION_NOT_FOUND" });
     assert.deepEqual((await relay.revokeAllFixtures()).payload, { count: 1 });
     assert.deepEqual((await facade.getConnection(geminiPending.payload.requestId)).payload,
       { requestId: geminiPending.payload.requestId, state: "stale" });
     assert.deepEqual((await relay.publishGeminiSnapshot(geminiTarget, geminiRows)).payload, { count: 0 });
+    assert.deepEqual((await facade.readGeminiSnapshot(geminiConnectionId)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
     otherFacade.close();
     facade.close();
     assert.deepEqual((await relay.listPending() as typeof listed).payload.requests, []);

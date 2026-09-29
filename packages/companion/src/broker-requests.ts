@@ -35,6 +35,9 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("read_fixture_snapshot"), payload: z.strictObject({
     connectionId: z.uuid(), limit: z.number().int().min(1).max(MAX_FIXTURE_SNAPSHOT_MESSAGES).optional()
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("read_gemini_snapshot"), payload: z.strictObject({
+    connectionId: z.uuid(), limit: z.number().int().min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES).optional()
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("read_fixture_events"), payload: z.strictObject({
     connectionId: z.uuid(), cursor: z.strictObject({
       epoch: z.uuid(), sequence: z.number().int().safe().nonnegative()
@@ -44,6 +47,7 @@ const requestSchema = z.discriminatedUnion("kind", [
     connectionId: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_fixture_read_challenges"), payload: z.strictObject({}) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_gemini_read_challenges"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("list_pending"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("approve_fixture"), payload: z.strictObject({
     pendingRequestId: z.uuid(),
@@ -57,7 +61,8 @@ const requestSchema = z.discriminatedUnion("kind", [
     challengeId: z.uuid().optional()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("publish_gemini_snapshot"), payload: z.strictObject({
-    target: geminiTarget, messages: z.array(geminiMessage).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES)
+    target: geminiTarget, messages: z.array(geminiMessage).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES),
+    challengeId: z.uuid().optional()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("mark_fixture_observation_gap"), payload: z.strictObject({
     target: fixtureTarget
@@ -93,6 +98,12 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
           activeTabIds: requests.listActiveFixtureTabIds(now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
+  if (request.kind === "list_gemini_read_challenges") {
+    return role === "relay"
+      ? { ...response, kind: "gemini_read_challenges" as const,
+        payload: { challenges: requests.listGeminiReadChallenges(now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
   if (request.kind === "approve_fixture") {
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
     const grant = requests.approve(request.payload.pendingRequestId, request.payload.target, now);
@@ -118,7 +129,8 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   if (request.kind === "publish_gemini_snapshot") {
     return role === "relay"
       ? { ...response, kind: "gemini_snapshot_published" as const,
-        payload: { count: requests.publishGeminiSnapshot(request.payload.target, request.payload.messages, now) } }
+        payload: { count: requests.publishGeminiSnapshot(request.payload.target, request.payload.messages,
+          now, request.payload.challengeId) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "mark_fixture_observation_gap") {
@@ -145,6 +157,13 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return requests.getApprovedTarget(owner, request.payload.connectionId, now)
       ? { ...response, kind: "fixture_read_authorized" as const, payload: {
         connectionId: request.payload.connectionId, limit: request.payload.limit ?? MAX_FIXTURE_SNAPSHOT_MESSAGES
+      } }
+      : { ...response, kind: "error" as const, payload: { code: "CONNECTION_NOT_FOUND" } };
+  }
+  if (request.kind === "read_gemini_snapshot") {
+    return requests.getGeminiTarget(owner, request.payload.connectionId, now)
+      ? { ...response, kind: "gemini_read_authorized" as const, payload: {
+        connectionId: request.payload.connectionId, limit: request.payload.limit ?? MAX_GEMINI_SNAPSHOT_MESSAGES
       } }
       : { ...response, kind: "error" as const, payload: { code: "CONNECTION_NOT_FOUND" } };
   }

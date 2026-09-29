@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { FIXTURE_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_GEMINI_SNAPSHOT_AGE_MS,
+import { FIXTURE_READ_TIMEOUT_MS, GEMINI_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_GEMINI_SNAPSHOT_AGE_MS,
   MAX_PENDING_REQUESTS, PendingConnectionRequests,
   PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS }
   from "./pending-connections.js";
@@ -375,6 +375,51 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   assert.equal(requests.approveGemini(requests.create(owner, 1000).requestId, target, 61_000), null);
   assert.equal(requests.revokeAllFixtures(), 1);
   assert.equal(requests.getGeminiTarget(owner, queryGrant!.connectionId, 2001), null);
+});
+
+test("fresh Gemini challenges require the exact owner, URL and document and cannot be replayed", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("Gemini reader");
+  const stranger = Symbol("other reader");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
+    url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 4, documentId: "CHROME-doc_gemini-42" };
+  const rows = [{ direction: "outgoing" as const, text: "Before" }];
+  assert.equal(requests.requestFreshGeminiRead(owner, pending.requestId, 2000), null);
+  const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+  assert.equal(requests.requestFreshGeminiRead(stranger, grant.connectionId, 2001), null);
+  assert.equal(requests.publishGeminiSnapshot(target, rows, 2001), 1);
+  const reading = requests.requestFreshGeminiRead(owner, grant.connectionId, 2002);
+  if (!reading || reading === "busy") throw new Error("Expected a Gemini read challenge");
+  assert.deepEqual(requests.listGeminiReadChallenges(2002), [{
+    challengeId: reading.challengeId, target, expiresAt: 2002 + GEMINI_READ_TIMEOUT_MS
+  }]);
+  assert.equal(requests.publishGeminiSnapshot({ ...target, url: `${target.url}&other=1` }, rows,
+    2003, reading.challengeId), 0);
+  assert.equal(requests.publishGeminiSnapshot({ ...target, documentId: "other" }, rows,
+    2003, reading.challengeId), 0);
+  assert.equal(requests.publishGeminiSnapshot(target, rows, 2003,
+    "a66b3997-9d43-4554-8399-267d1fe9f75c"), 0);
+  assert.equal(requests.listGeminiReadChallenges(2003).length, 1);
+  const current = [{ direction: "outgoing" as const, text: "After" }];
+  assert.equal(requests.publishGeminiSnapshot(target, current, 2004, reading.challengeId), 1);
+  const observed = await reading.result;
+  if (!observed || observed === "not_ready") throw new Error("Expected challenged Gemini rows");
+  assert.deepEqual(observed.messages[0], { ...current[0], identityQuality: "uncertain", generationState: "unknown" });
+  assert.equal(observed.capturedAt, 2004);
+  assert.deepEqual(requests.listGeminiReadChallenges(2004), []);
+  assert.equal(requests.publishGeminiSnapshot(target, current, 2005, reading.challengeId), 0);
+
+  const expired = requests.requestFreshGeminiRead(owner, grant.connectionId, 2005);
+  if (!expired || expired === "busy") throw new Error("Expected another Gemini challenge");
+  assert.deepEqual(requests.listGeminiReadChallenges(2005 + GEMINI_READ_TIMEOUT_MS), []);
+  assert.equal(await expired.result, "not_ready");
+  const cancelled = requests.requestFreshGeminiRead(owner, grant.connectionId, 2006);
+  if (!cancelled || cancelled === "busy") throw new Error("Expected a cancellable Gemini challenge");
+  assert.equal(requests.disconnectFixture(owner, grant.connectionId, 2007), true);
+  assert.equal(await cancelled.result, null);
+  assert.equal(requests.getGeminiSnapshot(owner, grant.connectionId, 2007), null);
+  assert.equal(requests.requestFreshGeminiRead(owner, grant.connectionId, 2007), null);
 });
 
 test("worker wake marks an exact fixture observation gap without revoking its owner", async () => {

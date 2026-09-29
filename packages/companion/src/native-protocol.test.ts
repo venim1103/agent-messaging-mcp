@@ -11,7 +11,8 @@ import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeFixtureReadChallenges, parseNativeFixtureReset, parseNativeFixtureRevocation,
-  parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiSnapshot, parseNativePendingList,
+  parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
+  parseNativeGeminiSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
   from "./native-protocol.js";
 
@@ -80,6 +81,21 @@ test("native read challenge listing accepts no selectors or browser-control fiel
   }
 });
 
+test("native Gemini read challenge listing accepts no selectors or browser-control fields", () => {
+  const listing = { ...request, kind: "list_gemini_read_challenges" };
+  assert.deepEqual(parseNativeGeminiReadChallenges(listing, now), listing);
+  for (const invalid of [
+    { ...listing, kind: "evaluate" },
+    { ...listing, connectionGeneration: 1 },
+    { ...listing, deadlineMs: now },
+    { ...listing, deadlineMs: now + 30_001 },
+    { ...listing, payload: { selector: "*" } },
+    { ...listing, tabId: 3 }
+  ]) {
+    assert.throws(() => parseNativeGeminiReadChallenges(invalid, now), /Invalid native Gemini read challenge list/);
+  }
+});
+
 test("native fixture approval refuses other origins, targets, and arbitrary fields", () => {
   const approval = { ...request, kind: "approve_fixture", payload: {
     pendingRequestId: "c783ef76-d6cd-4898-8c43-204543943bac",
@@ -137,11 +153,14 @@ test("native Gemini snapshots accept bounded synthetic rows only for an exact sa
     messages: [{ direction: "outgoing", text: "OK" }, { direction: "outgoing", text: "OK" }]
   } };
   assert.deepEqual(parseNativeGeminiSnapshot(snapshot, now), snapshot);
+  const challenged = { ...snapshot, payload: { ...snapshot.payload,
+    challengeId: "a66b3997-9d43-4554-8399-267d1fe9f75c" } };
+  assert.deepEqual(parseNativeGeminiSnapshot(challenged, now), challenged);
   for (const invalid of [
     { ...snapshot, kind: "evaluate" },
     { ...snapshot, deadlineMs: now },
     { ...snapshot, payload: { ...snapshot.payload, selector: "*" } },
-    { ...snapshot, payload: { ...snapshot.payload, challengeId: request.requestId } },
+    { ...snapshot, payload: { ...snapshot.payload, challengeId: "not-a-uuid" } },
     { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target,
       url: "https://gemini.google.com/app/other?hl=en" } } },
     { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target,
@@ -357,7 +376,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     } };
     publicationHost.stdin.end(encodeNativeFrame(publication));
     const [publicationExit] = await once(publicationHost, "exit");
-    assert.equal(publicationExit, 0, Buffer.concat(publicationErrors).toString());
+    assert.equal(publicationExit, 0, `${Buffer.concat(publicationErrors).toString()}Test deadline delta at exit: ${publication.deadlineMs - Date.now()}ms`);
     const [published] = new NativeFrameDecoder().push(Buffer.concat(publicationOutput)) as [{
       kind: string; requestId: string; payload: { count: number }
     }];
@@ -572,6 +591,64 @@ test("native relay lists only live broker pending IDs over real framing", { time
     }
     assert.equal(observedGemini.payload.observation.state, "recent");
     assert.equal("messages" in observedGemini.payload, false);
+
+    const readingGemini = facade.readGeminiSnapshot(geminiState.payload.connectionId);
+    const geminiObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
+    try {
+      let found = false;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const listed = await geminiObserver.listGeminiReadChallenges();
+        if (listed.kind !== "gemini_read_challenges") throw new Error("Expected Gemini read challenges");
+        if (listed.payload.challenges.length) { found = true; break; }
+        await setTimeout(10);
+      }
+      assert.equal(found, true, "Broker did not queue a native Gemini read challenge");
+    } finally {
+      geminiObserver.close();
+    }
+    const geminiChallengeHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const geminiChallengeOutput: Buffer[] = [];
+    const geminiChallengeErrors: Buffer[] = [];
+    geminiChallengeHost.stdout.on("data", (chunk: Buffer) => geminiChallengeOutput.push(chunk));
+    geminiChallengeHost.stderr.on("data", (chunk: Buffer) => geminiChallengeErrors.push(chunk));
+    const geminiChallengeList = { ...request, kind: "list_gemini_read_challenges", deadlineMs: Date.now() + 10_000 };
+    geminiChallengeHost.stdin.end(encodeNativeFrame(geminiChallengeList));
+    const [geminiChallengeExit] = await once(geminiChallengeHost, "exit");
+    assert.equal(geminiChallengeExit, 0, Buffer.concat(geminiChallengeErrors).toString());
+    const [geminiChallengeReply] = new NativeFrameDecoder().push(Buffer.concat(geminiChallengeOutput)) as [{
+      kind: string; payload: { challenges: { challengeId: string; target: unknown }[] }
+    }];
+    assert.equal(geminiChallengeReply.kind, "gemini_read_challenges");
+    const [geminiChallenge] = geminiChallengeReply.payload.challenges;
+    assert.ok(geminiChallenge?.challengeId);
+    assert.deepEqual(geminiChallenge.target, geminiPublication.payload.target);
+
+    const challengedHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const challengedOutput: Buffer[] = [];
+    const challengedErrors: Buffer[] = [];
+    challengedHost.stdout.on("data", (chunk: Buffer) => challengedOutput.push(chunk));
+    challengedHost.stderr.on("data", (chunk: Buffer) => challengedErrors.push(chunk));
+    const challengedPublication = { ...geminiPublication, deadlineMs: Date.now() + 10_000,
+      payload: { ...geminiPublication.payload, challengeId: geminiChallenge.challengeId,
+        messages: [{ direction: "outgoing", text: "Synthetic question" },
+          { direction: "incoming", text: "Fresh synthetic answer" }] } };
+    challengedHost.stdin.end(encodeNativeFrame(challengedPublication));
+    const [challengedExit] = await once(challengedHost, "exit");
+    assert.equal(challengedExit, 0, Buffer.concat(challengedErrors).toString());
+    const [challengedReply] = new NativeFrameDecoder().push(Buffer.concat(challengedOutput)) as [{
+      kind: string; payload: { count: number }
+    }];
+    assert.equal(challengedReply.kind, "gemini_snapshot_published");
+    assert.deepEqual(challengedReply.payload, { count: 1 });
+    const freshGemini = await readingGemini;
+    if (freshGemini.kind !== "gemini_snapshot") throw new Error("Expected challenged Gemini snapshot");
+    assert.deepEqual(freshGemini.payload.messages[1], { direction: "incoming", text: "Fresh synthetic answer",
+      identityQuality: "uncertain", generationState: "unknown" });
+    assert.equal("url" in freshGemini.payload, false);
 
     const geminiRelay = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
     try {

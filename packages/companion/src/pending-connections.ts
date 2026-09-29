@@ -10,6 +10,8 @@ export const MAX_FIXTURE_SNAPSHOT_AGE_MS = 30_000;
 export const MAX_GEMINI_SNAPSHOT_MESSAGES = 32;
 export const MAX_GEMINI_SNAPSHOT_BYTES = 64 * 1024;
 export const MAX_GEMINI_SNAPSHOT_AGE_MS = 30_000;
+export const GEMINI_READ_TIMEOUT_MS = 4_000;
+export const MAX_PENDING_GEMINI_READS = 16;
 export const MAX_FIXTURE_EVENTS_PER_READ = 2;
 export const FIXTURE_READ_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_READS = 16;
@@ -85,15 +87,32 @@ type PendingFixtureRead = {
   timer: ReturnType<typeof setTimeout>;
   resolve: (snapshot: FixtureSnapshot | "not_ready" | null) => void;
 };
+type PendingGeminiRead = {
+  owner: symbol;
+  connectionId: string;
+  target: GeminiTarget;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+  resolve: (snapshot: GeminiSnapshot | "not_ready" | null) => void;
+};
 
 export class PendingConnectionRequests {
   private readonly requests = new Map<string, RequestRecord>();
   private readonly fixtureReads = new Map<string, PendingFixtureRead>();
+  private readonly geminiReads = new Map<string, PendingGeminiRead>();
 
   private finishFixtureRead(challengeId: string, result: FixtureSnapshot | "not_ready" | null): void {
     const pending = this.fixtureReads.get(challengeId);
     if (!pending) return;
     this.fixtureReads.delete(challengeId);
+    clearTimeout(pending.timer);
+    pending.resolve(result);
+  }
+
+  private finishGeminiRead(challengeId: string, result: GeminiSnapshot | "not_ready" | null): void {
+    const pending = this.geminiReads.get(challengeId);
+    if (!pending) return;
+    this.geminiReads.delete(challengeId);
     clearTimeout(pending.timer);
     pending.resolve(result);
   }
@@ -106,6 +125,9 @@ export class PendingConnectionRequests {
     grant.geminiObservations = undefined;
     for (const [challengeId, pending] of this.fixtureReads) {
       if (pending.connectionId === grant.connection.connectionId) this.finishFixtureRead(challengeId, null);
+    }
+    for (const [challengeId, pending] of this.geminiReads) {
+      if (pending.connectionId === grant.connection.connectionId) this.finishGeminiRead(challengeId, null);
     }
   }
 
@@ -178,7 +200,30 @@ export class PendingConnectionRequests {
       ? grant.geminiSnapshot : "not_ready";
   }
 
-  publishGeminiSnapshot(target: GeminiTarget, messages: ReadonlyArray<GeminiRenderedMessage>, now = Date.now()): number {
+  requestFreshGeminiRead(owner: symbol, connectionId: string, now = Date.now()) {
+    const grant = this.liveGrant(owner, connectionId, now);
+    if (grant?.target.origin !== "https://gemini.google.com") return null;
+    if (this.geminiReads.size >= MAX_PENDING_GEMINI_READS) return "busy" as const;
+    const challengeId = randomUUID();
+    const expiresAt = now + GEMINI_READ_TIMEOUT_MS;
+    let resolve!: PendingGeminiRead["resolve"];
+    const result = new Promise<GeminiSnapshot | "not_ready" | null>((done) => { resolve = done; });
+    const timer = setTimeout(() => this.finishGeminiRead(challengeId, "not_ready"), GEMINI_READ_TIMEOUT_MS);
+    this.geminiReads.set(challengeId, { owner, connectionId, target: grant.target, expiresAt, timer, resolve });
+    return { challengeId, result };
+  }
+
+  listGeminiReadChallenges(now = Date.now()) {
+    for (const [challengeId, pending] of this.geminiReads) {
+      if (pending.expiresAt <= now) this.finishGeminiRead(challengeId, "not_ready");
+    }
+    return [...this.geminiReads].map(([challengeId, pending]) => ({
+      challengeId, target: pending.target, expiresAt: pending.expiresAt
+    }));
+  }
+
+  publishGeminiSnapshot(target: GeminiTarget, messages: ReadonlyArray<GeminiRenderedMessage>,
+    now = Date.now(), challengeId?: string): number {
     if (!messages.length || messages.length > MAX_GEMINI_SNAPSHOT_MESSAGES
       || messages.some((message) => typeof message !== "object" || message === null
         || (message.direction !== "incoming" && message.direction !== "outgoing")
@@ -186,6 +231,12 @@ export class PendingConnectionRequests {
       || Buffer.byteLength(JSON.stringify(messages), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
       throw new Error("Invalid Gemini snapshot");
     }
+    const pending = challengeId ? this.geminiReads.get(challengeId) : undefined;
+    if (challengeId && (!pending || pending.expiresAt <= now
+      || pending.target.origin !== target.origin || pending.target.conversationId !== target.conversationId
+      || pending.target.url !== target.url || pending.target.tabId !== target.tabId
+      || pending.target.documentId !== target.documentId
+      || !this.liveGrant(pending.owner, pending.connectionId, now))) return 0;
     const normalized = messages.map((message) => Object.freeze({ direction: message.direction, text: message.text,
       identityQuality: "uncertain" as const, generationState: "unknown" as const }));
     let published = 0;
@@ -204,6 +255,9 @@ export class PendingConnectionRequests {
       grant.geminiSnapshot = Object.freeze({ coverage: "rendered_only", generation: 1, capturedAt: now,
         cursor: grant.geminiObservations.bookmark(), messages: Object.freeze(normalized) });
       published++;
+    }
+    if (pending && challengeId) {
+      this.finishGeminiRead(challengeId, this.getGeminiSnapshot(pending.owner, pending.connectionId, now));
     }
     return published;
   }
@@ -392,6 +446,9 @@ export class PendingConnectionRequests {
   disconnect(owner: symbol): void {
     for (const [challengeId, pending] of this.fixtureReads) {
       if (pending.owner === owner) this.finishFixtureRead(challengeId, null);
+    }
+    for (const [challengeId, pending] of this.geminiReads) {
+      if (pending.owner === owner) this.finishGeminiRead(challengeId, null);
     }
     for (const [requestId, request] of this.requests) {
       if (request.owner === owner) this.requests.delete(requestId);

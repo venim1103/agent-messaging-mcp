@@ -8,7 +8,8 @@ import type { BrokerRole } from "./broker-roles.js";
 import type { FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_PENDING_FIXTURE_READS, MAX_PENDING_REQUESTS }
+import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
+  MAX_PENDING_FIXTURE_READS, MAX_PENDING_GEMINI_READS, MAX_PENDING_REQUESTS }
   from "./pending-connections.js";
 
 const helloResult = z.strictObject({
@@ -26,6 +27,15 @@ const fixtureMessage = z.strictObject({
 const fixtureTarget = z.strictObject({
   origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
   tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
+});
+const geminiTarget = z.strictObject({
+  origin: z.literal("https://gemini.google.com"),
+  conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), url: z.string().min(1).max(512),
+  tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
+});
+const geminiMessage = z.strictObject({
+  direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(2048),
+  identityQuality: z.literal("uncertain"), generationState: z.literal("unknown")
 });
 const fixtureCursor = z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() });
 
@@ -96,6 +106,13 @@ const replySchema = z.discriminatedUnion("kind", [
     activeTabIds: z.array(z.number().int().safe().positive()).max(MAX_PENDING_REQUESTS) })
   }),
   z.strictObject({
+    kind: z.literal("gemini_read_challenges"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ challenges: z.array(z.strictObject({
+      challengeId: z.uuid(), target: geminiTarget, expiresAt: z.number().int().safe()
+    })).max(MAX_PENDING_GEMINI_READS) })
+  }),
+  z.strictObject({
     kind: z.literal("fixture_disconnected"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ disconnected: z.boolean() })
@@ -112,6 +129,15 @@ const replySchema = z.discriminatedUnion("kind", [
       coverage: z.literal("rendered_only"), generation: z.literal(1), capturedAt: z.number().int().safe(),
       cursor: fixtureCursor,
       messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES), omittedBefore: z.boolean()
+    })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_snapshot"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({
+      coverage: z.literal("rendered_only"), generation: z.literal(1), capturedAt: z.number().int().safe(),
+      cursor: fixtureCursor,
+      messages: z.array(geminiMessage).max(MAX_GEMINI_SNAPSHOT_MESSAGES), omittedBefore: z.boolean()
     })
   }),
   z.strictObject({
@@ -189,11 +215,14 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     }
     let nextRequest: Promise<void> = Promise.resolve();
     const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
+      | "read_gemini_snapshot"
       | "disconnect_fixture"
-      | "list_pending" | "list_fixture_read_challenges" | "approve_fixture" | "approve_gemini"
+      | "list_pending" | "list_fixture_read_challenges" | "list_gemini_read_challenges"
+      | "approve_fixture" | "approve_gemini"
       | "publish_fixture_snapshot" | "publish_gemini_snapshot"
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap", payload: object) => {
       if (kind === "list_pending" || kind === "list_fixture_read_challenges"
+        || kind === "list_gemini_read_challenges"
         || kind === "approve_fixture" || kind === "approve_gemini" || kind === "revoke_fixture"
         || kind === "revoke_all_fixture" || kind === "publish_fixture_snapshot"
         || kind === "publish_gemini_snapshot"
@@ -245,11 +274,14 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       getConnection: (requestId: string) => request("get_connection", { requestId }),
       readFixtureSnapshot: (connectionId: string, limit?: number) =>
         request("read_fixture_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
+      readGeminiSnapshot: (connectionId: string, limit?: number) =>
+        request("read_gemini_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
       readFixtureEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>
         request("read_fixture_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }) }),
       disconnectFixture: (connectionId: string) => request("disconnect_fixture", { connectionId }),
       listPending: () => request("list_pending", {}),
       listFixtureReadChallenges: () => request("list_fixture_read_challenges", {}),
+      listGeminiReadChallenges: () => request("list_gemini_read_challenges", {}),
       approveFixture: (pendingRequestId: string, target: FixtureTarget) =>
         request("approve_fixture", { pendingRequestId, target }),
       approveGemini: (pendingRequestId: string, target: GeminiTarget) =>
@@ -257,8 +289,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       publishFixtureSnapshot: (target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>, challengeId?: string) =>
         request("publish_fixture_snapshot", { target, messages,
           ...(challengeId === undefined ? {} : { challengeId }) }),
-      publishGeminiSnapshot: (target: GeminiTarget, messages: ReadonlyArray<GeminiRenderedMessage>) =>
-        request("publish_gemini_snapshot", { target, messages }),
+      publishGeminiSnapshot: (target: GeminiTarget, messages: ReadonlyArray<GeminiRenderedMessage>, challengeId?: string) =>
+        request("publish_gemini_snapshot", { target, messages,
+          ...(challengeId === undefined ? {} : { challengeId }) }),
       markFixtureObservationGap: (target: FixtureTarget) => request("mark_fixture_observation_gap", { target }),
       revokeFixture: (tabId: number, observed: { documentId: string; conversationId: string } | null) =>
         request("revoke_fixture", { tabId, observed }),

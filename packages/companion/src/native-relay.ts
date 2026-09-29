@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
-  parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiSnapshot,
+  parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
+  parseNativeGeminiSnapshot,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
   from "./native-protocol.js";
@@ -43,18 +44,24 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                   && message.kind === "publish_gemini_snapshot" ? parseNativeGeminiSnapshot(message)
                 : typeof message === "object" && message !== null && "kind" in message
                   && message.kind === "list_fixture_read_challenges" ? parseNativeFixtureReadChallenges(message)
+                  : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "list_gemini_read_challenges" ? parseNativeGeminiReadChallenges(message)
                     : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "mark_fixture_observation_gap" ? parseNativeFixtureGap(message)
               : parseNativePendingList(message);
         nativeReply = nativeReply.then(async () => {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
-          let kind: "pending_list" | "fixture_read_challenges" | "fixture_approved" | "gemini_approved" | "fixture_revoked"
+          let kind: "pending_list" | "fixture_read_challenges" | "gemini_read_challenges"
+            | "fixture_approved" | "gemini_approved" | "fixture_revoked"
             | "fixture_snapshot_published" | "gemini_snapshot_published" | "fixture_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
               origin: string; conversationId: string; tabId: number; documentId: string
             }; expiresAt: number }>; activeTabIds: ReadonlyArray<number> }
+            | { challenges: ReadonlyArray<{ challengeId: string; target: {
+              origin: string; conversationId: string; url: string; tabId: number; documentId: string
+            }; expiresAt: number }> }
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"));
@@ -67,6 +74,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               const result = await client.listFixtureReadChallenges();
               if (result.kind !== "fixture_read_challenges") throw new Error("Broker refused read challenges");
               kind = "fixture_read_challenges";
+              payload = result.payload;
+            } else if (request.kind === "list_gemini_read_challenges") {
+              const result = await client.listGeminiReadChallenges();
+              if (result.kind !== "gemini_read_challenges") throw new Error("Broker refused Gemini read challenges");
+              kind = "gemini_read_challenges";
               payload = result.payload;
             } else if (request.kind === "approve_fixture") {
               const result = await client.approveFixture(request.payload.pendingRequestId, request.payload.target);
@@ -102,7 +114,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               kind = "fixture_gap_marked";
               payload = result.payload;
             } else if (request.kind === "publish_gemini_snapshot") {
-              const result = await client.publishGeminiSnapshot(request.payload.target, request.payload.messages);
+              const result = await client.publishGeminiSnapshot(request.payload.target, request.payload.messages,
+                request.payload.challengeId);
               if (result.kind !== "gemini_snapshot_published") throw new Error("Broker refused Gemini snapshot");
               kind = "gemini_snapshot_published";
               payload = result.payload;

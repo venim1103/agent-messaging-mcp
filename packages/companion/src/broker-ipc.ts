@@ -43,11 +43,13 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
             responses = responses.then(async () => {
               if (socket.destroyed) return;
               const reply = handleBrokerRequest(message, authenticatedRole, owner, requests);
-              if (reply.kind !== "fixture_read_authorized") {
+              if (reply.kind !== "fixture_read_authorized" && reply.kind !== "gemini_read_authorized") {
                 socket.write(encodeNativeFrame(reply));
                 return;
               }
-              const pending = requests.requestFreshFixtureRead(owner, reply.payload.connectionId);
+              const pending = reply.kind === "fixture_read_authorized"
+                ? requests.requestFreshFixtureRead(owner, reply.payload.connectionId)
+                : requests.requestFreshGeminiRead(owner, reply.payload.connectionId);
               if (!pending || pending === "busy") {
                 socket.write(encodeNativeFrame({ ...reply, kind: "error",
                   payload: { code: pending === "busy" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } }));
@@ -56,7 +58,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
               const snapshot = await pending.result;
               if (socket.destroyed) return;
               socket.write(encodeNativeFrame(snapshot && snapshot !== "not_ready"
-                ? { ...reply, kind: "fixture_snapshot", payload: {
+                ? { ...reply, kind: reply.kind === "fixture_read_authorized" ? "fixture_snapshot" : "gemini_snapshot", payload: {
                   ...snapshot, messages: snapshot.messages.slice(-reply.payload.limit),
                   omittedBefore: snapshot.messages.length > reply.payload.limit
                 } }

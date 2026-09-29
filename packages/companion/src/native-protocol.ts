@@ -23,6 +23,23 @@ const fixtureReadChallengesSchema = z.strictObject({
   payload: z.strictObject({})
 });
 
+const geminiReadChallengesSchema = z.strictObject({
+  kind: z.literal("list_gemini_read_challenges"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({})
+});
+
+export function parseNativeGeminiReadChallenges(message: unknown, now = Date.now()) {
+  const result = geminiReadChallengesSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native Gemini read challenge list");
+  }
+  return result.data;
+}
+
 export function parseNativeFixtureReadChallenges(message: unknown, now = Date.now()) {
   const result = fixtureReadChallengesSchema.safeParse(message);
   if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
@@ -99,7 +116,8 @@ const geminiSnapshotSchema = z.strictObject({
     target: geminiTargetSchema,
     messages: z.array(z.strictObject({
       direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(2048)
-    })).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES)
+    })).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES),
+    challengeId: z.uuid().optional()
   })
 });
 
