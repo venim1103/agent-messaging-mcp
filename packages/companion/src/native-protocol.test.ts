@@ -11,7 +11,7 @@ import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeFixtureReadChallenges, parseNativeFixtureReset, parseNativeFixtureRevocation,
-  parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativePendingList,
+  parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
   from "./native-protocol.js";
 
@@ -127,6 +127,35 @@ test("native Gemini approval accepts only one exact saved chat target", () => {
     { ...approval, payload: { target: { ...approval.payload.target, selector: "*" } } }
   ]) {
     assert.throws(() => parseNativeGeminiApproval(invalid, now), /Invalid native Gemini approval/);
+  }
+});
+
+test("native Gemini snapshots accept bounded synthetic rows only for an exact saved chat", () => {
+  const snapshot = { ...request, kind: "publish_gemini_snapshot", payload: {
+    target: { origin: "https://gemini.google.com", conversationId: "disposable-chat",
+      url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 3, documentId: "CHROME-doc_gemini-42" },
+    messages: [{ direction: "outgoing", text: "OK" }, { direction: "outgoing", text: "OK" }]
+  } };
+  assert.deepEqual(parseNativeGeminiSnapshot(snapshot, now), snapshot);
+  for (const invalid of [
+    { ...snapshot, kind: "evaluate" },
+    { ...snapshot, deadlineMs: now },
+    { ...snapshot, payload: { ...snapshot.payload, selector: "*" } },
+    { ...snapshot, payload: { ...snapshot.payload, challengeId: request.requestId } },
+    { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target,
+      url: "https://gemini.google.com/app/other?hl=en" } } },
+    { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target,
+      url: `${snapshot.payload.target.url}#reply` } } },
+    { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target, documentId: "" } } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "" }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "system", text: "No" }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x".repeat(2049) }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: Array.from({ length: 32 }, () => ({
+      direction: "incoming", text: "é".repeat(2048)
+    })) } }
+  ]) {
+    assert.throws(() => parseNativeGeminiSnapshot(invalid, now), /Invalid native Gemini snapshot/);
   }
 });
 
@@ -516,6 +545,55 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal("url" in geminiState.payload, false);
     assert.equal("tabId" in geminiState.payload, false);
     assert.equal("documentId" in geminiState.payload, false);
+
+    const publishHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const publishOutput: Buffer[] = [];
+    const publishErrors: Buffer[] = [];
+    publishHost.stdout.on("data", (chunk: Buffer) => publishOutput.push(chunk));
+    publishHost.stderr.on("data", (chunk: Buffer) => publishErrors.push(chunk));
+    const geminiPublication = { ...request, kind: "publish_gemini_snapshot", deadlineMs: Date.now() + 10_000,
+      payload: { target: geminiApproval.payload.target,
+        messages: [{ direction: "outgoing", text: "Synthetic question" },
+          { direction: "incoming", text: "Synthetic answer" }] } };
+    publishHost.stdin.end(encodeNativeFrame(geminiPublication));
+    const [publishExit] = await once(publishHost, "exit");
+    assert.equal(publishExit, 0, Buffer.concat(publishErrors).toString());
+    const [publishedGemini] = new NativeFrameDecoder().push(Buffer.concat(publishOutput)) as [{
+      kind: string; requestId: string; payload: { count: number }
+    }];
+    assert.equal(publishedGemini.kind, "gemini_snapshot_published");
+    assert.equal(publishedGemini.requestId, geminiPublication.requestId);
+    assert.deepEqual(publishedGemini.payload, { count: 1 });
+    const observedGemini = await facade.getConnection(geminiPending.payload.requestId);
+    if (observedGemini.kind !== "connection_state" || observedGemini.payload.state !== "ready_readonly") {
+      throw new Error("Expected a Gemini observation state");
+    }
+    assert.equal(observedGemini.payload.observation.state, "recent");
+    assert.equal("messages" in observedGemini.payload, false);
+
+    const geminiRelay = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
+    try {
+      assert.deepEqual((await geminiRelay.revokeAllFixtures()).payload, { count: 1 });
+    } finally {
+      geminiRelay.close();
+    }
+    const replayHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const replayOutput: Buffer[] = [];
+    const replayErrors: Buffer[] = [];
+    replayHost.stdout.on("data", (chunk: Buffer) => replayOutput.push(chunk));
+    replayHost.stderr.on("data", (chunk: Buffer) => replayErrors.push(chunk));
+    replayHost.stdin.end(encodeNativeFrame({ ...geminiPublication, deadlineMs: Date.now() + 10_000 }));
+    const [replayExit] = await once(replayHost, "exit");
+    assert.equal(replayExit, 0, Buffer.concat(replayErrors).toString());
+    const [replayedGemini] = new NativeFrameDecoder().push(Buffer.concat(replayOutput)) as [{
+      kind: string; payload: { count: number }
+    }];
+    assert.equal(replayedGemini.kind, "gemini_snapshot_published");
+    assert.deepEqual(replayedGemini.payload, { count: 0 });
   } finally {
     facade?.close();
     broker.kill("SIGTERM");

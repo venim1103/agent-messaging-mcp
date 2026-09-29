@@ -1,5 +1,6 @@
 import * as z from "zod/v4";
-import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES } from "./pending-connections.js";
+import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
+  MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES } from "./pending-connections.js";
 
 export const NATIVE_HOST_NAME = "com.agent_messaging_mcp.bridge";
 export const PROTOCOL_VERSION = 1;
@@ -47,6 +48,26 @@ const fixtureApprovalSchema = z.strictObject({
   })
 });
 
+const geminiTargetSchema = z.strictObject({
+  origin: z.literal("https://gemini.google.com"),
+  conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+  url: z.string().min(1).max(512),
+  tabId: z.number().int().safe().positive(),
+  documentId: z.string().regex(/^[!-~]{1,128}$/)
+});
+
+function isValidGeminiTarget(target: z.infer<typeof geminiTargetSchema>): boolean {
+  try {
+    const url = new URL(target.url);
+    const route = url.pathname.split("/").filter(Boolean);
+    return url.href === target.url && url.origin === target.origin && !url.username && !url.password
+      && !url.hash && route.length === 2 && route[1] === target.conversationId
+      && route.every((segment) => /^[A-Za-z0-9_-]{1,128}$/.test(segment));
+  } catch {
+    return false;
+  }
+}
+
 const geminiApprovalSchema = z.strictObject({
   kind: z.literal("approve_gemini"),
   protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -55,32 +76,39 @@ const geminiApprovalSchema = z.strictObject({
   deadlineMs: z.number().int().safe(),
   payload: z.strictObject({
     pendingRequestId: z.uuid(),
-    target: z.strictObject({
-      origin: z.literal("https://gemini.google.com"),
-      conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
-      url: z.string().min(1).max(512),
-      tabId: z.number().int().safe().positive(),
-      documentId: z.string().regex(/^[!-~]{1,128}$/)
-    })
+    target: geminiTargetSchema
   })
 });
 
 export function parseNativeGeminiApproval(message: unknown, now = Date.now()) {
   const result = geminiApprovalSchema.safeParse(message);
-  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) {
     throw new Error("Invalid native Gemini approval");
   }
-  try {
-    const { target } = result.data.payload;
-    const url = new URL(target.url);
-    const route = url.pathname.split("/").filter(Boolean);
-    if (url.href !== target.url || url.origin !== target.origin || url.username || url.password
-      || url.hash || route.length !== 2 || route[1] !== target.conversationId
-      || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) {
-      throw new Error("Invalid native Gemini approval");
-    }
-  } catch {
-    throw new Error("Invalid native Gemini approval");
+  return result.data;
+}
+
+const geminiSnapshotSchema = z.strictObject({
+  kind: z.literal("publish_gemini_snapshot"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({
+    target: geminiTargetSchema,
+    messages: z.array(z.strictObject({
+      direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(2048)
+    })).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES)
+  })
+});
+
+export function parseNativeGeminiSnapshot(message: unknown, now = Date.now()) {
+  const result = geminiSnapshotSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)
+    || Buffer.byteLength(JSON.stringify(result.data.payload.messages), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
+    throw new Error("Invalid native Gemini snapshot");
   }
   return result.data;
 }

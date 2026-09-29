@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
-  parseNativeFixtureReadChallenges, parseNativeGeminiApproval,
+  parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiSnapshot,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
   from "./native-protocol.js";
@@ -40,6 +40,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               : typeof message === "object" && message !== null && "kind" in message
                 && message.kind === "publish_fixture_snapshot" ? parseNativeFixtureSnapshot(message)
                 : typeof message === "object" && message !== null && "kind" in message
+                  && message.kind === "publish_gemini_snapshot" ? parseNativeGeminiSnapshot(message)
+                : typeof message === "object" && message !== null && "kind" in message
                   && message.kind === "list_fixture_read_challenges" ? parseNativeFixtureReadChallenges(message)
                     : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "mark_fixture_observation_gap" ? parseNativeFixtureGap(message)
@@ -48,7 +50,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
           let kind: "pending_list" | "fixture_read_challenges" | "fixture_approved" | "gemini_approved" | "fixture_revoked"
-            | "fixture_snapshot_published" | "fixture_gap_marked" | "error";
+            | "fixture_snapshot_published" | "gemini_snapshot_published" | "fixture_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
               origin: string; conversationId: string; tabId: number; documentId: string
@@ -98,6 +100,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               const result = await client.markFixtureObservationGap(request.payload.target);
               if (result.kind !== "fixture_gap_marked") throw new Error("Broker refused fixture gap");
               kind = "fixture_gap_marked";
+              payload = result.payload;
+            } else if (request.kind === "publish_gemini_snapshot") {
+              const result = await client.publishGeminiSnapshot(request.payload.target, request.payload.messages);
+              if (result.kind !== "gemini_snapshot_published") throw new Error("Broker refused Gemini snapshot");
+              kind = "gemini_snapshot_published";
               payload = result.payload;
             } else {
               const result = await client.publishFixtureSnapshot(request.payload.target, request.payload.messages,

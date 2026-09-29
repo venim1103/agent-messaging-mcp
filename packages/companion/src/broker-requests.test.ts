@@ -284,6 +284,31 @@ test("only a relay approves one exact Gemini chat and its MCP owner sees no brow
   assert.deepEqual(handleBrokerRequest({ ...envelope, kind: "read_fixture_snapshot", payload: {
     connectionId: "a66b3997-9d43-4554-8399-267d1fe9f75c"
   } }, "facade", owner, requests, 2001).payload, { code: "CONNECTION_NOT_FOUND" });
+  const rows = [{ direction: "outgoing", text: "OK" }, { direction: "outgoing", text: "OK" }];
+  const publish = { ...envelope, kind: "publish_gemini_snapshot", payload: { target, messages: rows } };
+  assert.deepEqual(handleBrokerRequest(publish, "facade", owner, requests, 2001).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest({ ...publish, payload: {
+    target: { ...target, url: `${target.url}?hl=en` }, messages: rows
+  } }, "relay", stranger, requests, 2001).payload, { count: 0 });
+  assert.deepEqual(handleBrokerRequest({ ...publish, payload: {
+    target: { ...target, documentId: "other" }, messages: rows
+  } }, "relay", stranger, requests, 2001).payload, { count: 0 });
+  assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2001), {
+    ...envelope, kind: "gemini_snapshot_published", payload: { count: 1 }
+  });
+  const connection = requests.get(owner, pending.requestId, 2001);
+  if (connection?.state !== "ready_readonly") throw new Error("Expected a Gemini connection");
+  assert.equal(requests.getGeminiSnapshot(stranger, connection.connectionId, 2001), null);
+  const observed = requests.getGeminiSnapshot(owner, connection.connectionId, 2001);
+  if (!observed || observed === "not_ready") throw new Error("Expected a private Gemini snapshot");
+  assert.deepEqual(observed.messages.map(({ direction, text }) => ({ direction, text })), rows);
+  assert.equal("messages" in handleBrokerRequest(lookup, "facade", owner, requests, 2001).payload, false);
+  assert.throws(() => handleBrokerRequest({ ...publish, payload: { ...publish.payload, selector: "*" } },
+    "relay", stranger, requests, 2001));
+  assert.equal(requests.revokeChangedTab(4, null), 1);
+  assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2002).payload, { count: 0 });
+  assert.equal(requests.getGeminiSnapshot(owner, connection.connectionId, 2002), null);
   assert.throws(() => handleBrokerRequest({ ...approval, payload: {
     ...approval.payload, target: { ...target, selector: "*" }
   } }, "relay", stranger, requests, 2000));

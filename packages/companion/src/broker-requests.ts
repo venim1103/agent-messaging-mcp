@@ -1,7 +1,8 @@
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests }
+import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
+  PendingConnectionRequests }
   from "./pending-connections.js";
 
 const envelope = {
@@ -23,6 +24,9 @@ const geminiTarget = z.strictObject({
 const fixtureMessage = z.strictObject({
   id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
   direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
+});
+const geminiMessage = z.strictObject({
+  direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(2048)
 });
 
 const requestSchema = z.discriminatedUnion("kind", [
@@ -51,6 +55,9 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("publish_fixture_snapshot"), payload: z.strictObject({
     target: fixtureTarget, messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES),
     challengeId: z.uuid().optional()
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("publish_gemini_snapshot"), payload: z.strictObject({
+    target: geminiTarget, messages: z.array(geminiMessage).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES)
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("mark_fixture_observation_gap"), payload: z.strictObject({
     target: fixtureTarget
@@ -106,6 +113,12 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       ? { ...response, kind: "fixture_snapshot_published" as const,
         payload: { count: requests.publishFixtureSnapshot(request.payload.target, request.payload.messages,
           now, request.payload.challengeId) } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "publish_gemini_snapshot") {
+    return role === "relay"
+      ? { ...response, kind: "gemini_snapshot_published" as const,
+        payload: { count: requests.publishGeminiSnapshot(request.payload.target, request.payload.messages, now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "mark_fixture_observation_gap") {

@@ -191,9 +191,29 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.deepEqual((await otherFacade.getConnection(geminiPending.payload.requestId)).payload, { state: "unknown" });
     assert.deepEqual((await facade.readFixtureSnapshot(geminiState.payload.connectionId)).payload,
       { code: "CONNECTION_NOT_FOUND" });
+    const geminiRows = [
+      { direction: "outgoing" as const, text: "Synthetic question" },
+      { direction: "incoming" as const, text: "Synthetic answer" }
+    ];
+    assert.throws(() => facade.publishGeminiSnapshot(geminiTarget, geminiRows), /Broker role cannot perform/);
+    assert.deepEqual((await relay.publishGeminiSnapshot({ ...geminiTarget, url: `${geminiTarget.url}&other=1` },
+      geminiRows)).payload, { count: 0 });
+    const publishedGemini = await relay.publishGeminiSnapshot(geminiTarget, geminiRows);
+    assert.equal(publishedGemini.kind, "gemini_snapshot_published");
+    assert.deepEqual(publishedGemini.payload, { count: 1 });
+    const observedGemini = await facade.getConnection(geminiPending.payload.requestId);
+    if (observedGemini.kind !== "connection_state" || observedGemini.payload.state !== "ready_readonly") {
+      throw new Error("Expected Gemini observation freshness");
+    }
+    assert.equal(observedGemini.payload.observation.state, "recent");
+    assert.equal("messages" in observedGemini.payload, false);
+    assert.equal("url" in observedGemini.payload, false);
+    assert.deepEqual((await facade.readFixtureSnapshot(geminiState.payload.connectionId)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
     assert.deepEqual((await relay.revokeAllFixtures()).payload, { count: 1 });
     assert.deepEqual((await facade.getConnection(geminiPending.payload.requestId)).payload,
       { requestId: geminiPending.payload.requestId, state: "stale" });
+    assert.deepEqual((await relay.publishGeminiSnapshot(geminiTarget, geminiRows)).payload, { count: 0 });
     otherFacade.close();
     facade.close();
     assert.deepEqual((await relay.listPending() as typeof listed).payload.requests, []);
