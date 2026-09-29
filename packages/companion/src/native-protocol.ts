@@ -47,6 +47,44 @@ const fixtureApprovalSchema = z.strictObject({
   })
 });
 
+const geminiApprovalSchema = z.strictObject({
+  kind: z.literal("approve_gemini"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({
+    pendingRequestId: z.uuid(),
+    target: z.strictObject({
+      origin: z.literal("https://gemini.google.com"),
+      conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+      url: z.string().min(1).max(512),
+      tabId: z.number().int().safe().positive(),
+      documentId: z.string().regex(/^[!-~]{1,128}$/)
+    })
+  })
+});
+
+export function parseNativeGeminiApproval(message: unknown, now = Date.now()) {
+  const result = geminiApprovalSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native Gemini approval");
+  }
+  try {
+    const { target } = result.data.payload;
+    const url = new URL(target.url);
+    const route = url.pathname.split("/").filter(Boolean);
+    if (url.href !== target.url || url.origin !== target.origin || url.username || url.password
+      || url.search || url.hash || route.length !== 2 || route[1] !== target.conversationId
+      || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) {
+      throw new Error("Invalid native Gemini approval");
+    }
+  } catch {
+    throw new Error("Invalid native Gemini approval");
+  }
+  return result.data;
+}
+
 const fixtureGapSchema = z.strictObject({
   kind: z.literal("mark_fixture_observation_gap"),
   protocolVersion: z.literal(PROTOCOL_VERSION),

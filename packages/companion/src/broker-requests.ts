@@ -14,6 +14,12 @@ const fixtureTarget = z.strictObject({
   origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
   tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
 });
+const geminiTarget = z.strictObject({
+  origin: z.literal("https://gemini.google.com"),
+  conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+  url: z.string().min(1).max(512),
+  tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
+});
 const fixtureMessage = z.strictObject({
   id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
   direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
@@ -38,6 +44,9 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("approve_fixture"), payload: z.strictObject({
     pendingRequestId: z.uuid(),
     target: fixtureTarget
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("approve_gemini"), payload: z.strictObject({
+    pendingRequestId: z.uuid(), target: geminiTarget
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("publish_fixture_snapshot"), payload: z.strictObject({
     target: fixtureTarget, messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES),
@@ -82,6 +91,14 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     const grant = requests.approve(request.payload.pendingRequestId, request.payload.target, now);
     return grant
       ? { ...response, kind: "fixture_approved" as const, payload: { requestId: grant.requestId, expiresAt: grant.expiresAt } }
+      : { ...response, kind: "error" as const, payload: { code: "APPROVAL_INVALID" } };
+  }
+  if (request.kind === "approve_gemini") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    const grant = requests.approveGemini(request.payload.pendingRequestId, request.payload.target, now);
+    return grant
+      ? { ...response, kind: "gemini_approved" as const,
+        payload: { requestId: grant.requestId, expiresAt: grant.expiresAt } }
       : { ...response, kind: "error" as const, payload: { code: "APPROVAL_INVALID" } };
   }
   if (request.kind === "publish_fixture_snapshot") {

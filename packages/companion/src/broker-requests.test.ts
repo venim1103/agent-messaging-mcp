@@ -250,3 +250,41 @@ test("only an authenticated relay can mark an exact fixture observation gap", ()
   assert.throws(() => handleBrokerRequest({ ...gap, payload: { ...gap.payload, selector: "*" } },
     "relay", Symbol("relay"), requests, 2002));
 });
+
+test("only a relay approves one exact Gemini chat and its MCP owner sees no browser IDs", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("selected chat owner");
+  const stranger = Symbol("another MCP client");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "https://gemini.google.com", conversationId: "disposable-chat",
+    url: "https://gemini.google.com/app/disposable-chat", tabId: 4, documentId: "CHROME-doc_gemini-42" };
+  const envelope = { protocolVersion: PROTOCOL_VERSION,
+    requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+  const approval = { ...envelope, kind: "approve_gemini", payload: {
+    pendingRequestId: pending.requestId, target
+  } };
+  assert.deepEqual(handleBrokerRequest(approval, "facade", owner, requests, 2000).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest({ ...approval, payload: {
+    ...approval.payload, target: { ...target, url: `${target.url}/other` }
+  } }, "relay", stranger, requests, 2000).payload, { code: "APPROVAL_INVALID" });
+  assert.equal(handleBrokerRequest(approval, "relay", stranger, requests, 2000).kind, "gemini_approved");
+  assert.deepEqual(handleBrokerRequest(approval, "relay", stranger, requests, 2000).payload,
+    { code: "APPROVAL_INVALID" });
+  const lookup = { ...envelope, kind: "get_connection", payload: { requestId: pending.requestId } };
+  assert.deepEqual(handleBrokerRequest(lookup, "facade", stranger, requests, 2001).payload,
+    { state: "unknown" });
+  const state = handleBrokerRequest(lookup, "facade", owner, requests, 2001);
+  assert.equal(state.kind, "connection_state");
+  assert.equal(state.payload.state, "ready_readonly");
+  assert.equal(state.payload.origin, target.origin);
+  assert.equal("tabId" in state.payload, false);
+  assert.equal("documentId" in state.payload, false);
+  assert.equal("url" in state.payload, false);
+  assert.deepEqual(handleBrokerRequest({ ...envelope, kind: "read_fixture_snapshot", payload: {
+    connectionId: "a66b3997-9d43-4554-8399-267d1fe9f75c"
+  } }, "facade", owner, requests, 2001).payload, { code: "CONNECTION_NOT_FOUND" });
+  assert.throws(() => handleBrokerRequest({ ...approval, payload: {
+    ...approval.payload, target: { ...target, selector: "*" }
+  } }, "relay", stranger, requests, 2000));
+});

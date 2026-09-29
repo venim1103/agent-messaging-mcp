@@ -11,7 +11,7 @@ import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeFixtureReadChallenges, parseNativeFixtureReset, parseNativeFixtureRevocation,
-  parseNativeFixtureSnapshot, parseNativePendingList,
+  parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativePendingList,
   PROTOCOL_VERSION }
   from "./native-protocol.js";
 
@@ -99,6 +99,28 @@ test("native fixture approval refuses other origins, targets, and arbitrary fiel
     { ...approval, payload: { ...approval.payload, command: "navigate" } }
   ]) {
     assert.throws(() => parseNativeFixtureApproval(invalid, now), /Invalid native fixture approval/);
+  }
+});
+
+test("native Gemini approval accepts only one exact saved chat target", () => {
+  const approval = { ...request, kind: "approve_gemini", payload: {
+    pendingRequestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+    target: { origin: "https://gemini.google.com", conversationId: "disposable-chat",
+      url: "https://gemini.google.com/app/disposable-chat", tabId: 3, documentId: "CHROME-doc_gemini-42" }
+  } };
+  assert.deepEqual(parseNativeGeminiApproval(approval, now), approval);
+  for (const invalid of [
+    { ...approval, kind: "evaluate" },
+    { ...approval, deadlineMs: now },
+    { ...approval, payload: { ...approval.payload, selector: "*" } },
+    { ...approval, payload: { target: { ...approval.payload.target, origin: "http://127.0.0.1:8787" } } },
+    { ...approval, payload: { target: { ...approval.payload.target, url: "https://gemini.google.com/app/other" } } },
+    { ...approval, payload: { target: { ...approval.payload.target, url: `${approval.payload.target.url}?hl=en` } } },
+    { ...approval, payload: { target: { ...approval.payload.target, documentId: "" } } },
+    { ...approval, payload: { target: { ...approval.payload.target, tabId: 0 } } },
+    { ...approval, payload: { target: { ...approval.payload.target, selector: "*" } } }
+  ]) {
+    assert.throws(() => parseNativeGeminiApproval(invalid, now), /Invalid native Gemini approval/);
   }
 });
 
@@ -199,7 +221,7 @@ test("spawned native relay replies with a framed version and no other stdout", a
   host.stdin.end(frame.subarray(3));
   const [exitCode] = await once(host, "exit");
 
-  assert.equal(exitCode, 0);
+  assert.equal(exitCode, 0, Buffer.concat(stderr).toString());
   assert.equal(Buffer.concat(stderr).toString(), "");
   const replies = new NativeFrameDecoder().push(Buffer.concat(stdout));
   assert.deepEqual(replies, [handleNativeHandshake(handshake, Date.now())]);
@@ -452,6 +474,42 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const resetState = await facade.getConnection(fresh.payload.requestId);
     if (resetState.kind !== "connection_state") throw new Error("Expected reset connection state");
     assert.deepEqual(resetState.payload, { requestId: fresh.payload.requestId, state: "stale" });
+
+    const geminiPending = await facade.requestConnection();
+    if (geminiPending.kind !== "connection_requested") throw new Error("Expected Gemini pending request");
+    const geminiHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const geminiOutput: Buffer[] = [];
+    const geminiErrors: Buffer[] = [];
+    geminiHost.stdout.on("data", (chunk: Buffer) => geminiOutput.push(chunk));
+    geminiHost.stderr.on("data", (chunk: Buffer) => geminiErrors.push(chunk));
+    const geminiApproval = { ...request, kind: "approve_gemini", deadlineMs: Date.now() + 10_000, payload: {
+      pendingRequestId: geminiPending.payload.requestId,
+      target: { origin: "https://gemini.google.com", conversationId: "disposable-chat",
+        url: "https://gemini.google.com/app/disposable-chat", tabId: 6, documentId: "CHROME-doc_gemini-42" }
+    } };
+    geminiHost.stdin.end(Buffer.concat([encodeNativeFrame(geminiApproval), encodeNativeFrame(geminiApproval)]));
+    const [geminiExit] = await once(geminiHost, "exit");
+    assert.equal(geminiExit, 0, Buffer.concat(geminiErrors).toString());
+    const geminiReplies = new NativeFrameDecoder().push(Buffer.concat(geminiOutput)) as [
+      { kind: string; requestId: string; payload: { requestId: string } },
+      { kind: string; payload: { code: string } }
+    ];
+    assert.equal(geminiReplies.length, 2);
+    assert.equal(geminiReplies[0].kind, "gemini_approved");
+    assert.equal(geminiReplies[0].requestId, geminiApproval.requestId);
+    assert.equal(geminiReplies[0].payload.requestId, geminiPending.payload.requestId);
+    assert.equal(geminiReplies[1].kind, "error");
+    assert.deepEqual(geminiReplies[1].payload, { code: "APPROVAL_INVALID" });
+    const geminiState = await facade.getConnection(geminiPending.payload.requestId);
+    if (geminiState.kind !== "connection_state" || geminiState.payload.state !== "ready_readonly") {
+      throw new Error("Expected a Gemini owner connection");
+    }
+    assert.equal(geminiState.payload.origin, "https://gemini.google.com");
+    assert.equal("url" in geminiState.payload, false);
+    assert.equal("tabId" in geminiState.payload, false);
+    assert.equal("documentId" in geminiState.payload, false);
   } finally {
     facade?.close();
     broker.kill("SIGTERM");

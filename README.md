@@ -2,7 +2,7 @@
 
 Connect an MCP agent to a browser chat that a person opens and approves through an extension. The intended experience uses the person's existing browser login and the chat website itself, not a provider API or exported credentials.
 
-> **Status: early local prototype.** The approved read path works only with the synthetic chat fixture; its toolbar-to-MCP route has been manually verified in container Chromium. Gemini is not connected through MCP, and there is no message-send tool. Do not use this build to grant access to personal conversations.
+> **Status: early local prototype.** The approved read path works only with the synthetic chat fixture; its toolbar-to-MCP route has been manually verified in container Chromium. A separate Gemini read-only approval grant is implemented but not yet verified through a real toolbar click. Gemini text is not available through MCP, and there is no message-send tool. Do not use this build to grant access to personal conversations.
 
 ## How It Works
 
@@ -21,7 +21,7 @@ There is no network browser-control listener, unrestricted CDP bridge, model-sup
 - `chat.wait_for_events` waits up to 20 seconds for later fixture snapshots after that cursor, returning at most two per call. Timeouts are explicit; an expired cursor requires another `chat.read_messages` snapshot. A real fixture message appeared through this route in a manual toolbar test. After an MV3 worker wake, the extension conservatively expires old fixture cursors if an observation gap is possible. Each event contains the current rendered snapshot, not only newly received rows.
 - `chat.disconnect` lets the owning MCP client revoke its fixture grant without closing the tab. The extension drops tracking and document observers when its native watcher sees that the broker no longer has a live grant. An unchanged reread refreshes capture time without manufacturing an event.
 - The extension observes the approved fixture's message list and publishes bounded updates. Reads are denied for other MCP clients and for revoked or expired grants.
-- The popup has separate structure-only Gemini diagnostics and explicitly approved draft-input probes. They do not create a Gemini MCP connection or click Send.
+- On a selected saved Gemini chat, the trusted popup can request an explicit read-only grant bound to that tab's exact URL and browser document. Synthetic tests cover owner isolation, native approval, route changes, and tab/restart revocation; a real toolbar approval is still pending. The popup's separate structure-only diagnostics and approved draft-input probes do not click Send.
 
 The local toolbar-approval-to-MCP-read route returned two synthetic rows on consecutive reads; switching fixture conversations then made that connection stale and blocked another read. A separate fixture-only message advanced the event cursor and appeared through `chat.wait_for_events`. See [HANDOFF.md](HANDOFF.md) for the exact evidence, remaining risks, and next step.
 
@@ -59,6 +59,6 @@ npm run test:unit
 npm run test:e2e
 ```
 
-Unit and isolated Chromium tests cover role isolation, native framing, read challenges, event cursors, worker-wake gap invalidation, and disconnect cleanup; the real toolbar fixture read and fixture message-to-MCP event routes also passed manual checks. Automated popup navigation does **not** grant Chrome's `activeTab` permission and is not counted as trusted approval coverage. Read challenges fail closed if the browser cannot verify the approved fixture document, but continuous browser-presence reporting and a reviewed real-site adapter are still needed before supporting other conversations. Sending requires a separate supervised approval and recovery path.
+Unit and isolated Chromium tests cover role isolation, native framing, read challenges, event cursors, worker-wake gap invalidation, Gemini grant selection, and disconnect cleanup; the real toolbar fixture read and fixture message-to-MCP event routes also passed manual checks. Automated popup navigation does **not** grant Chrome's `activeTab` permission and is not counted as trusted approval coverage. Read challenges fail closed if the browser cannot verify the approved fixture document. The Gemini approval route still needs a real toolbar check, and a reviewed exact-document Gemini read adapter plus continuous presence reporting are needed before Gemini text can reach MCP. Sending requires a separate supervised approval and recovery path.
 
 Read [DESIGN.md](DESIGN.md) for the architecture and intended capabilities, [HANDOFF.md](HANDOFF.md) for setup details and test evidence, and [LICENSE](LICENSE) for licensing.

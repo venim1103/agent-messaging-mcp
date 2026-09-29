@@ -23,14 +23,22 @@ export type FixtureTarget = Readonly<{
   tabId: number;
   documentId: string;
 }>;
+export type GeminiTarget = Readonly<{
+  origin: "https://gemini.google.com";
+  conversationId: string;
+  url: string;
+  tabId: number;
+  documentId: string;
+}>;
+export type ApprovedTarget = FixtureTarget | GeminiTarget;
 
 export type ReadonlyConnection = Readonly<{
   requestId: string;
   state: "ready_readonly";
   connectionId: string;
   generation: 1;
-  origin: FixtureTarget["origin"];
-  conversationId: FixtureTarget["conversationId"];
+  origin: ApprovedTarget["origin"];
+  conversationId: string;
   expiresAt: number;
 }>;
 export type ReadonlyConnectionState = ReadonlyConnection & Readonly<{
@@ -48,7 +56,7 @@ export type FixtureSnapshot = Readonly<{
 
 type FixtureGrant = {
   connection: ReadonlyConnection;
-  target: FixtureTarget;
+  target: ApprovedTarget;
   stale: boolean;
   observations?: ObservationBuffer;
   snapshot?: FixtureSnapshot;
@@ -57,7 +65,7 @@ type RequestRecord = { owner: symbol; expiresAt: number; grant?: FixtureGrant };
 type PendingFixtureRead = {
   owner: symbol;
   connectionId: string;
-  target: FixtureTarget;
+  target: ApprovedTarget;
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
   resolve: (snapshot: FixtureSnapshot | "not_ready" | null) => void;
@@ -136,12 +144,13 @@ export class PendingConnectionRequests {
   }
 
   getApprovedTarget(owner: symbol, connectionId: string, now = Date.now()): FixtureTarget | null {
-    return this.liveGrant(owner, connectionId, now)?.target ?? null;
+    const target = this.liveGrant(owner, connectionId, now)?.target;
+    return target?.origin === "http://127.0.0.1:8787" ? target : null;
   }
 
   getFixtureSnapshot(owner: symbol, connectionId: string, now = Date.now()): FixtureSnapshot | "not_ready" | null {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant) return null;
+    if (grant?.target.origin !== "http://127.0.0.1:8787") return null;
     return grant.snapshot && now - grant.snapshot.capturedAt <= MAX_FIXTURE_SNAPSHOT_AGE_MS
       ? grant.snapshot : "not_ready";
   }
@@ -149,13 +158,13 @@ export class PendingConnectionRequests {
   readFixtureEvents(owner: symbol, connectionId: string,
     cursor: { epoch: string; sequence: number }, limit = MAX_FIXTURE_EVENTS_PER_READ, now = Date.now()) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant) return null;
+    if (grant?.target.origin !== "http://127.0.0.1:8787") return null;
     return grant.observations?.read(cursor, limit) ?? "not_ready";
   }
 
   requestFreshFixtureRead(owner: symbol, connectionId: string, now = Date.now()) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant) return null;
+    if (grant?.target.origin !== "http://127.0.0.1:8787") return null;
     if (this.fixtureReads.size >= MAX_PENDING_FIXTURE_READS) return "busy" as const;
     const challengeId = randomUUID();
     const expiresAt = now + FIXTURE_READ_TIMEOUT_MS;
@@ -179,7 +188,8 @@ export class PendingConnectionRequests {
     const tabs = new Set<number>();
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (grant && !grant.stale && now < grant.connection.expiresAt) tabs.add(grant.target.tabId);
+      if (grant?.target.origin === "http://127.0.0.1:8787"
+        && !grant.stale && now < grant.connection.expiresAt) tabs.add(grant.target.tabId);
     }
     return [...tabs].sort((first, second) => first - second);
   }
@@ -248,11 +258,31 @@ export class PendingConnectionRequests {
   }
 
   approve(requestId: string, target: FixtureTarget, now = Date.now()): ReadonlyConnection | null {
-    const request = this.requests.get(requestId);
-    if (!request || request.grant || now >= request.expiresAt
-      || target.origin !== "http://127.0.0.1:8787" || target.conversationId !== "fixture-alpha"
+    if (target.origin !== "http://127.0.0.1:8787" || target.conversationId !== "fixture-alpha"
       || !Number.isSafeInteger(target.tabId) || target.tabId < 1
       || !/^[!-~]{1,128}$/.test(target.documentId)) return null;
+    return this.createGrant(requestId, target, now);
+  }
+
+  approveGemini(requestId: string, target: GeminiTarget, now = Date.now()): ReadonlyConnection | null {
+    if (target.origin !== "https://gemini.google.com" || !Number.isSafeInteger(target.tabId) || target.tabId < 1
+      || !/^[!-~]{1,128}$/.test(target.documentId) || target.url.length > 512) return null;
+    try {
+      const url = new URL(target.url);
+      const route = url.pathname.split("/").filter(Boolean);
+      if (url.origin !== target.origin || url.username || url.password || url.search || url.hash
+        || url.href !== target.url || route.length !== 2
+        || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))
+        || route[1] !== target.conversationId) return null;
+    } catch {
+      return null;
+    }
+    return this.createGrant(requestId, target, now);
+  }
+
+  private createGrant(requestId: string, target: ApprovedTarget, now: number): ReadonlyConnection | null {
+    const request = this.requests.get(requestId);
+    if (!request || request.grant || now >= request.expiresAt) return null;
 
     const connection = Object.freeze({
       requestId,

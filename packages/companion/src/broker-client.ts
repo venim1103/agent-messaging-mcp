@@ -5,7 +5,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
-import type { FixtureMessage, FixtureTarget } from "./pending-connections.js";
+import type { FixtureMessage, FixtureTarget, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_PENDING_FIXTURE_READS, MAX_PENDING_REQUESTS }
@@ -46,6 +46,11 @@ const replySchema = z.discriminatedUnion("kind", [
         generation: z.literal(1), origin: z.literal("http://127.0.0.1:8787"),
         conversationId: z.literal("fixture-alpha"), expiresAt: z.number().int().safe(),
         observation: z.strictObject({ state: z.enum(["not_observed", "recent", "old"]),
+          capturedAt: z.number().int().safe().nullable() }) }),
+      z.strictObject({ requestId: z.uuid(), state: z.literal("ready_readonly"), connectionId: z.uuid(),
+        generation: z.literal(1), origin: z.literal("https://gemini.google.com"),
+        conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), expiresAt: z.number().int().safe(),
+        observation: z.strictObject({ state: z.enum(["not_observed", "recent", "old"]),
           capturedAt: z.number().int().safe().nullable() }) })
     ])
   }),
@@ -59,6 +64,11 @@ const replySchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({
     kind: z.literal("fixture_approved"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ requestId: z.uuid(), expiresAt: z.number().int().safe() })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_approved"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ requestId: z.uuid(), expiresAt: z.number().int().safe() })
   }),
@@ -175,10 +185,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     let nextRequest: Promise<void> = Promise.resolve();
     const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "disconnect_fixture"
-      | "list_pending" | "list_fixture_read_challenges" | "approve_fixture" | "publish_fixture_snapshot"
+      | "list_pending" | "list_fixture_read_challenges" | "approve_fixture" | "approve_gemini"
+      | "publish_fixture_snapshot"
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap", payload: object) => {
       if (kind === "list_pending" || kind === "list_fixture_read_challenges"
-        || kind === "approve_fixture" || kind === "revoke_fixture"
+        || kind === "approve_fixture" || kind === "approve_gemini" || kind === "revoke_fixture"
         || kind === "revoke_all_fixture" || kind === "publish_fixture_snapshot"
         || kind === "mark_fixture_observation_gap"
         ? role !== "relay" : role !== "facade") {
@@ -235,6 +246,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       listFixtureReadChallenges: () => request("list_fixture_read_challenges", {}),
       approveFixture: (pendingRequestId: string, target: FixtureTarget) =>
         request("approve_fixture", { pendingRequestId, target }),
+      approveGemini: (pendingRequestId: string, target: GeminiTarget) =>
+        request("approve_gemini", { pendingRequestId, target }),
       publishFixtureSnapshot: (target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>, challengeId?: string) =>
         request("publish_fixture_snapshot", { target, messages,
           ...(challengeId === undefined ? {} : { challengeId }) }),

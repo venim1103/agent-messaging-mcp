@@ -295,6 +295,38 @@ test("owner disconnect revokes one fixture grant and cancels its pending reads",
   assert.equal(requests.getApprovedTarget(other, secondGrant.connectionId, 2002), null);
 });
 
+test("one exact Gemini conversation grants only its MCP owner without enabling fixture reads", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("approved reader");
+  const stranger = Symbol("another client");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "https://gemini.google.com" as const,
+    conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat",
+    tabId: 4, documentId: "CHROME-doc_gemini-42" };
+  assert.equal(requests.approveGemini(pending.requestId, { ...target, origin: "http://127.0.0.1:8787" as never }, 2000), null);
+  assert.equal(requests.approveGemini(pending.requestId, { ...target, url: `${target.url}?hl=en` }, 2000), null);
+  assert.equal(requests.approveGemini(pending.requestId, { ...target, url: `${target.url}#conversation` }, 2000), null);
+  assert.equal(requests.approveGemini(pending.requestId, { ...target, conversationId: "another-chat" }, 2000), null);
+  assert.equal(requests.approveGemini(pending.requestId, { ...target, documentId: "" }, 2000), null);
+  assert.equal(requests.approveGemini(pending.requestId, { ...target, tabId: 0 }, 2000), null);
+  const granted = requests.approveGemini(pending.requestId, target, 2000);
+  assert.equal(granted?.state, "ready_readonly");
+  assert.equal(granted?.origin, "https://gemini.google.com");
+  assert.equal(granted?.conversationId, "disposable-chat");
+  assert.equal("url" in granted!, false);
+  assert.equal("documentId" in granted!, false);
+  assert.equal(requests.get(stranger, pending.requestId, 2000), null);
+  assert.equal(requests.get(owner, pending.requestId, 2000)?.state, "ready_readonly");
+  assert.equal(requests.getApprovedTarget(owner, granted!.connectionId, 2000), null);
+  assert.equal(requests.getFixtureSnapshot(owner, granted!.connectionId, 2000), null);
+  assert.equal(requests.requestFreshFixtureRead(owner, granted!.connectionId, 2000), null);
+  assert.deepEqual(requests.listActiveFixtureTabIds(2000), []);
+  assert.equal(requests.approveGemini(pending.requestId, target, 2000), null);
+  assert.equal(requests.revokeChangedTab(4, { documentId: "another-document", conversationId: target.conversationId }), 1);
+  assert.deepEqual(requests.get(owner, pending.requestId, 2001), { requestId: pending.requestId, state: "stale" });
+  assert.equal(requests.approveGemini(requests.create(owner, 1000).requestId, target, 61_000), null);
+});
+
 test("worker wake marks an exact fixture observation gap without revoking its owner", async () => {
   const requests = new PendingConnectionRequests();
   const owner = Symbol("returning reader");

@@ -116,6 +116,16 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     assert.notEqual(response.error, "Fixture grant reset unavailable; try again");
     assert.equal(await worker.evaluate(async () =>
       (await chrome.storage.session.get("fixture-reset-done"))["fixture-reset-done"]), true);
+    const unselectedGemini = await facade.requestConnection();
+    if (unselectedGemini.kind !== "connection_requested") throw new Error("Expected a pending Gemini test request");
+    const popupTabId = await popup.evaluate(async () =>
+      (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id);
+    assert.ok(popupTabId);
+    const deniedGemini = await popup.evaluate(({ tabId, pendingRequestId }) => chrome.runtime.sendMessage({
+      kind: "approve_gemini", tabId, expectedUrl: "https://gemini.google.com/app/disposable-chat", pendingRequestId
+    }), { tabId: popupTabId, pendingRequestId: unselectedGemini.payload.requestId });
+    assert.equal(deniedGemini?.ok, false);
+    assert.equal((await facade.getConnection(unselectedGemini.payload.requestId)).payload.state, "pending");
     await popup.close();
 
     async function grant(tabId) {
@@ -198,6 +208,15 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await awake.close();
     await serviceWorkers.detach();
 
+    const geminiBeforeReload = await facade.requestConnection();
+    if (geminiBeforeReload.kind !== "connection_requested") throw new Error("Expected Gemini reload request");
+    const geminiReloadApproval = await relay.approveGemini(geminiBeforeReload.payload.requestId, {
+      origin: "https://gemini.google.com", conversationId: "disposable-chat",
+      url: "https://gemini.google.com/app/disposable-chat", tabId: 5,
+      documentId: "CHROME-doc_gemini-reload"
+    });
+    assert.equal(geminiReloadApproval.kind, "gemini_approved");
+
     const reloadError = await manager.evaluate((id) => new Promise((resolve) =>
       chrome.developerPrivate.reload(id, { failQuietly: false }, () =>
         resolve(chrome.runtime.lastError?.message ?? null))), extensionId);
@@ -206,6 +225,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
       chrome.developerPrivate.getExtensionInfo(id, (info) => resolve(info?.state === "ENABLED"))),
     extensionId, { timeout: 8000 });
     await waitForStale(beforeReload);
+    await waitForStale(geminiBeforeReload.payload.requestId);
     const wake = await context.newPage();
     await wake.goto(`chrome-extension://${extensionId}/popup.html`);
     await wake.evaluate(() => chrome.runtime.sendMessage({ kind: "list_fixture_pending", tabId: 1 }));
@@ -230,6 +250,22 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     }), { tabId: trackedTab.id });
     await worker.evaluate((tabId) => chrome.tabs.remove(tabId), trackedTab.id);
     await waitForStale(beforeTabClose);
+
+    const geminiTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
+    const geminiPending = await facade.requestConnection();
+    if (geminiPending.kind !== "connection_requested") throw new Error("Expected a synthetic Gemini request");
+    const geminiApproved = await relay.approveGemini(geminiPending.payload.requestId, {
+      origin: "https://gemini.google.com", conversationId: "disposable-chat",
+      url: "https://gemini.google.com/app/disposable-chat", tabId: geminiTab.id,
+      documentId: `CHROME-doc_${geminiTab.id}`
+    });
+    assert.equal(geminiApproved.kind, "gemini_approved");
+    await worker.evaluate(({ tabId }) => chrome.storage.session.set({
+      [`gemini-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`,
+        url: "https://gemini.google.com/app/disposable-chat", expiresAt: Date.now() + 30_000 }
+    }), { tabId: geminiTab.id });
+    await worker.evaluate((tabId) => chrome.tabs.remove(tabId), geminiTab.id);
+    await waitForStale(geminiPending.payload.requestId);
 
     const unapprovedTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
     const beforeDeniedRead = await grant(unapprovedTab.id);

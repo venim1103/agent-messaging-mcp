@@ -1,5 +1,6 @@
 import { browser } from "wxt/browser";
 import { geminiDraftText } from "../../lib/approved-probe";
+import { captureGeminiSnapshot } from "../../lib/gemini-observation";
 
 type FixturePreview = {
   conversationId: string;
@@ -32,6 +33,7 @@ const status = document.querySelector<HTMLElement>("#status");
 const result = document.querySelector<HTMLElement>("#result");
 const fixtureDocumentStatus = document.querySelector<HTMLElement>("#fixture-document-status");
 const pendingResult = document.querySelector<HTMLElement>("#pending-result");
+const pendingTarget = document.querySelector<HTMLElement>("#pending-target");
 const pendingRequests = document.querySelector<HTMLOListElement>("#pending-requests");
 const conversation = document.querySelector<HTMLElement>("#conversation");
 const messages = document.querySelector<HTMLOListElement>("#messages");
@@ -89,17 +91,22 @@ function inspectGeminiStructure(): GeminiPreview | null {
 }
 
 if (!inspectButton || !pendingButton || !fixtureInputButton || !geminiDraftReview || !geminiDraftPreview || !geminiDraftButton
-  || !status || !result || !fixtureDocumentStatus || !pendingResult || !pendingRequests || !conversation || !messages) {
+  || !status || !result || !fixtureDocumentStatus || !pendingResult || !pendingTarget
+  || !pendingRequests || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
 }
 
 let selectedGeminiTab: { id: number; url: string } | null = null;
 void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-  pendingButton.hidden = !tab?.url || new URL(tab.url).origin !== fixtureOrigin;
-  fixtureInputButton.hidden = tab?.url !== richFixtureUrl;
   const url = tab?.url ? new URL(tab.url) : null;
-  if (tab?.id != null && tab.url && url?.origin === geminiOrigin
-    && url.pathname.split("/").filter(Boolean).length === 2) {
+  const route = url?.pathname.split("/").filter(Boolean) ?? [];
+  const selectedSavedGemini = url?.origin === geminiOrigin && !url.search && !url.hash
+    && route.length === 2 && route.every((segment) => /^[A-Za-z0-9_-]{1,128}$/.test(segment));
+  pendingButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
+  pendingTarget.textContent = selectedSavedGemini
+    ? "Read-only target: selected Gemini conversation" : "Read-only target: local fixture / fixture-alpha";
+  fixtureInputButton.hidden = tab?.url !== richFixtureUrl;
+  if (tab?.id != null && tab.url && selectedSavedGemini) {
     selectedGeminiTab = { id: tab.id, url: tab.url };
     geminiDraftPreview.textContent = geminiDraftText;
     geminiDraftReview.hidden = false;
@@ -110,14 +117,19 @@ pendingButton.addEventListener("click", async () => {
   pendingButton.disabled = true;
   pendingResult.hidden = true;
   pendingRequests.replaceChildren();
-  status.textContent = "Checking pending IDs for the local fixture...";
+  status.textContent = selectedGeminiTab ? "Checking pending IDs for the selected Gemini chat..."
+    : "Checking pending IDs for the local fixture...";
   try {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id == null || !tab.url || new URL(tab.url).origin !== fixtureOrigin) {
-      status.textContent = "Select the local fixture tab first.";
+    const geminiSelected = selectedGeminiTab?.id === tab?.id && selectedGeminiTab?.url === tab?.url;
+    const fixtureSelected = !!tab?.url && new URL(tab.url).origin === fixtureOrigin;
+    if (tab?.id == null || (!fixtureSelected && !geminiSelected)) {
+      status.textContent = "Select the local fixture or saved Gemini chat first.";
       return;
     }
-    const response = await browser.runtime.sendMessage({ kind: "list_fixture_pending", tabId: tab.id }) as PendingListResult;
+    const response = await browser.runtime.sendMessage(geminiSelected
+      ? { kind: "list_gemini_pending", tabId: tab.id, expectedUrl: selectedGeminiTab!.url }
+      : { kind: "list_fixture_pending", tabId: tab.id }) as PendingListResult;
     if (!response.ok) {
       status.textContent = response.error;
       return;
@@ -130,28 +142,31 @@ pendingButton.addEventListener("click", async () => {
       expiry.textContent = `${Math.max(0, Math.ceil((request.expiresAt - Date.now()) / 1000))} seconds remaining`;
       const approve = document.createElement("button");
       approve.type = "button";
-      approve.textContent = "Approve read-only fixture";
+      approve.textContent = geminiSelected ? "Approve read-only Gemini chat" : "Approve read-only fixture";
       approve.addEventListener("click", async () => {
         approve.disabled = true;
-        status.textContent = "Checking the selected fixture and pending request...";
+        status.textContent = "Checking the selected chat and pending request...";
         try {
           const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-          if (tab?.id == null || !tab.url || new URL(tab.url).origin !== fixtureOrigin
+          if (tab?.id == null || !tab.url || (geminiSelected
+            ? selectedGeminiTab?.id !== tab.id || selectedGeminiTab?.url !== tab.url
+            : new URL(tab.url).origin !== fixtureOrigin)
             || Date.now() >= request.expiresAt) {
-            status.textContent = "Fixture changed or request expired. No approval sent.";
+            status.textContent = "Selected chat changed or request expired. No approval sent.";
             return;
           }
-          const result = await browser.runtime.sendMessage({
-            kind: "approve_fixture", tabId: tab.id, expectedUrl: tab.url, pendingRequestId: request.requestId
-          }) as FixtureApprovalResult;
+          const result = await browser.runtime.sendMessage({ kind: geminiSelected ? "approve_gemini" : "approve_fixture",
+            tabId: tab.id, expectedUrl: tab.url, pendingRequestId: request.requestId }) as FixtureApprovalResult;
           if (!result.ok) {
             status.textContent = `${result.error}.`;
             return;
           }
           row.remove();
-          status.textContent = `Approved ${result.requestId} for fixture-alpha (read only). Fixture snapshot captured for the MCP client.`;
+          status.textContent = geminiSelected
+            ? `Approved ${result.requestId} for the selected Gemini chat (read only). Message reads are not enabled yet.`
+            : `Approved ${result.requestId} for fixture-alpha (read only). Fixture snapshot captured for the MCP client.`;
         } catch {
-          status.textContent = "Fixture approval unavailable; check the selected tab.";
+          status.textContent = "Chat approval unavailable; check the selected tab.";
         } finally {
           approve.disabled = false;
         }
@@ -238,6 +253,23 @@ inspectButton.addEventListener("click", async () => {
         return;
       }
 
+      let readShape: { direction: string; characters: number }[] | null = null;
+      const documentId = injection.documentId;
+      if (typeof documentId === "string" && /^[!-~]{1,128}$/.test(documentId)
+        && preview.mainRegions === 1 && preview.timelineCount === 1) {
+        try {
+          const [captured] = await browser.scripting.executeScript({
+            target: { tabId: tab.id, documentIds: [documentId] }, func: captureGeminiSnapshot
+          });
+          if (captured?.frameId === 0 && captured.documentId === documentId
+            && (await browser.tabs.get(tab.id)).url === tab.url && captured.result) {
+            readShape = captured.result.messages.slice(-4).map((message) => ({
+              direction: message.direction, characters: message.text.length
+            }));
+          }
+        } catch {}
+      }
+
       conversation.textContent = "Gemini structure (not connected)";
       const details: [string, string][] = [
         ["Route", `${preview.routeDepth} path segments (values omitted)`],
@@ -245,7 +277,9 @@ inspectButton.addEventListener("click", async () => {
         ["Editors", preview.editors.map((editor) => `${editor.tag}: ${editor.isPrompt ? "Gemini prompt" : "other editor"}`).join("\n") || "None visible"],
         ["Rendered rows", preview.timelineCount === 1
           ? preview.rows.map((row) => `${row.tag} (${row.characters} chars)`).join("\n") || "No visible rows"
-          : "Missing or ambiguous chat region; no text inspected"]
+          : "Missing or ambiguous chat region; no text inspected"],
+        ["Read shape", readShape?.map((row) => `${row.direction} (${row.characters} chars)`).join("\n")
+          || "Unsupported or changed; no connection approved"]
       ];
       for (const [label, text] of details) {
         const row = document.createElement("li");

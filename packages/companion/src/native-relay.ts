@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
-  parseNativeFixtureReadChallenges,
+  parseNativeFixtureReadChallenges, parseNativeGeminiApproval,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
   from "./native-protocol.js";
@@ -29,6 +29,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
         const request = typeof message === "object" && message !== null && "kind" in message
           && message.kind === "approve_fixture" ? parseNativeFixtureApproval(message)
           : typeof message === "object" && message !== null && "kind" in message
+            && message.kind === "approve_gemini" ? parseNativeGeminiApproval(message)
+          : typeof message === "object" && message !== null && "kind" in message
             && message.kind === "revoke_fixture" ? parseNativeFixtureRevocation(message)
             : typeof message === "object" && message !== null && "kind" in message
               && message.kind === "revoke_all_fixture" ? parseNativeFixtureReset(message)
@@ -42,7 +44,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
         nativeReply = nativeReply.then(async () => {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
-          let kind: "pending_list" | "fixture_read_challenges" | "fixture_approved" | "fixture_revoked"
+          let kind: "pending_list" | "fixture_read_challenges" | "fixture_approved" | "gemini_approved" | "fixture_revoked"
             | "fixture_snapshot_published" | "fixture_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
@@ -70,6 +72,15 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 kind = "error";
                 payload = { code: "APPROVAL_INVALID" };
               } else throw new Error("Broker refused fixture approval");
+            } else if (request.kind === "approve_gemini") {
+              const result = await client.approveGemini(request.payload.pendingRequestId, request.payload.target);
+              if (result.kind === "gemini_approved") {
+                kind = "gemini_approved";
+                payload = result.payload;
+              } else if (result.kind === "error" && result.payload.code === "APPROVAL_INVALID") {
+                kind = "error";
+                payload = { code: "APPROVAL_INVALID" };
+              } else throw new Error("Broker refused Gemini approval");
             } else if (request.kind === "revoke_fixture") {
               const result = await client.revokeFixture(request.payload.tabId, request.payload.observed);
               if (result.kind !== "fixture_revoked") throw new Error("Broker refused fixture revocation");

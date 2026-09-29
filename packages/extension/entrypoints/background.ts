@@ -1,6 +1,7 @@
 import { browser } from "wxt/browser";
 import { geminiDraftText } from "../lib/approved-probe";
 import { captureFixtureSnapshot, observeFixtureMessages } from "../lib/fixture-observation";
+import { identifyGeminiConversation, observeGeminiIdentity } from "../lib/gemini-observation";
 
 const nativeHostName = "com.agent_messaging_mcp.bridge";
 const protocolVersion = 1;
@@ -18,7 +19,9 @@ type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
 let inputInProgress = false;
 const fixtureResetKey = "fixture-reset-done";
 const fixtureGrantKey = (tabId: number) => `fixture-grant-${tabId}`;
+const geminiGrantKey = (tabId: number) => `gemini-grant-${tabId}`;
 type StoredFixtureGrant = { documentId: string; expiresAt: number };
+type StoredGeminiGrant = { documentId: string; url: string; expiresAt: number };
 type FixtureCountRequest = { kind: "revoke_fixture"; payload: {
   tabId: number; observed: { documentId: string; conversationId: string } | null
 } } | { kind: "revoke_all_fixture"; payload: Record<string, never> }
@@ -31,14 +34,19 @@ const fixtureSnapshotJobs = new Map<number, Promise<boolean>>();
 let fixtureReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 
 async function revokeTrackedFixture(tabId: number): Promise<void> {
-  const key = fixtureGrantKey(tabId);
-  const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
-  if (!stored || typeof stored.documentId !== "string" || typeof stored.expiresAt !== "number") return;
-  if (stored.expiresAt <= Date.now()) {
-    await browser.storage.session.remove(key);
-    return;
+  const keys = [fixtureGrantKey(tabId), geminiGrantKey(tabId)];
+  const stored = await browser.storage.session.get(keys);
+  const active: string[] = [];
+  for (const key of keys) {
+    const grant = stored[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
+    if (!grant) continue;
+    if (typeof grant.expiresAt === "number" && grant.expiresAt <= Date.now()) {
+      await browser.storage.session.remove(key);
+    } else {
+      active.push(key);
+    }
   }
-  if (await revokeFixtureTab(tabId, null)) await browser.storage.session.remove(key);
+  if (active.length && await revokeFixtureTab(tabId, null)) await browser.storage.session.remove(active);
 }
 
 async function revokeFixtureTab(tabId: number,
@@ -480,17 +488,139 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
   }
 }
 
-async function listFixturePending(tabId: number): Promise<PendingListResult> {
+async function approveGemini(tabId: number, expectedUrl: string, pendingRequestId: string): Promise<FixtureApprovalResult> {
+  try {
+    if (!await ensureFixtureReset()) return { ok: false, error: "Connection reset unavailable; try again" };
+    const [active] = await browser.tabs.query({ active: true, currentWindow: true });
+    const tab = await browser.tabs.get(tabId);
+    if (active?.id !== tabId || !tab.active || tab.url !== expectedUrl
+      || new URL(expectedUrl).origin !== geminiOrigin) {
+      return { ok: false, error: "Selected Gemini chat changed; no approval sent" };
+    }
+    const [identity] = await browser.scripting.executeScript({ target: { tabId }, func: identifyGeminiConversation });
+    if (identity?.frameId !== 0 || identity.result?.url !== expectedUrl
+      || typeof identity.documentId !== "string" || !/^[!-~]{1,128}$/.test(identity.documentId)) {
+      return { ok: false, error: "Gemini chat identity unavailable; no approval sent" };
+    }
+    const documentId = identity.documentId;
+    const conversationId = identity.result.conversationId;
+    const [fresh] = await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+    });
+    if (fresh?.frameId !== 0 || fresh.documentId !== documentId
+      || fresh.result?.url !== expectedUrl || fresh.result.conversationId !== conversationId
+      || (await browser.tabs.get(tabId)).url !== expectedUrl) {
+      return { ok: false, error: "Selected Gemini chat changed; no approval sent" };
+    }
+
+    return await new Promise<FixtureApprovalResult>((resolve) => {
+      const requestId = crypto.randomUUID();
+      const deadlineMs = Date.now() + 10_000;
+      let port: ReturnType<typeof browser.runtime.connectNative>;
+      try {
+        port = browser.runtime.connectNative(nativeHostName);
+      } catch {
+        resolve({ ok: false, error: "Native Gemini approval unavailable" });
+        return;
+      }
+      let settled = false;
+      const timer = setTimeout(() => finish({ ok: false, error: "Gemini approval timed out" }), 10_000);
+
+      function finish(result: FixtureApprovalResult) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+        port.disconnect();
+      }
+
+      port.onMessage.addListener((value: unknown) => {
+        let brokerApproved = false;
+        void (async () => {
+          if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+          const reply = value as Record<string, unknown>;
+          if (Object.keys(reply).length !== 6 || reply.protocolVersion !== protocolVersion
+            || reply.requestId !== requestId || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
+            || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) throw new Error();
+          const payload = reply.payload as Record<string, unknown>;
+          if (reply.kind === "error" && Object.keys(payload).length === 1 && payload.code === "APPROVAL_INVALID") {
+            finish({ ok: false, error: "Request expired or already approved" });
+            return;
+          }
+          if (reply.kind === "error" && Object.keys(payload).length === 1 && payload.code === "BROKER_UNAVAILABLE") {
+            finish({ ok: false, error: "Broker unavailable; no approval" });
+            return;
+          }
+          if (reply.kind !== "gemini_approved" || Object.keys(payload).length !== 2
+            || payload.requestId !== pendingRequestId || typeof payload.expiresAt !== "number"
+            || !Number.isSafeInteger(payload.expiresAt)) throw new Error();
+          brokerApproved = true;
+          const [current] = await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+          });
+          const currentTab = await browser.tabs.get(tabId);
+          if (current?.frameId !== 0 || current.documentId !== documentId
+            || current.result?.url !== expectedUrl || current.result.conversationId !== conversationId
+            || !currentTab.active || currentTab.url !== expectedUrl) throw new Error();
+          await browser.storage.session.set({ [geminiGrantKey(tabId)]: {
+            documentId, url: expectedUrl, expiresAt: payload.expiresAt
+          } satisfies StoredGeminiGrant });
+          const [stillCurrent] = await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+          });
+          const stableTab = await browser.tabs.get(tabId);
+          if (stillCurrent?.frameId !== 0 || stillCurrent.documentId !== documentId
+            || stillCurrent.result?.url !== expectedUrl || stillCurrent.result.conversationId !== conversationId
+            || !stableTab.active || stableTab.url !== expectedUrl) throw new Error();
+          const [observing] = await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: observeGeminiIdentity, args: [expectedUrl]
+          });
+          if (observing?.frameId !== 0 || observing.documentId !== documentId || observing.result !== true) throw new Error();
+          finish({ ok: true, requestId: pendingRequestId, expiresAt: payload.expiresAt });
+        })().catch(async () => {
+          if (brokerApproved && await revokeFixtureTab(tabId, null)) {
+            await browser.storage.session.remove(geminiGrantKey(tabId)).catch(() => {});
+          }
+          finish({ ok: false, error: "Gemini chat changed or approval response invalid; reconnect" });
+        });
+      });
+      port.onDisconnect.addListener(() => finish({ ok: false, error: "Native Gemini approval unavailable" }));
+      port.postMessage({ kind: "approve_gemini", protocolVersion, requestId, connectionGeneration: 0,
+        deadlineMs, payload: { pendingRequestId, target: {
+          origin: geminiOrigin, conversationId, url: expectedUrl, tabId, documentId
+        } } });
+    });
+  } catch {
+    return { ok: false, error: "Selected Gemini chat changed or approval unavailable; reconnect" };
+  }
+}
+
+async function listPendingForSelectedTab(tabId: number, expectedGeminiUrl?: string): Promise<PendingListResult> {
   try {
     if (!await ensureFixtureReset()) return { ok: false, error: "Fixture grant reset unavailable; try again" };
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
     const tab = await browser.tabs.get(tabId);
-    if (active?.id !== tabId || !tab.active || !tab.url
-      || new URL(tab.url).origin !== "http://127.0.0.1:8787") {
-      return { ok: false, error: "Select the local fixture tab first" };
+    if (active?.id !== tabId || !tab.active || !tab.url) {
+      return { ok: false, error: expectedGeminiUrl ? "Select the saved Gemini chat first" : "Select the local fixture tab first" };
     }
-    const [fixture] = await browser.scripting.executeScript({ target: { tabId }, func: isSelectedFixture });
-    if (fixture?.result !== true) return { ok: false, error: "Fixture conversation not found" };
+    if (expectedGeminiUrl) {
+      if (tab.url !== expectedGeminiUrl || new URL(tab.url).origin !== geminiOrigin) {
+        return { ok: false, error: "Selected Gemini chat changed" };
+      }
+      const [identity] = await browser.scripting.executeScript({
+        target: { tabId }, func: identifyGeminiConversation
+      });
+      if (identity?.frameId !== 0 || identity.result?.url !== expectedGeminiUrl
+        || (await browser.tabs.get(tabId)).url !== expectedGeminiUrl) {
+        return { ok: false, error: "Selected Gemini conversation unavailable" };
+      }
+    } else {
+      if (new URL(tab.url).origin !== "http://127.0.0.1:8787") {
+        return { ok: false, error: "Select the local fixture tab first" };
+      }
+      const [fixture] = await browser.scripting.executeScript({ target: { tabId }, func: isSelectedFixture });
+      if (fixture?.result !== true) return { ok: false, error: "Fixture conversation not found" };
+    }
     const selectedUrl = tab.url;
 
     return await new Promise<PendingListResult>((resolve) => {
@@ -534,7 +664,7 @@ async function listFixturePending(tabId: number): Promise<PendingListResult> {
           const current = await browser.tabs.get(tabId);
           if (!current.active || current.url !== selectedUrl) throw new Error();
           finish({ ok: true, requests: requests as { requestId: string; expiresAt: number }[] });
-        })().catch(() => finish({ ok: false, error: "Pending list invalid or fixture tab changed" }));
+        })().catch(() => finish({ ok: false, error: "Pending list invalid or selected tab changed" }));
       });
       port.onDisconnect.addListener(() => finish({ ok: false, error: "Native pending list unavailable" }));
       port.postMessage({
@@ -543,7 +673,7 @@ async function listFixturePending(tabId: number): Promise<PendingListResult> {
       });
     });
   } catch {
-    return { ok: false, error: "Fixture pending list unavailable" };
+    return { ok: false, error: expectedGeminiUrl ? "Gemini pending list unavailable" : "Fixture pending list unavailable" };
   }
 }
 
@@ -700,6 +830,17 @@ export default defineBackground(() => {
   });
   browser.runtime.onMessage.addListener((message: unknown, sender) => {
     if (typeof message === "object" && message !== null && !Array.isArray(message)
+      && Object.keys(message).length === 1 && (message as { kind?: unknown }).kind === "gemini_identity_changed") {
+      if (sender.id !== browser.runtime.id || sender.origin !== geminiOrigin
+        || sender.frameId !== 0 || sender.tab?.id == null || typeof sender.documentId !== "string") return;
+      const tabId = sender.tab.id;
+      return browser.storage.session.get(geminiGrantKey(tabId)).then((stored) => {
+        const grant = stored[geminiGrantKey(tabId)] as StoredGeminiGrant | undefined;
+        if (grant?.documentId !== sender.documentId) return;
+        return revokeTrackedFixture(tabId);
+      });
+    }
+    if (typeof message === "object" && message !== null && !Array.isArray(message)
       && Object.keys(message).length === 1 && (message as { kind?: unknown }).kind === "fixture_messages_changed") {
       if (sender.id !== browser.runtime.id || sender.origin !== "http://127.0.0.1:8787"
         || sender.frameId !== 0 || sender.tab?.id == null || typeof sender.documentId !== "string") return;
@@ -729,13 +870,24 @@ export default defineBackground(() => {
     const request = message as Record<string, unknown>;
     if (request.kind === "list_fixture_pending" && Object.keys(request).length === 2
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {
-      return listFixturePending(request.tabId);
+      return listPendingForSelectedTab(request.tabId);
+    }
+    if (request.kind === "list_gemini_pending" && Object.keys(request).length === 3
+      && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
+      && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512) {
+      return listPendingForSelectedTab(request.tabId, request.expectedUrl);
     }
     if (request.kind === "approve_fixture" && Object.keys(request).length === 4
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
       && typeof request.expectedUrl === "string" && request.expectedUrl.length < 2048
       && typeof request.pendingRequestId === "string" && /^[0-9a-f-]{36}$/.test(request.pendingRequestId)) {
       return approveFixture(request.tabId, request.expectedUrl, request.pendingRequestId);
+    }
+    if (request.kind === "approve_gemini" && Object.keys(request).length === 4
+      && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
+      && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512
+      && typeof request.pendingRequestId === "string" && /^[0-9a-f-]{36}$/.test(request.pendingRequestId)) {
+      return approveGemini(request.tabId, request.expectedUrl, request.pendingRequestId);
     }
     if (request.kind === "probe_fixture_input" && Object.keys(request).length === 2
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {

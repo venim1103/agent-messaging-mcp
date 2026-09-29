@@ -170,6 +170,30 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.deepEqual(afterDisconnect.payload.activeTabIds, []);
     assert.deepEqual((await facade.getConnection(last.payload.requestId)).payload,
       { requestId: last.payload.requestId, state: "stale" });
+    const geminiPending = await facade.requestConnection();
+    if (geminiPending.kind !== "connection_requested") throw new Error("Expected a Gemini pending request");
+    const geminiTarget = { origin: "https://gemini.google.com" as const,
+      conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat",
+      tabId: 6, documentId: "CHROME-doc_gemini-42" };
+    assert.throws(() => facade.approveGemini(geminiPending.payload.requestId, geminiTarget),
+      /Broker role cannot perform/);
+    const geminiApproval = await relay.approveGemini(geminiPending.payload.requestId, geminiTarget);
+    assert.equal(geminiApproval.kind, "gemini_approved");
+    const geminiState = await facade.getConnection(geminiPending.payload.requestId);
+    if (geminiState.kind !== "connection_state" || geminiState.payload.state !== "ready_readonly") {
+      throw new Error("Expected a Gemini owner connection");
+    }
+    assert.equal(geminiState.payload.origin, geminiTarget.origin);
+    assert.equal(geminiState.payload.conversationId, geminiTarget.conversationId);
+    assert.equal("tabId" in geminiState.payload, false);
+    assert.equal("documentId" in geminiState.payload, false);
+    assert.equal("url" in geminiState.payload, false);
+    assert.deepEqual((await otherFacade.getConnection(geminiPending.payload.requestId)).payload, { state: "unknown" });
+    assert.deepEqual((await facade.readFixtureSnapshot(geminiState.payload.connectionId)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    assert.deepEqual((await relay.revokeAllFixtures()).payload, { count: 1 });
+    assert.deepEqual((await facade.getConnection(geminiPending.payload.requestId)).payload,
+      { requestId: geminiPending.payload.requestId, state: "stale" });
     otherFacade.close();
     facade.close();
     assert.deepEqual((await relay.listPending() as typeof listed).payload.requests, []);
