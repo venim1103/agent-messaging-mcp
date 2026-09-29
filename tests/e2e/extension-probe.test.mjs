@@ -233,6 +233,12 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
       (await chrome.storage.session.get("fixture-reset-done"))["fixture-reset-done"]);
     await wake.close();
     assert.equal(reloadedMarker, true);
+    const runtimeErrors = await manager.evaluate((id) => new Promise((resolve) =>
+      chrome.developerPrivate.getExtensionInfo(id, (info) => resolve(
+        info?.runtimeErrors?.map((error) => error.message) ?? []
+      ))), extensionId);
+    assert.equal(runtimeErrors.some((message) => message.includes("Unchecked runtime.lastError: Native host has exited")),
+      false, JSON.stringify(runtimeErrors));
 
     const beforeBrowserRestart = await grant(4);
     await context.close();

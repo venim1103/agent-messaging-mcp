@@ -89,7 +89,7 @@ async function sendFixtureCountRequest(command: FixtureCountRequest): Promise<bo
           && Number.isSafeInteger((payload as { count: number }).count)
           && (payload as { count: number }).count >= 0);
       });
-      port.onDisconnect.addListener(() => finish(false));
+      port.onDisconnect.addListener(() => { void browser.runtime.lastError; finish(false); });
       port.postMessage({ ...command, protocolVersion, requestId,
         connectionGeneration: 0, deadlineMs });
     });
@@ -203,7 +203,7 @@ async function publishFixtureSnapshot(tabId: number, documentId: string, challen
           && Number.isSafeInteger((payload as { count: number }).count)
           && (payload as { count: number }).count > 0);
       });
-      port.onDisconnect.addListener(() => finish(false));
+      port.onDisconnect.addListener(() => { void browser.runtime.lastError; finish(false); });
       port.postMessage({
         kind: "publish_fixture_snapshot", protocolVersion, requestId, connectionGeneration: 0,
         deadlineMs, payload: { target: {
@@ -370,7 +370,7 @@ function startFixtureReadWatch(): boolean {
       if (fixtureReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
     })().catch(stop);
   });
-  port.onDisconnect.addListener(stop);
+  port.onDisconnect.addListener(() => { void browser.runtime.lastError; stop(); });
   void poll();
   return true;
 }
@@ -475,7 +475,10 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
           finish({ ok: false, error: "Fixture changed or approval response invalid; reconnect" });
         });
       });
-      port.onDisconnect.addListener(() => finish({ ok: false, error: "Native fixture approval unavailable" }));
+      port.onDisconnect.addListener(() => {
+        void browser.runtime.lastError;
+        finish({ ok: false, error: "Native fixture approval unavailable" });
+      });
       port.postMessage({
         kind: "approve_fixture", protocolVersion, requestId, connectionGeneration: 0, deadlineMs,
         payload: { pendingRequestId, target: {
@@ -584,7 +587,10 @@ async function approveGemini(tabId: number, expectedUrl: string, pendingRequestI
           finish({ ok: false, error: "Gemini chat changed or approval response invalid; reconnect" });
         });
       });
-      port.onDisconnect.addListener(() => finish({ ok: false, error: "Native Gemini approval unavailable" }));
+      port.onDisconnect.addListener(() => {
+        void browser.runtime.lastError;
+        finish({ ok: false, error: "Native Gemini approval unavailable" });
+      });
       port.postMessage({ kind: "approve_gemini", protocolVersion, requestId, connectionGeneration: 0,
         deadlineMs, payload: { pendingRequestId, target: {
           origin: geminiOrigin, conversationId, url: expectedUrl, tabId, documentId
@@ -666,7 +672,10 @@ async function listPendingForSelectedTab(tabId: number, expectedGeminiUrl?: stri
           finish({ ok: true, requests: requests as { requestId: string; expiresAt: number }[] });
         })().catch(() => finish({ ok: false, error: "Pending list invalid or selected tab changed" }));
       });
-      port.onDisconnect.addListener(() => finish({ ok: false, error: "Native pending list unavailable" }));
+      port.onDisconnect.addListener(() => {
+        void browser.runtime.lastError;
+        finish({ ok: false, error: "Native pending list unavailable" });
+      });
       port.postMessage({
         kind: "list_pending", protocolVersion, requestId, connectionGeneration: 0,
         deadlineMs, payload: {}

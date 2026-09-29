@@ -20,8 +20,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
   let invalid = false;
 
   process.stdin.on("data", (chunk: Buffer) => {
+    let deadlineMs: number | undefined;
     try {
       for (const message of decoder.push(chunk)) {
+        deadlineMs = typeof message === "object" && message !== null && "deadlineMs" in message
+          && typeof message.deadlineMs === "number" ? message.deadlineMs : undefined;
         if (typeof message === "object" && message !== null && "kind" in message && message.kind === "handshake") {
           process.stdout.write(encodeNativeFrame(handleNativeHandshake(message)));
           continue;
@@ -119,9 +122,12 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           process.stdin.destroy();
         });
       }
-    } catch {
+    } catch (error) {
       invalid = true;
-      process.stderr.write("Invalid native host message\n");
+      const reason = error instanceof Error && /^Invalid native (handshake|pending list request|fixture (approval|reset|revocation|snapshot|gap|read challenge list)|frame size)$/.test(error.message)
+        ? error.message : error instanceof SyntaxError ? "Invalid JSON" : "Invalid schema";
+      const deadline = deadlineMs === undefined ? "missing" : String(Math.trunc(deadlineMs - Date.now()));
+      process.stderr.write(`Invalid native host message: ${reason}; deadline delta ${deadline}ms\n`);
       process.exitCode = 1;
       process.stdin.destroy();
     }
