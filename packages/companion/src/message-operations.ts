@@ -1,10 +1,33 @@
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { closeSync, constants, lstatSync, openSync } from "node:fs";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { PendingConnectionRequests, type FixtureTarget } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 60_000;
 export const MAX_PREPARED_MESSAGE_BYTES = 4_000;
 export const MAX_ACTIVE_PREPARED_MESSAGES = 100;
+
+export function openPrivateOperationDatabase(directory: string): DatabaseSync {
+  const owner = process.getuid?.();
+  const parent = lstatSync(directory);
+  if (owner === undefined || !parent.isDirectory() || parent.uid !== owner || (parent.mode & 0o077) !== 0) {
+    throw new Error("Operation directory must be owned by this user and private");
+  }
+  const filePath = join(directory, "operations.sqlite");
+  try {
+    const descriptor = openSync(filePath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
+    closeSync(descriptor);
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+  }
+  const file = lstatSync(filePath);
+  if (!file.isFile() || file.uid !== owner || (file.mode & 0o077) !== 0) {
+    throw new Error("Operation database must be owned by this user and private");
+  }
+  return new DatabaseSync(filePath);
+}
 
 type PreparedMessage = Readonly<{
   operationId: string;

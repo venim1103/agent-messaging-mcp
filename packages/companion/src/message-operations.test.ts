@@ -1,19 +1,25 @@
 import assert from "node:assert/strict";
-import { readFile, mkdtemp, rm } from "node:fs/promises";
+import { chmod, lstat, readFile, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { DatabaseSync } from "node:sqlite";
 import { MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
-  PreparedMessageOperations, PREPARED_MESSAGE_TTL_MS }
+  openPrivateOperationDatabase, PreparedMessageOperations, PREPARED_MESSAGE_TTL_MS }
   from "./message-operations.js";
 import { PendingConnectionRequests } from "./pending-connections.js";
 
 test("fixture preparation persists no text and cannot dispatch without a trusted approval path", async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-prepare-"));
   const path = join(home, "operations.sqlite");
-  let database = new DatabaseSync(path);
+  let database = openPrivateOperationDatabase(home);
   try {
+    assert.equal((await lstat(path)).mode & 0o777, 0o600);
+    await chmod(path, 0o644);
+    assert.throws(() => openPrivateOperationDatabase(home), /database must be owned by this user and private/);
+    await chmod(path, 0o600);
+    const linkedDirectory = join(home, "linked-directory");
+    await symlink(home, linkedDirectory);
+    assert.throws(() => openPrivateOperationDatabase(linkedDirectory), /directory must be owned by this user and private/);
     const requests = new PendingConnectionRequests();
     const owner = Symbol("MCP owner");
     const stranger = Symbol("other MCP client");
@@ -54,7 +60,7 @@ test("fixture preparation persists no text and cannot dispatch without a trusted
     assert.throws(() => ledger.prepare(owner, grant.connectionId, 1, text, key, 2003), /CONNECTION_NOT_FOUND/);
     ledger.disconnect(owner);
     database.close();
-    database = new DatabaseSync(path);
+    database = openPrivateOperationDatabase(home);
     const restartedRequests = new PendingConnectionRequests();
     const restartedOwner = Symbol("fresh broker owner");
     const restartedPending = restartedRequests.create(restartedOwner, 1000);
