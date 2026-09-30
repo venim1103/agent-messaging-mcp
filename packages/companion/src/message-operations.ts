@@ -9,6 +9,7 @@ export const PREPARED_KEY_RETENTION_MS = 24 * 60 * 60_000;
 export const MAX_PREPARED_MESSAGE_BYTES = 4_000;
 export const MAX_ACTIVE_PREPARED_MESSAGES = 100;
 export const MAX_RECORDED_PREPARED_MESSAGES = 10_000;
+export const MAX_PREPARED_REVIEWS = 8;
 
 export function openPrivateOperationDatabase(directory: string): DatabaseSync {
   const owner = process.getuid?.();
@@ -38,11 +39,12 @@ type PreparedMessage = Readonly<{
   expiresAt: number;
   preview: Readonly<{ target: "fixture-alpha"; text: string }>;
 }>;
+type PreparedReview = Readonly<Pick<PreparedMessage, "operationId" | "expiresAt" | "preview">>;
 
 export class PreparedMessageOperations {
   private readonly owners = new Map<symbol, string>();
   private readonly contents = new Map<string, Readonly<{
-    owner: symbol; target: FixtureTarget; text: string; expiresAt: number
+    owner: symbol; connectionId: string; target: FixtureTarget; text: string; expiresAt: number
   }>>();
   private readonly digestKey = randomBytes(32);
 
@@ -117,9 +119,32 @@ export class PreparedMessageOperations {
       (operation_id, owner_id, connection_id, idempotency_key, content_digest, target_digest, expires_at, state)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_approval')`)
       .run(operationId, ownerId, connectionId, idempotencyKey, contentDigest, targetDigest, expiresAt);
-    this.contents.set(operationId, Object.freeze({ owner, target, text, expiresAt }));
+    this.contents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt }));
     return Object.freeze({ operationId, connectionId, state: "awaiting_approval", expiresAt,
       preview: Object.freeze({ target: "fixture-alpha", text }) });
+  }
+
+  listFixtureReviews(target: FixtureTarget, now = Date.now()): Readonly<{
+    reviews: ReadonlyArray<PreparedReview>; hasMore: boolean
+  }> {
+    this.discardExpired(now);
+    const reviews: PreparedReview[] = [];
+    for (const [operationId, operation] of this.contents) {
+      if (operation.target.tabId !== target.tabId || operation.target.documentId !== target.documentId
+        || operation.target.origin !== target.origin || operation.target.conversationId !== target.conversationId) {
+        continue;
+      }
+      const live = this.requests.getApprovedTarget(operation.owner, operation.connectionId, now);
+      if (!live || live.tabId !== target.tabId || live.documentId !== target.documentId
+        || live.origin !== target.origin || live.conversationId !== target.conversationId) {
+        this.contents.delete(operationId);
+        continue;
+      }
+      reviews.push(Object.freeze({ operationId, expiresAt: operation.expiresAt,
+        preview: Object.freeze({ target: "fixture-alpha", text: operation.text }) }));
+    }
+    return Object.freeze({ reviews: Object.freeze(reviews.slice(-MAX_PREPARED_REVIEWS).reverse()),
+      hasMore: reviews.length > MAX_PREPARED_REVIEWS });
   }
 
   disconnect(owner: symbol): void {

@@ -53,6 +53,23 @@ const fixtureTargetSchema = z.strictObject({
   tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
 });
 
+const fixturePreparedReviewsSchema = z.strictObject({
+  kind: z.literal("list_fixture_prepared_reviews"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({ target: fixtureTargetSchema })
+});
+
+export function parseNativeFixturePreparedReviews(message: unknown, now = Date.now()) {
+  const result = fixturePreparedReviewsSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture prepared review list");
+  }
+  return result.data;
+}
+
 const fixtureApprovalSchema = z.strictObject({
   kind: z.literal("approve_fixture"),
   protocolVersion: z.literal(PROTOCOL_VERSION),

@@ -11,7 +11,7 @@ import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeGeminiGap,
-  parseNativeFixtureReadChallenges, parseNativeFixtureReset, parseNativeFixtureRevocation,
+  parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReset, parseNativeFixtureRevocation,
   parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeGeminiSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
@@ -116,6 +116,25 @@ test("native fixture approval refuses other origins, targets, and arbitrary fiel
     { ...approval, payload: { ...approval.payload, command: "navigate" } }
   ]) {
     assert.throws(() => parseNativeFixtureApproval(invalid, now), /Invalid native fixture approval/);
+  }
+});
+
+test("native fixture review listing accepts only an exact target and no approval or send fields", () => {
+  const listing = { ...request, kind: "list_fixture_prepared_reviews", payload: { target: {
+    origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+    documentId: "CHROME-doc_opaque-42"
+  } } };
+  assert.deepEqual(parseNativeFixturePreparedReviews(listing, now), listing);
+  for (const invalid of [
+    { ...listing, kind: "approve_message" },
+    { ...listing, deadlineMs: now },
+    { ...listing, connectionGeneration: 1 },
+    { ...listing, payload: { ...listing.payload, approved: true } },
+    { ...listing, payload: { target: { ...listing.payload.target, origin: "https://gemini.google.com" } } },
+    { ...listing, payload: { target: { ...listing.payload.target, documentId: "" } } },
+    { ...listing, payload: { target: { ...listing.payload.target, selector: "*" } } }
+  ]) {
+    assert.throws(() => parseNativeFixturePreparedReviews(invalid, now), /Invalid native fixture prepared review list/);
   }
 });
 
@@ -384,6 +403,29 @@ test("native relay lists only live broker pending IDs over real framing", { time
     if (granted.kind !== "connection_state") throw new Error("Expected owned connection state");
     assert.equal(granted.payload.state, "ready_readonly");
     if (granted.payload.state !== "ready_readonly") throw new Error("Expected approved fixture handle");
+
+    const prepared = await facade.prepareFixtureMessage(granted.payload.connectionId, 1,
+      "Synthetic fixture review", "b66b3997-9d43-4554-8399-267d1fe9f75c");
+    if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture review");
+    const reviewHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const reviewOutput: Buffer[] = [];
+    const reviewErrors: Buffer[] = [];
+    reviewHost.stdout.on("data", (chunk: Buffer) => reviewOutput.push(chunk));
+    reviewHost.stderr.on("data", (chunk: Buffer) => reviewErrors.push(chunk));
+    const reviewRequest = { ...request, kind: "list_fixture_prepared_reviews", deadlineMs: Date.now() + 10_000,
+      payload: { target: approval.payload.target } };
+    reviewHost.stdin.end(encodeNativeFrame(reviewRequest));
+    const [reviewExit] = await once(reviewHost, "exit");
+    assert.equal(reviewExit, 0, Buffer.concat(reviewErrors).toString());
+    const [reviewReply] = new NativeFrameDecoder().push(Buffer.concat(reviewOutput)) as [{
+      kind: string; payload: { reviews: { operationId: string; expiresAt: number;
+        preview: { target: string; text: string } }[]; hasMore: boolean }
+    }];
+    assert.equal(reviewReply.kind, "fixture_prepared_reviews");
+    assert.deepEqual(reviewReply.payload, { reviews: [{ operationId: prepared.payload.operationId,
+      expiresAt: prepared.payload.expiresAt, preview: prepared.payload.preview }], hasMore: false });
 
     const publicationHost = spawn(process.execPath, [relayEntry, origin, origin], {
       stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }

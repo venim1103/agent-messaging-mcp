@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
-  MAX_RECORDED_PREPARED_MESSAGES, openPrivateOperationDatabase, PreparedMessageOperations,
+  MAX_PREPARED_REVIEWS, MAX_RECORDED_PREPARED_MESSAGES, openPrivateOperationDatabase, PreparedMessageOperations,
   PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS }
   from "./message-operations.js";
 import { PendingConnectionRequests } from "./pending-connections.js";
@@ -43,6 +43,10 @@ test("fixture preparation persists no text and cannot dispatch without a trusted
     assert.equal(prepared.state, "awaiting_approval");
     assert.equal(prepared.preview.text, text);
     assert.equal(prepared.expiresAt, 2001 + PREPARED_MESSAGE_TTL_MS);
+    assert.deepEqual(ledger.listFixtureReviews({ ...target, documentId: "other-document" }, 2002),
+      { reviews: [], hasMore: false });
+    assert.deepEqual(ledger.listFixtureReviews(target, 2002), { reviews: [{ operationId: prepared.operationId,
+      expiresAt: prepared.expiresAt, preview: prepared.preview }], hasMore: false });
     assert.deepEqual(ledger.prepare(owner, grant.connectionId, 1, text, key, 2002), prepared);
     assert.throws(() => ledger.prepare(owner, grant.connectionId, 1, `${text}!`, key, 2002), /IDEMPOTENCY_CONFLICT/);
     assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, 1);
@@ -56,9 +60,12 @@ test("fixture preparation persists no text and cannot dispatch without a trusted
     }
     assert.throws(() => ledger.prepare(owner, grant.connectionId, 1, "Over capacity",
       "b66b3997-9d43-4554-8399-267d1fe9f75c", 2002), /TOO_MANY_PREPARED/);
+    assert.equal(ledger.listFixtureReviews(target, 2002).reviews.length, MAX_PREPARED_REVIEWS);
+    assert.equal(ledger.listFixtureReviews(target, 2002).hasMore, true);
     assert.equal(ledger.prepare(owner, grant.connectionId, 1, "After expiry",
       "b66b3997-9d43-4554-8399-267d1fe9f75c", prepared.expiresAt + 1).state, "awaiting_approval");
     requests.revokeChangedTab(3, null);
+    assert.deepEqual(ledger.listFixtureReviews(target, 2003), { reviews: [], hasMore: false });
     assert.throws(() => ledger.prepare(owner, grant.connectionId, 1, text, key, 2003), /CONNECTION_NOT_FOUND/);
     ledger.disconnect(owner);
     database.close();

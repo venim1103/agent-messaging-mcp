@@ -60,6 +60,9 @@ const requestSchema = z.discriminatedUnion("kind", [
     connectionId: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_fixture_read_challenges"), payload: z.strictObject({}) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_fixture_prepared_reviews"), payload: z.strictObject({
+    target: fixtureTarget
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_gemini_read_challenges"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("list_pending"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("approve_fixture"), payload: z.strictObject({
@@ -113,6 +116,14 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
         payload: { challenges: requests.listFixtureReadChallenges(now),
           activeTabIds: requests.listActiveFixtureTabIds(now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "list_fixture_prepared_reviews") {
+    if (role !== "relay") return { ...response, kind: "error" as const,
+      payload: { code: "PERMISSION_DENIED" } };
+    return operations
+      ? { ...response, kind: "fixture_prepared_reviews" as const,
+        payload: operations.listFixtureReviews(request.payload.target, now) }
+      : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
   }
   if (request.kind === "list_gemini_read_challenges") {
     return role === "relay"

@@ -51,8 +51,9 @@ test("only an owning facade prepares immutable fixture text without approval or 
     } };
     assert.deepEqual(handleBrokerRequest(prepare, "facade", owner, requests, 2000, operations).payload,
       { code: "CONNECTION_NOT_FOUND" });
-    const grant = requests.approve(pending.requestId, { origin: "http://127.0.0.1:8787",
-      conversationId: "fixture-alpha", tabId: 3, documentId: "CHROME-doc_opaque-42" }, 2000)!;
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const grant = requests.approve(pending.requestId, target, 2000)!;
     const owned = { ...prepare, payload: { ...prepare.payload, connectionId: grant.connectionId } };
     assert.deepEqual(handleBrokerRequest(owned, "relay", stranger, requests, 2001, operations).payload,
       { code: "PERMISSION_DENIED" });
@@ -62,6 +63,15 @@ test("only an owning facade prepares immutable fixture text without approval or 
     if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture text");
     assert.equal(prepared.payload.state, "awaiting_approval");
     assert.equal(prepared.payload.preview.text, owned.payload.text);
+    const list = { ...envelope, kind: "list_fixture_prepared_reviews", payload: { target } };
+    assert.deepEqual(handleBrokerRequest(list, "facade", owner, requests, 2002, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(list, "relay", stranger, requests, 2002, operations).payload,
+      { reviews: [{ operationId: prepared.payload.operationId, expiresAt: prepared.payload.expiresAt,
+        preview: prepared.payload.preview }], hasMore: false });
+    assert.deepEqual(handleBrokerRequest({ ...list, payload: { target: { ...target,
+      documentId: "other-document" } } }, "relay", stranger, requests, 2002, operations).payload,
+    { reviews: [], hasMore: false });
     assert.deepEqual(handleBrokerRequest(owned, "facade", owner, requests, 2002, operations).payload,
       prepared.payload);
     assert.deepEqual(handleBrokerRequest({ ...owned, payload: { ...owned.payload, text: "Changed" } },
@@ -69,6 +79,8 @@ test("only an owning facade prepares immutable fixture text without approval or 
     assert.throws(() => handleBrokerRequest({ ...owned, payload: { ...owned.payload, approved: true } },
       "facade", owner, requests, 2002, operations));
     requests.revokeChangedTab(3, null);
+    assert.deepEqual(handleBrokerRequest(list, "relay", stranger, requests, 2003, operations).payload,
+      { reviews: [], hasMore: false });
     assert.deepEqual(handleBrokerRequest(owned, "facade", owner, requests, 2003, operations).payload,
       { code: "CONNECTION_NOT_FOUND" });
     const geminiPending = requests.create(owner, 1000);
@@ -125,10 +137,10 @@ test("only an owning facade can create and query pending connections", () => {
   assert.deepEqual(handleBrokerRequest(get, "facade", secondClient, requests, 1000), {
     ...envelope, kind: "connection_state", payload: { state: "unknown" }
   });
-  assert.equal(handleBrokerRequest(get, "facade", firstClient, requests, 1000).payload.state, "pending");
+  assert.deepEqual(handleBrokerRequest(get, "facade", firstClient, requests, 1000).payload, created.payload);
   const expiredAt = 1000 + PENDING_REQUEST_TTL_MS;
-  assert.equal(handleBrokerRequest({ ...get, deadlineMs: expiredAt + 10_000 }, "facade", firstClient, requests,
-    expiredAt).payload.state, "expired");
+  assert.deepEqual(handleBrokerRequest({ ...get, deadlineMs: expiredAt + 10_000 }, "facade", firstClient, requests,
+    expiredAt).payload, { ...created.payload, state: "expired" });
   assert.throws(() => handleBrokerRequest({ ...create, kind: "evaluate" }, "facade", firstClient, requests, 1000));
   assert.throws(() => handleBrokerRequest({ ...create, deadlineMs: 1000 }, "facade", firstClient, requests, 1000));
 
@@ -160,6 +172,7 @@ test("authenticated relay alone approves a selected fixture and only its MCP own
   const lookup = { ...envelope, kind: "get_connection", payload: { requestId: pending.requestId } };
   assert.deepEqual(handleBrokerRequest(lookup, "facade", stranger, requests, 2000).payload, { state: "unknown" });
   const own = handleBrokerRequest(lookup, "facade", owner, requests, 2000);
+  if (own.kind !== "connection_state") throw new Error("Expected owned connection state");
   assert.equal(own.payload.state, "ready_readonly");
   assert.equal("tabId" in own.payload, false);
   const revoke = { ...envelope, kind: "revoke_fixture", payload: {

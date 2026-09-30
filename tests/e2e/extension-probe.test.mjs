@@ -386,6 +386,108 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
   }
 });
 
+test("trusted fixture popup reviews prepared text without editing the page", { timeout: 20000 }, async () => {
+  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-review-test-"));
+  const unpacked = join(profile, "unpacked-extension");
+  await cp(extensionDirectory, unpacked, { recursive: true });
+  const manifestPath = join(unpacked, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.host_permissions = ["http://127.0.0.1:8787/*"];
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const brokerDirectory = join(profile, ".config/agent-messaging-mcp/broker");
+  const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
+  let context;
+  let broker;
+  let brokerExit;
+  let facade;
+  try {
+    context = await chromium.launchPersistentContext(profile, {
+      executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+      args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`]
+    });
+    const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+    const extensionId = new URL(worker.url()).hostname;
+    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+    brokerExit = once(broker, "exit");
+    let ready = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      try {
+        ready = (await stat(join(brokerDirectory, "broker.sock"))).isSocket();
+        if (ready) break;
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      await setTimeout(25);
+    }
+    assert.equal(ready, true, "Broker did not start");
+    facade = await connectBroker("facade", brokerDirectory);
+
+    const fixture = await context.newPage();
+    const fixtureHtml = await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8");
+    await fixture.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
+      contentType: "text/html; charset=utf-8", body: fixtureHtml
+    }));
+    const url = "http://127.0.0.1:8787/";
+    await fixture.goto(url);
+    const selected = await worker.evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const [identity] = await chrome.scripting.executeScript({ target: { tabId: tab.id },
+        func: () => document.querySelector("main")?.getAttribute("data-conversation-id") });
+      return { tabId: tab.id, documentId: identity.documentId, conversation: identity.result };
+    });
+    assert.equal(selected.conversation, "fixture-alpha");
+    assert.match(selected.documentId, /^[!-~]{1,128}$/);
+
+    const popup = await context.newPage();
+    await fixture.bringToFront();
+    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+    await popup.getByRole("button", { name: "Review fixture drafts" }).waitFor({ state: "visible" });
+    const reviewArgs = { tabId: selected.tabId, expectedUrl: url };
+    const before = await popup.evaluate((args) => chrome.runtime.sendMessage({
+      kind: "list_fixture_prepared_reviews", ...args
+    }), reviewArgs);
+    assert.equal(before.ok, false);
+
+    const created = await facade.requestConnection();
+    if (created.kind !== "connection_requested") throw new Error("Expected fixture request");
+    const approved = await popup.evaluate(({ tabId, expectedUrl, pendingRequestId }) => chrome.runtime.sendMessage({
+      kind: "approve_fixture", tabId, expectedUrl, pendingRequestId
+    }), { ...reviewArgs, pendingRequestId: created.payload.requestId });
+    assert.equal(approved.ok, true, JSON.stringify(approved));
+    const connection = await facade.getConnection(created.payload.requestId);
+    if (connection.kind !== "connection_state" || connection.payload.state !== "ready_readonly") {
+      throw new Error("Expected approved fixture handle");
+    }
+    const text = "Synthetic <script>alert(1)</script> &\nSecond line";
+    const prepared = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text,
+      "b66b3997-9d43-4554-8399-267d1fe9f75c");
+    assert.equal(prepared.kind, "message_prepared");
+    await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
+    await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
+    assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
+    assert.equal(await popup.locator("#fixture-reviews button").count(), 0);
+    assert.equal(await fixture.locator("#message").inputValue(), "");
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+
+    await fixture.evaluate(() => document.querySelector("main").dataset.conversationId = "fixture-beta");
+    await popup.locator("#fixture-review-result").waitFor({ state: "hidden", timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-review-result").isHidden(), true);
+    assert.equal(await popup.locator("#fixture-reviews pre").count(), 0);
+    const afterSwitch = await popup.evaluate((args) => chrome.runtime.sendMessage({
+      kind: "list_fixture_prepared_reviews", ...args
+    }), reviewArgs);
+    assert.equal(afterSwitch.ok, false);
+  } finally {
+    facade?.close();
+    broker?.kill("SIGTERM");
+    if (brokerExit) await brokerExit;
+    await context?.close();
+    await rm(profile, { recursive: true, force: true });
+  }
+});
+
 test("test-only Gemini host access carries exact synthetic rows and later observations", { timeout: 20000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-read-test-"));
   const unpacked = join(profile, "unpacked-extension");

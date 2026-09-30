@@ -97,6 +97,15 @@
         white-space: pre-wrap;
         overflow-wrap: anywhere;
       }
+
+      #fixture-reviews pre {
+        max-height: 160px;
+        margin: 8px 0 0;
+        overflow: auto;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font: 13px/1.4 "Trebuchet MS", Verdana, sans-serif;
+      }
     </style>
   </head>
   <body>
@@ -107,6 +116,7 @@
       </header>
       <button type="button" id="inspect">Inspect this chat</button>
       <button type="button" id="view-pending" hidden>View pending requests</button>
+      <button type="button" id="view-fixture-reviews" hidden>Review fixture drafts</button>
       <button type="button" id="test-fixture-input" hidden>Test fixture input</button>
       <section id="gemini-draft-review" hidden>
         <h2>Unsent Gemini draft</h2>
@@ -123,6 +133,10 @@
         <h2>Pending connections</h2>
         <p id="pending-target">Read-only target: local fixture / fixture-alpha</p>
         <ol id="pending-requests" aria-label="Pending request IDs"></ol>
+      </section>
+      <section id="fixture-review-result" hidden>
+        <h2>Prepared fixture drafts</h2>
+        <ol id="fixture-reviews" aria-label="Prepared fixture drafts"></ol>
       </section>
     </main>
     <script type="module" src="./main.ts"></script>
