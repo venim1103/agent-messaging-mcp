@@ -1,6 +1,6 @@
 import { browser } from "wxt/browser";
 import { geminiDraftText } from "../lib/approved-probe";
-import { captureFixtureSnapshot, inspectFixturePreflight, observeFixtureMessages } from "../lib/fixture-observation";
+import { captureFixtureSnapshot, fillFixtureDraft, inspectFixturePreflight, observeFixtureMessages } from "../lib/fixture-observation";
 import { captureGeminiSnapshot, identifyGeminiConversation, isEligibleGeminiUrl,
   observeGeminiIdentity, observeGeminiMessages }
   from "../lib/gemini-observation";
@@ -24,6 +24,7 @@ type FixtureReviewApprovalResult = { ok: true; operationId: string; expiresAt: n
   | { ok: false; error: string };
 type FixturePreflightChallenge = { challengeId: string; operationId: string; expiresAt: number;
   tabId: number; documentId: string; text: string };
+type FixtureFillChallenge = Omit<FixturePreflightChallenge, "challengeId"> & { attemptId: string };
 
 let inputInProgress = false;
 const fixtureResetKey = "fixture-reset-done";
@@ -492,7 +493,66 @@ async function checkTrackedFixturePreflight(check: FixturePreflightChallenge): P
       }
     }
   } catch {}
+  await completeFixtureBrowserCheck(check, observation);
+}
+
+async function fillTrackedFixtureDraft(check: FixtureFillChallenge): Promise<void> {
   if (check.expiresAt <= Date.now()) return;
+  if (inputInProgress) {
+    await completeFixtureBrowserCheck(check, { ok: false, code: "FILL_UNAVAILABLE" });
+    return;
+  }
+  inputInProgress = true;
+  let observation: ReturnType<typeof fillFixtureDraft> = { ok: false, code: "TARGET_CHANGED" };
+  try {
+    const key = fixtureGrantKey(check.tabId);
+    const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
+    const [active] = await browser.tabs.query({ active: true, currentWindow: true });
+    const tab = await browser.tabs.get(check.tabId);
+    if (grant?.documentId === check.documentId && typeof grant.expiresAt === "number" && grant.expiresAt > Date.now()
+      && active?.id === check.tabId && tab.active
+      && (tab.url === "http://127.0.0.1:8787/" || tab.url === richFixtureUrl)) {
+      const expectedUrl = tab.url;
+      const [preflight] = await browser.scripting.executeScript({ target: { tabId: check.tabId, documentIds: [check.documentId] },
+        func: inspectFixturePreflight, args: [{ expectedUrl, text: check.text }] });
+      if (preflight?.frameId === 0 && preflight.documentId === check.documentId && preflight.result) {
+        observation = preflight.result;
+        if (preflight.result.ok) {
+          observation = { ok: false, code: "TARGET_CHANGED" };
+          const [selected] = await browser.tabs.query({ active: true, currentWindow: true });
+          const current = await browser.tabs.get(check.tabId);
+          const stillGranted = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
+          if (check.expiresAt > Date.now() && selected?.id === check.tabId && current.active && current.url === expectedUrl
+            && stillGranted?.documentId === check.documentId && typeof stillGranted.expiresAt === "number"
+            && stillGranted.expiresAt > Date.now()) {
+            observation = { ok: false, code: "FILL_UNCERTAIN" };
+            const [filled] = await browser.scripting.executeScript({ target: { tabId: check.tabId, documentIds: [check.documentId] },
+              func: fillFixtureDraft, args: [{ expectedUrl, text: check.text, operationId: check.operationId,
+                attemptId: check.attemptId, expiresAt: check.expiresAt }] });
+            if (filled?.frameId === 0 && filled.documentId === check.documentId && filled.result) {
+              const [identity] = await browser.scripting.executeScript({ target: { tabId: check.tabId, documentIds: [check.documentId] },
+                func: readFixtureIdentity });
+              const [afterSelection] = await browser.tabs.query({ active: true, currentWindow: true });
+              const afterTab = await browser.tabs.get(check.tabId);
+              const afterGrant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
+              if (identity?.frameId === 0 && identity.documentId === check.documentId && identity.result === "fixture-alpha"
+                && afterSelection?.id === check.tabId && afterTab.active && afterTab.url === expectedUrl
+                && afterGrant?.documentId === check.documentId && typeof afterGrant.expiresAt === "number"
+                && afterGrant.expiresAt > Date.now()) observation = filled.result;
+            }
+          }
+        }
+      }
+    }
+  } catch {}
+  finally { inputInProgress = false; }
+  await completeFixtureBrowserCheck(check, observation);
+}
+
+async function completeFixtureBrowserCheck(check: FixturePreflightChallenge | FixtureFillChallenge,
+  observation: ReturnType<typeof fillFixtureDraft>): Promise<void> {
+  if (check.expiresAt <= Date.now()) return;
+  const fill = "attemptId" in check;
   await new Promise<boolean>((resolve) => {
     const requestId = crypto.randomUUID();
     const deadlineMs = Date.now() + 5_000;
@@ -512,16 +572,18 @@ async function checkTrackedFixturePreflight(check: FixturePreflightChallenge): P
       if (typeof value !== "object" || value === null || Array.isArray(value)) return finish(false);
       const reply = value as Record<string, unknown>;
       const payload = reply.payload;
-      finish(Object.keys(reply).length === 6 && reply.kind === "fixture_preflight_recorded"
+      finish(Object.keys(reply).length === 6 && reply.kind === (fill ? "fixture_fill_recorded" : "fixture_preflight_recorded")
         && reply.protocolVersion === protocolVersion && reply.requestId === requestId
         && reply.connectionGeneration === 0 && reply.deadlineMs === deadlineMs
         && typeof payload === "object" && payload !== null && !Array.isArray(payload)
         && Object.keys(payload).length === 1 && (payload as { accepted?: unknown }).accepted === true);
     });
     port.onDisconnect.addListener(() => { void browser.runtime.lastError; finish(false); });
-    port.postMessage({ kind: "complete_fixture_preflight", protocolVersion, requestId, connectionGeneration: 0,
+    port.postMessage({ kind: fill ? "complete_fixture_fill" : "complete_fixture_preflight",
+      protocolVersion, requestId, connectionGeneration: 0,
       deadlineMs, payload: { target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
-        tabId: check.tabId, documentId: check.documentId }, challengeId: check.challengeId, observation } });
+        tabId: check.tabId, documentId: check.documentId },
+        ...(fill ? { attemptId: check.attemptId } : { challengeId: check.challengeId }), observation } });
   }).catch(() => false);
 }
 
@@ -533,12 +595,13 @@ function parseFixtureReadChallenges(value: unknown, requestId: string, deadlineM
     || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
     || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) throw new Error();
   const payload = reply.payload as Record<string, unknown>;
-  if (Object.keys(payload).length !== 3 || !Array.isArray(payload.challenges)
+  if (Object.keys(payload).length !== 4 || !Array.isArray(payload.challenges)
     || payload.challenges.length > 16 || !Array.isArray(payload.activeTabIds)
     || payload.activeTabIds.length > 100 || !payload.activeTabIds.every((tabId: unknown) =>
       typeof tabId === "number" && Number.isSafeInteger(tabId) && tabId > 0)
     || new Set(payload.activeTabIds).size !== payload.activeTabIds.length
-    || !Array.isArray(payload.preflightChecks) || payload.preflightChecks.length > 16) throw new Error();
+    || !Array.isArray(payload.preflightChecks) || payload.preflightChecks.length > 16
+    || !Array.isArray(payload.draftFills) || payload.draftFills.length > 1) throw new Error();
 
   const challenges = payload.challenges.map((entry: unknown) => {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error();
@@ -555,12 +618,12 @@ function parseFixtureReadChallenges(value: unknown, requestId: string, deadlineM
     return { challengeId: challenge.challengeId, expiresAt: challenge.expiresAt,
       tabId: target.tabId, documentId: target.documentId };
   });
-  const preflightChecks = payload.preflightChecks.map((entry: unknown): FixturePreflightChallenge => {
+  const parseWriteCheck = (entry: unknown, identifier: "challengeId" | "attemptId") => {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error();
     const check = entry as Record<string, unknown>;
     const validId = (value: unknown) => typeof value === "string"
       && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
-    if (Object.keys(check).length !== 5 || !validId(check.challengeId) || !validId(check.operationId)
+    if (Object.keys(check).length !== 5 || !validId(check[identifier]) || !validId(check.operationId)
       || typeof check.expiresAt !== "number" || !Number.isSafeInteger(check.expiresAt)
       || typeof check.text !== "string" || !check.text || check.text.length > 4000
       || new TextEncoder().encode(check.text).length > 4000
@@ -570,10 +633,18 @@ function parseFixtureReadChallenges(value: unknown, requestId: string, deadlineM
       || target.conversationId !== "fixture-alpha" || typeof target.tabId !== "number"
       || !Number.isSafeInteger(target.tabId) || target.tabId < 1
       || typeof target.documentId !== "string" || !/^[!-~]{1,128}$/.test(target.documentId)) throw new Error();
-    return { challengeId: check.challengeId as string, operationId: check.operationId as string,
+    return { id: check[identifier] as string, operationId: check.operationId as string,
       expiresAt: check.expiresAt, text: check.text, tabId: target.tabId, documentId: target.documentId };
+  };
+  const preflightChecks = payload.preflightChecks.map((entry: unknown): FixturePreflightChallenge => {
+    const { id, ...check } = parseWriteCheck(entry, "challengeId");
+    return { ...check, challengeId: id };
   });
-  return { challenges, activeTabIds: payload.activeTabIds as number[], preflightChecks };
+  const draftFills = payload.draftFills.map((entry: unknown): FixtureFillChallenge => {
+    const { id, ...check } = parseWriteCheck(entry, "attemptId");
+    return { ...check, attemptId: id };
+  });
+  return { challenges, activeTabIds: payload.activeTabIds as number[], preflightChecks, draftFills };
 }
 
 function parseGeminiReadChallenges(value: unknown, requestId: string, deadlineMs: number) {
@@ -657,6 +728,7 @@ function startFixtureReadWatch(): boolean {
     if (!listing) return;
     void (async () => {
       await releaseDisconnectedFixtures(listing.activeTabIds);
+      for (const check of listing.draftFills) await fillTrackedFixtureDraft(check);
       for (const check of listing.preflightChecks) await checkTrackedFixturePreflight(check);
       for (const challenge of listing.challenges) {
         if (challenge.expiresAt <= Date.now()) continue;

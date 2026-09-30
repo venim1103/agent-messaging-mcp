@@ -7,7 +7,7 @@ import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, pars
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
-  parseNativeFixturePreflight,
+  parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeGeminiSnapshot,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
@@ -59,6 +59,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "complete_fixture_preflight" ? parseNativeFixturePreflight(message)
                   : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "complete_fixture_fill" ? parseNativeFixtureFill(message)
+                  : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "list_gemini_read_challenges" ? parseNativeGeminiReadChallenges(message)
                     : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "mark_fixture_observation_gap" ? parseNativeFixtureGap(message)
@@ -71,7 +73,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           let kind: "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
             | "fixture_approved" | "fixture_review_approved" | "gemini_approved" | "fixture_revoked"
             | "fixture_fill_reviews" | "fixture_fill_review_approved"
-            | "fixture_preflight_recorded"
+            | "fixture_fill_recorded" | "fixture_preflight_recorded"
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
@@ -79,6 +81,9 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               origin: string; conversationId: string; tabId: number; documentId: string
             }; expiresAt: number }>; activeTabIds: ReadonlyArray<number>;
               preflightChecks: ReadonlyArray<{ challengeId: string; operationId: string; target: {
+                origin: string; conversationId: string; tabId: number; documentId: string
+              }; text: string; expiresAt: number }>;
+              draftFills: ReadonlyArray<{ attemptId: string; operationId: string; target: {
                 origin: string; conversationId: string; tabId: number; documentId: string
               }; text: string; expiresAt: number }> }
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
@@ -136,6 +141,12 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 request.payload.observation);
               if (result.kind !== "fixture_preflight_recorded") throw new Error("Broker refused fixture preflight");
               kind = "fixture_preflight_recorded";
+              payload = result.payload;
+            } else if (request.kind === "complete_fixture_fill") {
+              const result = await client.completeFixtureFill(request.payload.target, request.payload.attemptId,
+                request.payload.observation);
+              if (result.kind !== "fixture_fill_recorded") throw new Error("Broker refused fixture fill result");
+              kind = "fixture_fill_recorded";
               payload = result.payload;
             } else if (request.kind === "list_gemini_read_challenges") {
               const result = await client.listGeminiReadChallenges();

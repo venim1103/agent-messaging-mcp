@@ -15,6 +15,8 @@ export const MAX_RECORDED_PREPARED_MESSAGES = 10_000;
 export const MAX_PREPARED_REVIEWS = 8;
 export const FIXTURE_PREFLIGHT_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_PREFLIGHTS = 16;
+export const FIXTURE_FILL_TIMEOUT_MS = 4_000;
+export const MAX_PENDING_FIXTURE_FILLS = 1;
 export const fixturePreflightResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]) }),
   z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
@@ -24,6 +26,16 @@ export type FixturePreflightResult = z.infer<typeof fixturePreflightResultSchema
 export const fixturePreflightStatusSchema = z.discriminatedUnion("ok", [
   fixturePreflightResultSchema.options[0].extend({ operationId: z.uuid(), checkedAt: z.number().int().safe() }),
   fixturePreflightResultSchema.options[1].extend({ operationId: z.uuid(), checkedAt: z.number().int().safe() })
+]);
+export const fixtureFillResultSchema = z.discriminatedUnion("ok", [
+  fixturePreflightResultSchema.options[0],
+  z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
+    "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "SUBMIT_UNAVAILABLE", "FILL_UNAVAILABLE", "FILL_UNCERTAIN"]) })
+]);
+export type FixtureFillResult = z.infer<typeof fixtureFillResultSchema>;
+export const fixtureFillStatusSchema = z.discriminatedUnion("ok", [
+  fixtureFillResultSchema.options[0].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() }),
+  fixtureFillResultSchema.options[1].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() })
 ]);
 const fixtureObservationSchema = z.strictObject({
   kind: z.literal("fixture_snapshot"),
@@ -78,6 +90,11 @@ type PendingFixturePreflight = {
   owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number;
   timer: ReturnType<typeof setTimeout>; resolve: (status: FixturePreflightStatus | null) => void
 };
+type FixtureFillStatus = z.infer<typeof fixtureFillStatusSchema>;
+type PendingFixtureFill = {
+  owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number;
+  timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureFillStatus | null) => void
+};
 
 export class PreparedMessageOperations {
   private readonly owners = new Map<symbol, string>();
@@ -93,6 +110,7 @@ export class PreparedMessageOperations {
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
   private readonly ambiguousEvidence = new Set<string>();
   private readonly preflightChecks = new Map<string, PendingFixturePreflight>();
+  private readonly fillChecks = new Map<string, PendingFixtureFill>();
   private readonly digestKey = randomBytes(32);
 
   constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync) {
@@ -146,6 +164,9 @@ export class PreparedMessageOperations {
   private release(operationId: string): void {
     for (const [challengeId, pending] of this.preflightChecks) {
       if (pending.operationId === operationId) this.finishPreflightCheck(challengeId, null);
+    }
+    for (const [attemptId, pending] of this.fillChecks) {
+      if (pending.operationId === operationId) this.finishFillCheck(attemptId, null);
     }
     this.contents.delete(operationId);
     this.reviewTokens.delete(operationId);
@@ -423,6 +444,53 @@ export class PreparedMessageOperations {
       || pending.target.tabId !== target.tabId || pending.target.documentId !== target.documentId
       || this.getOperation(pending.owner, pending.operationId, now).state !== "approved") return false;
     this.finishPreflightCheck(challengeId, { ...parsed.data, operationId: pending.operationId, checkedAt: now });
+    return true;
+  }
+
+  private finishFillCheck(attemptId: string, status: FixtureFillStatus | null): void {
+    const pending = this.fillChecks.get(attemptId);
+    if (!pending) return;
+    this.fillChecks.delete(attemptId);
+    clearTimeout(pending.timer);
+    pending.resolve(status);
+  }
+
+  requestFixtureFill(owner: symbol, operationId: string, now = Date.now()) {
+    if (!this.getFixtureFillAuthorization(owner, operationId, now)) return null;
+    this.listFixtureFillChallenges(now);
+    if (this.fillChecks.size >= MAX_PENDING_FIXTURE_FILLS) return "busy" as const;
+    const authorization = this.consumeFixtureFillApproval(owner, operationId, now);
+    if (!authorization) return null;
+    const attemptId = randomUUID();
+    const expiresAt = Math.min(authorization.expiresAt, now + FIXTURE_FILL_TIMEOUT_MS);
+    let resolve!: PendingFixtureFill["resolve"];
+    const result = new Promise<FixtureFillStatus | null>((done) => { resolve = done; });
+    const timer = setTimeout(() => this.finishFillCheck(attemptId, null), expiresAt - now);
+    this.fillChecks.set(attemptId, { owner, operationId, target: authorization.target,
+      text: authorization.text, expiresAt, timer, resolve });
+    return { attemptId, result };
+  }
+
+  listFixtureFillChallenges(now = Date.now()) {
+    for (const [attemptId, pending] of this.fillChecks) {
+      if (pending.expiresAt <= now || this.getOperation(pending.owner, pending.operationId, now).state !== "approved") {
+        this.finishFillCheck(attemptId, null);
+      }
+    }
+    return [...this.fillChecks].map(([attemptId, pending]) => Object.freeze({
+      attemptId, operationId: pending.operationId, target: pending.target, text: pending.text, expiresAt: pending.expiresAt
+    }));
+  }
+
+  completeFixtureFill(target: FixtureTarget, attemptId: string, observation: FixtureFillResult,
+    now = Date.now()): boolean {
+    const parsed = fixtureFillResultSchema.safeParse(observation);
+    const pending = this.fillChecks.get(attemptId);
+    if (!parsed.success || !pending || pending.expiresAt <= now
+      || pending.target.origin !== target.origin || pending.target.conversationId !== target.conversationId
+      || pending.target.tabId !== target.tabId || pending.target.documentId !== target.documentId
+      || this.getOperation(pending.owner, pending.operationId, now).state !== "approved") return false;
+    this.finishFillCheck(attemptId, { ...parsed.data, operationId: pending.operationId, completedAt: now });
     return true;
   }
 

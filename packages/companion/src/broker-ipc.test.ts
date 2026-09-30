@@ -107,6 +107,35 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
     assert.equal(fillConsent.payload.state, "fill_approved");
     assert.deepEqual((await relay.approveFixtureFillReview(target, operationId, fillReviewId)).payload,
       { code: "FILL_REVIEW_UNAVAILABLE" });
+    assert.throws(() => relay.fillFixtureDraft(operationId), /role cannot perform/);
+    assert.deepEqual((await otherFacade.fillFixtureDraft(operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    const filling = facade.fillFixtureDraft(operationId);
+    let attemptId: string | undefined;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const watch = await relay.listFixtureReadChallenges();
+      if (watch.kind !== "fixture_read_challenges") throw new Error("Expected fixture fill metadata");
+      attemptId = watch.payload.draftFills[0]?.attemptId;
+      if (attemptId) {
+        assert.equal(watch.payload.draftFills[0]?.text, text);
+        assert.equal(JSON.stringify(watch.payload).includes(prepared.payload.recoveryToken), false);
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(attemptId, "Broker did not queue one fill attempt");
+    assert.throws(() => facade.completeFixtureFill(target, attemptId!, { ok: true, editor: "textarea" }),
+      /role cannot perform/);
+    assert.deepEqual((await relay.completeFixtureFill({ ...target, documentId: "other-document" }, attemptId,
+      { ok: true, editor: "textarea" })).payload, { accepted: false });
+    assert.deepEqual((await relay.completeFixtureFill(target, attemptId, { ok: false, code: "DRAFT_PRESENT" })).payload,
+      { accepted: true });
+    const fillResult = await filling;
+    if (fillResult.kind !== "fixture_fill") throw new Error("Expected one fill result");
+    assert.equal(fillResult.payload.operationId, operationId);
+    assert.equal(fillResult.payload.ok, false);
+    if (fillResult.payload.ok) throw new Error("Expected user draft preservation");
+    assert.equal(fillResult.payload.code, "DRAFT_PRESENT");
+    assert.deepEqual((await facade.fillFixtureDraft(operationId)).payload, { code: "FILL_UNAVAILABLE" });
     assert.deepEqual((await otherFacade.checkFixturePreflight(operationId)).payload, { code: "OPERATION_UNAVAILABLE" });
     assert.throws(() => relay.checkFixturePreflight(operationId), /role cannot perform/);
     const checking = facade.checkFixturePreflight(operationId);
@@ -144,6 +173,23 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
     assert.deepEqual((await relay.approveFixtureReview(target, prepared.payload.operationId,
       reviewId)).payload, { code: "REVIEW_UNAVAILABLE" });
     assert.deepEqual((await relay.listFixturePreparedReviews(target)).payload, { reviews: [], hasMore: false });
+    const silent = await facade.prepareFixtureMessage(connectionId, 1, "Synthetic unacknowledged fill",
+      "d66b3997-9d43-4554-8399-267d1fe9f75c");
+    if (silent.kind !== "message_prepared") throw new Error("Expected an unanswered fill candidate");
+    const silentReviews = await relay.listFixturePreparedReviews(target);
+    if (silentReviews.kind !== "fixture_prepared_reviews") throw new Error("Expected unanswered review");
+    const silentReview = silentReviews.payload.reviews[0];
+    assert.ok(silentReview);
+    await relay.approveFixtureReview(target, silent.payload.operationId, silentReview.reviewId);
+    const silentFillReviews = await relay.listFixtureFillReviews(target);
+    if (silentFillReviews.kind !== "fixture_fill_reviews") throw new Error("Expected unanswered fill consent");
+    const silentFillReview = silentFillReviews.payload.reviews[0];
+    assert.ok(silentFillReview);
+    await relay.approveFixtureFillReview(target, silent.payload.operationId, silentFillReview.reviewId);
+    const unanswered = await facade.fillFixtureDraft(silent.payload.operationId);
+    if (unanswered.kind !== "fixture_fill" || unanswered.payload.ok) throw new Error("Expected unknown browser fill outcome");
+    assert.equal(unanswered.payload.code, "FILL_UNCERTAIN");
+    assert.deepEqual((await facade.fillFixtureDraft(silent.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
     const retry = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text, idempotencyKey);
     if (retry.kind !== "message_prepared") throw new Error("Expected same prepared draft");
     assert.equal(retry.payload.operationId, prepared.payload.operationId);

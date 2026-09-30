@@ -1,6 +1,7 @@
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
-import { fixturePreflightResultSchema, MAX_PREPARED_MESSAGE_BYTES, PreparedMessageOperations } from "./message-operations.js";
+import { fixtureFillResultSchema, fixturePreflightResultSchema, MAX_PREPARED_MESSAGE_BYTES,
+  PreparedMessageOperations } from "./message-operations.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
   PendingConnectionRequests }
@@ -64,6 +65,12 @@ const requestSchema = z.discriminatedUnion("kind", [
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("complete_fixture_preflight"), payload: z.strictObject({
     target: fixtureTarget, challengeId: z.uuid(), observation: fixturePreflightResultSchema
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("fill_fixture_draft"), payload: z.strictObject({
+    operationId: z.uuid()
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("complete_fixture_fill"), payload: z.strictObject({
+    target: fixtureTarget, attemptId: z.uuid(), observation: fixtureFillResultSchema
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("disconnect_fixture"), payload: z.strictObject({
     connectionId: z.uuid()
@@ -133,7 +140,8 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       ? { ...response, kind: "fixture_read_challenges" as const,
         payload: { challenges: requests.listFixtureReadChallenges(now),
           activeTabIds: requests.listActiveFixtureTabIds(now),
-          preflightChecks: operations?.listFixturePreflightChallenges(now) ?? [] } }
+          preflightChecks: operations?.listFixturePreflightChallenges(now) ?? [],
+          draftFills: operations?.listFixtureFillChallenges(now) ?? [] } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "list_fixture_prepared_reviews") {
@@ -189,6 +197,13 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return operations
       ? { ...response, kind: "fixture_preflight_recorded" as const, payload: { accepted: operations.completeFixturePreflight(
         request.payload.target, request.payload.challengeId, request.payload.observation, now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+  }
+  if (request.kind === "complete_fixture_fill") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    return operations
+      ? { ...response, kind: "fixture_fill_recorded" as const, payload: { accepted: operations.completeFixtureFill(
+        request.payload.target, request.payload.attemptId, request.payload.observation, now) } }
       : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
   }
   if (request.kind === "list_gemini_read_challenges") {
@@ -266,6 +281,12 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return operations.getOperation(owner, request.payload.operationId, now).state === "approved"
       ? { ...response, kind: "fixture_preflight_authorized" as const, payload: { operationId: request.payload.operationId } }
       : { ...response, kind: "error" as const, payload: { code: "OPERATION_UNAVAILABLE" } };
+  }
+  if (request.kind === "fill_fixture_draft") {
+    if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+    return operations.getFixtureFillAuthorization(owner, request.payload.operationId, now)
+      ? { ...response, kind: "fixture_fill_authorized" as const, payload: { operationId: request.payload.operationId } }
+      : { ...response, kind: "error" as const, payload: { code: "FILL_UNAVAILABLE" } };
   }
   if (request.kind === "prepare_fixture_message") {
     if (!operations) return { ...response, kind: "error" as const,

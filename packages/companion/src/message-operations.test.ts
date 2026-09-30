@@ -587,6 +587,94 @@ test("expired, revoked, or writer-blocked fill consent cannot authorize a draft 
   }
 });
 
+test("fixture fill queue consumes separate owner consent before one exact-target attempt", async () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("fixture owner");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic one-shot fill",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    assert.equal(ledger.requestFixtureFill(owner, prepared.operationId, 2004), null);
+    const [fillReview] = ledger.listFixtureFillReviews(target, 2004).reviews;
+    assert.ok(fillReview);
+    ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2005);
+    assert.equal(ledger.requestFixtureFill(Symbol("foreign"), prepared.operationId, 2006), null);
+    const filling = ledger.requestFixtureFill(owner, prepared.operationId, 2006);
+    if (!filling || filling === "busy") throw new Error("Expected one owner fill attempt");
+    assert.equal(ledger.getFixtureFillAuthorization(owner, prepared.operationId, 2006), null);
+    assert.equal(ledger.requestFixtureFill(owner, prepared.operationId, 2007), null);
+    assert.deepEqual(ledger.listFixtureFillChallenges(2007), [{ attemptId: filling.attemptId,
+      operationId: prepared.operationId, target, text: prepared.preview.text, expiresAt: 6006 }]);
+    const second = ledger.prepare(owner, grant.connectionId, 1, "Synthetic second fill",
+      "c66b3997-9d43-4554-8399-267d1fe9f75c", 2007);
+    const [secondReview] = ledger.listFixtureReviews(target, 2008).reviews;
+    assert.ok(secondReview);
+    ledger.approveFixtureReview(target, second.operationId, secondReview.reviewId, 2008);
+    const [secondFillReview] = ledger.listFixtureFillReviews(target, 2009).reviews;
+    assert.ok(secondFillReview);
+    ledger.approveFixtureFillReview(target, second.operationId, secondFillReview.reviewId, 2009);
+    assert.equal(ledger.requestFixtureFill(owner, second.operationId, 2010), "busy");
+    assert.ok(ledger.getFixtureFillAuthorization(owner, second.operationId, 2010));
+    assert.equal(ledger.completeFixtureFill({ ...target, documentId: "other" }, filling.attemptId,
+      { ok: true, editor: "textarea" }, 2010), false);
+    assert.equal(ledger.completeFixtureFill(target, filling.attemptId,
+      { ok: true, editor: "textarea", draftText: "private" } as never, 2010), false);
+    assert.equal(ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "textarea" }, 2011), true);
+    assert.deepEqual(await filling.result, { operationId: prepared.operationId, completedAt: 2011,
+      ok: true, editor: "textarea" });
+    assert.equal(ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "textarea" }, 2012), false);
+    assert.equal(ledger.requestFixtureFill(owner, prepared.operationId, 2012), null);
+    const next = ledger.requestFixtureFill(owner, second.operationId, 2012);
+    if (!next || next === "busy") throw new Error("Expected serialized second attempt");
+    assert.deepEqual(ledger.listFixtureFillChallenges(6012), []);
+    assert.equal(await next.result, null);
+    assert.equal(ledger.requestFixtureFill(owner, second.operationId, 6013), null);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("fixture fill queues cancel on disconnect and never regain consumed consent", async () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("fixture owner");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic disconnected fill",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    const [fillReview] = ledger.listFixtureFillReviews(target, 2004).reviews;
+    assert.ok(fillReview);
+    ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2005);
+    const filling = ledger.requestFixtureFill(owner, prepared.operationId, 2006);
+    if (!filling || filling === "busy") throw new Error("Expected disconnectable fill");
+    ledger.disconnect(owner);
+    assert.equal(await filling.result, null);
+    assert.deepEqual(ledger.listFixtureFillChallenges(2007), []);
+    assert.equal(ledger.requestFixtureFill(owner, prepared.operationId, 2007), null);
+    assert.equal(ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "textarea" }, 2007), false);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
 test("fixture dispatch baselines require a fresh owned snapshot and trusted approval", () => {
   const database = new DatabaseSync(":memory:");
   try {

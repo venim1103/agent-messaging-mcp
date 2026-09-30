@@ -296,6 +296,19 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
       [`gemini-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, url, expiresAt: Date.now() + 30_000 }
     }), { tabId: unapprovedGeminiTab.id, url: geminiTarget.url });
     const disconnectedTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
+    await worker.evaluate(async (tabId) => {
+      await new Promise((resolve) => {
+        const finished = () => {
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+          resolve();
+        };
+        const onUpdated = (updatedTabId, changes) => {
+          if (updatedTabId === tabId && changes.status === "complete") finished();
+        };
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        void chrome.tabs.get(tabId).then((tab) => { if (tab.status === "complete") finished(); });
+      });
+    }, disconnectedTab.id);
     const beforeDisconnect = await grant(disconnectedTab.id);
     const disconnectState = await facade.getConnection(beforeDisconnect);
     if (disconnectState.kind !== "connection_state" || disconnectState.payload.state !== "ready_readonly") {
@@ -386,7 +399,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
   }
 });
 
-test("trusted fixture popup keeps review and draft-fill consent separate without editing", { timeout: 20000 }, async () => {
+test("trusted fixture popup separates consent from one-shot exact-document draft fill", { timeout: 30000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-review-test-"));
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
@@ -524,13 +537,49 @@ test("trusted fixture popup keeps review and draft-fill consent separate without
     const operationAfterCheck = await facade.getPreparedOperation(prepared.payload.operationId);
     assert.equal(operationAfterCheck.kind, "prepared_operation_state");
     assert.equal(operationAfterCheck.payload.state, "approved");
+    const filled = await facade.fillFixtureDraft(prepared.payload.operationId);
+    assert.equal(filled.kind, "fixture_fill");
+    assert.equal(filled.payload.ok, true, JSON.stringify(filled.payload));
+    assert.equal(filled.payload.editor, "textarea");
+    assert.equal(await fixture.locator("#message").inputValue(), text);
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    assert.deepEqual((await facade.fillFixtureDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    await fixture.locator("#message").fill("");
+    assert.deepEqual((await facade.fillFixtureDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    assert.equal(await fixture.locator("#message").inputValue(), "");
+
+    const approveFillCandidate = async (candidate) => {
+      for (const [buttonId, statusText] of [
+        ["view-fixture-reviews", `Approved fixture draft ${candidate.operationId}. No message was sent.`],
+        ["view-fixture-fill-reviews", `Allowed fixture draft fill ${candidate.operationId}. Editor unchanged. No message was sent.`]
+      ]) {
+        await popup.evaluate((id) => document.getElementById(id).click(), buttonId);
+        await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+        assert.equal(await popup.locator("#fixture-reviews pre").textContent(), candidate.preview.text);
+        await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+        await popup.getByText(statusText).waitFor({ timeout: 4000 });
+      }
+    };
 
     const second = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, "Second fixture draft",
       "c66b3997-9d43-4554-8399-267d1fe9f75c");
     assert.equal(second.kind, "message_prepared");
+    await approveFillCandidate(second.payload);
+    await fixture.locator("#message").fill("Preserve this user draft");
+    const blockedFill = await facade.fillFixtureDraft(second.payload.operationId);
+    assert.equal(blockedFill.kind, "fixture_fill");
+    assert.equal(blockedFill.payload.ok, false);
+    assert.equal(blockedFill.payload.code, "DRAFT_PRESENT");
+    assert.equal(await fixture.locator("#message").inputValue(), "Preserve this user draft");
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    await fixture.locator("#message").fill("");
+    assert.deepEqual((await facade.fillFixtureDraft(second.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    const third = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, "Third fixture draft",
+      "d66b3997-9d43-4554-8399-267d1fe9f75c");
+    assert.equal(third.kind, "message_prepared");
     await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
     await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
-    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), "Second fixture draft");
+    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), "Third fixture draft");
     await fixture.evaluate(() => document.querySelector("main").dataset.conversationId = "fixture-beta");
     await popup.locator("#fixture-review-result").waitFor({ state: "hidden", timeout: 4000 });
     assert.equal(await popup.locator("#fixture-review-result").isHidden(), true);
@@ -539,6 +588,60 @@ test("trusted fixture popup keeps review and draft-fill consent separate without
       kind: "list_fixture_prepared_reviews", ...args
     }), reviewArgs);
     assert.equal(afterSwitch.ok, false);
+
+    const richUrl = "http://127.0.0.1:8787/?editor=rich";
+    await fixture.goto(richUrl);
+    await fixture.bringToFront();
+    await popup.reload();
+    await popup.getByRole("button", { name: "Review fixture drafts" }).waitFor({ state: "visible" });
+    const richPending = await facade.requestConnection();
+    assert.equal(richPending.kind, "connection_requested");
+    const richApproval = await popup.evaluate((args) => chrome.runtime.sendMessage({ kind: "approve_fixture", ...args }), {
+      tabId: selected.tabId, expectedUrl: richUrl, pendingRequestId: richPending.payload.requestId
+    });
+    assert.equal(richApproval.ok, true, JSON.stringify(richApproval));
+    const richConnection = await facade.getConnection(richPending.payload.requestId);
+    assert.equal(richConnection.kind, "connection_state");
+    assert.equal(richConnection.payload.state, "ready_readonly");
+    const richPrepared = await facade.prepareFixtureMessage(richConnection.payload.connectionId, 1,
+      "Rich exact line\nSecond line \u00e9", "e66b3997-9d43-4554-8399-267d1fe9f75c");
+    assert.equal(richPrepared.kind, "message_prepared");
+    await approveFillCandidate(richPrepared.payload);
+    const richFilled = await facade.fillFixtureDraft(richPrepared.payload.operationId);
+    assert.equal(richFilled.kind, "fixture_fill");
+    assert.equal(richFilled.payload.ok, true, JSON.stringify(richFilled.payload));
+    assert.equal(richFilled.payload.editor, "rich");
+    assert.equal(await fixture.locator("#rich-message").innerText(), richPrepared.payload.preview.text);
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    await fixture.locator("#rich-message").fill("");
+    const lostPrepared = await facade.prepareFixtureMessage(richConnection.payload.connectionId, 1,
+      "Synthetic fill with a lost script result", "f66b3997-9d43-4554-8399-267d1fe9f75c");
+    assert.equal(lostPrepared.kind, "message_prepared");
+    await approveFillCandidate(lostPrepared.payload);
+    await worker.evaluate(() => {
+      const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+      globalThis.fixtureOriginalExecute = execute;
+      chrome.scripting.executeScript = async (options) => {
+        const results = await execute(options);
+        return options.args?.[0]?.attemptId ? [] : results;
+      };
+    });
+    try {
+      const lostResult = await facade.fillFixtureDraft(lostPrepared.payload.operationId);
+      assert.equal(lostResult.kind, "fixture_fill");
+      assert.equal(lostResult.payload.ok, false);
+      assert.equal(lostResult.payload.code, "FILL_UNCERTAIN");
+      assert.equal(await fixture.locator("#rich-message").innerText(), lostPrepared.payload.preview.text);
+      assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+      await fixture.locator("#rich-message").fill("");
+      assert.deepEqual((await facade.fillFixtureDraft(lostPrepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
+      assert.equal(await fixture.locator("#rich-message").innerText(), "\n");
+    } finally {
+      await worker.evaluate(() => {
+        chrome.scripting.executeScript = globalThis.fixtureOriginalExecute;
+        delete globalThis.fixtureOriginalExecute;
+      });
+    }
   } finally {
     facade?.close();
     relay?.close();

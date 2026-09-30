@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
-import { captureFixtureSnapshot, inspectFixturePreflight, observeFixtureMessages } from "../../packages/extension/lib/fixture-observation.ts";
+import { captureFixtureSnapshot, fillFixtureDraft, inspectFixturePreflight, observeFixtureMessages } from "../../packages/extension/lib/fixture-observation.ts";
 import { PreparedMessageOperations } from "../../packages/companion/dist/message-operations.js";
 import { PendingConnectionRequests } from "../../packages/companion/dist/pending-connections.js";
 import { createFixtureServer } from "../fixtures/server.mjs";
@@ -181,6 +181,66 @@ test("fixture native insertText preserves multiline text and produces trusted in
       assert.equal(await page.locator("ol#messages > li").count(), 3);
       assert.equal(await page.locator("ol#messages > li:last-child p").textContent(), text);
     }
+  } finally {
+    await browser.close();
+  }
+});
+
+test("one-shot fixture draft fill preserves user input and never activates Send", async () => {
+  const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
+      status: 200, contentType: "text/html; charset=utf-8", body: html
+    }));
+    const text = "First exact line\nSecond exact line \u00e9";
+    const fillInput = (expectedUrl) => ({ expectedUrl, text, expiresAt: Date.now() + 4000,
+      operationId: "a66b3997-9d43-4554-8399-267d1fe9f75c", attemptId: crypto.randomUUID() });
+    for (const kind of ["textarea", "rich"]) {
+      const expectedUrl = `http://127.0.0.1:8787/${kind === "rich" ? "?editor=rich" : ""}`;
+      await page.goto(expectedUrl);
+      const editor = page.getByRole("textbox", { name: "Message" });
+      await page.locator("#composer").evaluate((form) => {
+        window.fixtureSubmitCount = 0;
+        form.addEventListener("submit", () => { window.fixtureSubmitCount++; });
+      });
+      const input = fillInput(expectedUrl);
+      assert.deepEqual(await page.evaluate(fillFixtureDraft, input), { ok: true, editor: kind });
+      assert.equal(kind === "rich" ? await editor.innerText() : await editor.inputValue(), text);
+      assert.equal(await page.locator("ol#messages > li").count(), 2);
+      assert.equal(await page.evaluate(() => window.fixtureSubmitCount), 0);
+      await editor.fill("");
+      assert.deepEqual(await page.evaluate(fillFixtureDraft, { ...input, expiresAt: Date.now() + 4000 }),
+        { ok: false, code: "FILL_UNAVAILABLE" });
+      await editor.fill("User draft must remain");
+      assert.deepEqual(await page.evaluate(fillFixtureDraft, fillInput(expectedUrl)), { ok: false, code: "DRAFT_PRESENT" });
+      assert.equal(kind === "rich" ? await editor.innerText() : await editor.inputValue(), "User draft must remain");
+      await editor.fill("");
+      assert.deepEqual(await page.evaluate(fillFixtureDraft, { ...fillInput(expectedUrl), expiresAt: Date.now() - 1 }),
+        { ok: false, code: "FILL_UNAVAILABLE" });
+      await page.getByRole("button", { name: "Send" }).evaluate((button) => { button.disabled = true; });
+      assert.deepEqual(await page.evaluate(fillFixtureDraft, fillInput(expectedUrl)), { ok: false, code: "SUBMIT_UNAVAILABLE" });
+      await page.getByRole("button", { name: "Send" }).evaluate((button) => { button.disabled = false; });
+      await editor.evaluate((element) => element.addEventListener("input", () => {
+        if (element instanceof HTMLTextAreaElement) element.value = "";
+        else element.replaceChildren();
+      }, { once: true }));
+      const altered = fillInput(expectedUrl);
+      assert.deepEqual(await page.evaluate(fillFixtureDraft, altered), { ok: false, code: "FILL_UNCERTAIN" });
+      assert.deepEqual(await page.evaluate(fillFixtureDraft, { ...altered, expiresAt: Date.now() + 4000 }),
+        { ok: false, code: "FILL_UNAVAILABLE" });
+      await page.goto(expectedUrl);
+      await editor.evaluate((element) => element.addEventListener("focus", () => {
+        document.querySelector("main").dataset.conversationId = "fixture-beta";
+      }, { once: true }));
+      assert.deepEqual(await page.evaluate(fillFixtureDraft, fillInput(expectedUrl)), { ok: false, code: "TARGET_CHANGED" });
+      assert.equal(kind === "rich" ? await editor.innerText() : await editor.inputValue(), "");
+      assert.equal(await page.locator("ol#messages > li").count(), 2);
+    }
+    await page.goto("about:blank");
+    assert.deepEqual(await page.evaluate(fillFixtureDraft, fillInput("http://127.0.0.1:8787/")),
+      { ok: false, code: "TARGET_CHANGED" });
   } finally {
     await browser.close();
   }

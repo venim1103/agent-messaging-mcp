@@ -1,5 +1,5 @@
 import * as z from "zod/v4";
-import { fixturePreflightResultSchema } from "./message-operations.js";
+import { fixtureFillResultSchema, fixturePreflightResultSchema } from "./message-operations.js";
 import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
   MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES } from "./pending-connections.js";
 
@@ -76,6 +76,19 @@ export function parseNativeFixturePreflight(message: unknown, now = Date.now()) 
   const result = fixturePreflightSchema.safeParse(message);
   if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
     throw new Error("Invalid native fixture preflight");
+  }
+  return result.data;
+}
+
+const fixtureFillSchema = fixturePreflightSchema.extend({
+  kind: z.literal("complete_fixture_fill"),
+  payload: z.strictObject({ target: fixtureTargetSchema, attemptId: z.uuid(), observation: fixtureFillResultSchema })
+});
+
+export function parseNativeFixtureFill(message: unknown, now = Date.now()) {
+  const result = fixtureFillSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture fill");
   }
   return result.data;
 }

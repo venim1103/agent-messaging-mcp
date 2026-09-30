@@ -141,6 +141,32 @@ test("only an owning facade prepares immutable fixture text without approval or 
     assert.deepEqual(handleBrokerRequest(approveFill, "relay", stranger, requests, 2003, operations).payload,
       { code: "FILL_REVIEW_UNAVAILABLE" });
     assert.equal(operations.getFixtureFillAuthorization(stranger, prepared.payload.operationId, 2003), null);
+    const fillRequest = { ...envelope, kind: "fill_fixture_draft", payload: { operationId: prepared.payload.operationId } };
+    assert.deepEqual(handleBrokerRequest(fillRequest, "relay", stranger, requests, 2003, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(fillRequest, "facade", stranger, requests, 2003, operations).payload,
+      { code: "FILL_UNAVAILABLE" });
+    assert.deepEqual(handleBrokerRequest(fillRequest, "facade", owner, requests, 2003, operations), {
+      ...envelope, kind: "fixture_fill_authorized", payload: { operationId: prepared.payload.operationId }
+    });
+    assert.throws(() => handleBrokerRequest({ ...fillRequest, payload: { ...fillRequest.payload, text: "Changed" } },
+      "facade", owner, requests, 2003, operations));
+    const filling = operations.requestFixtureFill(owner, prepared.payload.operationId, 2003);
+    if (!filling || filling === "busy") throw new Error("Expected consented fixture fill");
+    const completeFill = { ...envelope, kind: "complete_fixture_fill", payload: {
+      target, attemptId: filling.attemptId, observation: { ok: false, code: "DRAFT_PRESENT" }
+    } };
+    assert.deepEqual(handleBrokerRequest(completeFill, "facade", owner, requests, 2004, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest({ ...completeFill, payload: { ...completeFill.payload,
+      target: { ...target, documentId: "other-document" } } }, "relay", stranger, requests, 2004, operations).payload,
+    { accepted: false });
+    assert.deepEqual(handleBrokerRequest(completeFill, "relay", stranger, requests, 2004, operations).payload,
+      { accepted: true });
+    assert.deepEqual(handleBrokerRequest(completeFill, "relay", stranger, requests, 2004, operations).payload,
+      { accepted: false });
+    assert.deepEqual(handleBrokerRequest(fillRequest, "facade", owner, requests, 2004, operations).payload,
+      { code: "FILL_UNAVAILABLE" });
     assert.deepEqual(handleBrokerRequest(preflight, "facade", stranger, requests, 2003, operations).payload,
       { code: "OPERATION_UNAVAILABLE" });
     assert.deepEqual(handleBrokerRequest(preflight, "facade", owner, requests, 2003, operations), {
@@ -393,7 +419,7 @@ test("a relay publishes bounded fixture rows but only the owning facade reads an
   assert.deepEqual(handleBrokerRequest(challenges, "facade", owner, requests, 2000).payload,
     { code: "PERMISSION_DENIED" });
   assert.deepEqual(handleBrokerRequest(challenges, "relay", stranger, requests, 2000).payload,
-    { challenges: [], activeTabIds: [3], preflightChecks: [] });
+    { challenges: [], activeTabIds: [3], preflightChecks: [], draftFills: [] });
   assert.deepEqual(handleBrokerRequest({ ...publish, payload: { ...publish.payload, target: { ...target, tabId: 4 } } },
     "relay", stranger, requests, 2001).payload, { count: 0 });
   assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2001).payload, { count: 1 });
@@ -468,7 +494,7 @@ test("only the owning facade disconnects an approved fixture without exposing it
     payload: { requestId: pending.requestId } }, "facade", owner, requests, 2001).payload,
     { requestId: pending.requestId, state: "stale" });
   assert.deepEqual(handleBrokerRequest({ ...envelope, kind: "list_fixture_read_challenges", payload: {} },
-    "relay", stranger, requests, 2001).payload, { challenges: [], activeTabIds: [], preflightChecks: [] });
+    "relay", stranger, requests, 2001).payload, { challenges: [], activeTabIds: [], preflightChecks: [], draftFills: [] });
   assert.throws(() => handleBrokerRequest({ ...disconnect, payload: { ...disconnect.payload, tabId: 3 } },
     "facade", owner, requests, 2001));
 });

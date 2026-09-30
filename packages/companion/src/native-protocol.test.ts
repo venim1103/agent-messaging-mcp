@@ -13,7 +13,7 @@ import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, pars
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
-  parseNativeFixturePreflight,
+  parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeFixtureReset, parseNativeFixtureRevocation,
   parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeGeminiSnapshot, parseNativePendingList,
@@ -185,6 +185,26 @@ test("native fixture preflight accepts only fixed results for an exact challenge
     { ...completed, payload: { ...completed.payload, observation: { ok: false, code: "SEND_APPROVED" } } },
     { ...completed, payload: { ...completed.payload, target: { ...completed.payload.target, origin: "https://gemini.google.com" } } }
   ]) assert.throws(() => parseNativeFixturePreflight(invalid, now), /Invalid native fixture preflight/);
+});
+
+test("native fill completion carries only a fixed outcome for one exact document attempt", () => {
+  const completion = { ...request, kind: "complete_fixture_fill", payload: {
+    target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "CHROME-doc_opaque-42" },
+    attemptId: "c783ef76-d6cd-4898-8c43-204543943bac", observation: { ok: true, editor: "rich" }
+  } };
+  assert.deepEqual(parseNativeFixtureFill(completion, now), completion);
+  const uncertain = { ...completion, payload: { ...completion.payload, observation: { ok: false, code: "FILL_UNCERTAIN" } } };
+  assert.deepEqual(parseNativeFixtureFill(uncertain, now), uncertain);
+  for (const invalid of [
+    { ...completion, kind: "fill_fixture_draft" },
+    { ...completion, deadlineMs: now },
+    { ...completion, payload: { ...completion.payload, attemptId: "wrong" } },
+    { ...completion, payload: { ...completion.payload, text: "Changed approved text" } },
+    { ...completion, payload: { ...completion.payload, observation: { ok: true, editor: "rich", draftText: "private" } } },
+    { ...completion, payload: { ...completion.payload, observation: { ok: false, code: "SEND_APPROVED" } } },
+    { ...completion, payload: { ...completion.payload, target: { ...completion.payload.target, origin: "https://gemini.google.com" } } }
+  ]) assert.throws(() => parseNativeFixtureFill(invalid, now), /Invalid native fixture fill/);
 });
 
 test("native fixture review approval requires one exact target and review token", () => {
@@ -555,6 +575,41 @@ test("native relay lists only live broker pending IDs over real framing", { time
     }];
     assert.equal(fillReplay.kind, "error");
     assert.equal(fillReplay.payload.code, "FILL_REVIEW_UNAVAILABLE");
+
+    const filling = facade.fillFixtureDraft(prepared.payload.operationId);
+    const fillObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
+    let fillAttemptId: string | undefined;
+    try {
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const watch = await fillObserver.listFixtureReadChallenges();
+        if (watch.kind !== "fixture_read_challenges") throw new Error("Expected fill watch metadata");
+        fillAttemptId = watch.payload.draftFills[0]?.attemptId;
+        if (fillAttemptId) {
+          assert.equal(watch.payload.draftFills[0]?.operationId, prepared.payload.operationId);
+          assert.equal(watch.payload.draftFills[0]?.text, prepared.payload.preview.text);
+          assert.equal(JSON.stringify(watch.payload).includes(prepared.payload.recoveryToken), false);
+          break;
+        }
+        await setTimeout(10);
+      }
+    } finally {
+      fillObserver.close();
+    }
+    assert.ok(fillAttemptId);
+    const fillCompletionRequest = { ...request, kind: "complete_fixture_fill", deadlineMs: Date.now() + 10_000,
+      payload: { target: approval.payload.target, attemptId: fillAttemptId, observation: { ok: true, editor: "textarea" } } };
+    const [fillCompletion] = await exchangeFillReview(fillCompletionRequest) as [{ kind: string; payload: { accepted: boolean } }];
+    assert.equal(fillCompletion.kind, "fixture_fill_recorded");
+    assert.equal(fillCompletion.payload.accepted, true);
+    const fillResult = await filling;
+    if (fillResult.kind !== "fixture_fill") throw new Error("Expected native fixture fill result");
+    assert.equal(fillResult.payload.ok, true);
+    assert.equal(fillResult.payload.operationId, prepared.payload.operationId);
+    const [fillCompletionReplay] = await exchangeFillReview({ ...fillCompletionRequest, deadlineMs: Date.now() + 10_000 }) as [{
+      kind: string; payload: { accepted: boolean }
+    }];
+    assert.equal(fillCompletionReplay.payload.accepted, false);
+    assert.deepEqual((await facade.fillFixtureDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
 
     const checking = facade.checkFixturePreflight(prepared.payload.operationId);
     const preflightObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
