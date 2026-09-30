@@ -40,7 +40,7 @@ server.registerTool("browser_chat_feasibility", {
   content: [{ type: "text", text: "MCP stdio diagnostic OK. No browser data was read or sent." }]
 }));
 
-server.registerTool("chat.request_connection", {
+server.registerTool("chat_request_connection", {
   description: "Request a pending browser-chat connection. No tab is read until separate browser-side approval.",
   inputSchema: z.object({}).strict()
 }, async () => {
@@ -54,7 +54,7 @@ server.registerTool("chat.request_connection", {
   }
 });
 
-server.registerTool("chat.get_connection", {
+server.registerTool("chat_get_connection", {
   description: "Check an owned pending request; an unapproved request never contains messages or a connection handle.",
   inputSchema: z.object({ requestId: z.uuid() }).strict(),
   annotations: { readOnlyHint: true }
@@ -69,7 +69,7 @@ server.registerTool("chat.get_connection", {
   }
 });
 
-server.registerTool("chat.read_messages", {
+server.registerTool("chat_read_messages", {
   description: "Read a fresh rendered-only snapshot from an owned, toolbar-approved fixture or Gemini chat after an exact-document browser challenge. Gemini results contain the selected chat's visible message text, not complete history.",
   inputSchema: z.object({ connectionId: z.uuid(), limit: z.number().int().min(1).max(32).optional() }).strict(),
   annotations: { readOnlyHint: true }
@@ -84,7 +84,7 @@ server.registerTool("chat.read_messages", {
   }
 });
 
-server.registerTool("chat.wait_for_events", {
+server.registerTool("chat_wait_for_events", {
   description: "Wait for later rendered-only observations from an owned local fixture cursor, with a bounded timeout and explicit resnapshot on cursor expiry.",
   inputSchema: z.object({
     connectionId: z.uuid(),
@@ -103,7 +103,7 @@ server.registerTool("chat.wait_for_events", {
       if (result.kind !== "fixture_events") return unavailable();
       if (result.payload.state === "expired") return {
         isError: true,
-        content: [{ type: "text" as const, text: "CURSOR_EXPIRED: Call chat.read_messages for a new snapshot." }],
+        content: [{ type: "text" as const, text: "CURSOR_EXPIRED: Call chat_read_messages for a new snapshot." }],
         structuredContent: { code: "CURSOR_EXPIRED", resnapshot: true }
       };
       const timedOut = result.payload.events.length === 0 && Date.now() >= deadline;
@@ -118,7 +118,7 @@ server.registerTool("chat.wait_for_events", {
   }
 });
 
-server.registerTool("chat.disconnect", {
+server.registerTool("chat_disconnect", {
   description: "Revoke an owned read-only browser-chat connection without closing its tab. Pending reads are cancelled and subsequent access is denied.",
   inputSchema: z.object({ connectionId: z.uuid() }).strict()
 }, async ({ connectionId }) => {

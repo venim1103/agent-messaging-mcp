@@ -284,16 +284,16 @@ Keep the public tool list small and stable. Per-connection capabilities are retu
 
 | Tool | Main arguments | Result and behavior |
 | --- | --- | --- |
-| `chat.request_connection` | Optional user-facing label | Short-lived connection request; waits for browser-side user selection without scraping tabs |
-| `chat.get_connection` | Connection request ID | Pending/ready state, connection handle, generation, target summary, capabilities, and health |
-| `chat.read_messages` | Connection handle, bounded limit, optional snapshot-pagination token | Structured snapshot, coverage, freshness, and event cursor; no automatic scrolling |
-| `chat.wait_for_events` | Connection handle, event cursor, bounded timeout and limit | Incremental observations/revisions/status changes; returns normally on timeout |
-| `chat.prepare_message` | Connection handle, expected generation, text, idempotency key | Operation ID, canonical preview, and approval state |
-| `chat.commit_message` | Operation ID | Executes only if approved and still valid; otherwise reports the blocking state |
-| `chat.get_operation` | Operation ID | Current status and evidence; the recovery path for ambiguous outcomes |
-| `chat.disconnect` | Connection handle | Revokes access and cancels pending work |
+| `chat_request_connection` | Optional user-facing label | Short-lived connection request; waits for browser-side user selection without scraping tabs |
+| `chat_get_connection` | Connection request ID | Pending/ready state, connection handle, generation, target summary, capabilities, and health |
+| `chat_read_messages` | Connection handle, bounded limit, optional snapshot-pagination token | Structured snapshot, coverage, freshness, and event cursor; no automatic scrolling |
+| `chat_wait_for_events` | Connection handle, event cursor, bounded timeout and limit | Incremental observations/revisions/status changes; returns normally on timeout |
+| `chat_prepare_message` | Connection handle, expected generation, text, idempotency key | Operation ID, canonical preview, and approval state |
+| `chat_commit_message` | Operation ID | Executes only if approved and still valid; otherwise reports the blocking state |
+| `chat_get_operation` | Operation ID | Current status and evidence; the recovery path for ambiguous outcomes |
+| `chat_disconnect` | Connection handle | Revokes access and cancels pending work |
 
-Use shared Zod schemas, bounded inputs, output schemas, and structured tool results. Include a serialized text representation where needed for older clients. Mark reads appropriately; mark sending as a non-read-only external action. Tool annotations help clients present risk but are not access controls.
+Tool names use lowercase letters, digits, underscores, and hyphens for VS Code host compatibility. The prepare/commit/operation tools above are planned, not implemented. Use shared Zod schemas, bounded inputs, output schemas, and structured tool results. Include a serialized text representation where needed for older clients. Mark reads appropriately; mark sending as a non-read-only external action. Tool annotations help clients present risk but are not access controls.
 
 Domain failures should be actionable, for example `CONVERSATION_CHANGED`, `DRAFT_PRESENT`, `APPROVAL_REQUIRED`, `ADAPTER_STALE`, `BROWSER_DISCONNECTED`, `CURSOR_EXPIRED`, and `SEND_OUTCOME_UNKNOWN`. Return structured error details with whether a safe retry is possible. A transport failure after dispatch does not become a known send failure.
 

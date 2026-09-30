@@ -1,12 +1,14 @@
 # Implementation Handoff
 
-Updated: 2026-09-29.
+Updated: 2026-09-30.
 
 This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **The opt-in broker and user-approved fixture-only connection work. Each MCP fixture read waits for a bounded exact-document browser challenge; real toolbar-approved reads, a chat switch, and a fixture message-to-MCP event wait passed. Gemini read-only approval passed a real toolbar state-only check and was then disconnected. The Gemini text route passes synthetic tests only; no selected live Gemini text read or real-site send has occurred.** VS Code tool executions run in the Podman devcontainer, and the user confirmed that its Chromium fixture window is visible on Windows.
 
 ## 1. Start Here
 
 Read this document and [DESIGN.md](DESIGN.md), then inspect the current worktree before changing anything. Preserve any work added after this handoff. Do not spend another session redesigning the system unless a focused experiment disproves an important assumption.
+
+Current public MCP tools use underscores: `chat_request_connection`, `chat_get_connection`, `chat_read_messages`, `chat_wait_for_events`, and `chat_disconnect`. VS Code rejected the earlier dotted spellings quoted in historical milestones below; those are not usable tool names. `browser_chat_feasibility` remains unchanged.
 
 Suggested request for the next AI when the user is ready to start:
 
@@ -244,7 +246,7 @@ Test another intended MCP host and document the verified browser/host/version ma
 
 ### MCP operations
 
-Use the tool names in the design: `chat.request_connection`, `chat.get_connection`, `chat.read_messages`, `chat.wait_for_events`, `chat.prepare_message`, `chat.commit_message`, `chat.get_operation`, and `chat.disconnect`.
+Use the tool names in the design: `chat_request_connection`, `chat_get_connection`, `chat_read_messages`, `chat_wait_for_events`, `chat_prepare_message`, `chat_commit_message`, `chat_get_operation`, and `chat_disconnect`.
 
 Implement only the read-only subset in Milestone 1. `get_connection` resolves the pending request into current connection state. `prepare_message` creates an immutable text/target operation without changing the composer. `commit_message` executes only a still-valid approved operation; `get_operation` is how a client recovers from a lost response. Keep blocked/pending states explicit rather than encouraging the model to create another operation.
 

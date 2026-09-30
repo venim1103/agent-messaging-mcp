@@ -22,9 +22,10 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     await client.connect(transport);
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
-      "browser_chat_feasibility", "chat.request_connection", "chat.get_connection", "chat.read_messages",
-      "chat.wait_for_events", "chat.disconnect"
+      "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_read_messages",
+      "chat_wait_for_events", "chat_disconnect"
     ]);
+    assert.ok(tools.every((tool) => /^[a-z0-9_-]+$/.test(tool.name)));
 
     const result = await client.callTool({ name: "browser_chat_feasibility", arguments: {} });
     assert.equal(result.isError, undefined);
@@ -50,7 +51,7 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
 
   try {
     await clientOne.connect(new StdioClientTransport(options));
-    const unavailable = await clientOne.callTool({ name: "chat.request_connection", arguments: {} });
+    const unavailable = await clientOne.callTool({ name: "chat_request_connection", arguments: {} });
     assert.equal(unavailable.isError, true);
     assert.match(unavailable.content[0]?.type === "text" ? unavailable.content[0].text : "", /BROKER_UNAVAILABLE/);
 
@@ -68,20 +69,20 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     }
     assert.equal(ready, true, "Broker did not start");
 
-    const created = await clientOne.callTool({ name: "chat.request_connection", arguments: {} });
+    const created = await clientOne.callTool({ name: "chat_request_connection", arguments: {} });
     assert.equal(created.isError, undefined);
     const handle = created.structuredContent as { requestId: string; state: string; expiresAt: number };
     assert.equal(handle.state, "pending");
-    const pendingRead = await clientOne.callTool({ name: "chat.read_messages", arguments: {
+    const pendingRead = await clientOne.callTool({ name: "chat_read_messages", arguments: {
       connectionId: "a66b3997-9d43-4554-8399-267d1fe9f75c"
     } });
     assert.equal(pendingRead.isError, true);
     assert.match(pendingRead.content[0]?.type === "text" ? pendingRead.content[0].text : "", /CONNECTION_NOT_FOUND/);
 
     await clientTwo.connect(new StdioClientTransport(options));
-    const hidden = await clientTwo.callTool({ name: "chat.get_connection", arguments: { requestId: handle.requestId } });
+    const hidden = await clientTwo.callTool({ name: "chat_get_connection", arguments: { requestId: handle.requestId } });
     assert.deepEqual(hidden.structuredContent, { state: "unknown" });
-    const own = await clientOne.callTool({ name: "chat.get_connection", arguments: { requestId: handle.requestId } });
+    const own = await clientOne.callTool({ name: "chat_get_connection", arguments: { requestId: handle.requestId } });
     assert.deepEqual(own.structuredContent, handle);
 
     const relay = await connectBroker("relay", brokerDirectory);
@@ -91,7 +92,7 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     } as const;
     const approved = await relay.approveFixture(handle.requestId, target);
     assert.equal(approved.kind, "fixture_approved");
-    const readyState = await clientOne.callTool({ name: "chat.get_connection", arguments: { requestId: handle.requestId } });
+    const readyState = await clientOne.callTool({ name: "chat_get_connection", arguments: { requestId: handle.requestId } });
     assert.equal(readyState.isError, undefined);
     const readyContent = readyState.structuredContent;
     assert.ok(readyContent && typeof readyContent === "object" && !Array.isArray(readyContent));
@@ -100,16 +101,16 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.deepEqual((readyContent as { observation: unknown }).observation,
       { state: "not_observed", capturedAt: null });
     const connectionId = (readyContent as { connectionId: string }).connectionId;
-    const notObserved = await clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId } });
+    const notObserved = await clientOne.callTool({ name: "chat_read_messages", arguments: { connectionId } });
     assert.equal(notObserved.isError, true);
     assert.match(notObserved.content[0]?.type === "text" ? notObserved.content[0].text : "",
       /OBSERVATION_UNAVAILABLE/);
-    const hiddenRead = await clientTwo.callTool({ name: "chat.read_messages", arguments: { connectionId } });
+    const hiddenRead = await clientTwo.callTool({ name: "chat_read_messages", arguments: { connectionId } });
     assert.equal(hiddenRead.isError, true);
     assert.match(hiddenRead.content[0]?.type === "text" ? hiddenRead.content[0].text : "", /CONNECTION_NOT_FOUND/);
     const messages = [{ id: "fixture-1", direction: "incoming" as const, text: "Synthetic fixture message" }];
     assert.deepEqual((await relay.publishFixtureSnapshot(target, messages)).payload, { count: 1 });
-    const reading = clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId, limit: 1 } });
+    const reading = clientOne.callTool({ name: "chat_read_messages", arguments: { connectionId, limit: 1 } });
     let challengeId: string | undefined;
     for (let attempt = 0; attempt < 40; attempt++) {
       const listed = await relay.listFixtureReadChallenges();
@@ -130,33 +131,33 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.deepEqual((snapshot.structuredContent as { messages: unknown }).messages, messages);
     assert.equal((snapshot.structuredContent as { coverage: string }).coverage, "rendered_only");
     assert.equal((snapshot.structuredContent as { omittedBefore: boolean }).omittedBefore, false);
-    const observedState = await clientOne.callTool({ name: "chat.get_connection", arguments: {
+    const observedState = await clientOne.callTool({ name: "chat_get_connection", arguments: {
       requestId: handle.requestId
     } });
     assert.deepEqual((observedState.structuredContent as { observation: unknown }).observation,
       { state: "recent", capturedAt: (snapshot.structuredContent as { capturedAt: number }).capturedAt });
     const cursor = (snapshot.structuredContent as { cursor: { epoch: string; sequence: number } }).cursor;
-    const empty = await clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+    const empty = await clientOne.callTool({ name: "chat_wait_for_events", arguments: {
       connectionId, cursor, timeoutMs: 0
     } });
     assert.deepEqual((empty.structuredContent as { events: unknown[]; timedOut: boolean }).events, []);
     assert.equal((empty.structuredContent as { timedOut: boolean }).timedOut, true);
-    const hiddenEvents = await clientTwo.callTool({ name: "chat.wait_for_events", arguments: {
+    const hiddenEvents = await clientTwo.callTool({ name: "chat_wait_for_events", arguments: {
       connectionId, cursor, timeoutMs: 0
     } });
     assert.equal(hiddenEvents.isError, true);
     const cancelledRequest = new AbortController();
-    const cancelled = clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+    const cancelled = clientOne.callTool({ name: "chat_wait_for_events", arguments: {
       connectionId, cursor, timeoutMs: 20_000
     } }, { signal: cancelledRequest.signal });
     await setTimeout(25);
     cancelledRequest.abort();
     await assert.rejects(cancelled, { name: "SdkError", message: /AbortError/ });
-    const afterCancellation = await clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+    const afterCancellation = await clientOne.callTool({ name: "chat_wait_for_events", arguments: {
       connectionId, cursor, timeoutMs: 0
     } });
     assert.deepEqual((afterCancellation.structuredContent as { events: unknown[] }).events, []);
-    const waiting = clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+    const waiting = clientOne.callTool({ name: "chat_wait_for_events", arguments: {
       connectionId, cursor, timeoutMs: 2000, limit: 1
     } });
     await setTimeout(25);
@@ -170,37 +171,37 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal(eventPage.timedOut, false);
     assert.deepEqual(eventPage.events[0]?.payload, { kind: "fixture_snapshot", messages: later });
     assert.equal(eventPage.cursor.sequence, cursor.sequence + 1);
-    const expired = await clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+    const expired = await clientOne.callTool({ name: "chat_wait_for_events", arguments: {
       connectionId, cursor: { epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 }, timeoutMs: 0
     } });
     assert.equal(expired.isError, true);
     assert.deepEqual(expired.structuredContent, { code: "CURSOR_EXPIRED", resnapshot: true });
     assert.deepEqual((await relay.revokeFixture(3, null)).payload, { count: 1 });
-    const staleRead = await clientOne.callTool({ name: "chat.read_messages", arguments: { connectionId } });
+    const staleRead = await clientOne.callTool({ name: "chat_read_messages", arguments: { connectionId } });
     assert.equal(staleRead.isError, true);
     assert.match(staleRead.content[0]?.type === "text" ? staleRead.content[0].text : "", /CONNECTION_NOT_FOUND/);
-    const staleEvents = await clientOne.callTool({ name: "chat.wait_for_events", arguments: {
+    const staleEvents = await clientOne.callTool({ name: "chat_wait_for_events", arguments: {
       connectionId, cursor, timeoutMs: 0
     } });
     assert.equal(staleEvents.isError, true);
 
-    const geminiRequested = await clientOne.callTool({ name: "chat.request_connection", arguments: {} });
+    const geminiRequested = await clientOne.callTool({ name: "chat_request_connection", arguments: {} });
     const geminiHandle = geminiRequested.structuredContent as { requestId: string };
     const geminiTarget = { origin: "https://gemini.google.com" as const,
       conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat?hl=en",
       tabId: 5, documentId: "CHROME-doc_gemini-42" };
     assert.equal((await relay.approveGemini(geminiHandle.requestId, geminiTarget)).kind, "gemini_approved");
-    const geminiReady = await clientOne.callTool({ name: "chat.get_connection", arguments: {
+    const geminiReady = await clientOne.callTool({ name: "chat_get_connection", arguments: {
       requestId: geminiHandle.requestId
     } });
     const geminiConnection = geminiReady.structuredContent as { connectionId: string; origin: string };
     assert.equal(geminiConnection.origin, "https://gemini.google.com");
     assert.equal("url" in geminiConnection, false);
-    const hiddenGemini = await clientTwo.callTool({ name: "chat.read_messages", arguments: {
+    const hiddenGemini = await clientTwo.callTool({ name: "chat_read_messages", arguments: {
       connectionId: geminiConnection.connectionId
     } });
     assert.equal(hiddenGemini.isError, true);
-    const geminiReading = clientOne.callTool({ name: "chat.read_messages", arguments: {
+    const geminiReading = clientOne.callTool({ name: "chat_read_messages", arguments: {
       connectionId: geminiConnection.connectionId, limit: 1
     } });
     let geminiChallengeId: string | undefined;
@@ -230,43 +231,43 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal((geminiSnapshot.structuredContent as { coverage: string }).coverage, "rendered_only");
     assert.equal((geminiSnapshot.structuredContent as { omittedBefore: boolean }).omittedBefore, true);
     assert.equal("url" in (geminiSnapshot.structuredContent as object), false);
-    assert.deepEqual((await clientOne.callTool({ name: "chat.disconnect", arguments: {
+    assert.deepEqual((await clientOne.callTool({ name: "chat_disconnect", arguments: {
       connectionId: geminiConnection.connectionId
     } })).structuredContent, { disconnected: true });
-    const afterGeminiDisconnect = await clientOne.callTool({ name: "chat.read_messages", arguments: {
+    const afterGeminiDisconnect = await clientOne.callTool({ name: "chat_read_messages", arguments: {
       connectionId: geminiConnection.connectionId
     } });
     assert.equal(afterGeminiDisconnect.isError, true);
 
-    const next = await clientOne.callTool({ name: "chat.request_connection", arguments: {} });
+    const next = await clientOne.callTool({ name: "chat_request_connection", arguments: {} });
     const pendingDisconnect = next.structuredContent as { requestId: string };
     await relay.approveFixture(pendingDisconnect.requestId, { ...target, tabId: 4 });
-    const readyDisconnect = await clientOne.callTool({ name: "chat.get_connection", arguments: {
+    const readyDisconnect = await clientOne.callTool({ name: "chat_get_connection", arguments: {
       requestId: pendingDisconnect.requestId
     } });
     const disconnectId = (readyDisconnect.structuredContent as { connectionId: string }).connectionId;
-    assert.deepEqual((await clientTwo.callTool({ name: "chat.disconnect", arguments: {
+    assert.deepEqual((await clientTwo.callTool({ name: "chat_disconnect", arguments: {
       connectionId: disconnectId
     } })).structuredContent, { disconnected: false });
-    assert.deepEqual((await clientOne.callTool({ name: "chat.disconnect", arguments: {
+    assert.deepEqual((await clientOne.callTool({ name: "chat_disconnect", arguments: {
       connectionId: disconnectId
     } })).structuredContent, { disconnected: true });
-    assert.deepEqual((await clientOne.callTool({ name: "chat.disconnect", arguments: {
+    assert.deepEqual((await clientOne.callTool({ name: "chat_disconnect", arguments: {
       connectionId: disconnectId
     } })).structuredContent, { disconnected: false });
-    assert.deepEqual((await clientOne.callTool({ name: "chat.get_connection", arguments: {
+    assert.deepEqual((await clientOne.callTool({ name: "chat_get_connection", arguments: {
       requestId: pendingDisconnect.requestId
     } })).structuredContent, { requestId: pendingDisconnect.requestId, state: "stale" });
-    const disconnectedRead = await clientOne.callTool({ name: "chat.read_messages", arguments: {
+    const disconnectedRead = await clientOne.callTool({ name: "chat_read_messages", arguments: {
       connectionId: disconnectId
     } });
     assert.equal(disconnectedRead.isError, true);
     relay.close();
     assert.deepEqual((await clientTwo.callTool({
-      name: "chat.get_connection", arguments: { requestId: handle.requestId }
+      name: "chat_get_connection", arguments: { requestId: handle.requestId }
     })).structuredContent, { state: "unknown" });
     await clientOne.close();
-    const disconnected = await clientTwo.callTool({ name: "chat.get_connection", arguments: { requestId: handle.requestId } });
+    const disconnected = await clientTwo.callTool({ name: "chat_get_connection", arguments: { requestId: handle.requestId } });
     assert.deepEqual(disconnected.structuredContent, { state: "unknown" });
   } finally {
     await clientOne.close();
