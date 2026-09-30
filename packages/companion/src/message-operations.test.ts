@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { chmod, lstat, readFile, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
-  openPrivateOperationDatabase, PreparedMessageOperations, PREPARED_MESSAGE_TTL_MS }
+  MAX_RECORDED_PREPARED_MESSAGES, openPrivateOperationDatabase, PreparedMessageOperations,
+  PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS }
   from "./message-operations.js";
 import { PendingConnectionRequests } from "./pending-connections.js";
 
@@ -73,5 +75,42 @@ test("fixture preparation persists no text and cannot dispatch without a trusted
   } finally {
     database.close();
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("expired preparation keys have bounded retention and metadata refuses excess rows", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const requests = new PendingConnectionRequests();
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("fixture owner");
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const firstPending = requests.create(owner, 1000);
+    const firstGrant = requests.approve(firstPending.requestId, target, 2000)!;
+    const key = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+    const first = ledger.prepare(owner, firstGrant.connectionId, 1, "Synthetic", key, 2001);
+    assert.throws(() => ledger.prepare(owner, firstGrant.connectionId, 1, "Synthetic", key,
+      first.expiresAt + 1), /OPERATION_EXPIRED/);
+
+    const later = first.expiresAt + PREPARED_KEY_RETENTION_MS + 1;
+    const laterPending = requests.create(owner, later - 2);
+    const laterGrant = requests.approve(laterPending.requestId, target, later - 1)!;
+    assert.equal(ledger.prepare(owner, laterGrant.connectionId, 1, "New draft", key, later).state,
+      "awaiting_approval");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, 1);
+    database.prepare(`WITH RECURSIVE sequence(number) AS (
+      SELECT 1 UNION ALL SELECT number + 1 FROM sequence WHERE number < ?
+    ) INSERT INTO prepared_message_operations
+      (operation_id, owner_id, connection_id, idempotency_key, content_digest, target_digest, expires_at, state)
+    SELECT 'seed-' || number, 'other-owner', 'other-connection', 'seed-key-' || number,
+      'content-digest', 'target-digest', ?, 'awaiting_approval' FROM sequence`)
+      .run(MAX_RECORDED_PREPARED_MESSAGES - 1, later + PREPARED_MESSAGE_TTL_MS);
+    assert.throws(() => ledger.prepare(owner, laterGrant.connectionId, 1, "Another draft",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", later + 1), /TOO_MANY_PREPARED/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count,
+      MAX_RECORDED_PREPARED_MESSAGES);
+  } finally {
+    database.close();
   }
 });

@@ -47,7 +47,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
             const authenticatedRole = role;
             responses = responses.then(async () => {
               if (socket.destroyed) return;
-              const reply = handleBrokerRequest(message, authenticatedRole, owner, requests);
+              const reply = handleBrokerRequest(message, authenticatedRole, owner, requests, Date.now(), operations);
               if (reply.kind !== "fixture_read_authorized" && reply.kind !== "gemini_read_authorized") {
                 socket.write(encodeNativeFrame(reply));
                 return;

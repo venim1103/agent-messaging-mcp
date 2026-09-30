@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { handleBrokerRequest } from "./broker-requests.js";
+import { PreparedMessageOperations } from "./message-operations.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS }
   from "./pending-connections.js";
@@ -31,6 +33,54 @@ test("only a relay marks a gap for the exact approved Gemini URL and document", 
   assert.equal(requests.get(owner, pending.requestId, 2002)?.state, "ready_readonly");
   assert.throws(() => handleBrokerRequest({ ...gap, payload: { ...gap.payload, selector: "*" } },
     "relay", Symbol("relay"), requests, 2002));
+});
+
+test("only an owning facade prepares immutable fixture text without approval or dispatch", () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  try {
+    const operations = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("fixture owner");
+    const stranger = Symbol("other facade");
+    const pending = requests.create(owner, 1000);
+    const envelope = { protocolVersion: PROTOCOL_VERSION,
+      requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+    const prepare = { ...envelope, kind: "prepare_fixture_message", payload: {
+      connectionId: "a66b3997-9d43-4554-8399-267d1fe9f75c", expectedGeneration: 1,
+      text: "Synthetic fixture-only draft", idempotencyKey: "b66b3997-9d43-4554-8399-267d1fe9f75c"
+    } };
+    assert.deepEqual(handleBrokerRequest(prepare, "facade", owner, requests, 2000, operations).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    const grant = requests.approve(pending.requestId, { origin: "http://127.0.0.1:8787",
+      conversationId: "fixture-alpha", tabId: 3, documentId: "CHROME-doc_opaque-42" }, 2000)!;
+    const owned = { ...prepare, payload: { ...prepare.payload, connectionId: grant.connectionId } };
+    assert.deepEqual(handleBrokerRequest(owned, "relay", stranger, requests, 2001, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(owned, "facade", stranger, requests, 2001, operations).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    const prepared = handleBrokerRequest(owned, "facade", owner, requests, 2001, operations);
+    if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture text");
+    assert.equal(prepared.payload.state, "awaiting_approval");
+    assert.equal(prepared.payload.preview.text, owned.payload.text);
+    assert.deepEqual(handleBrokerRequest(owned, "facade", owner, requests, 2002, operations).payload,
+      prepared.payload);
+    assert.deepEqual(handleBrokerRequest({ ...owned, payload: { ...owned.payload, text: "Changed" } },
+      "facade", owner, requests, 2002, operations).payload, { code: "IDEMPOTENCY_CONFLICT" });
+    assert.throws(() => handleBrokerRequest({ ...owned, payload: { ...owned.payload, approved: true } },
+      "facade", owner, requests, 2002, operations));
+    requests.revokeChangedTab(3, null);
+    assert.deepEqual(handleBrokerRequest(owned, "facade", owner, requests, 2003, operations).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    const geminiPending = requests.create(owner, 1000);
+    const gemini = requests.approveGemini(geminiPending.requestId, { origin: "https://gemini.google.com",
+      conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat?hl=en",
+      tabId: 4, documentId: "CHROME-doc_gemini-42" }, 2000)!;
+    assert.deepEqual(handleBrokerRequest({ ...owned, payload: { ...owned.payload,
+      connectionId: gemini.connectionId } }, "facade", owner, requests, 2003, operations).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+  } finally {
+    database.close();
+  }
 });
 
 test("only an owning facade can create and query pending connections", () => {

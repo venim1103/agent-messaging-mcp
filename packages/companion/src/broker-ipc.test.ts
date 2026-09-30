@@ -4,7 +4,9 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
 import { endianness, tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
+import { connectBroker } from "./broker-client.js";
 import { BROKER_IDLE_TIMEOUT_MS, startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials } from "./broker-roles.js";
 import { encodeNativeFrame, MAX_NATIVE_FRAME_BYTES, NativeFrameDecoder } from "./native-framing.js";
@@ -39,6 +41,50 @@ async function exchange(socket: Socket, message: unknown): Promise<unknown> {
     socket.write(encodeNativeFrame(message));
   });
 }
+
+test("authenticated fixture preparation remains owner-bound and cannot dispatch", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-prepare-ipc-"));
+  const directory = join(home, "broker");
+  const database = new DatabaseSync(":memory:");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+  const facade = await connectBroker("facade", directory);
+  const otherFacade = await connectBroker("facade", directory);
+  const relay = await connectBroker("relay", directory);
+  try {
+    const pending = await facade.requestConnection();
+    if (pending.kind !== "connection_requested") throw new Error("Expected pending fixture approval");
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    assert.equal((await relay.approveFixture(pending.payload.requestId, target)).kind, "fixture_approved");
+    const connection = await facade.getConnection(pending.payload.requestId);
+    if (connection.kind !== "connection_state" || connection.payload.state !== "ready_readonly") {
+      throw new Error("Expected ready fixture handle");
+    }
+    const connectionId = connection.payload.connectionId;
+    const idempotencyKey = "b66b3997-9d43-4554-8399-267d1fe9f75c";
+    const text = "Synthetic fixture-only draft";
+    assert.deepEqual((await otherFacade.prepareFixtureMessage(connection.payload.connectionId, 1,
+      text, idempotencyKey)).payload, { code: "CONNECTION_NOT_FOUND" });
+    const prepared = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text, idempotencyKey);
+    if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture draft");
+    assert.equal(prepared.payload.state, "awaiting_approval");
+    assert.deepEqual(prepared.payload.preview, { target: "fixture-alpha", text });
+    const retry = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text, idempotencyKey);
+    if (retry.kind !== "message_prepared") throw new Error("Expected same prepared draft");
+    assert.equal(retry.payload.operationId, prepared.payload.operationId);
+    assert.deepEqual((await facade.prepareFixtureMessage(connection.payload.connectionId, 1,
+      "Changed draft", idempotencyKey)).payload, { code: "IDEMPOTENCY_CONFLICT" });
+    assert.throws(() => relay.prepareFixtureMessage(connectionId, 1, text, idempotencyKey),
+      /role cannot perform/);
+  } finally {
+    facade.close();
+    otherFacade.close();
+    relay.close();
+    await broker.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("private broker socket authenticates one role and refuses impersonation or a second instance", { timeout: 5000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-ipc-"));

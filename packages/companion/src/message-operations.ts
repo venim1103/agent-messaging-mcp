@@ -5,8 +5,10 @@ import { DatabaseSync } from "node:sqlite";
 import { PendingConnectionRequests, type FixtureTarget } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 60_000;
+export const PREPARED_KEY_RETENTION_MS = 24 * 60 * 60_000;
 export const MAX_PREPARED_MESSAGE_BYTES = 4_000;
 export const MAX_ACTIVE_PREPARED_MESSAGES = 100;
+export const MAX_RECORDED_PREPARED_MESSAGES = 10_000;
 
 export function openPrivateOperationDatabase(directory: string): DatabaseSync {
   const owner = process.getuid?.();
@@ -82,6 +84,8 @@ export class PreparedMessageOperations {
       throw new Error("INVALID_IDEMPOTENCY_KEY");
     }
 
+    this.database.prepare("DELETE FROM prepared_message_operations WHERE expires_at <= ?")
+      .run(now - PREPARED_KEY_RETENTION_MS);
     const ownerId = this.owners.get(owner) ?? randomUUID();
     this.owners.set(owner, ownerId);
     const contentDigest = this.digest(text);
@@ -104,6 +108,9 @@ export class PreparedMessageOperations {
     }
 
     if (this.contents.size >= MAX_ACTIVE_PREPARED_MESSAGES) throw new Error("TOO_MANY_PREPARED");
+    const recorded = this.database.prepare("SELECT count(*) AS count FROM prepared_message_operations")
+      .get() as { count: number };
+    if (recorded.count >= MAX_RECORDED_PREPARED_MESSAGES) throw new Error("TOO_MANY_PREPARED");
     const operationId = randomUUID();
     const expiresAt = now + PREPARED_MESSAGE_TTL_MS;
     this.database.prepare(`INSERT INTO prepared_message_operations

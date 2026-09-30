@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import { connectBroker } from "./broker-client.js";
+import { MAX_PREPARED_MESSAGE_BYTES } from "./message-operations.js";
 
 const server = new McpServer({ name: "browser-chat-feasibility", version: "0.0.1" });
 const runtimeDirectory = join(homedir(), ".config/agent-messaging-mcp/broker");
@@ -114,6 +115,22 @@ server.registerTool("chat_wait_for_events", {
       }
       await waitForPoll(Math.min(200, deadline - Date.now()), extra.mcpReq.signal);
     }
+  } catch {
+    return unavailable();
+  }
+});
+
+server.registerTool("chat_prepare_message", {
+  description: "Prepare an immutable fixture-only message preview for an owned approved connection. The draft expires after 60 seconds. This cannot approve, fill, or send a message; Gemini preparation is unavailable.",
+  inputSchema: z.object({ connectionId: z.uuid(), expectedGeneration: z.literal(1),
+    text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), idempotencyKey: z.uuid() }).strict()
+}, async ({ connectionId, expectedGeneration, text, idempotencyKey }) => {
+  try {
+    const result = await (await pendingBroker()).prepareFixtureMessage(connectionId, expectedGeneration,
+      text, idempotencyKey);
+    if (result.kind === "error") return blocked(result.payload.code);
+    if (result.kind !== "message_prepared") return unavailable();
+    return { content: [{ type: "text", text: JSON.stringify(result.payload) }], structuredContent: result.payload };
   } catch {
     return unavailable();
   }

@@ -1,5 +1,6 @@
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
+import { MAX_PREPARED_MESSAGE_BYTES, PreparedMessageOperations } from "./message-operations.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
   PendingConnectionRequests }
@@ -51,6 +52,10 @@ const requestSchema = z.discriminatedUnion("kind", [
       epoch: z.uuid(), sequence: z.number().int().safe().nonnegative()
     }), limit: z.number().int().min(1).max(2).optional()
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("prepare_fixture_message"), payload: z.strictObject({
+    connectionId: z.uuid(), expectedGeneration: z.literal(1),
+    text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), idempotencyKey: z.uuid()
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("disconnect_fixture"), payload: z.strictObject({
     connectionId: z.uuid()
   }) }),
@@ -88,7 +93,7 @@ const requestSchema = z.discriminatedUnion("kind", [
 ]);
 
 export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: symbol,
-  requests: PendingConnectionRequests, now = Date.now()) {
+  requests: PendingConnectionRequests, now = Date.now(), operations?: PreparedMessageOperations) {
   const request = requestSchema.parse(message);
   if (request.deadlineMs <= now || request.deadlineMs > now + 30_000) throw new Error("Invalid broker deadline");
   const response = {
@@ -170,6 +175,22 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   }
   if (role !== "facade") {
     return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "prepare_fixture_message") {
+    if (!operations) return { ...response, kind: "error" as const,
+      payload: { code: "PREPARATION_UNAVAILABLE" } };
+    try {
+      return { ...response, kind: "message_prepared" as const,
+        payload: operations.prepare(owner, request.payload.connectionId, request.payload.expectedGeneration,
+          request.payload.text, request.payload.idempotencyKey, now) };
+    } catch (error) {
+      if (error instanceof Error && ["CONNECTION_NOT_FOUND", "GENERATION_MISMATCH", "INVALID_MESSAGE_TEXT",
+        "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED", "OPERATION_UNAVAILABLE",
+        "TOO_MANY_PREPARED"].includes(error.message)) {
+        return { ...response, kind: "error" as const, payload: { code: error.message } };
+      }
+      throw error;
+    }
   }
   if (request.kind === "read_fixture_snapshot") {
     return requests.getApprovedTarget(owner, request.payload.connectionId, now)

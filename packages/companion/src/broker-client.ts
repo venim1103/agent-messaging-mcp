@@ -5,6 +5,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
+import { MAX_PREPARED_MESSAGE_BYTES } from "./message-operations.js";
 import type { FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
@@ -120,6 +121,14 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ disconnected: z.boolean() })
   }),
   z.strictObject({
+    kind: z.literal("message_prepared"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), connectionId: z.uuid(),
+      state: z.literal("awaiting_approval"), expiresAt: z.number().int().safe(),
+      preview: z.strictObject({ target: z.literal("fixture-alpha"),
+        text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES) }) })
+  }),
+  z.strictObject({
     kind: z.literal("fixture_gap_marked"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
@@ -175,7 +184,9 @@ const replySchema = z.discriminatedUnion("kind", [
     kind: z.literal("error"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ code: z.enum(["PERMISSION_DENIED", "TOO_MANY_PENDING", "APPROVAL_INVALID",
-      "OBSERVATION_UNAVAILABLE", "CONNECTION_NOT_FOUND"]) })
+      "OBSERVATION_UNAVAILABLE", "CONNECTION_NOT_FOUND", "PREPARATION_UNAVAILABLE", "GENERATION_MISMATCH",
+      "INVALID_MESSAGE_TEXT", "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED",
+      "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED"]) })
   })
 ]);
 
@@ -236,7 +247,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
-      | "disconnect_fixture"
+      | "disconnect_fixture" | "prepare_fixture_message"
       | "list_pending" | "list_fixture_read_challenges" | "list_gemini_read_challenges"
       | "approve_fixture" | "approve_gemini"
       | "publish_fixture_snapshot" | "publish_gemini_snapshot"
@@ -305,6 +316,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       readApprovedEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>
         request("read_approved_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }) }),
       disconnectFixture: (connectionId: string) => request("disconnect_fixture", { connectionId }),
+      prepareFixtureMessage: (connectionId: string, expectedGeneration: 1, text: string, idempotencyKey: string) =>
+        request("prepare_fixture_message", { connectionId, expectedGeneration, text, idempotencyKey }),
       listPending: () => request("list_pending", {}),
       listFixtureReadChallenges: () => request("list_fixture_read_challenges", {}),
       listGeminiReadChallenges: () => request("list_gemini_read_challenges", {}),

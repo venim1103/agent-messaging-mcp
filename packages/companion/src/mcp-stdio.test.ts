@@ -23,7 +23,7 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
       "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_read_messages",
-      "chat_wait_for_events", "chat_disconnect"
+      "chat_wait_for_events", "chat_prepare_message", "chat_disconnect"
     ]);
     assert.ok(tools.every((tool) => /^[a-z0-9_-]+$/.test(tool.name)));
 
@@ -101,6 +101,26 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.deepEqual((readyContent as { observation: unknown }).observation,
       { state: "not_observed", capturedAt: null });
     const connectionId = (readyContent as { connectionId: string }).connectionId;
+    const draft = { connectionId, expectedGeneration: 1, text: "Synthetic fixture-only draft",
+      idempotencyKey: "b66b3997-9d43-4554-8399-267d1fe9f75c" };
+    const otherPrepare = await clientTwo.callTool({ name: "chat_prepare_message", arguments: draft });
+    assert.equal(otherPrepare.isError, true);
+    assert.match(otherPrepare.content[0]?.type === "text" ? otherPrepare.content[0].text : "",
+      /CONNECTION_NOT_FOUND/);
+    const prepared = await clientOne.callTool({ name: "chat_prepare_message", arguments: draft });
+    assert.equal(prepared.isError, undefined);
+    const preview = prepared.structuredContent as { state: string; operationId: string;
+      connectionId: string; expiresAt: number; preview: { target: string; text: string } };
+    assert.equal(preview.state, "awaiting_approval");
+    assert.equal(preview.connectionId, connectionId);
+    assert.deepEqual(preview.preview, { target: "fixture-alpha", text: draft.text });
+    assert.deepEqual((await clientOne.callTool({ name: "chat_prepare_message", arguments: draft })).structuredContent,
+      preview);
+    const conflict = await clientOne.callTool({ name: "chat_prepare_message", arguments: {
+      ...draft, text: "Changed draft"
+    } });
+    assert.equal(conflict.isError, true);
+    assert.match(conflict.content[0]?.type === "text" ? conflict.content[0].text : "", /IDEMPOTENCY_CONFLICT/);
     const notObserved = await clientOne.callTool({ name: "chat_read_messages", arguments: { connectionId } });
     assert.equal(notObserved.isError, true);
     assert.match(notObserved.content[0]?.type === "text" ? notObserved.content[0].text : "",
@@ -177,6 +197,7 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal(expired.isError, true);
     assert.deepEqual(expired.structuredContent, { code: "CURSOR_EXPIRED", resnapshot: true });
     assert.deepEqual((await relay.revokeFixture(3, null)).payload, { count: 1 });
+    assert.equal((await clientOne.callTool({ name: "chat_prepare_message", arguments: draft })).isError, true);
     const staleRead = await clientOne.callTool({ name: "chat_read_messages", arguments: { connectionId } });
     assert.equal(staleRead.isError, true);
     assert.match(staleRead.content[0]?.type === "text" ? staleRead.content[0].text : "", /CONNECTION_NOT_FOUND/);
@@ -197,6 +218,12 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     const geminiConnection = geminiReady.structuredContent as { connectionId: string; origin: string };
     assert.equal(geminiConnection.origin, "https://gemini.google.com");
     assert.equal("url" in geminiConnection, false);
+    const geminiPrepare = await clientOne.callTool({ name: "chat_prepare_message", arguments: {
+      ...draft, connectionId: geminiConnection.connectionId, idempotencyKey: "c66b3997-9d43-4554-8399-267d1fe9f75c"
+    } });
+    assert.equal(geminiPrepare.isError, true);
+    assert.match(geminiPrepare.content[0]?.type === "text" ? geminiPrepare.content[0].text : "",
+      /CONNECTION_NOT_FOUND/);
     const hiddenGemini = await clientTwo.callTool({ name: "chat_read_messages", arguments: {
       connectionId: geminiConnection.connectionId
     } });
