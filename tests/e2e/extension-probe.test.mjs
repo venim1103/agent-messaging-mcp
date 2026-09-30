@@ -342,10 +342,29 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     assert.equal(denied.kind, "error");
     assert.deepEqual(denied.payload, { code: "CONNECTION_NOT_FOUND" });
     await waitForStale(beforeDeniedRead);
+    const beforeGeminiChallenge = await facade.getConnection(unapprovedGemini.payload.requestId);
+    const trackedGeminiBefore = await resumedPopup.evaluate(async (tabId) => {
+      const key = `gemini-grant-${tabId}`;
+      return (await chrome.storage.session.get(key))[key] !== undefined;
+    }, unapprovedGeminiTab.id);
+    assert.equal(beforeGeminiChallenge.payload.state, "ready_readonly",
+      `Gemini grant was revoked before its challenge; tracked: ${trackedGeminiBefore}`);
+    assert.equal(trackedGeminiBefore, true);
     const deniedGeminiRead = await facade.readGeminiSnapshot(unapprovedGeminiState.payload.connectionId);
     assert.equal(deniedGeminiRead.kind, "error");
     assert.deepEqual(deniedGeminiRead.payload, { code: "CONNECTION_NOT_FOUND" });
     await waitForStale(unapprovedGemini.payload.requestId);
+    await resumedPopup.waitForFunction(async (tabId) => {
+      const key = `gemini-grant-status-${tabId}`;
+      return (await chrome.storage.session.get(key))[key]?.code === "target_changed";
+    }, unapprovedGeminiTab.id, { timeout: 2000 });
+    const geminiStatus = await resumedPopup.evaluate(async (tabId) => {
+      const key = `gemini-grant-status-${tabId}`;
+      return (await chrome.storage.session.get(key))[key];
+    }, unapprovedGeminiTab.id);
+    assert.equal(geminiStatus?.code, "target_changed");
+    assert.equal(Number.isSafeInteger(geminiStatus?.recordedAt), true);
+    assert.deepEqual(Object.keys(geminiStatus).sort(), ["code", "recordedAt"]);
     assert.deepEqual((await facade.disconnectFixture(disconnectState.payload.connectionId)).payload,
       { disconnected: true });
     await resumedPopup.waitForFunction(async (tabId) => {
@@ -525,6 +544,43 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
       return (await chrome.storage.session.get(key))[key] === undefined;
     }, selected.tabId, { timeout: 4000 });
     assert.equal(page.isClosed(), false);
+
+    const second = await facade.requestConnection();
+    if (second.kind !== "connection_requested") throw new Error("Expected another synthetic Gemini request");
+    await page.bringToFront();
+    const secondApproval = await popup.evaluate(({ tabId, expectedUrl, pendingRequestId }) => chrome.runtime.sendMessage({
+      kind: "approve_gemini", tabId, expectedUrl, pendingRequestId
+    }), { tabId: selected.tabId, expectedUrl: url, pendingRequestId: second.payload.requestId });
+    assert.equal(secondApproval?.ok, true, JSON.stringify(secondApproval));
+    await page.locator("main").evaluate((main) => {
+      const timeline = main.querySelector("infinite-scroller");
+      main.append(timeline.cloneNode(true));
+      timeline.querySelector("model-response-content p").textContent = "Synthetic ambiguous timeline";
+    });
+    let ambiguousRevoked = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const current = await facade.getConnection(second.payload.requestId);
+      if (current.payload.state === "stale") { ambiguousRevoked = true; break; }
+      await setTimeout(25);
+    }
+    assert.equal(ambiguousRevoked, true, "Ambiguous Gemini timeline did not revoke its grant");
+    await popup.waitForFunction(async (tabId) => {
+      const key = `gemini-grant-status-${tabId}`;
+      return (await chrome.storage.session.get(key))[key]?.code === "observation_unavailable";
+    }, selected.tabId, { timeout: 4000 });
+    const status = await popup.evaluate(async (tabId) => {
+      const key = `gemini-grant-status-${tabId}`;
+      return (await chrome.storage.session.get(key))[key];
+    }, selected.tabId);
+    assert.deepEqual(Object.keys(status).sort(), ["code", "recordedAt"]);
+    assert.equal(Number.isSafeInteger(status.recordedAt), true);
+    await page.bringToFront();
+    await popup.evaluate(() => document.querySelector("#inspect").click());
+    await popup.getByText("Last read-only grant", { exact: true }).waitFor({ timeout: 4000 });
+    const diagnostic = await popup.locator("#messages li").filter({ hasText: "Last read-only grant" }).innerText();
+    assert.match(diagnostic, /Observation unavailable; grant revoked/);
+    assert.equal(diagnostic.includes("https://"), false);
+    assert.equal(diagnostic.includes("Synthetic ambiguous timeline"), false);
   } finally {
     facade?.close();
     await context?.close();

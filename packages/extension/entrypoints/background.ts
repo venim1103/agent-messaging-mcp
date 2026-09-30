@@ -22,8 +22,10 @@ let inputInProgress = false;
 const fixtureResetKey = "fixture-reset-done";
 const fixtureGrantKey = (tabId: number) => `fixture-grant-${tabId}`;
 const geminiGrantKey = (tabId: number) => `gemini-grant-${tabId}`;
+const geminiStatusKey = (tabId: number) => `gemini-grant-status-${tabId}`;
 type StoredFixtureGrant = { documentId: string; expiresAt: number };
 type StoredGeminiGrant = { documentId: string; url: string; expiresAt: number };
+type GeminiGrantStatus = { code: "target_changed" | "observation_unavailable"; recordedAt: number };
 type GrantCountRequest = { kind: "revoke_fixture"; payload: {
   tabId: number; observed: { documentId: string; conversationId: string } | null
 } } | { kind: "revoke_all_fixture"; payload: Record<string, never> }
@@ -40,7 +42,28 @@ const geminiSnapshotJobs = new Map<number, Promise<boolean>>();
 let fixtureReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 let geminiReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 
-async function revokeTrackedFixture(tabId: number): Promise<void> {
+async function recordGeminiGrantStatus(tabId: number, code: GeminiGrantStatus["code"]): Promise<void> {
+  const key = geminiStatusKey(tabId);
+  const previous = (await browser.storage.session.get(key))[key] as GeminiGrantStatus | undefined;
+  if (previous?.recordedAt && Date.now() - previous.recordedAt < 5 * 60_000) return;
+  await browser.storage.session.set({ [key]: { code, recordedAt: Date.now() } satisfies GeminiGrantStatus });
+}
+
+async function classifyGeminiPublicationFailure(tabId: number, expectedUrl: string,
+  documentId: string): Promise<GeminiGrantStatus["code"]> {
+  try {
+    if ((await browser.tabs.get(tabId)).url !== expectedUrl) return "target_changed";
+    const [current] = await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+    });
+    return current?.frameId === 0 && current.documentId === documentId
+      ? "observation_unavailable" : "target_changed";
+  } catch {
+    return "target_changed";
+  }
+}
+
+async function revokeTrackedFixture(tabId: number, geminiReason?: GeminiGrantStatus["code"]): Promise<void> {
   const keys = [fixtureGrantKey(tabId), geminiGrantKey(tabId)];
   const stored = await browser.storage.session.get(keys);
   const active: string[] = [];
@@ -53,7 +76,12 @@ async function revokeTrackedFixture(tabId: number): Promise<void> {
       active.push(key);
     }
   }
-  if (active.length && await revokeFixtureTab(tabId, null)) await browser.storage.session.remove(active);
+  if (active.length && await revokeFixtureTab(tabId, null)) {
+    if (geminiReason && active.includes(geminiGrantKey(tabId))) {
+      await recordGeminiGrantStatus(tabId, geminiReason).catch(() => {});
+    }
+    await browser.storage.session.remove(active);
+  }
 }
 
 async function revokeFixtureTab(tabId: number,
@@ -615,7 +643,10 @@ function startGeminiReadWatch(): boolean {
         if (!grant || grant.documentId !== challenge.documentId || grant.url !== challenge.url
           || typeof grant.expiresAt !== "number" || grant.expiresAt <= Date.now()) continue;
         if (!await queueGeminiSnapshot(challenge.tabId, challenge.url,
-          challenge.documentId, challenge.challengeId)) await revokeTrackedFixture(challenge.tabId);
+          challenge.documentId, challenge.challengeId)) {
+          await revokeTrackedFixture(challenge.tabId,
+            await classifyGeminiPublicationFailure(challenge.tabId, challenge.url, challenge.documentId));
+        }
       }
       if (geminiReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
     })().catch(stop);
@@ -818,6 +849,7 @@ async function approveGemini(tabId: number, expectedUrl: string, pendingRequestI
           await browser.storage.session.set({ [geminiGrantKey(tabId)]: {
             documentId, url: expectedUrl, expiresAt: payload.expiresAt
           } satisfies StoredGeminiGrant });
+          await browser.storage.session.remove(geminiStatusKey(tabId));
           const [stillCurrent] = await browser.scripting.executeScript({
             target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
           });
@@ -1092,7 +1124,9 @@ export default defineBackground(() => {
   }).catch(() => {});
   browser.tabs.onRemoved.addListener((tabId) => { void revokeTrackedFixture(tabId).catch(() => {}); });
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (changeInfo.status === "loading" || changeInfo.url) void revokeTrackedFixture(tabId).catch(() => {});
+    if (changeInfo.status === "loading" || changeInfo.url) {
+      void revokeTrackedFixture(tabId, "target_changed").catch(() => {});
+    }
   });
   browser.runtime.onMessage.addListener((message: unknown, sender) => {
     if (typeof message === "object" && message !== null && !Array.isArray(message)
@@ -1105,7 +1139,9 @@ export default defineBackground(() => {
         const grant = stored[geminiGrantKey(tabId)] as StoredGeminiGrant | undefined;
         if (!grant || grant.documentId !== documentId || !isEligibleGeminiUrl(grant.url)
           || typeof grant.expiresAt !== "number" || grant.expiresAt <= Date.now()) return;
-        if (!await queueGeminiSnapshot(tabId, grant.url, documentId)) await revokeTrackedFixture(tabId);
+        if (!await queueGeminiSnapshot(tabId, grant.url, documentId)) {
+          await revokeTrackedFixture(tabId, await classifyGeminiPublicationFailure(tabId, grant.url, documentId));
+        }
       }).catch(() => {});
     }
     if (typeof message === "object" && message !== null && !Array.isArray(message)
@@ -1113,10 +1149,10 @@ export default defineBackground(() => {
       if (sender.id !== browser.runtime.id || sender.origin !== geminiOrigin
         || sender.frameId !== 0 || sender.tab?.id == null || typeof sender.documentId !== "string") return;
       const tabId = sender.tab.id;
-      return browser.storage.session.get(geminiGrantKey(tabId)).then((stored) => {
+      return browser.storage.session.get(geminiGrantKey(tabId)).then(async (stored) => {
         const grant = stored[geminiGrantKey(tabId)] as StoredGeminiGrant | undefined;
         if (grant?.documentId !== sender.documentId) return;
-        return revokeTrackedFixture(tabId);
+        await revokeTrackedFixture(tabId, "target_changed");
       });
     }
     if (typeof message === "object" && message !== null && !Array.isArray(message)

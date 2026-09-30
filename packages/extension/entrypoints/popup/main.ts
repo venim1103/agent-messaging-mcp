@@ -290,6 +290,16 @@ inspectButton.addEventListener("click", async () => {
         ["Read shape", readShape?.map((row) => `${row.direction} (${row.characters} chars)`).join("\n")
           || "Unsupported or changed; no connection approved"]
       ];
+      const grantStatusKey = `gemini-grant-status-${tab.id}`;
+      const grantStatus = (await browser.storage.session.get(grantStatusKey))[grantStatusKey] as
+        { code?: unknown; recordedAt?: unknown } | undefined;
+      if (grantStatus && typeof grantStatus.recordedAt === "number"
+        && Number.isSafeInteger(grantStatus.recordedAt)
+        && Date.now() - grantStatus.recordedAt >= 0
+        && Date.now() - grantStatus.recordedAt < 5 * 60_000) {
+        if (grantStatus.code === "target_changed") details.push(["Last read-only grant", "Target or document changed/unavailable"]);
+        if (grantStatus.code === "observation_unavailable") details.push(["Last read-only grant", "Observation unavailable; grant revoked"]);
+      }
       for (const [label, text] of details) {
         const row = document.createElement("li");
         const heading = document.createElement("strong");
