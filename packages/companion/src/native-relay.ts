@@ -6,6 +6,7 @@ import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, pars
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
+  parseNativeFixturePreflight,
   parseNativeGeminiSnapshot,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
@@ -51,6 +52,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "approve_fixture_review" ? parseNativeFixtureReviewApproval(message)
                   : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "complete_fixture_preflight" ? parseNativeFixturePreflight(message)
+                  : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "list_gemini_read_challenges" ? parseNativeGeminiReadChallenges(message)
                     : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "mark_fixture_observation_gap" ? parseNativeFixtureGap(message)
@@ -62,18 +65,23 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
           let kind: "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
             | "fixture_approved" | "fixture_review_approved" | "gemini_approved" | "fixture_revoked"
+            | "fixture_preflight_recorded"
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
               origin: string; conversationId: string; tabId: number; documentId: string
-            }; expiresAt: number }>; activeTabIds: ReadonlyArray<number> }
+            }; expiresAt: number }>; activeTabIds: ReadonlyArray<number>;
+              preflightChecks: ReadonlyArray<{ challengeId: string; operationId: string; target: {
+                origin: string; conversationId: string; tabId: number; documentId: string
+              }; text: string; expiresAt: number }> }
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
               origin: string; conversationId: string; url: string; tabId: number; documentId: string
             }; expiresAt: number }>; activeTabIds: ReadonlyArray<number> }
             | { reviews: ReadonlyArray<{ operationId: string; reviewId: string; expiresAt: number;
               preview: { target: "fixture-alpha"; text: string } }>; hasMore: boolean }
             | { operationId: string; state: "approved"; approvedAt: number; expiresAt: number }
+            | { accepted: boolean }
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"));
@@ -102,6 +110,12 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 kind = "error";
                 payload = { code: "REVIEW_UNAVAILABLE" };
               } else throw new Error("Broker refused fixture review approval");
+            } else if (request.kind === "complete_fixture_preflight") {
+              const result = await client.completeFixturePreflight(request.payload.target, request.payload.challengeId,
+                request.payload.observation);
+              if (result.kind !== "fixture_preflight_recorded") throw new Error("Broker refused fixture preflight");
+              kind = "fixture_preflight_recorded";
+              payload = result.payload;
             } else if (request.kind === "list_gemini_read_challenges") {
               const result = await client.listGeminiReadChallenges();
               if (result.kind !== "gemini_read_challenges") throw new Error("Broker refused Gemini read challenges");

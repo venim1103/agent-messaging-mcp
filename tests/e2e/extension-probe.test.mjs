@@ -477,8 +477,37 @@ test("trusted fixture popup approves prepared text without editing the page", { 
     const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
       tabId: selected.tabId, documentId: selected.documentId };
     assert.deepEqual((await relay.listFixturePreparedReviews(target)).payload, { reviews: [], hasMore: false });
+    const checked = await facade.checkFixturePreflight(prepared.payload.operationId);
+    if (checked.kind !== "fixture_preflight") throw new Error(`Expected fixture preflight: ${JSON.stringify(checked.payload)}`);
+    assert.equal(checked.payload.ok, true, JSON.stringify(checked.payload));
+    assert.equal(checked.payload.editor, "textarea");
+    assert.equal(JSON.stringify(checked.payload).includes(text), false);
     assert.equal(await fixture.locator("#message").inputValue(), "");
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+
+    await fixture.locator("#message").fill("User draft must remain");
+    const draftCheck = await facade.checkFixturePreflight(prepared.payload.operationId);
+    assert.equal(draftCheck.kind, "fixture_preflight");
+    assert.equal(draftCheck.payload.ok, false);
+    assert.equal(draftCheck.payload.code, "DRAFT_PRESENT");
+    assert.equal(await fixture.locator("#message").inputValue(), "User draft must remain");
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    await fixture.locator("#message").fill("");
+    await fixture.locator("button[type=submit]").evaluate((button) => { button.disabled = true; });
+    const submitCheck = await facade.checkFixturePreflight(prepared.payload.operationId);
+    assert.equal(submitCheck.kind, "fixture_preflight");
+    assert.equal(submitCheck.payload.ok, false);
+    assert.equal(submitCheck.payload.code, "SUBMIT_UNAVAILABLE");
+    await fixture.locator("button[type=submit]").evaluate((button) => { button.disabled = false; });
+    await popup.bringToFront();
+    const inactiveCheck = await facade.checkFixturePreflight(prepared.payload.operationId);
+    assert.equal(inactiveCheck.kind, "fixture_preflight");
+    assert.equal(inactiveCheck.payload.ok, false);
+    assert.equal(inactiveCheck.payload.code, "TARGET_CHANGED");
+    await fixture.bringToFront();
+    const operationAfterCheck = await facade.getPreparedOperation(prepared.payload.operationId);
+    assert.equal(operationAfterCheck.kind, "prepared_operation_state");
+    assert.equal(operationAfterCheck.payload.state, "approved");
 
     const second = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, "Second fixture draft",
       "c66b3997-9d43-4554-8399-267d1fe9f75c");

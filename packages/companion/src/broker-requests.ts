@@ -1,6 +1,6 @@
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
-import { MAX_PREPARED_MESSAGE_BYTES, PreparedMessageOperations } from "./message-operations.js";
+import { fixturePreflightResultSchema, MAX_PREPARED_MESSAGE_BYTES, PreparedMessageOperations } from "./message-operations.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
   PendingConnectionRequests }
@@ -58,6 +58,12 @@ const requestSchema = z.discriminatedUnion("kind", [
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("get_prepared_operation"), payload: z.strictObject({
     operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional()
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("check_fixture_preflight"), payload: z.strictObject({
+    operationId: z.uuid()
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("complete_fixture_preflight"), payload: z.strictObject({
+    target: fixtureTarget, challengeId: z.uuid(), observation: fixturePreflightResultSchema
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("disconnect_fixture"), payload: z.strictObject({
     connectionId: z.uuid()
@@ -120,7 +126,8 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return role === "relay"
       ? { ...response, kind: "fixture_read_challenges" as const,
         payload: { challenges: requests.listFixtureReadChallenges(now),
-          activeTabIds: requests.listActiveFixtureTabIds(now) } }
+          activeTabIds: requests.listActiveFixtureTabIds(now),
+          preflightChecks: operations?.listFixturePreflightChallenges(now) ?? [] } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "list_fixture_prepared_reviews") {
@@ -146,6 +153,13 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       }
       throw error;
     }
+  }
+  if (request.kind === "complete_fixture_preflight") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    return operations
+      ? { ...response, kind: "fixture_preflight_recorded" as const, payload: { accepted: operations.completeFixturePreflight(
+        request.payload.target, request.payload.challengeId, request.payload.observation, now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
   }
   if (request.kind === "list_gemini_read_challenges") {
     return role === "relay"
@@ -216,6 +230,12 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
           ? operations.getOperation(owner, request.payload.operationId, now)
           : operations.recoverOperationStatus(request.payload.operationId, request.payload.recoveryToken) }
       : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+  }
+  if (request.kind === "check_fixture_preflight") {
+    if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+    return operations.getOperation(owner, request.payload.operationId, now).state === "approved"
+      ? { ...response, kind: "fixture_preflight_authorized" as const, payload: { operationId: request.payload.operationId } }
+      : { ...response, kind: "error" as const, payload: { code: "OPERATION_UNAVAILABLE" } };
   }
   if (request.kind === "prepare_fixture_message") {
     if (!operations) return { ...response, kind: "error" as const,

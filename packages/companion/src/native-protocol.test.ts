@@ -12,6 +12,7 @@ import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
+  parseNativeFixturePreflight,
   parseNativeFixtureReset, parseNativeFixtureRevocation,
   parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeGeminiSnapshot, parseNativePendingList,
@@ -137,6 +138,26 @@ test("native fixture review listing accepts only an exact target and no approval
   ]) {
     assert.throws(() => parseNativeFixturePreparedReviews(invalid, now), /Invalid native fixture prepared review list/);
   }
+});
+
+test("native fixture preflight accepts only fixed results for an exact challenge target", () => {
+  const completed = { ...request, kind: "complete_fixture_preflight", payload: {
+    target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "CHROME-doc_opaque-42" },
+    challengeId: "c783ef76-d6cd-4898-8c43-204543943bac", observation: { ok: true, editor: "textarea" }
+  } };
+  assert.deepEqual(parseNativeFixturePreflight(completed, now), completed);
+  const denied = { ...completed, payload: { ...completed.payload, observation: { ok: false, code: "DRAFT_PRESENT" } } };
+  assert.deepEqual(parseNativeFixturePreflight(denied, now), denied);
+  for (const invalid of [
+    { ...completed, kind: "send" },
+    { ...completed, deadlineMs: now },
+    { ...completed, payload: { ...completed.payload, challengeId: "invalid" } },
+    { ...completed, payload: { ...completed.payload, selector: "#message" } },
+    { ...completed, payload: { ...completed.payload, observation: { ok: true, editor: "textarea", draftText: "private" } } },
+    { ...completed, payload: { ...completed.payload, observation: { ok: false, code: "SEND_APPROVED" } } },
+    { ...completed, payload: { ...completed.payload, target: { ...completed.payload.target, origin: "https://gemini.google.com" } } }
+  ]) assert.throws(() => parseNativeFixturePreflight(invalid, now), /Invalid native fixture preflight/);
 });
 
 test("native fixture review approval requires one exact target and review token", () => {
@@ -469,6 +490,70 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(approvalReviewReply.kind, "fixture_review_approved");
     assert.equal(approvalReviewReply.payload.operationId, prepared.payload.operationId);
     assert.equal(approvalReviewReply.payload.state, "approved");
+
+    const checking = facade.checkFixturePreflight(prepared.payload.operationId);
+    const preflightObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
+    try {
+      let queued = false;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const watch = await preflightObserver.listFixtureReadChallenges();
+        if (watch.kind !== "fixture_read_challenges") throw new Error("Expected fixture watch metadata");
+        if (watch.payload.preflightChecks.length) { queued = true; break; }
+        await setTimeout(10);
+      }
+      assert.equal(queued, true, "Broker did not queue a native preflight check");
+    } finally {
+      preflightObserver.close();
+    }
+    const preflightWatchHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const preflightWatchOutput: Buffer[] = [];
+    const preflightWatchErrors: Buffer[] = [];
+    preflightWatchHost.stdout.on("data", (chunk: Buffer) => preflightWatchOutput.push(chunk));
+    preflightWatchHost.stderr.on("data", (chunk: Buffer) => preflightWatchErrors.push(chunk));
+    preflightWatchHost.stdin.end(encodeNativeFrame({ ...request, kind: "list_fixture_read_challenges",
+      deadlineMs: Date.now() + 10_000 }));
+    const [preflightWatchExit] = await once(preflightWatchHost, "exit");
+    assert.equal(preflightWatchExit, 0, Buffer.concat(preflightWatchErrors).toString());
+    const [preflightWatch] = new NativeFrameDecoder().push(Buffer.concat(preflightWatchOutput)) as [{
+      kind: string; payload: { preflightChecks: { challengeId: string; operationId: string; text: string; target: unknown }[] }
+    }];
+    assert.equal(preflightWatch.kind, "fixture_read_challenges");
+    const [preflight] = preflightWatch.payload.preflightChecks;
+    assert.ok(preflight);
+    assert.equal(preflight.operationId, prepared.payload.operationId);
+    assert.equal(preflight.text, prepared.payload.preview.text);
+    assert.deepEqual(preflight.target, approval.payload.target);
+    assert.equal(JSON.stringify(preflightWatch).includes(prepared.payload.recoveryToken), false);
+
+    const completionHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const completionOutput: Buffer[] = [];
+    const completionErrors: Buffer[] = [];
+    completionHost.stdout.on("data", (chunk: Buffer) => completionOutput.push(chunk));
+    completionHost.stderr.on("data", (chunk: Buffer) => completionErrors.push(chunk));
+    const complete = { ...request, kind: "complete_fixture_preflight", deadlineMs: Date.now() + 10_000,
+      payload: { target: approval.payload.target, challengeId: preflight.challengeId,
+        observation: { ok: true, editor: "textarea" } } };
+    completionHost.stdin.end(Buffer.concat([encodeNativeFrame(complete), encodeNativeFrame(complete)]));
+    const [completionExit] = await once(completionHost, "exit");
+    assert.equal(completionExit, 0, Buffer.concat(completionErrors).toString());
+    const completions = new NativeFrameDecoder().push(Buffer.concat(completionOutput)) as {
+      kind: string; payload: { accepted: boolean }
+    }[];
+    assert.deepEqual(completions.map((reply) => ({ kind: reply.kind, payload: reply.payload })), [
+      { kind: "fixture_preflight_recorded", payload: { accepted: true } },
+      { kind: "fixture_preflight_recorded", payload: { accepted: false } }
+    ]);
+    const checked = await checking;
+    if (checked.kind !== "fixture_preflight") throw new Error("Expected completed fixture preflight");
+    assert.equal(checked.payload.operationId, prepared.payload.operationId);
+    assert.equal(checked.payload.ok, true);
+    const operationAfterCheck = await facade.getPreparedOperation(prepared.payload.operationId);
+    if (operationAfterCheck.kind !== "prepared_operation_state") throw new Error("Expected operation status");
+    assert.equal(operationAfterCheck.payload.state, "approved");
 
     const publicationHost = spawn(process.execPath, [relayEntry, origin, origin], {
       stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }

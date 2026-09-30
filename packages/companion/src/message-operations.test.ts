@@ -7,7 +7,8 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
   MAX_PREPARED_REVIEWS, MAX_RECORDED_PREPARED_MESSAGES, openPrivateOperationDatabase, PreparedMessageOperations,
-  PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS, FIXTURE_REVIEW_APPROVAL_TTL_MS }
+  PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS, FIXTURE_REVIEW_APPROVAL_TTL_MS,
+  FIXTURE_PREFLIGHT_TIMEOUT_MS, MAX_PENDING_FIXTURE_PREFLIGHTS }
   from "./message-operations.js";
 import { PendingConnectionRequests } from "./pending-connections.js";
 
@@ -373,6 +374,89 @@ test("one unresolved fixture dispatch intent blocks a second approved operation"
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
     assert.equal(ledger.getOperation(owner, second.operationId, 2005).state, "approved");
   } finally {
+    database.close();
+  }
+});
+
+test("approved fixture preflight challenges are exact-target, bounded, and cannot dispatch", async () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("fixture owner");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic preflight text",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    assert.equal(ledger.requestFixturePreflight(owner, prepared.operationId, 2002), null);
+    const receipt = ledger.createRecoveryReceipt(owner, prepared.operationId, 2002);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    assert.equal(ledger.requestFixturePreflight(Symbol("other"), prepared.operationId, 2004), null);
+    const check = ledger.requestFixturePreflight(owner, prepared.operationId, 2004);
+    if (!check || check === "busy") throw new Error("Expected a preflight challenge");
+    assert.equal(ledger.requestFixturePreflight(owner, prepared.operationId, 2004), "busy");
+    assert.deepEqual(ledger.listFixturePreflightChallenges(2004), [{ challengeId: check.challengeId,
+      operationId: prepared.operationId, target, text: prepared.preview.text,
+      expiresAt: 2004 + FIXTURE_PREFLIGHT_TIMEOUT_MS }]);
+    assert.equal(JSON.stringify(ledger.listFixturePreflightChallenges(2004)).includes(receipt.recoveryToken), false);
+    assert.equal(ledger.completeFixturePreflight({ ...target, documentId: "other" }, check.challengeId,
+      { ok: true, editor: "textarea" }, 2005), false);
+    const extra = { ok: true as const, editor: "textarea" as const, draftText: "Synthetic private draft" };
+    assert.equal(ledger.completeFixturePreflight(target, check.challengeId, extra, 2005), false);
+    assert.equal(ledger.completeFixturePreflight(target, check.challengeId, { ok: false, code: "DRAFT_PRESENT" }, 2006), true);
+    assert.deepEqual(await check.result, { operationId: prepared.operationId, checkedAt: 2006,
+      ok: false, code: "DRAFT_PRESENT" });
+    assert.equal(ledger.completeFixturePreflight(target, check.challengeId, { ok: true, editor: "textarea" }, 2007), false);
+    const expired = ledger.requestFixturePreflight(owner, prepared.operationId, 2008);
+    if (!expired || expired === "busy") throw new Error("Expected another challenge");
+    assert.deepEqual(ledger.listFixturePreflightChallenges(2008 + FIXTURE_PREFLIGHT_TIMEOUT_MS), []);
+    assert.equal(await expired.result, null);
+    const revoked = ledger.requestFixturePreflight(owner, prepared.operationId, 2009);
+    if (!revoked || revoked === "busy") throw new Error("Expected a cancellable challenge");
+    requests.revokeChangedTab(3, null);
+    assert.deepEqual(ledger.listFixturePreflightChallenges(2010), []);
+    assert.equal(await revoked.result, null);
+    assert.equal(ledger.requestFixturePreflight(owner, prepared.operationId, 2010), null);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("fixture preflight capacity and owner disconnect cancel waiting checks", async () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("fixture owner");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const waiting: Array<Promise<unknown>> = [];
+    for (let index = 1; index <= MAX_PENDING_FIXTURE_PREFLIGHTS + 1; index++) {
+      const prepared = ledger.prepare(owner, grant.connectionId, 1, `Synthetic check ${index}`,
+        `b66b3997-9d43-4554-8399-${String(index).padStart(12, "0")}`, 2001);
+      const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+      assert.ok(review);
+      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+      const check = ledger.requestFixturePreflight(owner, prepared.operationId, 2004);
+      if (index > MAX_PENDING_FIXTURE_PREFLIGHTS) assert.equal(check, "busy");
+      else {
+        if (!check || check === "busy") throw new Error("Expected an available check slot");
+        waiting.push(check.result);
+      }
+    }
+    ledger.disconnect(owner);
+    assert.deepEqual(await Promise.all(waiting), Array(MAX_PENDING_FIXTURE_PREFLIGHTS).fill(null));
+    assert.deepEqual(ledger.listFixturePreflightChallenges(2005), []);
+  } finally {
+    ledger.disconnect(owner);
     database.close();
   }
 });

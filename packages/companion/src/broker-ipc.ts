@@ -48,6 +48,19 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
             responses = responses.then(async () => {
               if (socket.destroyed) return;
               const reply = handleBrokerRequest(message, authenticatedRole, owner, requests, Date.now(), operations);
+              if (reply.kind === "fixture_preflight_authorized") {
+                const pending = operations?.requestFixturePreflight(owner, reply.payload.operationId);
+                if (!pending || pending === "busy") {
+                  socket.write(encodeNativeFrame({ ...reply, kind: "error", payload: { code: "PREFLIGHT_UNAVAILABLE" } }));
+                  return;
+                }
+                const checked = await pending.result;
+                if (socket.destroyed) return;
+                socket.write(encodeNativeFrame(checked
+                  ? { ...reply, kind: "fixture_preflight", payload: checked }
+                  : { ...reply, kind: "error", payload: { code: "PREFLIGHT_UNAVAILABLE" } }));
+                return;
+              }
               if (reply.kind !== "fixture_read_authorized" && reply.kind !== "gemini_read_authorized") {
                 socket.write(encodeNativeFrame(reply));
                 return;

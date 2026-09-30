@@ -89,6 +89,38 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
       prepared.payload.operationId, reviewId)).payload, { code: "REVIEW_UNAVAILABLE" });
     const approved = await relay.approveFixtureReview(target, prepared.payload.operationId, reviewId);
     assert.equal(approved.kind, "fixture_review_approved");
+    const operationId = prepared.payload.operationId;
+    assert.deepEqual((await otherFacade.checkFixturePreflight(operationId)).payload, { code: "OPERATION_UNAVAILABLE" });
+    assert.throws(() => relay.checkFixturePreflight(operationId), /role cannot perform/);
+    const checking = facade.checkFixturePreflight(operationId);
+    let challengeId: string | undefined;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const watch = await relay.listFixtureReadChallenges();
+      if (watch.kind !== "fixture_read_challenges") throw new Error("Expected fixture watch reply");
+      challengeId = watch.payload.preflightChecks[0]?.challengeId;
+      if (challengeId) {
+        assert.equal(watch.payload.preflightChecks[0]?.operationId, operationId);
+        assert.equal(watch.payload.preflightChecks[0]?.text, text);
+        assert.equal(JSON.stringify(watch.payload).includes(prepared.payload.recoveryToken), false);
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(challengeId, "Broker did not queue a preflight check");
+    assert.throws(() => facade.completeFixturePreflight(target, challengeId!, { ok: true, editor: "textarea" }),
+      /role cannot perform/);
+    assert.deepEqual((await relay.completeFixturePreflight({ ...target, documentId: "other-document" }, challengeId,
+      { ok: true, editor: "textarea" })).payload, { accepted: false });
+    assert.deepEqual((await relay.completeFixturePreflight(target, challengeId, { ok: false, code: "DRAFT_PRESENT" })).payload,
+      { accepted: true });
+    const checked = await checking;
+    if (checked.kind !== "fixture_preflight") throw new Error("Expected a fixed preflight result");
+    assert.equal(checked.payload.operationId, operationId);
+    assert.equal(checked.payload.ok, false);
+    if (checked.payload.ok) throw new Error("Expected draft preservation");
+    assert.equal(checked.payload.code, "DRAFT_PRESENT");
+    assert.deepEqual((await relay.completeFixturePreflight(target, challengeId, { ok: true, editor: "textarea" })).payload,
+      { accepted: false });
     assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload,
       { operationId: prepared.payload.operationId, state: "approved", expiresAt: prepared.payload.expiresAt,
         approvalExpiresAt: approved.payload.expiresAt });
@@ -103,6 +135,26 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
       "Changed draft", idempotencyKey)).payload, { code: "IDEMPOTENCY_CONFLICT" });
     assert.throws(() => relay.prepareFixtureMessage(connectionId, 1, text, idempotencyKey),
       /role cannot perform/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    const cancelled = facade.checkFixturePreflight(operationId);
+    let queued = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const watch = await relay.listFixtureReadChallenges();
+      if (watch.kind !== "fixture_read_challenges") throw new Error("Expected pending preflight metadata");
+      if (watch.payload.preflightChecks.length) { queued = true; break; }
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(queued, true);
+    facade.close();
+    await assert.rejects(cancelled, /closed|disconnected/i);
+    let cleared = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const watch = await relay.listFixtureReadChallenges();
+      if (watch.kind !== "fixture_read_challenges") throw new Error("Expected cleared watch metadata");
+      if (!watch.payload.preflightChecks.length) { cleared = true; break; }
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(cleared, true, "Closed facade left a pending preflight");
   } finally {
     facade.close();
     otherFacade.close();

@@ -64,6 +64,13 @@ test("only an owning facade prepares immutable fixture text without approval or 
     assert.equal(prepared.payload.state, "awaiting_approval");
     assert.equal(prepared.payload.preview.text, owned.payload.text);
     assert.match(prepared.payload.recoveryToken, /^[0-9a-f]{64}$/);
+    const preflight = { ...envelope, kind: "check_fixture_preflight", payload: {
+      operationId: prepared.payload.operationId
+    } };
+    assert.deepEqual(handleBrokerRequest(preflight, "facade", owner, requests, 2002, operations).payload,
+      { code: "OPERATION_UNAVAILABLE" });
+    assert.deepEqual(handleBrokerRequest(preflight, "relay", stranger, requests, 2002, operations).payload,
+      { code: "PERMISSION_DENIED" });
     const status = { ...envelope, kind: "get_prepared_operation", payload: {
       operationId: prepared.payload.operationId
     } };
@@ -105,9 +112,38 @@ test("only an owning facade prepares immutable fixture text without approval or 
     assert.deepEqual(handleBrokerRequest(status, "facade", owner, requests, 2002, operations).payload,
       { operationId: prepared.payload.operationId, state: "approved", expiresAt: prepared.payload.expiresAt,
         approvalExpiresAt: 2002 + 30_000 });
+    assert.deepEqual(handleBrokerRequest(preflight, "facade", stranger, requests, 2003, operations).payload,
+      { code: "OPERATION_UNAVAILABLE" });
+    assert.deepEqual(handleBrokerRequest(preflight, "facade", owner, requests, 2003, operations), {
+      ...envelope, kind: "fixture_preflight_authorized", payload: { operationId: prepared.payload.operationId }
+    });
+    const check = operations.requestFixturePreflight(owner, prepared.payload.operationId, 2003);
+    if (!check || check === "busy") throw new Error("Expected a queued preflight");
+    const listing = handleBrokerRequest({ ...envelope, kind: "list_fixture_read_challenges", payload: {} },
+      "relay", stranger, requests, 2003, operations);
+    if (listing.kind !== "fixture_read_challenges") throw new Error("Expected native watch metadata");
+    assert.equal(listing.payload.preflightChecks.length, 1);
+    assert.equal(JSON.stringify(listing.payload).includes(prepared.payload.recoveryToken), false);
+    const complete = { ...envelope, kind: "complete_fixture_preflight", payload: {
+      target, challengeId: check.challengeId, observation: { ok: true, editor: "textarea" }
+    } };
+    assert.deepEqual(handleBrokerRequest(complete, "facade", owner, requests, 2004, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest({ ...complete, payload: { ...complete.payload, target: { ...target,
+      documentId: "wrong-document" } } }, "relay", stranger, requests, 2004, operations).payload, { accepted: false });
+    assert.deepEqual(handleBrokerRequest(complete, "relay", stranger, requests, 2004, operations).payload,
+      { accepted: true });
+    assert.deepEqual(handleBrokerRequest(complete, "relay", stranger, requests, 2005, operations).payload,
+      { accepted: false });
+    assert.throws(() => handleBrokerRequest({ ...complete, payload: { ...complete.payload,
+      observation: { ok: true, editor: "textarea", draftText: "Synthetic page draft" } } },
+    "relay", stranger, requests, 2005, operations));
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
     assert.deepEqual(handleBrokerRequest(approveReview, "relay", stranger, requests, 2002, operations).payload,
       { code: "REVIEW_UNAVAILABLE" });
     requests.revokeChangedTab(3, null);
+    assert.deepEqual(handleBrokerRequest(preflight, "facade", owner, requests, 2003, operations).payload,
+      { code: "OPERATION_UNAVAILABLE" });
     assert.deepEqual(handleBrokerRequest(status, "facade", owner, requests, 2003, operations).payload,
       { operationId: prepared.payload.operationId, state: "stale" });
     assert.deepEqual(handleBrokerRequest(list, "relay", stranger, requests, 2003, operations).payload,
@@ -327,7 +363,7 @@ test("a relay publishes bounded fixture rows but only the owning facade reads an
   assert.deepEqual(handleBrokerRequest(challenges, "facade", owner, requests, 2000).payload,
     { code: "PERMISSION_DENIED" });
   assert.deepEqual(handleBrokerRequest(challenges, "relay", stranger, requests, 2000).payload,
-    { challenges: [], activeTabIds: [3] });
+    { challenges: [], activeTabIds: [3], preflightChecks: [] });
   assert.deepEqual(handleBrokerRequest({ ...publish, payload: { ...publish.payload, target: { ...target, tabId: 4 } } },
     "relay", stranger, requests, 2001).payload, { count: 0 });
   assert.deepEqual(handleBrokerRequest(publish, "relay", stranger, requests, 2001).payload, { count: 1 });
@@ -402,7 +438,7 @@ test("only the owning facade disconnects an approved fixture without exposing it
     payload: { requestId: pending.requestId } }, "facade", owner, requests, 2001).payload,
     { requestId: pending.requestId, state: "stale" });
   assert.deepEqual(handleBrokerRequest({ ...envelope, kind: "list_fixture_read_challenges", payload: {} },
-    "relay", stranger, requests, 2001).payload, { challenges: [], activeTabIds: [] });
+    "relay", stranger, requests, 2001).payload, { challenges: [], activeTabIds: [], preflightChecks: [] });
   assert.throws(() => handleBrokerRequest({ ...disconnect, payload: { ...disconnect.payload, tabId: 3 } },
     "facade", owner, requests, 2001));
 });

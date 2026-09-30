@@ -13,6 +13,18 @@ export const MAX_PREPARED_MESSAGE_BYTES = 4_000;
 export const MAX_ACTIVE_PREPARED_MESSAGES = 100;
 export const MAX_RECORDED_PREPARED_MESSAGES = 10_000;
 export const MAX_PREPARED_REVIEWS = 8;
+export const FIXTURE_PREFLIGHT_TIMEOUT_MS = 4_000;
+export const MAX_PENDING_FIXTURE_PREFLIGHTS = 16;
+export const fixturePreflightResultSchema = z.discriminatedUnion("ok", [
+  z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]) }),
+  z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
+    "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "SUBMIT_UNAVAILABLE"]) })
+]);
+export type FixturePreflightResult = z.infer<typeof fixturePreflightResultSchema>;
+export const fixturePreflightStatusSchema = z.discriminatedUnion("ok", [
+  fixturePreflightResultSchema.options[0].extend({ operationId: z.uuid(), checkedAt: z.number().int().safe() }),
+  fixturePreflightResultSchema.options[1].extend({ operationId: z.uuid(), checkedAt: z.number().int().safe() })
+]);
 const fixtureObservationSchema = z.strictObject({
   kind: z.literal("fixture_snapshot"),
   messages: z.array(z.strictObject({ id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
@@ -61,6 +73,11 @@ type FixtureDispatchStatus = Readonly<{
 }> | Readonly<{
   operationId: string; state: "observed_in_ui"; startedAt: number; observedAt: number; messageId: string
 }>;
+type FixturePreflightStatus = z.infer<typeof fixturePreflightStatusSchema>;
+type PendingFixturePreflight = {
+  owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number;
+  timer: ReturnType<typeof setTimeout>; resolve: (status: FixturePreflightStatus | null) => void
+};
 
 export class PreparedMessageOperations {
   private readonly owners = new Map<symbol, string>();
@@ -72,6 +89,7 @@ export class PreparedMessageOperations {
   private readonly recoveryReceipts = new Map<string, string>();
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
   private readonly ambiguousEvidence = new Set<string>();
+  private readonly preflightChecks = new Map<string, PendingFixturePreflight>();
   private readonly digestKey = randomBytes(32);
 
   constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync) {
@@ -123,6 +141,9 @@ export class PreparedMessageOperations {
   }
 
   private release(operationId: string): void {
+    for (const [challengeId, pending] of this.preflightChecks) {
+      if (pending.operationId === operationId) this.finishPreflightCheck(challengeId, null);
+    }
     this.contents.delete(operationId);
     this.reviewTokens.delete(operationId);
     this.approvals.delete(operationId);
@@ -286,6 +307,53 @@ export class PreparedMessageOperations {
     const supplied = createHash("sha256").update(JSON.stringify([operationId, recoveryToken])).digest();
     if (!timingSafeEqual(supplied, Buffer.from(record.token_digest, "hex"))) return { state: "unknown" as const };
     return this.dispatchStatus(operationId) ?? { state: "unknown" as const };
+  }
+
+  private finishPreflightCheck(challengeId: string, status: FixturePreflightStatus | null): void {
+    const pending = this.preflightChecks.get(challengeId);
+    if (!pending) return;
+    this.preflightChecks.delete(challengeId);
+    clearTimeout(pending.timer);
+    pending.resolve(status);
+  }
+
+  requestFixturePreflight(owner: symbol, operationId: string, now = Date.now()) {
+    const status = this.getOperation(owner, operationId, now);
+    const operation = this.contents.get(operationId);
+    if (status.state !== "approved" || !operation || operation.owner !== owner) return null;
+    if (this.preflightChecks.size >= MAX_PENDING_FIXTURE_PREFLIGHTS
+      || [...this.preflightChecks.values()].some((pending) => pending.operationId === operationId)) return "busy" as const;
+    const challengeId = randomUUID();
+    const expiresAt = Math.min(status.approvalExpiresAt, now + FIXTURE_PREFLIGHT_TIMEOUT_MS);
+    let resolve!: PendingFixturePreflight["resolve"];
+    const result = new Promise<FixturePreflightStatus | null>((done) => { resolve = done; });
+    const timer = setTimeout(() => this.finishPreflightCheck(challengeId, null), expiresAt - now);
+    this.preflightChecks.set(challengeId, { owner, operationId, target: operation.target,
+      text: operation.text, expiresAt, timer, resolve });
+    return { challengeId, result };
+  }
+
+  listFixturePreflightChallenges(now = Date.now()) {
+    for (const [challengeId, pending] of this.preflightChecks) {
+      if (pending.expiresAt <= now || this.getOperation(pending.owner, pending.operationId, now).state !== "approved") {
+        this.finishPreflightCheck(challengeId, null);
+      }
+    }
+    return [...this.preflightChecks].map(([challengeId, pending]) => Object.freeze({
+      challengeId, operationId: pending.operationId, target: pending.target, text: pending.text, expiresAt: pending.expiresAt
+    }));
+  }
+
+  completeFixturePreflight(target: FixtureTarget, challengeId: string, observation: FixturePreflightResult,
+    now = Date.now()): boolean {
+    const parsed = fixturePreflightResultSchema.safeParse(observation);
+    const pending = this.preflightChecks.get(challengeId);
+    if (!parsed.success || !pending || pending.expiresAt <= now
+      || pending.target.origin !== target.origin || pending.target.conversationId !== target.conversationId
+      || pending.target.tabId !== target.tabId || pending.target.documentId !== target.documentId
+      || this.getOperation(pending.owner, pending.operationId, now).state !== "approved") return false;
+    this.finishPreflightCheck(challengeId, { ...parsed.data, operationId: pending.operationId, checkedAt: now });
+    return true;
   }
 
   recordFixtureDispatchBaseline(owner: symbol, operationId: string, now = Date.now()) {
