@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
+  parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixtureReset, parseNativeFixtureRevocation,
   parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeGeminiSnapshot, parseNativePendingList,
@@ -143,6 +144,27 @@ test("native Gemini approval accepts only one exact saved chat target", () => {
     { ...approval, payload: { target: { ...approval.payload.target, selector: "*" } } }
   ]) {
     assert.throws(() => parseNativeGeminiApproval(invalid, now), /Invalid native Gemini approval/);
+  }
+});
+
+test("native Gemini gap accepts only one exact saved-chat URL and document", () => {
+  const gap = { ...request, kind: "mark_gemini_observation_gap", payload: { target: {
+    origin: "https://gemini.google.com", conversationId: "disposable-chat",
+    url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 3,
+    documentId: "CHROME-doc_gemini-42"
+  } } };
+  assert.deepEqual(parseNativeGeminiGap(gap, now), gap);
+  for (const invalid of [
+    { ...gap, kind: "evaluate" },
+    { ...gap, deadlineMs: now },
+    { ...gap, payload: { ...gap.payload, selector: "*" } },
+    { ...gap, payload: { target: { ...gap.payload.target, url: `${gap.payload.target.url}&changed=1` },
+      selector: "*" } },
+    { ...gap, payload: { target: { ...gap.payload.target, url: `${gap.payload.target.url}#reply` } } },
+    { ...gap, payload: { target: { ...gap.payload.target, documentId: "" } } },
+    { ...gap, payload: { target: { ...gap.payload.target, conversationId: "other" } } }
+  ]) {
+    assert.throws(() => parseNativeGeminiGap(invalid, now), /Invalid native Gemini gap/);
   }
 });
 
@@ -650,6 +672,28 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.deepEqual(freshGemini.payload.messages[1], { direction: "incoming", text: "Fresh synthetic answer",
       identityQuality: "uncertain", generationState: "unknown" });
     assert.equal("url" in freshGemini.payload, false);
+
+    const geminiGapHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    const geminiGapOutput: Buffer[] = [];
+    const geminiGapErrors: Buffer[] = [];
+    geminiGapHost.stdout.on("data", (chunk: Buffer) => geminiGapOutput.push(chunk));
+    geminiGapHost.stderr.on("data", (chunk: Buffer) => geminiGapErrors.push(chunk));
+    const geminiGap = { ...request, kind: "mark_gemini_observation_gap", deadlineMs: Date.now() + 10_000,
+      payload: { target: geminiPublication.payload.target } };
+    geminiGapHost.stdin.end(encodeNativeFrame(geminiGap));
+    const [geminiGapExit] = await once(geminiGapHost, "exit");
+    assert.equal(geminiGapExit, 0, Buffer.concat(geminiGapErrors).toString());
+    const [geminiGapReply] = new NativeFrameDecoder().push(Buffer.concat(geminiGapOutput)) as [{
+      kind: string; requestId: string; payload: { count: number }
+    }];
+    assert.equal(geminiGapReply.kind, "gemini_gap_marked");
+    assert.equal(geminiGapReply.requestId, geminiGap.requestId);
+    assert.deepEqual(geminiGapReply.payload, { count: 1 });
+    const expiredGemini = await facade.readApprovedEvents(geminiState.payload.connectionId, freshGemini.payload.cursor);
+    assert.equal(expiredGemini.kind, "gemini_events");
+    assert.deepEqual(expiredGemini.payload, { state: "expired", resnapshot: true });
 
     const geminiRelay = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
     try {

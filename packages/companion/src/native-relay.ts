@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
+  parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeGeminiSnapshot,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
@@ -48,13 +49,16 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                     && message.kind === "list_gemini_read_challenges" ? parseNativeGeminiReadChallenges(message)
                     : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "mark_fixture_observation_gap" ? parseNativeFixtureGap(message)
+                    : typeof message === "object" && message !== null && "kind" in message
+                      && message.kind === "mark_gemini_observation_gap" ? parseNativeGeminiGap(message)
               : parseNativePendingList(message);
         nativeReply = nativeReply.then(async () => {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
           let kind: "pending_list" | "fixture_read_challenges" | "gemini_read_challenges"
             | "fixture_approved" | "gemini_approved" | "fixture_revoked"
-            | "fixture_snapshot_published" | "gemini_snapshot_published" | "fixture_gap_marked" | "error";
+            | "fixture_snapshot_published" | "gemini_snapshot_published"
+            | "fixture_gap_marked" | "gemini_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
               origin: string; conversationId: string; tabId: number; documentId: string
@@ -112,6 +116,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               const result = await client.markFixtureObservationGap(request.payload.target);
               if (result.kind !== "fixture_gap_marked") throw new Error("Broker refused fixture gap");
               kind = "fixture_gap_marked";
+              payload = result.payload;
+            } else if (request.kind === "mark_gemini_observation_gap") {
+              const result = await client.markGeminiObservationGap(request.payload.target);
+              if (result.kind !== "gemini_gap_marked") throw new Error("Broker refused Gemini gap");
+              kind = "gemini_gap_marked";
               payload = result.payload;
             } else if (request.kind === "publish_gemini_snapshot") {
               const result = await client.publishGeminiSnapshot(request.payload.target, request.payload.messages,

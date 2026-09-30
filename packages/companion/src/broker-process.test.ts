@@ -256,6 +256,18 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.equal(eventPage.payload.cursor.sequence, freshGemini.payload.cursor.sequence + 1);
     assert.deepEqual(eventPage.payload.events[0]?.payload, { kind: "gemini_snapshot",
       messages: laterRows.map((row) => ({ ...row, identityQuality: "uncertain", generationState: "unknown" })) });
+    assert.throws(() => facade.markGeminiObservationGap(geminiTarget), /Broker role cannot perform/);
+    assert.deepEqual((await relay.markGeminiObservationGap({ ...geminiTarget,
+      url: `${geminiTarget.url}&changed=1` })).payload, { count: 0 });
+    assert.deepEqual((await relay.markGeminiObservationGap(geminiTarget)).payload, { count: 1 });
+    assert.deepEqual((await facade.readApprovedEvents(geminiConnectionId, freshGemini.payload.cursor)).payload,
+      { state: "expired", resnapshot: true });
+    const readyAfterGeminiGap = await facade.getConnection(geminiPending.payload.requestId);
+    if (readyAfterGeminiGap.kind !== "connection_state"
+      || readyAfterGeminiGap.payload.state !== "ready_readonly") {
+      throw new Error("Expected live Gemini grant after an observation gap");
+    }
+    assert.deepEqual(readyAfterGeminiGap.payload.observation, { state: "not_observed", capturedAt: null });
     assert.deepEqual((await facade.readFixtureSnapshot(geminiState.payload.connectionId)).payload,
       { code: "CONNECTION_NOT_FOUND" });
     assert.deepEqual((await relay.revokeAllFixtures()).payload, { count: 1 });

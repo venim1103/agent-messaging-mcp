@@ -351,6 +351,26 @@ export class PendingConnectionRequests {
     return marked;
   }
 
+  markGeminiObservationGap(target: GeminiTarget, now = Date.now()): number {
+    let marked = 0;
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (!grant || grant.stale || now >= grant.connection.expiresAt
+        || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
+        || grant.target.url !== target.url || grant.target.tabId !== target.tabId
+        || grant.target.documentId !== target.documentId) continue;
+      if (!grant.geminiSnapshot
+        && (!grant.geminiObservations || grant.geminiObservations.bookmark().sequence === 0)) continue;
+      grant.geminiSnapshot = undefined;
+      grant.geminiObservations = new ObservationBuffer({ maxEvents: 32, maxBytes: 256 * 1024 });
+      for (const [challengeId, pending] of this.geminiReads) {
+        if (pending.connectionId === grant.connection.connectionId) this.finishGeminiRead(challengeId, "not_ready");
+      }
+      marked++;
+    }
+    return marked;
+  }
+
   publishFixtureSnapshot(target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>,
     now = Date.now(), challengeId?: string): number {
     if (messages.length > MAX_FIXTURE_SNAPSHOT_MESSAGES

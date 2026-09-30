@@ -475,3 +475,37 @@ test("worker wake marks an exact fixture observation gap without revoking its ow
   assert.equal(after.cursor.sequence, 1);
   assert.equal(requests.markFixtureObservationGap(target, grant.expiresAt), 0);
 });
+
+test("Gemini worker wake expires only the exact approved chat's observed cursor", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("returning Gemini reader");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
+    url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 4,
+    documentId: "CHROME-doc_gemini-42" };
+  const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+  const rows = [{ direction: "incoming" as const, text: "Synthetic before suspension" }];
+  assert.equal(requests.publishGeminiSnapshot(target, rows, 2001), 1);
+  const before = requests.getGeminiSnapshot(owner, grant.connectionId, 2001);
+  if (!before || before === "not_ready") throw new Error("Expected an old Gemini cursor");
+  const reading = requests.requestFreshGeminiRead(owner, grant.connectionId, 2002);
+  if (!reading || reading === "busy") throw new Error("Expected a Gemini challenge");
+  assert.equal(requests.markGeminiObservationGap({ ...target, url: `${target.url}&changed=1` }, 2003), 0);
+  assert.equal(requests.markGeminiObservationGap({ ...target, documentId: "other" }, 2003), 0);
+  assert.equal(requests.markGeminiObservationGap(target, 2003), 1);
+  assert.equal(await reading.result, "not_ready");
+  assert.equal(requests.getGeminiSnapshot(owner, grant.connectionId, 2003), "not_ready");
+  assert.deepEqual(requests.readGeminiEvents(owner, grant.connectionId, before.cursor, 1, 2003),
+    { state: "expired", resnapshot: true });
+  assert.equal(requests.get(owner, pending.requestId, 2003)?.state, "ready_readonly");
+  assert.equal(requests.markGeminiObservationGap(target, 2003), 0);
+  const resumed = requests.requestFreshGeminiRead(owner, grant.connectionId, 2004);
+  if (!resumed || resumed === "busy") throw new Error("Expected a post-gap Gemini challenge");
+  assert.equal(requests.markGeminiObservationGap(target, 2004), 0);
+  assert.equal(requests.publishGeminiSnapshot(target, rows, 2005, resumed.challengeId), 1);
+  const after = await resumed.result;
+  if (!after || after === "not_ready") throw new Error("Expected a resnapshot");
+  assert.notEqual(after.cursor.epoch, before.cursor.epoch);
+  assert.equal(after.cursor.sequence, 1);
+  assert.equal(requests.markGeminiObservationGap(target, grant.expiresAt), 0);
+});

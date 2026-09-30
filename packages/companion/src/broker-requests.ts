@@ -75,6 +75,9 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("mark_fixture_observation_gap"), payload: z.strictObject({
     target: fixtureTarget
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("mark_gemini_observation_gap"), payload: z.strictObject({
+    target: geminiTarget
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("revoke_fixture"), payload: z.strictObject({
     tabId: z.number().int().safe().positive(),
     observed: z.union([z.null(), z.strictObject({
@@ -146,6 +149,12 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return role === "relay"
       ? { ...response, kind: "fixture_gap_marked" as const,
         payload: { count: requests.markFixtureObservationGap(request.payload.target, now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "mark_gemini_observation_gap") {
+    return role === "relay"
+      ? { ...response, kind: "gemini_gap_marked" as const,
+        payload: { count: requests.markGeminiObservationGap(request.payload.target, now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "revoke_fixture") {

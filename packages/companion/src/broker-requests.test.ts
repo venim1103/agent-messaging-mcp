@@ -5,6 +5,34 @@ import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS }
   from "./pending-connections.js";
 
+test("only a relay marks a gap for the exact approved Gemini URL and document", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("Gemini owner");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
+    url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 4,
+    documentId: "CHROME-doc_gemini-42" };
+  const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+  requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic" }], 2001);
+  const before = requests.getGeminiSnapshot(owner, grant.connectionId, 2001);
+  if (!before || before === "not_ready") throw new Error("Expected an old Gemini cursor");
+  const envelope = { protocolVersion: PROTOCOL_VERSION,
+    requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+  const gap = { ...envelope, kind: "mark_gemini_observation_gap", payload: { target } };
+  assert.deepEqual(handleBrokerRequest(gap, "facade", owner, requests, 2002).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest({ ...gap, payload: { target: { ...target, url: `${target.url}&other=1` } } },
+    "relay", Symbol("relay"), requests, 2002).payload, { count: 0 });
+  assert.deepEqual(handleBrokerRequest(gap, "relay", Symbol("relay"), requests, 2002), {
+    ...envelope, kind: "gemini_gap_marked", payload: { count: 1 }
+  });
+  assert.deepEqual(requests.readGeminiEvents(owner, grant.connectionId, before.cursor, 1, 2002),
+    { state: "expired", resnapshot: true });
+  assert.equal(requests.get(owner, pending.requestId, 2002)?.state, "ready_readonly");
+  assert.throws(() => handleBrokerRequest({ ...gap, payload: { ...gap.payload, selector: "*" } },
+    "relay", Symbol("relay"), requests, 2002));
+});
+
 test("only an owning facade can create and query pending connections", () => {
   const requests = new PendingConnectionRequests();
   const firstClient = Symbol("first facade");

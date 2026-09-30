@@ -125,6 +125,11 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
   }),
   z.strictObject({
+    kind: z.literal("gemini_gap_marked"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
+  }),
+  z.strictObject({
     kind: z.literal("fixture_snapshot"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({
@@ -235,13 +240,14 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       | "list_pending" | "list_fixture_read_challenges" | "list_gemini_read_challenges"
       | "approve_fixture" | "approve_gemini"
       | "publish_fixture_snapshot" | "publish_gemini_snapshot"
-      | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap", payload: object) => {
+      | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap"
+      | "mark_gemini_observation_gap", payload: object) => {
       if (kind === "list_pending" || kind === "list_fixture_read_challenges"
         || kind === "list_gemini_read_challenges"
         || kind === "approve_fixture" || kind === "approve_gemini" || kind === "revoke_fixture"
         || kind === "revoke_all_fixture" || kind === "publish_fixture_snapshot"
         || kind === "publish_gemini_snapshot"
-        || kind === "mark_fixture_observation_gap"
+        || kind === "mark_fixture_observation_gap" || kind === "mark_gemini_observation_gap"
         ? role !== "relay" : role !== "facade") {
         throw new Error("Broker role cannot perform this operation");
       }
@@ -313,6 +319,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
         request("publish_gemini_snapshot", { target, messages,
           ...(challengeId === undefined ? {} : { challengeId }) }),
       markFixtureObservationGap: (target: FixtureTarget) => request("mark_fixture_observation_gap", { target }),
+      markGeminiObservationGap: (target: GeminiTarget) => request("mark_gemini_observation_gap", { target }),
       revokeFixture: (tabId: number, observed: { documentId: string; conversationId: string } | null) =>
         request("revoke_fixture", { tabId, observed }),
       revokeAllFixtures: () => request("revoke_all_fixture", {}),

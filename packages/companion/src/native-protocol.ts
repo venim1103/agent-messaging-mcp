@@ -106,6 +106,24 @@ export function parseNativeGeminiApproval(message: unknown, now = Date.now()) {
   return result.data;
 }
 
+const geminiGapSchema = z.strictObject({
+  kind: z.literal("mark_gemini_observation_gap"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({ target: geminiTargetSchema })
+});
+
+export function parseNativeGeminiGap(message: unknown, now = Date.now()) {
+  const result = geminiGapSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) {
+    throw new Error("Invalid native Gemini gap");
+  }
+  return result.data;
+}
+
 const geminiSnapshotSchema = z.strictObject({
   kind: z.literal("publish_gemini_snapshot"),
   protocolVersion: z.literal(PROTOCOL_VERSION),

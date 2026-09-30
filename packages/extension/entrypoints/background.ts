@@ -24,11 +24,14 @@ const fixtureGrantKey = (tabId: number) => `fixture-grant-${tabId}`;
 const geminiGrantKey = (tabId: number) => `gemini-grant-${tabId}`;
 type StoredFixtureGrant = { documentId: string; expiresAt: number };
 type StoredGeminiGrant = { documentId: string; url: string; expiresAt: number };
-type FixtureCountRequest = { kind: "revoke_fixture"; payload: {
+type GrantCountRequest = { kind: "revoke_fixture"; payload: {
   tabId: number; observed: { documentId: string; conversationId: string } | null
 } } | { kind: "revoke_all_fixture"; payload: Record<string, never> }
   | { kind: "mark_fixture_observation_gap"; payload: { target: {
     origin: "http://127.0.0.1:8787"; conversationId: "fixture-alpha";
+    tabId: number; documentId: string
+  } } } | { kind: "mark_gemini_observation_gap"; payload: { target: {
+    origin: "https://gemini.google.com"; conversationId: string; url: string;
     tabId: number; documentId: string
   } } };
 let fixtureResetPromise: Promise<boolean> | undefined;
@@ -55,10 +58,10 @@ async function revokeTrackedFixture(tabId: number): Promise<void> {
 
 async function revokeFixtureTab(tabId: number,
   observed: { documentId: string; conversationId: string } | null): Promise<boolean> {
-  return sendFixtureCountRequest({ kind: "revoke_fixture", payload: { tabId, observed } });
+  return sendGrantCountRequest({ kind: "revoke_fixture", payload: { tabId, observed } });
 }
 
-async function sendFixtureCountRequest(command: FixtureCountRequest): Promise<boolean> {
+async function sendGrantCountRequest(command: GrantCountRequest): Promise<boolean> {
   try {
     return await new Promise<boolean>((resolve) => {
       const requestId = crypto.randomUUID();
@@ -85,7 +88,8 @@ async function sendFixtureCountRequest(command: FixtureCountRequest): Promise<bo
         if (typeof value !== "object" || value === null || Array.isArray(value)) return finish(false);
         const reply = value as Record<string, unknown>;
         const payload = reply.payload;
-        finish(reply.kind === (command.kind === "mark_fixture_observation_gap" ? "fixture_gap_marked" : "fixture_revoked")
+        finish(reply.kind === (command.kind === "mark_fixture_observation_gap" ? "fixture_gap_marked"
+          : command.kind === "mark_gemini_observation_gap" ? "gemini_gap_marked" : "fixture_revoked")
           && reply.protocolVersion === protocolVersion
           && reply.requestId === requestId && reply.connectionGeneration === 0 && reply.deadlineMs === deadlineMs
           && typeof payload === "object" && payload !== null && !Array.isArray(payload)
@@ -107,7 +111,7 @@ function ensureFixtureReset(): Promise<boolean> {
     fixtureResetPromise = (async () => {
       const stored = await browser.storage.session.get(fixtureResetKey);
       if (stored[fixtureResetKey] === true) return true;
-      if (!await sendFixtureCountRequest({ kind: "revoke_all_fixture", payload: {} })) return false;
+      if (!await sendGrantCountRequest({ kind: "revoke_all_fixture", payload: {} })) return false;
       await browser.storage.session.set({ [fixtureResetKey]: true });
       return true;
     })().catch(() => false).then((ready) => {
@@ -385,9 +389,27 @@ async function markTrackedFixtureGaps(): Promise<boolean> {
     if (!Number.isSafeInteger(tabId) || typeof grant?.documentId !== "string"
       || !/^[!-~]{1,128}$/.test(grant.documentId) || typeof grant.expiresAt !== "number"
       || !Number.isSafeInteger(grant.expiresAt) || grant.expiresAt <= Date.now()) continue;
-    if (!await sendFixtureCountRequest({ kind: "mark_fixture_observation_gap", payload: {
+    if (!await sendGrantCountRequest({ kind: "mark_fixture_observation_gap", payload: {
       target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId,
         documentId: grant.documentId }
+    } })) return false;
+  }
+  return true;
+}
+
+async function markTrackedGeminiGaps(): Promise<boolean> {
+  const stored = await browser.storage.session.get(null);
+  for (const [key, value] of Object.entries(stored)) {
+    if (!/^gemini-grant-[1-9]\d*$/.test(key)) continue;
+    const tabId = Number(key.slice("gemini-grant-".length));
+    const grant = value as StoredGeminiGrant | undefined;
+    if (!Number.isSafeInteger(tabId) || typeof grant?.documentId !== "string"
+      || !/^[!-~]{1,128}$/.test(grant.documentId) || typeof grant.url !== "string"
+      || !isEligibleGeminiUrl(grant.url) || typeof grant.expiresAt !== "number"
+      || !Number.isSafeInteger(grant.expiresAt) || grant.expiresAt <= Date.now()) continue;
+    if (!await sendGrantCountRequest({ kind: "mark_gemini_observation_gap", payload: {
+      target: { origin: geminiOrigin, conversationId: new URL(grant.url).pathname.split("/").filter(Boolean)[1]!,
+        url: grant.url, tabId, documentId: grant.documentId }
     } })) return false;
   }
   return true;
@@ -1066,7 +1088,7 @@ function isHandshakeReply(value: unknown, requestId: string, deadlineMs: number)
 export default defineBackground(() => {
   void ensureFixtureReset().then(async (ready) => {
     if (ready && await hasTrackedFixtureGrant() && await markTrackedFixtureGaps()) startFixtureReadWatch();
-    if (ready && await hasTrackedGeminiGrant()) startGeminiReadWatch();
+    if (ready && await hasTrackedGeminiGrant() && await markTrackedGeminiGaps()) startGeminiReadWatch();
   }).catch(() => {});
   browser.tabs.onRemoved.addListener((tabId) => { void revokeTrackedFixture(tabId).catch(() => {}); });
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {

@@ -465,6 +465,44 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
       { direction: "incoming", text: "Later synthetic answer", identityQuality: "uncertain", generationState: "unknown" }
     ]);
     assert.equal(JSON.stringify(observed.events).includes("Private draft"), false);
+
+    const manager = await context.newPage();
+    await manager.goto("chrome://extensions/");
+    const serviceWorkers = await context.newCDPSession(manager);
+    let confirmStopped;
+    const stopped = new Promise((resolve) => { confirmStopped = resolve; });
+    const registered = new Promise((resolve) => serviceWorkers.on("ServiceWorker.workerVersionUpdated", (event) => {
+      const version = event.versions.find((entry) => entry.scriptURL === worker.url());
+      if (version) resolve(version.versionId);
+      if (version?.runningStatus === "stopped") confirmStopped();
+    }));
+    await serviceWorkers.send("ServiceWorker.enable");
+    const versionId = await Promise.race([registered, setTimeout(3000).then(() => {
+      throw new Error("Gemini worker version not found");
+    })]);
+    await serviceWorkers.send("ServiceWorker.stopWorker", { versionId });
+    await Promise.race([stopped, setTimeout(5000).then(() => { throw new Error("Gemini worker did not stop"); })]);
+    const wake = await context.newPage();
+    await wake.goto(`chrome-extension://${extensionId}/popup.html`);
+    await wake.evaluate(() => chrome.runtime.sendMessage({ kind: "probe_native_handshake" }));
+    let expired = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const old = await facade.readApprovedEvents(state.payload.connectionId, observed.cursor, 1);
+      if (old.kind === "gemini_events" && old.payload.state === "expired") { expired = true; break; }
+      await setTimeout(50);
+    }
+    assert.equal(expired, true, "Gemini worker wake did not expire the old event cursor");
+    const afterWake = await facade.getConnection(created.payload.requestId);
+    if (afterWake.kind !== "connection_state" || afterWake.payload.state !== "ready_readonly") {
+      throw new Error("Gemini worker wake revoked its valid owner");
+    }
+    assert.deepEqual(afterWake.payload.observation, { state: "not_observed", capturedAt: null });
+    const refreshed = await facade.readApprovedSnapshot(state.payload.connectionId);
+    if (refreshed.kind !== "gemini_snapshot") throw new Error("Expected resnapshot after Gemini worker wake");
+    assert.notEqual(refreshed.payload.cursor.epoch, observed.cursor.epoch);
+    assert.deepEqual(refreshed.payload.messages, observed.events[0]?.payload.messages);
+    await serviceWorkers.detach();
+
     assert.deepEqual((await facade.disconnectFixture(state.payload.connectionId)).payload, { disconnected: true });
     await popup.waitForFunction(async (tabId) => {
       const key = `gemini-grant-${tabId}`;
