@@ -232,6 +232,54 @@ test("only the owning facade disconnects an approved fixture without exposing it
     "facade", owner, requests, 2001));
 });
 
+test("generic event reads follow the owned Gemini grant and not a caller-selected provider", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("Gemini reader");
+  const other = Symbol("second facade");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "https://gemini.google.com" as const,
+    conversationId: "disposable-chat", url: "https://gemini.google.com/app/disposable-chat?hl=en",
+    tabId: 4, documentId: "CHROME-doc_gemini-42" };
+  const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+  const firstRows = [{ direction: "outgoing" as const, text: "Synthetic question" }];
+  requests.publishGeminiSnapshot(target, firstRows, 2001);
+  const first = requests.getGeminiSnapshot(owner, grant.connectionId, 2001);
+  if (!first || first === "not_ready") throw new Error("Expected a Gemini cursor");
+  const envelope = { protocolVersion: PROTOCOL_VERSION,
+    requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+  const read = { ...envelope, kind: "read_approved_events", payload: {
+    connectionId: grant.connectionId, cursor: first.cursor, limit: 1
+  } };
+  assert.deepEqual(handleBrokerRequest(read, "relay", other, requests, 2001).payload,
+    { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest(read, "facade", other, requests, 2001).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+  const empty = handleBrokerRequest(read, "facade", owner, requests, 2001);
+  if (empty.kind !== "gemini_events" || empty.payload.state !== "ok") throw new Error("Expected empty Gemini events");
+  assert.deepEqual(empty.payload.events, []);
+  const laterRows = [...firstRows, { direction: "incoming" as const, text: "Synthetic reply" }];
+  requests.publishGeminiSnapshot({ ...target, url: `${target.url}&changed=1` }, laterRows, 2002);
+  const unchanged = handleBrokerRequest(read, "facade", owner, requests, 2002);
+  if (unchanged.kind !== "gemini_events" || unchanged.payload.state !== "ok") {
+    throw new Error("Expected unchanged Gemini events");
+  }
+  assert.deepEqual(unchanged.payload.events, []);
+  requests.publishGeminiSnapshot(target, laterRows, 2002);
+  const later = handleBrokerRequest(read, "facade", owner, requests, 2002);
+  if (later.kind !== "gemini_events" || later.payload.state !== "ok") throw new Error("Expected Gemini update");
+  assert.deepEqual(later.payload.events[0]?.payload, { kind: "gemini_snapshot", messages: laterRows.map((row) => ({
+    ...row, identityQuality: "uncertain", generationState: "unknown"
+  })) });
+  assert.deepEqual(handleBrokerRequest({ ...read, payload: { ...read.payload,
+    cursor: { epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 } } },
+  "facade", owner, requests, 2002).payload, { state: "expired", resnapshot: true });
+  assert.throws(() => handleBrokerRequest({ ...read, payload: { ...read.payload, provider: "fixture" } },
+    "facade", owner, requests, 2002));
+  requests.disconnectFixture(owner, grant.connectionId, 2003);
+  assert.deepEqual(handleBrokerRequest(read, "facade", owner, requests, 2003).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+});
+
 test("only an authenticated relay can mark an exact fixture observation gap", () => {
   const requests = new PendingConnectionRequests();
   const owner = Symbol("owner");

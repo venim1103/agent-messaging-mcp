@@ -161,7 +161,7 @@ pendingButton.addEventListener("click", async () => {
           }
           row.remove();
           status.textContent = geminiSelected
-            ? `Approved ${result.requestId} for the selected Gemini chat (read only). Message reads are not enabled yet.`
+            ? `Approved ${result.requestId} for the selected Gemini chat (read only). MCP reads are enabled; nothing was sent.`
             : `Approved ${result.requestId} for fixture-alpha (read only). Fixture snapshot captured for the MCP client.`;
         } catch {
           status.textContent = "Chat approval unavailable; check the selected tab.";
@@ -268,7 +268,7 @@ inspectButton.addEventListener("click", async () => {
         } catch {}
       }
 
-      conversation.textContent = "Gemini structure (not connected)";
+      conversation.textContent = "Gemini structure (diagnostic)";
       const selectedUrl = new URL(tab.url);
       const selectedRoute = selectedUrl.pathname.split("/").filter(Boolean);
       const approvalRouteIssues = [

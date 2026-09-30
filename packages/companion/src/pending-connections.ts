@@ -10,6 +10,7 @@ export const MAX_FIXTURE_SNAPSHOT_AGE_MS = 30_000;
 export const MAX_GEMINI_SNAPSHOT_MESSAGES = 32;
 export const MAX_GEMINI_SNAPSHOT_BYTES = 64 * 1024;
 export const MAX_GEMINI_SNAPSHOT_AGE_MS = 30_000;
+export const MAX_GEMINI_EVENTS_PER_READ = 2;
 export const GEMINI_READ_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_GEMINI_READS = 16;
 export const MAX_FIXTURE_EVENTS_PER_READ = 2;
@@ -198,6 +199,13 @@ export class PendingConnectionRequests {
     if (grant?.target.origin !== "https://gemini.google.com") return null;
     return grant.geminiSnapshot && now - grant.geminiSnapshot.capturedAt <= MAX_GEMINI_SNAPSHOT_AGE_MS
       ? grant.geminiSnapshot : "not_ready";
+  }
+
+  readGeminiEvents(owner: symbol, connectionId: string,
+    cursor: { epoch: string; sequence: number }, limit = MAX_GEMINI_EVENTS_PER_READ, now = Date.now()) {
+    const grant = this.liveGrant(owner, connectionId, now);
+    if (grant?.target.origin !== "https://gemini.google.com") return null;
+    return grant.geminiObservations?.read(cursor, limit) ?? "not_ready";
   }
 
   requestFreshGeminiRead(owner: symbol, connectionId: string, now = Date.now()) {

@@ -46,6 +46,11 @@ const requestSchema = z.discriminatedUnion("kind", [
       epoch: z.uuid(), sequence: z.number().int().safe().nonnegative()
     }), limit: z.number().int().min(1).max(MAX_FIXTURE_EVENTS_PER_READ).optional()
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("read_approved_events"), payload: z.strictObject({
+    connectionId: z.uuid(), cursor: z.strictObject({
+      epoch: z.uuid(), sequence: z.number().int().safe().nonnegative()
+    }), limit: z.number().int().min(1).max(2).optional()
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("disconnect_fixture"), payload: z.strictObject({
     connectionId: z.uuid()
   }) }),
@@ -185,6 +190,21 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       request.payload.cursor, request.payload.limit ?? MAX_FIXTURE_EVENTS_PER_READ, now);
     return events && events !== "not_ready"
       ? { ...response, kind: "fixture_events" as const, payload: events }
+      : { ...response, kind: "error" as const,
+        payload: { code: events === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } };
+  }
+  if (request.kind === "read_approved_events") {
+    const target = requests.getApprovedTarget(owner, request.payload.connectionId, now)
+      ?? requests.getGeminiTarget(owner, request.payload.connectionId, now);
+    const events = target?.origin === "http://127.0.0.1:8787"
+      ? requests.readFixtureEvents(owner, request.payload.connectionId, request.payload.cursor,
+        request.payload.limit ?? 2, now)
+      : target?.origin === "https://gemini.google.com"
+        ? requests.readGeminiEvents(owner, request.payload.connectionId, request.payload.cursor,
+          request.payload.limit ?? 2, now) : null;
+    return events && events !== "not_ready"
+      ? { ...response, kind: target?.origin === "http://127.0.0.1:8787"
+        ? "fixture_events" as const : "gemini_events" as const, payload: events }
       : { ...response, kind: "error" as const,
         payload: { code: events === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } };
   }

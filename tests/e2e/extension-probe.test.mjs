@@ -367,7 +367,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
   }
 });
 
-test("test-only Gemini host access carries exact synthetic rows through challenged read", { timeout: 20000 }, async () => {
+test("test-only Gemini host access carries exact synthetic rows and later observations", { timeout: 20000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-read-test-"));
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
@@ -446,6 +446,25 @@ test("test-only Gemini host access carries exact synthetic rows through challeng
     ]);
     assert.equal("url" in read.payload, false);
     assert.equal(JSON.stringify(read.payload).includes("Private draft"), false);
+    await page.locator("model-response-content p").evaluate((paragraph) => {
+      paragraph.textContent = "Later synthetic answer";
+    });
+    let observed;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const next = await facade.readApprovedEvents(state.payload.connectionId, read.payload.cursor, 1);
+      if (next.kind !== "gemini_events" || next.payload.state !== "ok") {
+        throw new Error("Expected a live Gemini event cursor");
+      }
+      if (next.payload.events.length) { observed = next.payload; break; }
+      await setTimeout(25);
+    }
+    assert.ok(observed, "Gemini timeline mutation did not reach the owner buffer");
+    assert.equal(observed.cursor.sequence, read.payload.cursor.sequence + 1);
+    assert.deepEqual(observed.events[0]?.payload.messages, [
+      { direction: "outgoing", text: "Synthetic question", identityQuality: "uncertain", generationState: "unknown" },
+      { direction: "incoming", text: "Later synthetic answer", identityQuality: "uncertain", generationState: "unknown" }
+    ]);
+    assert.equal(JSON.stringify(observed.events).includes("Private draft"), false);
     assert.deepEqual((await facade.disconnectFixture(state.payload.connectionId)).payload, { disconnected: true });
     await popup.waitForFunction(async (tabId) => {
       const key = `gemini-grant-${tabId}`;

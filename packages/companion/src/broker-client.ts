@@ -8,7 +8,8 @@ import type { BrokerRole } from "./broker-roles.js";
 import type { FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
+import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_EVENTS_PER_READ,
+  MAX_GEMINI_SNAPSHOT_MESSAGES,
   MAX_PENDING_FIXTURE_READS, MAX_PENDING_GEMINI_READS, MAX_PENDING_REQUESTS }
   from "./pending-connections.js";
 
@@ -154,6 +155,18 @@ const replySchema = z.discriminatedUnion("kind", [
     ])
   }),
   z.strictObject({
+    kind: z.literal("gemini_events"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.discriminatedUnion("state", [
+      z.strictObject({ state: z.literal("expired"), resnapshot: z.literal(true) }),
+      z.strictObject({ state: z.literal("ok"), cursor: fixtureCursor,
+        events: z.array(z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().positive(),
+          payload: z.strictObject({ kind: z.literal("gemini_snapshot"),
+            messages: z.array(geminiMessage).max(MAX_GEMINI_SNAPSHOT_MESSAGES) })
+        })).max(MAX_GEMINI_EVENTS_PER_READ) })
+    ])
+  }),
+  z.strictObject({
     kind: z.literal("error"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ code: z.enum(["PERMISSION_DENIED", "TOO_MANY_PENDING", "APPROVAL_INVALID",
@@ -216,6 +229,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     }
     let nextRequest: Promise<void> = Promise.resolve();
     const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
+      | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
       | "disconnect_fixture"
       | "list_pending" | "list_fixture_read_challenges" | "list_gemini_read_challenges"
@@ -282,6 +296,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
         request("read_approved_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
       readFixtureEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>
         request("read_fixture_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }) }),
+      readApprovedEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>
+        request("read_approved_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }) }),
       disconnectFixture: (connectionId: string) => request("disconnect_fixture", { connectionId }),
       listPending: () => request("list_pending", {}),
       listFixtureReadChallenges: () => request("list_fixture_read_challenges", {}),

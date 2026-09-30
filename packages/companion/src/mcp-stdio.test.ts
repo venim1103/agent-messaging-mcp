@@ -231,6 +231,34 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal((geminiSnapshot.structuredContent as { coverage: string }).coverage, "rendered_only");
     assert.equal((geminiSnapshot.structuredContent as { omittedBefore: boolean }).omittedBefore, true);
     assert.equal("url" in (geminiSnapshot.structuredContent as object), false);
+    const geminiCursor = (geminiSnapshot.structuredContent as { cursor: { epoch: string; sequence: number } }).cursor;
+    const emptyGemini = await clientOne.callTool({ name: "chat_wait_for_events", arguments: {
+      connectionId: geminiConnection.connectionId, cursor: geminiCursor, timeoutMs: 0
+    } });
+    assert.equal((emptyGemini.structuredContent as { timedOut: boolean }).timedOut, true);
+    assert.equal((await clientTwo.callTool({ name: "chat_wait_for_events", arguments: {
+      connectionId: geminiConnection.connectionId, cursor: geminiCursor, timeoutMs: 0
+    } })).isError, true);
+    const waitingGemini = clientOne.callTool({ name: "chat_wait_for_events", arguments: {
+      connectionId: geminiConnection.connectionId, cursor: geminiCursor, timeoutMs: 2000, limit: 1
+    } });
+    await setTimeout(25);
+    const laterGeminiRows = [...geminiRows, { direction: "incoming" as const, text: "Synthetic follow-up" }];
+    assert.deepEqual((await relay.publishGeminiSnapshot(geminiTarget, laterGeminiRows)).payload, { count: 1 });
+    const geminiEvents = await waitingGemini;
+    assert.equal(geminiEvents.isError, undefined);
+    const geminiPage = geminiEvents.structuredContent as { events: { payload: {
+      kind: string; messages: { direction: string; text: string; identityQuality: string; generationState: string }[]
+    } }[]; cursor: { sequence: number }; timedOut: boolean };
+    assert.equal(geminiPage.timedOut, false);
+    assert.equal(geminiPage.cursor.sequence, geminiCursor.sequence + 1);
+    assert.deepEqual(geminiPage.events[0]?.payload.messages.at(-1), {
+      direction: "incoming", text: "Synthetic follow-up", identityQuality: "uncertain", generationState: "unknown"
+    });
+    assert.equal((await clientOne.callTool({ name: "chat_wait_for_events", arguments: {
+      connectionId: geminiConnection.connectionId,
+      cursor: { epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 }, timeoutMs: 0
+    } })).isError, true);
     assert.deepEqual((await clientOne.callTool({ name: "chat_disconnect", arguments: {
       connectionId: geminiConnection.connectionId
     } })).structuredContent, { disconnected: true });
@@ -238,6 +266,9 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
       connectionId: geminiConnection.connectionId
     } });
     assert.equal(afterGeminiDisconnect.isError, true);
+    assert.equal((await clientOne.callTool({ name: "chat_wait_for_events", arguments: {
+      connectionId: geminiConnection.connectionId, cursor: geminiCursor, timeoutMs: 0
+    } })).isError, true);
 
     const next = await clientOne.callTool({ name: "chat_request_connection", arguments: {} });
     const pendingDisconnect = next.structuredContent as { requestId: string };

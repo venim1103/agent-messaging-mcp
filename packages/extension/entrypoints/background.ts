@@ -1,7 +1,8 @@
 import { browser } from "wxt/browser";
 import { geminiDraftText } from "../lib/approved-probe";
 import { captureFixtureSnapshot, observeFixtureMessages } from "../lib/fixture-observation";
-import { captureGeminiSnapshot, identifyGeminiConversation, isEligibleGeminiUrl, observeGeminiIdentity }
+import { captureGeminiSnapshot, identifyGeminiConversation, isEligibleGeminiUrl,
+  observeGeminiIdentity, observeGeminiMessages }
   from "../lib/gemini-observation";
 
 const nativeHostName = "com.agent_messaging_mcp.bridge";
@@ -32,6 +33,7 @@ type FixtureCountRequest = { kind: "revoke_fixture"; payload: {
   } } };
 let fixtureResetPromise: Promise<boolean> | undefined;
 const fixtureSnapshotJobs = new Map<number, Promise<boolean>>();
+const geminiSnapshotJobs = new Map<number, Promise<boolean>>();
 let fixtureReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 let geminiReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 
@@ -238,10 +240,11 @@ function queueFixtureSnapshot(tabId: number, documentId: string, challengeId?: s
 }
 
 async function publishGeminiSnapshot(tabId: number, expectedUrl: string,
-  documentId: string, challengeId: string): Promise<boolean> {
+  documentId: string, challengeId?: string): Promise<boolean> {
   try {
     if (!isEligibleGeminiUrl(expectedUrl)
-      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(challengeId)) {
+      || (challengeId !== undefined
+        && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(challengeId))) {
       return false;
     }
     const key = geminiGrantKey(tabId);
@@ -295,7 +298,7 @@ async function publishGeminiSnapshot(tabId: number, expectedUrl: string,
       port.postMessage({ kind: "publish_gemini_snapshot", protocolVersion, requestId,
         connectionGeneration: 0, deadlineMs, payload: { target: {
           origin: geminiOrigin, conversationId, url: expectedUrl, tabId, documentId
-        }, messages, challengeId } });
+        }, messages, ...(challengeId === undefined ? {} : { challengeId }) } });
     });
     if (!published) return false;
     const [current] = await browser.scripting.executeScript({
@@ -308,6 +311,17 @@ async function publishGeminiSnapshot(tabId: number, expectedUrl: string,
   } catch {
     return false;
   }
+}
+
+function queueGeminiSnapshot(tabId: number, expectedUrl: string, documentId: string, challengeId?: string) {
+  const previous = geminiSnapshotJobs.get(tabId) ?? Promise.resolve(true);
+  const job = previous.then(() => publishGeminiSnapshot(tabId, expectedUrl, documentId, challengeId),
+    () => publishGeminiSnapshot(tabId, expectedUrl, documentId, challengeId));
+  geminiSnapshotJobs.set(tabId, job);
+  void job.finally(() => {
+    if (geminiSnapshotJobs.get(tabId) === job) geminiSnapshotJobs.delete(tabId);
+  });
+  return job;
 }
 
 async function hasTrackedFixtureGrant(): Promise<boolean> {
@@ -334,9 +348,17 @@ async function hasTrackedGeminiGrant(): Promise<boolean> {
 }
 
 function stopGeminiObservation(): void {
-  const scope = globalThis as typeof globalThis & { geminiIdentityObserver?: MutationObserver };
+  const scope = globalThis as typeof globalThis & {
+    geminiIdentityObserver?: MutationObserver; geminiMessagesObserver?: MutationObserver;
+    geminiMessagesObserverUrl?: string; geminiMessagesNotifyTimer?: ReturnType<typeof setTimeout>
+  };
   scope.geminiIdentityObserver?.disconnect();
+  scope.geminiMessagesObserver?.disconnect();
+  clearTimeout(scope.geminiMessagesNotifyTimer);
   delete scope.geminiIdentityObserver;
+  delete scope.geminiMessagesObserver;
+  delete scope.geminiMessagesObserverUrl;
+  delete scope.geminiMessagesNotifyTimer;
 }
 
 async function releaseDisconnectedGemini(activeTabIds: number[]): Promise<void> {
@@ -570,7 +592,7 @@ function startGeminiReadWatch(): boolean {
         const grant = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
         if (!grant || grant.documentId !== challenge.documentId || grant.url !== challenge.url
           || typeof grant.expiresAt !== "number" || grant.expiresAt <= Date.now()) continue;
-        if (!await publishGeminiSnapshot(challenge.tabId, challenge.url,
+        if (!await queueGeminiSnapshot(challenge.tabId, challenge.url,
           challenge.documentId, challenge.challengeId)) await revokeTrackedFixture(challenge.tabId);
       }
       if (geminiReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
@@ -785,6 +807,11 @@ async function approveGemini(tabId: number, expectedUrl: string, pendingRequestI
             target: { tabId, documentIds: [documentId] }, func: observeGeminiIdentity, args: [expectedUrl]
           });
           if (observing?.frameId !== 0 || observing.documentId !== documentId || observing.result !== true) throw new Error();
+          const [watchingMessages] = await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: observeGeminiMessages, args: [expectedUrl]
+          });
+          if (watchingMessages?.frameId !== 0 || watchingMessages.documentId !== documentId
+            || watchingMessages.result !== true) throw new Error();
           if (!startGeminiReadWatch()) throw new Error();
           finish({ ok: true, requestId: pendingRequestId, expiresAt: payload.expiresAt });
         })().catch(async () => {
@@ -1046,6 +1073,19 @@ export default defineBackground(() => {
     if (changeInfo.status === "loading" || changeInfo.url) void revokeTrackedFixture(tabId).catch(() => {});
   });
   browser.runtime.onMessage.addListener((message: unknown, sender) => {
+    if (typeof message === "object" && message !== null && !Array.isArray(message)
+      && Object.keys(message).length === 1 && (message as { kind?: unknown }).kind === "gemini_messages_changed") {
+      if (sender.id !== browser.runtime.id || sender.origin !== geminiOrigin
+        || sender.frameId !== 0 || sender.tab?.id == null || typeof sender.documentId !== "string") return;
+      const tabId = sender.tab.id;
+      const documentId = sender.documentId;
+      return browser.storage.session.get(geminiGrantKey(tabId)).then(async (stored) => {
+        const grant = stored[geminiGrantKey(tabId)] as StoredGeminiGrant | undefined;
+        if (!grant || grant.documentId !== documentId || !isEligibleGeminiUrl(grant.url)
+          || typeof grant.expiresAt !== "number" || grant.expiresAt <= Date.now()) return;
+        if (!await queueGeminiSnapshot(tabId, grant.url, documentId)) await revokeTrackedFixture(tabId);
+      }).catch(() => {});
+    }
     if (typeof message === "object" && message !== null && !Array.isArray(message)
       && Object.keys(message).length === 1 && (message as { kind?: unknown }).kind === "gemini_identity_changed") {
       if (sender.id !== browser.runtime.id || sender.origin !== geminiOrigin

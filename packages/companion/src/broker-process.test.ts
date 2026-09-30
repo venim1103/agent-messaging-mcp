@@ -238,6 +238,24 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.equal(freshGemini.payload.omittedBefore, true);
     assert.equal("url" in freshGemini.payload, false);
     assert.equal("tabId" in freshGemini.payload, false);
+    assert.throws(() => relay.readApprovedEvents(geminiConnectionId, freshGemini.payload.cursor),
+      /Broker role cannot perform/);
+    assert.deepEqual((await otherFacade.readApprovedEvents(geminiConnectionId, freshGemini.payload.cursor)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    const initialEvents = await facade.readApprovedEvents(geminiConnectionId, freshGemini.payload.cursor);
+    if (initialEvents.kind !== "gemini_events" || initialEvents.payload.state !== "ok") {
+      throw new Error("Expected an empty owned Gemini event page");
+    }
+    assert.deepEqual(initialEvents.payload.events, []);
+    const laterRows = [...freshRows, { direction: "incoming" as const, text: "Later synthetic reply" }];
+    assert.deepEqual((await relay.publishGeminiSnapshot(geminiTarget, laterRows)).payload, { count: 1 });
+    const eventPage = await facade.readApprovedEvents(geminiConnectionId, freshGemini.payload.cursor, 1);
+    if (eventPage.kind !== "gemini_events" || eventPage.payload.state !== "ok") {
+      throw new Error("Expected an owned Gemini event update");
+    }
+    assert.equal(eventPage.payload.cursor.sequence, freshGemini.payload.cursor.sequence + 1);
+    assert.deepEqual(eventPage.payload.events[0]?.payload, { kind: "gemini_snapshot",
+      messages: laterRows.map((row) => ({ ...row, identityQuality: "uncertain", generationState: "unknown" })) });
     assert.deepEqual((await facade.readFixtureSnapshot(geminiState.payload.connectionId)).payload,
       { code: "CONNECTION_NOT_FOUND" });
     assert.deepEqual((await relay.revokeAllFixtures()).payload, { count: 1 });
@@ -245,6 +263,8 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
       { requestId: geminiPending.payload.requestId, state: "stale" });
     assert.deepEqual((await relay.publishGeminiSnapshot(geminiTarget, geminiRows)).payload, { count: 0 });
     assert.deepEqual((await facade.readGeminiSnapshot(geminiConnectionId)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    assert.deepEqual((await facade.readApprovedEvents(geminiConnectionId, freshGemini.payload.cursor)).payload,
       { code: "CONNECTION_NOT_FOUND" });
     otherFacade.close();
     facade.close();

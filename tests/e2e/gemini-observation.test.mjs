@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
-import { captureGeminiSnapshot, identifyGeminiConversation, isEligibleGeminiUrl, observeGeminiIdentity }
+import { captureGeminiSnapshot, identifyGeminiConversation, isEligibleGeminiUrl,
+  observeGeminiIdentity, observeGeminiMessages }
   from "../../packages/extension/lib/gemini-observation.ts";
 
 test("Gemini URL eligibility accepts bounded saved chats and rejects unsupported shapes", () => {
@@ -43,16 +44,23 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
     });
     await page.evaluate(() => {
       window.identityNotifications = [];
+      window.messageNotifications = [];
       window.chrome = { runtime: { sendMessage: (message) => {
-        window.identityNotifications.push(message);
+        if (message.kind === "gemini_identity_changed") window.identityNotifications.push(message);
+        if (message.kind === "gemini_messages_changed") window.messageNotifications.push(message);
         return Promise.resolve();
       } } };
     });
     assert.equal(await page.evaluate(observeGeminiIdentity, "https://gemini.google.com/app/disposable-chat"), true);
+    assert.equal(await page.evaluate(observeGeminiMessages, "https://gemini.google.com/app/disposable-chat"), true);
+    await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = "Another answer"; });
+    await page.waitForFunction(() => window.messageNotifications.length === 1);
+    assert.deepEqual(await page.evaluate(() => window.messageNotifications), [{ kind: "gemini_messages_changed" }]);
     await page.evaluate(() => history.pushState({}, "", "/app/another-chat"));
     await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = "Changed"; });
     await page.waitForFunction(() => window.identityNotifications.length === 1);
     assert.deepEqual(await page.evaluate(() => window.identityNotifications), [{ kind: "gemini_identity_changed" }]);
+    assert.equal((await page.evaluate(() => window.messageNotifications)).length, 1);
     await page.goto("https://gemini.google.com/app/disposable-chat");
     assert.deepEqual(await page.evaluate(captureGeminiSnapshot), { messages: [
       { direction: "outgoing", text: "First line\nSecond line \u00e9" },

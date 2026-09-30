@@ -86,7 +86,7 @@ server.registerTool("chat_read_messages", {
 });
 
 server.registerTool("chat_wait_for_events", {
-  description: "Wait for later rendered-only observations from an owned local fixture cursor, with a bounded timeout and explicit resnapshot on cursor expiry.",
+  description: "Wait for later rendered-only fixture or Gemini snapshots from an owned cursor, with a bounded timeout and explicit resnapshot on cursor expiry. Gemini row identity and completion remain uncertain.",
   inputSchema: z.object({
     connectionId: z.uuid(),
     cursor: z.object({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() }).strict(),
@@ -99,9 +99,9 @@ server.registerTool("chat_wait_for_events", {
   try {
     while (true) {
       if (extra.mcpReq.signal.aborted) return blocked("CANCELLED");
-      const result = await (await pendingBroker()).readFixtureEvents(connectionId, cursor, limit);
+      const result = await (await pendingBroker()).readApprovedEvents(connectionId, cursor, limit);
       if (result.kind === "error") return blocked(result.payload.code);
-      if (result.kind !== "fixture_events") return unavailable();
+      if (result.kind !== "fixture_events" && result.kind !== "gemini_events") return unavailable();
       if (result.payload.state === "expired") return {
         isError: true,
         content: [{ type: "text" as const, text: "CURSOR_EXPIRED: Call chat_read_messages for a new snapshot." }],

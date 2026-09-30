@@ -48,6 +48,50 @@ export function observeGeminiIdentity(expectedUrl: string): boolean {
   return true;
 }
 
+export function observeGeminiMessages(expectedUrl: string): boolean {
+  if (location.origin !== "https://gemini.google.com" || location.href !== expectedUrl) return false;
+  const visible = (element: HTMLElement) => element.getClientRects().length > 0;
+  const regions = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);
+  if (regions.length !== 1) return false;
+  const timelines = [...regions[0]!.querySelectorAll<HTMLElement>("infinite-scroller")]
+    .filter((timeline) => visible(timeline) && timeline.querySelector("user-query, model-response"));
+  if (timelines.length !== 1) return false;
+  const runtime = (globalThis as typeof globalThis & {
+    chrome?: { runtime?: { sendMessage: (message: { kind: string }) => Promise<unknown> } }
+  }).chrome?.runtime;
+  if (!runtime) return false;
+  const scope = globalThis as typeof globalThis & {
+    geminiMessagesObserver?: MutationObserver; geminiMessagesObserverUrl?: string;
+    geminiMessagesNotifyTimer?: ReturnType<typeof setTimeout>
+  };
+  if (scope.geminiMessagesObserver && scope.geminiMessagesObserverUrl === expectedUrl) return true;
+  scope.geminiMessagesObserver?.disconnect();
+  clearTimeout(scope.geminiMessagesNotifyTimer);
+  const timeline = timelines[0]!;
+  const observer = new MutationObserver(() => {
+    if (!timeline.isConnected || location.href !== expectedUrl) {
+      observer.disconnect();
+      clearTimeout(scope.geminiMessagesNotifyTimer);
+      delete scope.geminiMessagesObserver;
+      delete scope.geminiMessagesObserverUrl;
+      delete scope.geminiMessagesNotifyTimer;
+      return;
+    }
+    if (scope.geminiMessagesNotifyTimer) return;
+    scope.geminiMessagesNotifyTimer = setTimeout(() => {
+      delete scope.geminiMessagesNotifyTimer;
+      if (timeline.isConnected && location.href === expectedUrl) {
+        void runtime.sendMessage({ kind: "gemini_messages_changed" }).catch(() => {});
+      }
+    }, 200);
+  });
+  observer.observe(timeline, { childList: true, characterData: true, subtree: true,
+    attributes: true, attributeFilter: ["hidden", "class", "style"] });
+  scope.geminiMessagesObserver = observer;
+  scope.geminiMessagesObserverUrl = expectedUrl;
+  return true;
+}
+
 export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiRenderedMessage[] } | null {
   if (location.origin !== "https://gemini.google.com"
     || (expectedUrl !== undefined && location.href !== expectedUrl)) return null;

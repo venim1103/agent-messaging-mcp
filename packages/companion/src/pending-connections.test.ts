@@ -340,6 +340,12 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
     identityQuality: "uncertain", generationState: "unknown" })));
   assert.equal(snapshot.coverage, "rendered_only");
   assert.equal(snapshot.cursor.sequence, 1);
+  const initialEvents = requests.readGeminiEvents(owner, granted!.connectionId, snapshot.cursor, 1, 2001);
+  if (!initialEvents || initialEvents === "not_ready" || initialEvents.state !== "ok") {
+    throw new Error("Expected an empty Gemini event page");
+  }
+  assert.deepEqual(initialEvents.events, []);
+  assert.equal(requests.readGeminiEvents(stranger, granted!.connectionId, snapshot.cursor, 1, 2001), null);
   assert.deepEqual((requests.get(owner, pending.requestId, 2001) as { observation: unknown }).observation,
     { state: "recent", capturedAt: 2001 });
   assert.equal(requests.publishGeminiSnapshot(target, messages, 2002), 1);
@@ -349,6 +355,16 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   assert.equal(refreshed.cursor.sequence, snapshot.cursor.sequence);
   assert.equal(requests.getGeminiSnapshot(owner, granted!.connectionId, 2002 + MAX_GEMINI_SNAPSHOT_AGE_MS + 1),
     "not_ready");
+  const later = [...messages, { direction: "incoming" as const, text: "Another reply" }];
+  assert.equal(requests.publishGeminiSnapshot(target, later, 2003), 1);
+  const events = requests.readGeminiEvents(owner, granted!.connectionId, snapshot.cursor, 1, 2003);
+  if (!events || events === "not_ready" || events.state !== "ok") throw new Error("Expected one Gemini update");
+  assert.equal(events.cursor.sequence, snapshot.cursor.sequence + 1);
+  assert.deepEqual(events.events[0]?.payload, { kind: "gemini_snapshot", messages: later.map((message) => ({
+    ...message, identityQuality: "uncertain", generationState: "unknown"
+  })) });
+  assert.deepEqual(requests.readGeminiEvents(owner, granted!.connectionId, { epoch: "other", sequence: 1 }, 1, 2003),
+    { state: "expired", resnapshot: true });
   assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "x".repeat(2049) }], 2002),
     /Invalid Gemini snapshot/);
   assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: 0 as never }], 2002),
@@ -365,6 +381,7 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   assert.deepEqual(requests.get(owner, pending.requestId, 2001), { requestId: pending.requestId, state: "stale" });
   assert.equal(requests.getGeminiTarget(owner, granted!.connectionId, 2001), null);
   assert.equal(requests.getGeminiSnapshot(owner, granted!.connectionId, 2001), null);
+  assert.equal(requests.readGeminiEvents(owner, granted!.connectionId, snapshot.cursor, 1, 2001), null);
   const queryPending = requests.create(owner, 1000);
   const queryTarget = { ...target, url: `${target.url}?hl=en` };
   const queryGrant = requests.approveGemini(queryPending.requestId, queryTarget, 2000);
