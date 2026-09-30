@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
-import { captureFixtureSnapshot, observeFixtureMessages } from "../../packages/extension/lib/fixture-observation.ts";
+import { captureFixtureSnapshot, inspectFixturePreflight, observeFixtureMessages } from "../../packages/extension/lib/fixture-observation.ts";
 import { PreparedMessageOperations } from "../../packages/companion/dist/message-operations.js";
 import { PendingConnectionRequests } from "../../packages/companion/dist/pending-connections.js";
 import { createFixtureServer } from "../fixtures/server.mjs";
@@ -152,6 +152,93 @@ test("fixture browser evidence distinguishes a new outgoing row from existing id
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get().count, 1);
   } finally {
     database.close();
+    await browser.close();
+  }
+});
+
+test("read-only fixture preflight protects drafts and rejects blocked or changed controls", async () => {
+  const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
+      status: 200, contentType: "text/html; charset=utf-8", body: html
+    }));
+    for (const editor of ["textarea", "rich"]) {
+      const expectedUrl = `http://127.0.0.1:8787/${editor === "rich" ? "?editor=rich" : ""}`;
+      await page.goto(expectedUrl);
+      const input = { expectedUrl, text: "First line\nSecond line \u00e9" };
+      const before = await page.evaluate(() => ({ focus: document.activeElement?.id,
+        rows: document.querySelector("ol#messages").innerText, scroll: window.scrollY }));
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: true, editor });
+      assert.deepEqual(await page.evaluate(() => ({ focus: document.activeElement?.id,
+        rows: document.querySelector("ol#messages").innerText, scroll: window.scrollY })), before);
+      for (const text of [" ", " padded ", "CR\r\nLF", "x".repeat(2049), "\u00e9".repeat(2048)]) {
+        assert.deepEqual(await page.evaluate(inspectFixturePreflight, { expectedUrl, text }),
+          { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
+      }
+      const textbox = page.getByRole("textbox", { name: "Message" });
+      await textbox.fill("User draft");
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "DRAFT_PRESENT" });
+      assert.equal(editor === "rich" ? await textbox.innerText() : await textbox.inputValue(), "User draft");
+      await textbox.fill(" ");
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "DRAFT_PRESENT" });
+      await textbox.fill("");
+      await textbox.evaluate((element) => {
+        if (element instanceof HTMLTextAreaElement) element.readOnly = true;
+        else element.setAttribute("aria-readonly", "true");
+      });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+      await textbox.evaluate((element) => {
+        if (element instanceof HTMLTextAreaElement) element.readOnly = false;
+        else element.removeAttribute("aria-readonly");
+      });
+      await page.locator("#composer").evaluate((form) => { form.inert = true; });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+      await page.locator("#composer").evaluate((form) => { form.inert = false; });
+      await textbox.evaluate((element) => {
+        const fieldset = document.createElement("fieldset");
+        fieldset.id = "test-disabled-fieldset";
+        fieldset.disabled = true;
+        element.replaceWith(fieldset);
+        fieldset.append(element);
+      });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+      await page.locator("#test-disabled-fieldset").evaluate((fieldset) => fieldset.replaceWith(...fieldset.childNodes));
+      await page.getByRole("button", { name: "Send" }).evaluate((button) => { button.disabled = true; });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "SUBMIT_UNAVAILABLE" });
+      await page.getByRole("button", { name: "Send" }).evaluate((button) => { button.disabled = false; });
+      await page.evaluate(() => {
+        const overlay = document.createElement("div");
+        overlay.id = "test-overlay";
+        Object.assign(overlay.style, { position: "fixed", inset: "0", zIndex: "9999", background: "white" });
+        document.body.append(overlay);
+      });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "SUBMIT_UNAVAILABLE" });
+      await page.locator("#test-overlay").evaluate((overlay) => overlay.remove());
+      await textbox.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const overlay = document.createElement("div");
+        overlay.id = "test-editor-overlay";
+        Object.assign(overlay.style, { position: "fixed", left: `${rect.left}px`, top: `${rect.top}px`,
+          width: `${rect.width}px`, height: `${rect.height}px`, zIndex: "9999", background: "white" });
+        document.body.append(overlay);
+      });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+      await page.locator("#test-editor-overlay").evaluate((overlay) => overlay.remove());
+      await page.locator("#composer").evaluate((form) => {
+        const editor = form.querySelector("textarea:not([hidden]), [contenteditable=true]:not([hidden])");
+        form.append(editor.cloneNode(true));
+      });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+      await page.goto(expectedUrl);
+      await page.getByRole("button", { name: "Switch chat" }).click();
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "TARGET_CHANGED" });
+    }
+    await page.goto("about:blank");
+    assert.deepEqual(await page.evaluate(inspectFixturePreflight, { expectedUrl: "http://127.0.0.1:8787/", text: "Synthetic" }),
+      { ok: false, code: "TARGET_CHANGED" });
+  } finally {
     await browser.close();
   }
 });
