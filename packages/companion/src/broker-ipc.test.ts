@@ -9,9 +9,10 @@ import { test } from "node:test";
 import { connectBroker } from "./broker-client.js";
 import { BROKER_IDLE_TIMEOUT_MS, startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials } from "./broker-roles.js";
+import { PreparedMessageOperations } from "./message-operations.js";
 import { encodeNativeFrame, MAX_NATIVE_FRAME_BYTES, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
+import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
 
 async function exchange(socket: Socket, message: unknown): Promise<unknown> {
   const decoder = new NativeFrameDecoder();
@@ -69,6 +70,7 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
     if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture draft");
     assert.equal(prepared.payload.state, "awaiting_approval");
     assert.deepEqual(prepared.payload.preview, { target: "fixture-alpha", text });
+    assert.match(prepared.payload.recoveryToken, /^[0-9a-f]{64}$/);
     assert.deepEqual((await otherFacade.getPreparedOperation(prepared.payload.operationId)).payload,
       { state: "unknown" });
     assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload,
@@ -96,6 +98,7 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
     const retry = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text, idempotencyKey);
     if (retry.kind !== "message_prepared") throw new Error("Expected same prepared draft");
     assert.equal(retry.payload.operationId, prepared.payload.operationId);
+    assert.equal(retry.payload.recoveryToken, prepared.payload.recoveryToken);
     assert.deepEqual((await facade.prepareFixtureMessage(connection.payload.connectionId, 1,
       "Changed draft", idempotencyKey)).payload, { code: "IDEMPOTENCY_CONFLICT" });
     assert.throws(() => relay.prepareFixtureMessage(connectionId, 1, text, idempotencyKey),
@@ -103,6 +106,51 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
   } finally {
     facade.close();
     otherFacade.close();
+    relay.close();
+    await broker.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a new facade recovers uncertain status without inheriting a browser grant", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-recovery-ipc-"));
+  const directory = join(home, "broker");
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("previous owner");
+  const ledger = new PreparedMessageOperations(requests, database);
+  const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42" };
+  const pending = requests.create(owner);
+  const grant = requests.approve(pending.requestId, target)!;
+  const key = "b66b3997-9d43-4554-8399-267d1fe9f75c";
+  const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic receipt status", key);
+  const receipt = ledger.createRecoveryReceipt(owner, prepared.operationId);
+  const [review] = ledger.listFixtureReviews(target).reviews;
+  assert.ok(review);
+  ledger.approveFixtureReview(target, prepared.operationId, review.reviewId);
+  const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId);
+  ledger.disconnect(owner);
+
+  const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+  const facade = await connectBroker("facade", directory);
+  const relay = await connectBroker("relay", directory);
+  try {
+    assert.deepEqual((await facade.getPreparedOperation(prepared.operationId)).payload, { state: "unknown" });
+    assert.deepEqual((await facade.getPreparedOperation(prepared.operationId, "0".repeat(64))).payload,
+      { state: "unknown" });
+    const recovered = await facade.getPreparedOperation(prepared.operationId, receipt.recoveryToken);
+    assert.equal(recovered.kind, "prepared_operation_state");
+    assert.deepEqual(recovered.payload, { operationId: prepared.operationId, state: "dispatch_uncertain",
+      startedAt: started.startedAt });
+    assert.deepEqual((await facade.getConnection(pending.requestId)).payload, { state: "unknown" });
+    assert.deepEqual((await facade.readApprovedSnapshot(grant.connectionId)).payload, { code: "CONNECTION_NOT_FOUND" });
+    assert.deepEqual((await facade.prepareFixtureMessage(grant.connectionId, 1, "Synthetic receipt status", key)).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    assert.throws(() => relay.getPreparedOperation(prepared.operationId, receipt.recoveryToken), /role cannot perform/);
+  } finally {
+    facade.close();
     relay.close();
     await broker.close();
     database.close();

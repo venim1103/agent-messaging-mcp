@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { connectBroker } from "./broker-client.js";
+import { openPrivateOperationDatabase, PreparedMessageOperations } from "./message-operations.js";
+import { PendingConnectionRequests } from "./pending-connections.js";
 
 test("official SDK stdio client discovers and calls the diagnostic tool", async () => {
   const client = new Client({ name: "browser-chat-test", version: "0.0.1" });
@@ -110,10 +112,11 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     const prepared = await clientOne.callTool({ name: "chat_prepare_message", arguments: draft });
     assert.equal(prepared.isError, undefined);
     const preview = prepared.structuredContent as { state: string; operationId: string;
-      connectionId: string; expiresAt: number; preview: { target: string; text: string } };
+      connectionId: string; expiresAt: number; recoveryToken: string; preview: { target: string; text: string } };
     assert.equal(preview.state, "awaiting_approval");
     assert.equal(preview.connectionId, connectionId);
     assert.deepEqual(preview.preview, { target: "fixture-alpha", text: draft.text });
+    assert.match(preview.recoveryToken, /^[0-9a-f]{64}$/);
     assert.deepEqual((await clientTwo.callTool({ name: "chat_get_operation", arguments: {
       operationId: preview.operationId
     } })).structuredContent, { state: "unknown" });
@@ -123,6 +126,7 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
       state: "awaiting_approval", expiresAt: preview.expiresAt });
     const reviewed = await relay.listFixturePreparedReviews(target);
     if (reviewed.kind !== "fixture_prepared_reviews") throw new Error("Expected test fixture review");
+    assert.equal(JSON.stringify(reviewed.payload).includes(preview.recoveryToken), false);
     const reviewId = reviewed.payload.reviews[0]?.reviewId;
     assert.ok(reviewId);
     assert.equal((await relay.approveFixtureReview(target, preview.operationId, reviewId)).kind,
@@ -373,6 +377,73 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     await clientTwo.close();
     broker?.kill("SIGTERM");
     if (brokerExit) await brokerExit;
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a recovery receipt reveals only uncertain status to a fresh MCP process", { timeout: 8000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-receipt-"));
+  const parent = join(home, ".config/agent-messaging-mcp");
+  const client = new Client({ name: "recovery-client", version: "0.0.1" });
+  const brokerEntry = fileURLToPath(new URL("./broker-process.js", import.meta.url));
+  let database: ReturnType<typeof openPrivateOperationDatabase> | undefined;
+  let broker: ReturnType<typeof spawn> | undefined;
+  let brokerExit: ReturnType<typeof once> | undefined;
+  try {
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    database = openPrivateOperationDatabase(parent);
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("old preparing owner");
+    const ledger = new PreparedMessageOperations(requests, database);
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner);
+    const grant = requests.approve(pending.requestId, target)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic recovery status only",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c");
+    const receipt = ledger.createRecoveryReceipt(owner, prepared.operationId);
+    const [review] = ledger.listFixtureReviews(target).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId);
+    const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId);
+    database.close();
+    database = undefined;
+
+    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
+    brokerExit = once(broker, "exit");
+    let ready = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      try {
+        ready = (await stat(join(parent, "broker/broker.sock"))).isSocket();
+        if (ready) break;
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      await setTimeout(25);
+    }
+    assert.equal(ready, true, "Recovery broker did not start");
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))], env: { ...process.env, HOME: home } }));
+    const status = { name: "chat_get_operation", arguments: { operationId: prepared.operationId } };
+    assert.deepEqual((await client.callTool(status)).structuredContent, { state: "unknown" });
+    assert.deepEqual((await client.callTool({ ...status, arguments: {
+      ...status.arguments, recoveryToken: "0".repeat(64)
+    } })).structuredContent, { state: "unknown" });
+    const recovered = await client.callTool({ ...status, arguments: {
+      ...status.arguments, recoveryToken: receipt.recoveryToken
+    } });
+    assert.equal(recovered.isError, undefined);
+    assert.deepEqual(recovered.structuredContent, { operationId: prepared.operationId,
+      state: "dispatch_uncertain", startedAt: started.startedAt });
+    assert.deepEqual((await client.callTool(status)).structuredContent, { state: "unknown" });
+    const read = await client.callTool({ name: "chat_read_messages", arguments: { connectionId: grant.connectionId } });
+    assert.equal(read.isError, true);
+    assert.match(read.content[0]?.type === "text" ? read.content[0].text : "", /CONNECTION_NOT_FOUND/);
+  } finally {
+    await client.close();
+    broker?.kill("SIGTERM");
+    if (brokerExit) await brokerExit;
+    database?.close();
     await rm(home, { recursive: true, force: true });
   }
 });

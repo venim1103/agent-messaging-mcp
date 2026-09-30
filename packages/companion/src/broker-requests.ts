@@ -57,7 +57,7 @@ const requestSchema = z.discriminatedUnion("kind", [
     text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), idempotencyKey: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("get_prepared_operation"), payload: z.strictObject({
-    operationId: z.uuid()
+    operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("disconnect_fixture"), payload: z.strictObject({
     connectionId: z.uuid()
@@ -212,16 +212,20 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   if (request.kind === "get_prepared_operation") {
     return operations
       ? { ...response, kind: "prepared_operation_state" as const,
-        payload: operations.getOperation(owner, request.payload.operationId, now) }
+        payload: request.payload.recoveryToken === undefined
+          ? operations.getOperation(owner, request.payload.operationId, now)
+          : operations.recoverOperationStatus(request.payload.operationId, request.payload.recoveryToken) }
       : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
   }
   if (request.kind === "prepare_fixture_message") {
     if (!operations) return { ...response, kind: "error" as const,
       payload: { code: "PREPARATION_UNAVAILABLE" } };
     try {
+      const prepared = operations.prepare(owner, request.payload.connectionId, request.payload.expectedGeneration,
+        request.payload.text, request.payload.idempotencyKey, now);
+      const receipt = operations.createRecoveryReceipt(owner, prepared.operationId, now);
       return { ...response, kind: "message_prepared" as const,
-        payload: operations.prepare(owner, request.payload.connectionId, request.payload.expectedGeneration,
-          request.payload.text, request.payload.idempotencyKey, now) };
+        payload: { ...prepared, recoveryToken: receipt.recoveryToken } };
     } catch (error) {
       if (error instanceof Error && ["CONNECTION_NOT_FOUND", "GENERATION_MISMATCH", "INVALID_MESSAGE_TEXT",
         "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED", "OPERATION_UNAVAILABLE",

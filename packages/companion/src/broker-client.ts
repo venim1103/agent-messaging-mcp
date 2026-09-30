@@ -140,6 +140,7 @@ const replySchema = z.discriminatedUnion("kind", [
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ operationId: z.uuid(), connectionId: z.uuid(),
       state: z.literal("awaiting_approval"), expiresAt: z.number().int().safe(),
+      recoveryToken: z.string().regex(/^[0-9a-f]{64}$/),
       preview: z.strictObject({ target: z.literal("fixture-alpha"),
         text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES) }) })
   }),
@@ -351,7 +352,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       disconnectFixture: (connectionId: string) => request("disconnect_fixture", { connectionId }),
       prepareFixtureMessage: (connectionId: string, expectedGeneration: 1, text: string, idempotencyKey: string) =>
         request("prepare_fixture_message", { connectionId, expectedGeneration, text, idempotencyKey }),
-      getPreparedOperation: (operationId: string) => request("get_prepared_operation", { operationId }),
+      getPreparedOperation: (operationId: string, recoveryToken?: string) =>
+        request("get_prepared_operation", { operationId,
+          ...(recoveryToken === undefined ? {} : { recoveryToken }) }),
       listPending: () => request("list_pending", {}),
       listFixtureReadChallenges: () => request("list_fixture_read_challenges", {}),
       listFixturePreparedReviews: (target: FixtureTarget) => request("list_fixture_prepared_reviews", { target }),

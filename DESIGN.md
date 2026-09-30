@@ -290,7 +290,7 @@ Keep the public tool list small and stable. Per-connection capabilities are retu
 | `chat_wait_for_events` | Connection handle, event cursor, bounded timeout and limit | Incremental observations/revisions/status changes; returns normally on timeout |
 | `chat_prepare_message` | Connection handle, expected generation, text, idempotency key | Operation ID, canonical preview, and approval state |
 | `chat_commit_message` | Operation ID | Executes only if approved and still valid; otherwise reports the blocking state |
-| `chat_get_operation` | Operation ID | Current status and evidence; the recovery path for ambiguous outcomes |
+| `chat_get_operation` | Operation ID, optional status-recovery secret | Current status and evidence; receipt recovery cannot restore approval or permit replay |
 | `chat_disconnect` | Connection handle | Revokes access and cancels pending work |
 
 Tool names use lowercase letters, digits, underscores, and hyphens for VS Code host compatibility. The prepare/commit/operation tools above are planned, not implemented. Use shared Zod schemas, bounded inputs, output schemas, and structured tool results. Include a serialized text representation where needed for older clients. Mark reads appropriately; mark sending as a non-read-only external action. Tool annotations help clients present risk but are not access controls.

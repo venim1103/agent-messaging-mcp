@@ -63,6 +63,7 @@ test("only an owning facade prepares immutable fixture text without approval or 
     if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture text");
     assert.equal(prepared.payload.state, "awaiting_approval");
     assert.equal(prepared.payload.preview.text, owned.payload.text);
+    assert.match(prepared.payload.recoveryToken, /^[0-9a-f]{64}$/);
     const status = { ...envelope, kind: "get_prepared_operation", payload: {
       operationId: prepared.payload.operationId
     } };
@@ -120,6 +121,59 @@ test("only an owning facade prepares immutable fixture text without approval or 
     assert.deepEqual(handleBrokerRequest({ ...owned, payload: { ...owned.payload,
       connectionId: gemini.connectionId } }, "facade", owner, requests, 2003, operations).payload,
     { code: "CONNECTION_NOT_FOUND" });
+  } finally {
+    database.close();
+  }
+});
+
+test("a facade receipt recovers only uncertain operation status after an owner restart", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("preparing owner");
+    const operations = new PreparedMessageOperations(requests, database);
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const envelope = { protocolVersion: PROTOCOL_VERSION,
+      requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+    const prepared = handleBrokerRequest({ ...envelope, kind: "prepare_fixture_message", payload: {
+      connectionId: grant.connectionId, expectedGeneration: 1, text: "Synthetic recovery preview",
+      idempotencyKey: "b66b3997-9d43-4554-8399-267d1fe9f75c"
+    } }, "facade", owner, requests, 2001, operations);
+    if (prepared.kind !== "message_prepared") throw new Error("Expected fixture recovery receipt");
+    const recover = { ...envelope, kind: "get_prepared_operation", payload: {
+      operationId: prepared.payload.operationId, recoveryToken: prepared.payload.recoveryToken
+    } };
+    assert.deepEqual(handleBrokerRequest(recover, "facade", owner, requests, 2002, operations).payload,
+      { state: "unknown" });
+    const [review] = operations.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    assert.equal(JSON.stringify(review).includes(prepared.payload.recoveryToken), false);
+    operations.approveFixtureReview(target, prepared.payload.operationId, review.reviewId, 2003);
+    operations.recordFixtureDispatchStart(owner, prepared.payload.operationId, 2004);
+
+    const restartedRequests = new PendingConnectionRequests();
+    const restarted = new PreparedMessageOperations(restartedRequests, database);
+    const reader = Symbol("new facade session");
+    assert.deepEqual(handleBrokerRequest({ ...recover, payload: { operationId: prepared.payload.operationId } },
+      "facade", reader, restartedRequests, 2005, restarted).payload, { state: "unknown" });
+    assert.deepEqual(handleBrokerRequest({ ...recover, payload: { ...recover.payload, recoveryToken: "0".repeat(64) } },
+      "facade", reader, restartedRequests, 2005, restarted).payload, { state: "unknown" });
+    assert.deepEqual(handleBrokerRequest(recover, "relay", reader, restartedRequests, 2005, restarted).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(recover, "facade", reader, restartedRequests, 2005, restarted), {
+      ...envelope, kind: "prepared_operation_state", payload: {
+        operationId: prepared.payload.operationId, state: "dispatch_uncertain", startedAt: 2004
+      }
+    });
+    assert.deepEqual(restarted.getOperation(reader, prepared.payload.operationId, 2005), { state: "unknown" });
+    assert.equal(restartedRequests.getApprovedTarget(reader, grant.connectionId, 2005), null);
+    const operationId = prepared.payload.operationId;
+    assert.throws(() => restarted.recordFixtureDispatchStart(reader, operationId, 2005), /APPROVAL_REQUIRED/);
+    assert.throws(() => handleBrokerRequest({ ...recover, payload: { ...recover.payload, recoveryToken: "invalid" } },
+      "facade", reader, restartedRequests, 2005, restarted));
   } finally {
     database.close();
   }

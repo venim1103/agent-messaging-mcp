@@ -121,7 +121,7 @@ server.registerTool("chat_wait_for_events", {
 });
 
 server.registerTool("chat_prepare_message", {
-  description: "Prepare an immutable fixture-only message preview for an owned approved connection. The draft expires after 60 seconds. This cannot approve, fill, or send a message; Gemini preparation is unavailable.",
+  description: "Prepare an immutable fixture-only preview and private status-recovery token for an owned connection. The draft expires after 60 seconds. This cannot approve, fill, or send; Gemini preparation is unavailable.",
   inputSchema: z.object({ connectionId: z.uuid(), expectedGeneration: z.literal(1),
     text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), idempotencyKey: z.uuid() }).strict()
 }, async ({ connectionId, expectedGeneration, text, idempotencyKey }) => {
@@ -137,12 +137,12 @@ server.registerTool("chat_prepare_message", {
 });
 
 server.registerTool("chat_get_operation", {
-  description: "Read the owning client's fixture-only prepared operation state. Approval is short-lived and does not send; a revoked grant is stale and no commit tool exists.",
-  inputSchema: z.object({ operationId: z.uuid() }).strict(),
+  description: "Read an owned fixture operation state. An optional recoveryToken from preparation recovers only dispatch_uncertain status after restart, not browser access, approval, or permission to resend. No commit tool exists.",
+  inputSchema: z.object({ operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   annotations: { readOnlyHint: true }
-}, async ({ operationId }) => {
+}, async ({ operationId, recoveryToken }) => {
   try {
-    const result = await (await pendingBroker()).getPreparedOperation(operationId);
+    const result = await (await pendingBroker()).getPreparedOperation(operationId, recoveryToken);
     if (result.kind === "error") return blocked(result.payload.code);
     if (result.kind !== "prepared_operation_state") return unavailable();
     return { content: [{ type: "text", text: JSON.stringify(result.payload) }], structuredContent: result.payload };
