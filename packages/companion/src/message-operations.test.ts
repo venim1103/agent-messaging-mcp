@@ -461,6 +461,132 @@ test("fixture preflight capacity and owner disconnect cancel waiting checks", as
   }
 });
 
+test("draft-fill consent is separate from no-send review and consumed once for its owner", () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("fixture owner");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic exact draft fill",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    assert.deepEqual(ledger.listFixtureFillReviews(target, 2002), { reviews: [], hasMore: false });
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    assert.equal(ledger.getFixtureFillAuthorization(owner, prepared.operationId, 2004), null);
+    assert.throws(() => ledger.approveFixtureFillReview(target, prepared.operationId, review.reviewId, 2004),
+      /FILL_REVIEW_UNAVAILABLE/);
+    const [oldFillReview] = ledger.listFixtureFillReviews(target, 2004).reviews;
+    assert.ok(oldFillReview);
+    const [fillReview] = ledger.listFixtureFillReviews(target, 2005).reviews;
+    assert.ok(fillReview);
+    assert.throws(() => ledger.approveFixtureFillReview(target, prepared.operationId, oldFillReview.reviewId, 2006),
+      /FILL_REVIEW_UNAVAILABLE/);
+    assert.throws(() => ledger.approveFixtureFillReview({ ...target, documentId: "other" }, prepared.operationId,
+      fillReview.reviewId, 2006), /FILL_REVIEW_UNAVAILABLE/);
+    const consent = ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2006);
+    assert.equal(consent.state, "fill_approved");
+    assert.equal(consent.expiresAt, 2003 + FIXTURE_REVIEW_APPROVAL_TTL_MS);
+    assert.equal(ledger.getFixtureFillAuthorization(Symbol("other owner"), prepared.operationId, 2007), null);
+    assert.deepEqual(ledger.consumeFixtureFillApproval(owner, prepared.operationId, 2007), {
+      operationId: prepared.operationId, target, text: prepared.preview.text, expiresAt: consent.expiresAt
+    });
+    assert.equal(ledger.consumeFixtureFillApproval(owner, prepared.operationId, 2008), null);
+    assert.deepEqual(ledger.listFixtureFillReviews(target, 2008), { reviews: [], hasMore: false });
+    assert.throws(() => ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2008),
+      /FILL_REVIEW_UNAVAILABLE/);
+    assert.equal(ledger.getOperation(owner, prepared.operationId, 2008).state, "approved");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    ledger.disconnect(owner);
+    assert.equal(ledger.getFixtureFillAuthorization(owner, prepared.operationId, 2009), null);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("renewing no-send approval cannot revive an expired fill-review token", () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("fixture owner");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic expiring fill review",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    const [oldFillReview] = ledger.listFixtureFillReviews(target, 2004).reviews;
+    assert.ok(oldFillReview);
+    const renewedAt = oldFillReview.expiresAt + 1;
+    const [renewedReview] = ledger.listFixtureReviews(target, renewedAt).reviews;
+    assert.ok(renewedReview);
+    ledger.approveFixtureReview(target, prepared.operationId, renewedReview.reviewId, renewedAt);
+    assert.equal(ledger.getOperation(owner, prepared.operationId, renewedAt).state, "approved");
+    assert.throws(() => ledger.approveFixtureFillReview(target, prepared.operationId, oldFillReview.reviewId, renewedAt),
+      /FILL_REVIEW_UNAVAILABLE/);
+    const [freshFillReview] = ledger.listFixtureFillReviews(target, renewedAt).reviews;
+    assert.ok(freshFillReview);
+    assert.equal(ledger.approveFixtureFillReview(target, prepared.operationId, freshFillReview.reviewId, renewedAt).state,
+      "fill_approved");
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("expired, revoked, or writer-blocked fill consent cannot authorize a draft edit", () => {
+  for (const failure of ["expired", "revoked", "writer_uncertain"]) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("fixture owner");
+    const ledger = new PreparedMessageOperations(requests, database);
+    try {
+      const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 3, documentId: "CHROME-doc_opaque-42" };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approve(pending.requestId, target, 2000)!;
+      const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic fill candidate",
+        "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+      const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+      assert.ok(review);
+      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+      const [fillReview] = ledger.listFixtureFillReviews(target, 2004).reviews;
+      assert.ok(fillReview);
+      const consent = ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2005);
+      if (failure === "expired") {
+        assert.equal(ledger.getFixtureFillAuthorization(owner, prepared.operationId, consent.expiresAt), null);
+        assert.equal(ledger.consumeFixtureFillApproval(owner, prepared.operationId, consent.expiresAt), null);
+      } else if (failure === "revoked") {
+        requests.revokeChangedTab(3, null);
+        assert.equal(ledger.getFixtureFillAuthorization(owner, prepared.operationId, 2006), null);
+        assert.equal(ledger.consumeFixtureFillApproval(owner, prepared.operationId, 2006), null);
+      } else {
+        const blocking = ledger.prepare(owner, grant.connectionId, 1, "Synthetic unresolved attempt",
+          "c66b3997-9d43-4554-8399-267d1fe9f75c", 2006);
+        ledger.createRecoveryReceipt(owner, blocking.operationId, 2006);
+        const [blockingReview] = ledger.listFixtureReviews(target, 2007).reviews;
+        assert.ok(blockingReview);
+        ledger.approveFixtureReview(target, blocking.operationId, blockingReview.reviewId, 2008);
+        ledger.recordFixtureDispatchStart(owner, blocking.operationId, 2009);
+        assert.equal(ledger.consumeFixtureFillApproval(owner, prepared.operationId, 2010), null);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      }
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
 test("fixture dispatch baselines require a fresh owned snapshot and trusted approval", () => {
   const database = new DatabaseSync(":memory:");
   try {

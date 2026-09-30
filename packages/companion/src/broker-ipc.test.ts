@@ -90,6 +90,23 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
     const approved = await relay.approveFixtureReview(target, prepared.payload.operationId, reviewId);
     assert.equal(approved.kind, "fixture_review_approved");
     const operationId = prepared.payload.operationId;
+    assert.throws(() => facade.listFixtureFillReviews(target), /role cannot perform/);
+    const fillListed = await relay.listFixtureFillReviews(target);
+    if (fillListed.kind !== "fixture_fill_reviews") throw new Error("Expected separate fill reviews");
+    const fillReviewId = fillListed.payload.reviews[0]?.reviewId;
+    assert.ok(fillReviewId);
+    assert.notEqual(fillReviewId, reviewId);
+    assert.equal(JSON.stringify(fillListed.payload).includes(prepared.payload.recoveryToken), false);
+    assert.throws(() => facade.approveFixtureFillReview(target, operationId, fillReviewId), /role cannot perform/);
+    assert.deepEqual((await relay.approveFixtureFillReview(target, operationId, reviewId)).payload,
+      { code: "FILL_REVIEW_UNAVAILABLE" });
+    assert.deepEqual((await relay.approveFixtureFillReview({ ...target, documentId: "other-document" },
+      operationId, fillReviewId)).payload, { code: "FILL_REVIEW_UNAVAILABLE" });
+    const fillConsent = await relay.approveFixtureFillReview(target, operationId, fillReviewId);
+    if (fillConsent.kind !== "fixture_fill_review_approved") throw new Error("Expected separate fill consent");
+    assert.equal(fillConsent.payload.state, "fill_approved");
+    assert.deepEqual((await relay.approveFixtureFillReview(target, operationId, fillReviewId)).payload,
+      { code: "FILL_REVIEW_UNAVAILABLE" });
     assert.deepEqual((await otherFacade.checkFixturePreflight(operationId)).payload, { code: "OPERATION_UNAVAILABLE" });
     assert.throws(() => relay.checkFixturePreflight(operationId), /role cannot perform/);
     const checking = facade.checkFixturePreflight(operationId);

@@ -86,6 +86,9 @@ export class PreparedMessageOperations {
   }>>();
   private readonly reviewTokens = new Map<string, string>();
   private readonly approvals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
+  private readonly fillReviewTokens = new Map<string, Readonly<{ reviewId: string; expiresAt: number }>>();
+  private readonly fillApprovals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
+  private readonly consumedFillApprovals = new Set<string>();
   private readonly recoveryReceipts = new Map<string, string>();
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
   private readonly ambiguousEvidence = new Set<string>();
@@ -147,6 +150,9 @@ export class PreparedMessageOperations {
     this.contents.delete(operationId);
     this.reviewTokens.delete(operationId);
     this.approvals.delete(operationId);
+    this.fillReviewTokens.delete(operationId);
+    this.fillApprovals.delete(operationId);
+    this.consumedFillApprovals.delete(operationId);
     this.recoveryReceipts.delete(operationId);
     this.dispatchBaselines.delete(operationId);
     this.ambiguousEvidence.delete(operationId);
@@ -158,6 +164,9 @@ export class PreparedMessageOperations {
     }
     for (const [operationId, approval] of this.approvals) {
       if (approval.expiresAt <= now) this.approvals.delete(operationId);
+    }
+    for (const [operationId, approval] of this.fillApprovals) {
+      if (approval.expiresAt <= now) this.fillApprovals.delete(operationId);
     }
   }
 
@@ -266,6 +275,67 @@ export class PreparedMessageOperations {
       expiresAt: Math.min(operation.expiresAt, now + FIXTURE_REVIEW_APPROVAL_TTL_MS) });
     this.approvals.set(operationId, approval);
     return approval;
+  }
+
+  listFixtureFillReviews(target: FixtureTarget, now = Date.now()) {
+    this.discardExpired(now);
+    const reviews: PreparedReview[] = [];
+    for (const [operationId, operation] of this.contents) {
+      if (operation.target.origin !== target.origin || operation.target.conversationId !== target.conversationId
+        || operation.target.tabId !== target.tabId || operation.target.documentId !== target.documentId) continue;
+      this.fillReviewTokens.delete(operationId);
+      if (this.getOperation(operation.owner, operationId, now).state !== "approved"
+        || this.fillApprovals.has(operationId) || this.consumedFillApprovals.has(operationId)) continue;
+      const reviewId = randomUUID();
+      reviews.push(Object.freeze({ operationId, reviewId, expiresAt: this.approvals.get(operationId)!.expiresAt,
+        preview: Object.freeze({ target: "fixture-alpha", text: operation.text }) }));
+    }
+    const selected = reviews.slice(-MAX_PREPARED_REVIEWS).reverse();
+    for (const review of selected) this.fillReviewTokens.set(review.operationId,
+      Object.freeze({ reviewId: review.reviewId, expiresAt: review.expiresAt }));
+    return Object.freeze({ reviews: Object.freeze(selected), hasMore: reviews.length > MAX_PREPARED_REVIEWS });
+  }
+
+  approveFixtureFillReview(target: FixtureTarget, operationId: string, reviewId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.contents.get(operationId);
+    const approval = this.approvals.get(operationId);
+    const fillReview = this.fillReviewTokens.get(operationId);
+    if (!operation || !approval || this.getOperation(operation.owner, operationId, now).state !== "approved"
+      || typeof reviewId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(reviewId)
+      || fillReview?.reviewId !== reviewId || fillReview.expiresAt <= now || this.fillApprovals.has(operationId)
+      || this.consumedFillApprovals.has(operationId)
+      || operation.target.origin !== target.origin || operation.target.conversationId !== target.conversationId
+      || operation.target.tabId !== target.tabId || operation.target.documentId !== target.documentId) {
+      throw new Error("FILL_REVIEW_UNAVAILABLE");
+    }
+    const consent = Object.freeze({ operationId, state: "fill_approved" as const, approvedAt: now,
+      expiresAt: Math.min(operation.expiresAt, approval.expiresAt, now + FIXTURE_REVIEW_APPROVAL_TTL_MS) });
+    this.fillReviewTokens.delete(operationId);
+    this.fillApprovals.set(operationId, consent);
+    return consent;
+  }
+
+  getFixtureFillAuthorization(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.contents.get(operationId);
+    const consent = this.fillApprovals.get(operationId);
+    if (!operation || operation.owner !== owner || !consent || consent.expiresAt <= now
+      || this.consumedFillApprovals.has(operationId) || this.getOperation(owner, operationId, now).state !== "approved") {
+      return null;
+    }
+    return Object.freeze({ operationId, target: operation.target, text: operation.text, expiresAt: consent.expiresAt });
+  }
+
+  consumeFixtureFillApproval(owner: symbol, operationId: string, now = Date.now()) {
+    const authorization = this.getFixtureFillAuthorization(owner, operationId, now);
+    if (!authorization || this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
+      LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+      WHERE evidence.operation_id IS NULL LIMIT 1`).get()) return null;
+    this.fillApprovals.delete(operationId);
+    this.fillReviewTokens.delete(operationId);
+    this.consumedFillApprovals.add(operationId);
+    return authorization;
   }
 
   createRecoveryReceipt(owner: symbol, operationId: string, now = Date.now()) {

@@ -12,6 +12,7 @@ import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
+  parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
   parseNativeFixturePreflight,
   parseNativeFixtureReset, parseNativeFixtureRevocation,
   parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
@@ -138,6 +139,32 @@ test("native fixture review listing accepts only an exact target and no approval
   ]) {
     assert.throws(() => parseNativeFixturePreparedReviews(invalid, now), /Invalid native fixture prepared review list/);
   }
+});
+
+test("native fixture fill consent refuses no-send tokens, arbitrary controls, and stale envelopes", () => {
+  const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+    documentId: "CHROME-doc_opaque-42" };
+  const listing = { ...request, kind: "list_fixture_fill_reviews", payload: { target } };
+  assert.deepEqual(parseNativeFixtureFillReviews(listing, now), listing);
+  for (const invalid of [
+    { ...listing, kind: "list_fixture_prepared_reviews" },
+    { ...listing, deadlineMs: now },
+    { ...listing, deadlineMs: now + 30_001 },
+    { ...listing, payload: { target, approved: true } },
+    { ...listing, payload: { target: { ...target, selector: "#message" } } },
+    { ...listing, payload: { target: { ...target, origin: "https://gemini.google.com" } } }
+  ]) assert.throws(() => parseNativeFixtureFillReviews(invalid, now), /Invalid native fixture fill review list/);
+  const approval = { ...listing, kind: "approve_fixture_fill_review", payload: { target,
+    operationId: "a66b3997-9d43-4554-8399-267d1fe9f75c", reviewId: "b66b3997-9d43-4554-8399-267d1fe9f75c" } };
+  assert.deepEqual(parseNativeFixtureFillReviewApproval(approval, now), approval);
+  for (const invalid of [
+    { ...approval, kind: "approve_fixture_review" },
+    { ...approval, deadlineMs: now },
+    { ...approval, connectionGeneration: 1 },
+    { ...approval, payload: { ...approval.payload, reviewId: "" } },
+    { ...approval, payload: { ...approval.payload, text: "Changed approved text" } },
+    { ...approval, payload: { ...approval.payload, send: true } }
+  ]) assert.throws(() => parseNativeFixtureFillReviewApproval(invalid, now), /Invalid native fixture fill review approval/);
 });
 
 test("native fixture preflight accepts only fixed results for an exact challenge target", () => {
@@ -490,6 +517,44 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(approvalReviewReply.kind, "fixture_review_approved");
     assert.equal(approvalReviewReply.payload.operationId, prepared.payload.operationId);
     assert.equal(approvalReviewReply.payload.state, "approved");
+
+    const exchangeFillReview = async (message: unknown) => {
+      const fillHost = spawn(process.execPath, [relayEntry, origin, origin], {
+        stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      });
+      const fillOutput: Buffer[] = [];
+      const fillErrors: Buffer[] = [];
+      fillHost.stdout.on("data", (chunk: Buffer) => fillOutput.push(chunk));
+      fillHost.stderr.on("data", (chunk: Buffer) => fillErrors.push(chunk));
+      fillHost.stdin.end(encodeNativeFrame(message));
+      const [fillExit] = await once(fillHost, "exit");
+      assert.equal(fillExit, 0, Buffer.concat(fillErrors).toString());
+      return new NativeFrameDecoder().push(Buffer.concat(fillOutput));
+    };
+    const [fillListing] = await exchangeFillReview({ ...request, kind: "list_fixture_fill_reviews",
+      deadlineMs: Date.now() + 10_000, payload: { target: approval.payload.target } }) as [{
+      kind: string; payload: { reviews: { operationId: string; reviewId: string; preview: { text: string } }[] }
+    }];
+    assert.equal(fillListing.kind, "fixture_fill_reviews");
+    const [fillReview] = fillListing.payload.reviews;
+    assert.ok(fillReview);
+    assert.equal(fillReview.operationId, prepared.payload.operationId);
+    assert.equal(fillReview.preview.text, prepared.payload.preview.text);
+    assert.notEqual(fillReview.reviewId, reviewId);
+    assert.equal(JSON.stringify(fillListing).includes(prepared.payload.recoveryToken), false);
+    const fillApprovalRequest = { ...request, kind: "approve_fixture_fill_review", deadlineMs: Date.now() + 10_000,
+      payload: { target: approval.payload.target, operationId: fillReview.operationId, reviewId: fillReview.reviewId } };
+    const [fillApproval] = await exchangeFillReview(fillApprovalRequest) as [{
+      kind: string; payload: { operationId: string; state: string }
+    }];
+    assert.equal(fillApproval.kind, "fixture_fill_review_approved");
+    assert.equal(fillApproval.payload.operationId, prepared.payload.operationId);
+    assert.equal(fillApproval.payload.state, "fill_approved");
+    const [fillReplay] = await exchangeFillReview({ ...fillApprovalRequest, deadlineMs: Date.now() + 10_000 }) as [{
+      kind: string; payload: { code: string }
+    }];
+    assert.equal(fillReplay.kind, "error");
+    assert.equal(fillReplay.payload.code, "FILL_REVIEW_UNAVAILABLE");
 
     const checking = facade.checkFixturePreflight(prepared.payload.operationId);
     const preflightObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));

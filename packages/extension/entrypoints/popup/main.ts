@@ -31,6 +31,7 @@ const geminiOrigin = "https://gemini.google.com";
 const inspectButton = document.querySelector<HTMLButtonElement>("#inspect");
 const pendingButton = document.querySelector<HTMLButtonElement>("#view-pending");
 const fixtureReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-reviews");
+const fixtureFillReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-fill-reviews");
 const fixtureInputButton = document.querySelector<HTMLButtonElement>("#test-fixture-input");
 const geminiDraftReview = document.querySelector<HTMLElement>("#gemini-draft-review");
 const geminiDraftPreview = document.querySelector<HTMLElement>("#gemini-draft-text");
@@ -42,6 +43,7 @@ const pendingResult = document.querySelector<HTMLElement>("#pending-result");
 const pendingTarget = document.querySelector<HTMLElement>("#pending-target");
 const pendingRequests = document.querySelector<HTMLOListElement>("#pending-requests");
 const fixtureReviewResult = document.querySelector<HTMLElement>("#fixture-review-result");
+const fixtureReviewHeading = document.querySelector<HTMLElement>("#fixture-review-heading");
 const fixtureReviews = document.querySelector<HTMLOListElement>("#fixture-reviews");
 const conversation = document.querySelector<HTMLElement>("#conversation");
 const messages = document.querySelector<HTMLOListElement>("#messages");
@@ -98,9 +100,9 @@ function inspectGeminiStructure(): GeminiPreview | null {
   };
 }
 
-if (!inspectButton || !pendingButton || !fixtureReviewButton || !fixtureInputButton || !geminiDraftReview
+if (!inspectButton || !pendingButton || !fixtureReviewButton || !fixtureFillReviewButton || !fixtureInputButton || !geminiDraftReview
   || !geminiDraftPreview || !geminiDraftButton || !status || !result || !fixtureDocumentStatus || !pendingResult
-  || !pendingTarget || !pendingRequests || !fixtureReviewResult || !fixtureReviews || !conversation || !messages) {
+  || !pendingTarget || !pendingRequests || !fixtureReviewResult || !fixtureReviewHeading || !fixtureReviews || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
 }
 
@@ -140,6 +142,7 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   const selectedSavedGemini = tab?.url ? isEligibleGeminiUrl(tab.url) : false;
   pendingButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
   fixtureReviewButton.hidden = url?.origin !== fixtureOrigin;
+  fixtureFillReviewButton.hidden = url?.origin !== fixtureOrigin;
   if (tab?.id != null && tab.url && url?.origin === fixtureOrigin) {
     selectedFixtureTab = { id: tab.id, url: tab.url };
   }
@@ -153,9 +156,11 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   }
 });
 
-fixtureReviewButton.addEventListener("click", async () => {
+const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
   fixtureReviewButton.disabled = true;
+  fixtureFillReviewButton.disabled = true;
   clearFixtureReviews();
+  fixtureReviewHeading.textContent = purpose === "fill" ? "Fixture draft-fill consent" : "Prepared fixture drafts";
   status.textContent = "Checking the selected fixture draft...";
   try {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -163,7 +168,8 @@ fixtureReviewButton.addEventListener("click", async () => {
       status.textContent = "Selected fixture changed. No draft shown.";
       return;
     }
-    const response = await browser.runtime.sendMessage({ kind: "list_fixture_prepared_reviews",
+    const response = await browser.runtime.sendMessage({
+      kind: purpose === "fill" ? "list_fixture_fill_reviews" : "list_fixture_prepared_reviews",
       tabId: tab.id, expectedUrl: selectedFixtureTab.url }) as FixtureReviewsResult;
     if (!response.ok) {
       status.textContent = response.error;
@@ -179,7 +185,7 @@ fixtureReviewButton.addEventListener("click", async () => {
       text.textContent = review.preview.text;
       const approve = document.createElement("button");
       approve.type = "button";
-      approve.textContent = "Approve draft (no send)";
+      approve.textContent = purpose === "fill" ? "Allow draft fill (no send)" : "Approve draft (no send)";
       approve.addEventListener("click", async () => {
         approve.disabled = true;
         try {
@@ -191,7 +197,8 @@ fixtureReviewButton.addEventListener("click", async () => {
             status.textContent = "Fixture or draft changed. No approval recorded.";
             return;
           }
-          const approved = await browser.runtime.sendMessage({ kind: "approve_fixture_review",
+          const approved = await browser.runtime.sendMessage({
+            kind: purpose === "fill" ? "approve_fixture_fill_review" : "approve_fixture_review",
             tabId: tab.id, expectedUrl: selectedFixtureTab.url, operationId: review.operationId,
             reviewId: review.reviewId }) as FixtureReviewApprovalResult;
           if (!approved.ok) {
@@ -200,7 +207,9 @@ fixtureReviewButton.addEventListener("click", async () => {
             return;
           }
           row.remove();
-          status.textContent = `Approved fixture draft ${approved.operationId}. No message was sent.`;
+          status.textContent = purpose === "fill"
+            ? `Allowed fixture draft fill ${approved.operationId}. Editor unchanged. No message was sent.`
+            : `Approved fixture draft ${approved.operationId}. No message was sent.`;
         } catch {
           clearFixtureReviews();
           status.textContent = "Fixture draft approval unavailable. No message was sent.";
@@ -225,8 +234,11 @@ fixtureReviewButton.addEventListener("click", async () => {
     status.textContent = "Fixture draft review unavailable.";
   } finally {
     fixtureReviewButton.disabled = false;
+    fixtureFillReviewButton.disabled = false;
   }
-});
+};
+fixtureReviewButton.addEventListener("click", () => { void reviewFixtureDrafts("review"); });
+fixtureFillReviewButton.addEventListener("click", () => { void reviewFixtureDrafts("fill"); });
 
 pendingButton.addEventListener("click", async () => {
   pendingButton.disabled = true;

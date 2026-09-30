@@ -156,6 +156,36 @@ test("fixture browser evidence distinguishes a new outgoing row from existing id
   }
 });
 
+test("fixture native insertText preserves multiline text and produces trusted input", async () => {
+  const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
+      status: 200, contentType: "text/html; charset=utf-8", body: html
+    }));
+    const text = "First exact line\nSecond exact line \u00e9";
+    for (const kind of ["textarea", "rich"]) {
+      await page.goto(`http://127.0.0.1:8787/${kind === "rich" ? "?editor=rich" : ""}`);
+      const editor = page.getByRole("textbox", { name: "Message" });
+      await editor.evaluate((element) => {
+        window.fixtureInputProof = [];
+        element.addEventListener("input", (event) => window.fixtureInputProof.push({ trusted: event.isTrusted }));
+        element.focus();
+      });
+      assert.equal(await page.evaluate((approvedText) => document.execCommand("insertText", false, approvedText), text), true);
+      assert.equal(kind === "rich" ? await editor.innerText() : await editor.inputValue(), text);
+      assert.equal(await page.evaluate(() => window.fixtureInputProof.some((event) => event.trusted)), true);
+      assert.equal(await page.locator("ol#messages > li").count(), 2);
+      await page.getByRole("button", { name: "Send" }).click();
+      assert.equal(await page.locator("ol#messages > li").count(), 3);
+      assert.equal(await page.locator("ol#messages > li:last-child p").textContent(), text);
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
 test("read-only fixture preflight protects drafts and rejects blocked or changed controls", async () => {
   const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
   const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });

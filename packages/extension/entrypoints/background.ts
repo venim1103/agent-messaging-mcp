@@ -1061,7 +1061,8 @@ async function listPendingForSelectedTab(tabId: number, expectedGeminiUrl?: stri
   }
 }
 
-async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: string): Promise<FixtureReviewsResult> {
+async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: string,
+  purpose: "review" | "fill" = "review"): Promise<FixtureReviewsResult> {
   try {
     if (!await ensureFixtureReset()) return { ok: false, error: "Fixture grant reset unavailable" };
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -1122,7 +1123,8 @@ async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: stri
             return;
           }
           const reviews = payload.reviews;
-          if (reply.kind !== "fixture_prepared_reviews" || Object.keys(payload).length !== 2
+          if (reply.kind !== (purpose === "fill" ? "fixture_fill_reviews" : "fixture_prepared_reviews")
+            || Object.keys(payload).length !== 2
             || !Array.isArray(reviews) || reviews.length > 8 || typeof payload.hasMore !== "boolean"
             || !reviews.every((item: unknown) => {
               if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
@@ -1158,7 +1160,8 @@ async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: stri
         void browser.runtime.lastError;
         finish({ ok: false, error: "Native fixture review unavailable" });
       });
-      port.postMessage({ kind: "list_fixture_prepared_reviews", protocolVersion, requestId,
+      port.postMessage({ kind: purpose === "fill" ? "list_fixture_fill_reviews" : "list_fixture_prepared_reviews",
+        protocolVersion, requestId,
         connectionGeneration: 0, deadlineMs, payload: { target: {
           origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId
         } } });
@@ -1169,7 +1172,7 @@ async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: stri
 }
 
 async function approveFixtureReviewForSelectedTab(tabId: number, expectedUrl: string,
-  operationId: string, reviewId: string): Promise<FixtureReviewApprovalResult> {
+  operationId: string, reviewId: string, purpose: "review" | "fill" = "review"): Promise<FixtureReviewApprovalResult> {
   try {
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
     const tab = await browser.tabs.get(tabId);
@@ -1225,7 +1228,7 @@ async function approveFixtureReviewForSelectedTab(tabId: number, expectedUrl: st
           }
           const payload = reply.payload as Record<string, unknown>;
           if (reply.kind === "error" && Object.keys(payload).length === 1
-            && payload.code === "REVIEW_UNAVAILABLE") {
+            && payload.code === (purpose === "fill" ? "FILL_REVIEW_UNAVAILABLE" : "REVIEW_UNAVAILABLE")) {
             finish({ ok: false, error: "Draft review expired or already approved" });
             return;
           }
@@ -1234,8 +1237,9 @@ async function approveFixtureReviewForSelectedTab(tabId: number, expectedUrl: st
             finish({ ok: false, error: "Broker unavailable; no approval" });
             return;
           }
-          if (reply.kind !== "fixture_review_approved" || Object.keys(payload).length !== 4
-            || payload.operationId !== operationId || payload.state !== "approved"
+          if (reply.kind !== (purpose === "fill" ? "fixture_fill_review_approved" : "fixture_review_approved")
+            || Object.keys(payload).length !== 4 || payload.operationId !== operationId
+            || payload.state !== (purpose === "fill" ? "fill_approved" : "approved")
             || typeof payload.approvedAt !== "number" || !Number.isSafeInteger(payload.approvedAt)
             || typeof payload.expiresAt !== "number" || !Number.isSafeInteger(payload.expiresAt)
             || payload.expiresAt <= Date.now()) throw new Error();
@@ -1262,7 +1266,8 @@ async function approveFixtureReviewForSelectedTab(tabId: number, expectedUrl: st
         void browser.runtime.lastError;
         finish({ ok: false, error: "Native fixture approval unavailable" });
       });
-      port.postMessage({ kind: "approve_fixture_review", protocolVersion, requestId,
+      port.postMessage({ kind: purpose === "fill" ? "approve_fixture_fill_review" : "approve_fixture_review",
+        protocolVersion, requestId,
         connectionGeneration: 0, deadlineMs, payload: { target: {
           origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId
         }, operationId, reviewId } });
@@ -1485,18 +1490,21 @@ export default defineBackground(() => {
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {
       return listPendingForSelectedTab(request.tabId);
     }
-    if (request.kind === "list_fixture_prepared_reviews" && Object.keys(request).length === 3
+    if ((request.kind === "list_fixture_prepared_reviews" || request.kind === "list_fixture_fill_reviews")
+      && Object.keys(request).length === 3
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
       && typeof request.expectedUrl === "string" && request.expectedUrl.length < 2048) {
-      return listFixtureReviewsForSelectedTab(request.tabId, request.expectedUrl);
+      return listFixtureReviewsForSelectedTab(request.tabId, request.expectedUrl,
+        request.kind === "list_fixture_fill_reviews" ? "fill" : "review");
     }
-    if (request.kind === "approve_fixture_review" && Object.keys(request).length === 5
+    if ((request.kind === "approve_fixture_review" || request.kind === "approve_fixture_fill_review")
+      && Object.keys(request).length === 5
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
       && typeof request.expectedUrl === "string" && request.expectedUrl.length < 2048
       && typeof request.operationId === "string" && /^[0-9a-f-]{36}$/.test(request.operationId)
       && typeof request.reviewId === "string" && /^[0-9a-f-]{36}$/.test(request.reviewId)) {
       return approveFixtureReviewForSelectedTab(request.tabId, request.expectedUrl,
-        request.operationId, request.reviewId);
+        request.operationId, request.reviewId, request.kind === "approve_fixture_fill_review" ? "fill" : "review");
     }
     if (request.kind === "list_gemini_pending" && Object.keys(request).length === 3
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0

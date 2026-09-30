@@ -112,6 +112,35 @@ test("only an owning facade prepares immutable fixture text without approval or 
     assert.deepEqual(handleBrokerRequest(status, "facade", owner, requests, 2002, operations).payload,
       { operationId: prepared.payload.operationId, state: "approved", expiresAt: prepared.payload.expiresAt,
         approvalExpiresAt: 2002 + 30_000 });
+    const fillList = { ...envelope, kind: "list_fixture_fill_reviews", payload: { target } };
+    assert.deepEqual(handleBrokerRequest(fillList, "facade", owner, requests, 2003, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    const fillListed = handleBrokerRequest(fillList, "relay", stranger, requests, 2003, operations);
+    if (fillListed.kind !== "fixture_fill_reviews") throw new Error("Expected a separate fill review");
+    const fillReviewId = fillListed.payload.reviews[0]?.reviewId;
+    assert.ok(fillReviewId);
+    assert.notEqual(fillReviewId, reviewId);
+    assert.equal(fillListed.payload.reviews[0]?.preview.text, prepared.payload.preview.text);
+    assert.equal(JSON.stringify(fillListed.payload).includes(prepared.payload.recoveryToken), false);
+    const approveFill = { ...envelope, kind: "approve_fixture_fill_review", payload: {
+      target, operationId: prepared.payload.operationId, reviewId: fillReviewId
+    } };
+    assert.deepEqual(handleBrokerRequest(approveFill, "facade", owner, requests, 2003, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest({ ...approveFill, payload: { ...approveFill.payload, reviewId } },
+      "relay", stranger, requests, 2003, operations).payload, { code: "FILL_REVIEW_UNAVAILABLE" });
+    assert.deepEqual(handleBrokerRequest({ ...approveFill, payload: { ...approveFill.payload,
+      target: { ...target, documentId: "other-document" } } }, "relay", stranger, requests, 2003, operations).payload,
+    { code: "FILL_REVIEW_UNAVAILABLE" });
+    assert.throws(() => handleBrokerRequest({ ...approveFill, payload: { ...approveFill.payload, approved: true } },
+      "relay", stranger, requests, 2003, operations));
+    const fillConsent = handleBrokerRequest(approveFill, "relay", stranger, requests, 2003, operations);
+    if (fillConsent.kind !== "fixture_fill_review_approved") throw new Error("Expected separate fill consent");
+    assert.equal(fillConsent.payload.state, "fill_approved");
+    assert.equal(fillConsent.payload.expiresAt, 2002 + 30_000);
+    assert.deepEqual(handleBrokerRequest(approveFill, "relay", stranger, requests, 2003, operations).payload,
+      { code: "FILL_REVIEW_UNAVAILABLE" });
+    assert.equal(operations.getFixtureFillAuthorization(stranger, prepared.payload.operationId, 2003), null);
     assert.deepEqual(handleBrokerRequest(preflight, "facade", stranger, requests, 2003, operations).payload,
       { code: "OPERATION_UNAVAILABLE" });
     assert.deepEqual(handleBrokerRequest(preflight, "facade", owner, requests, 2003, operations), {
@@ -142,6 +171,7 @@ test("only an owning facade prepares immutable fixture text without approval or 
     assert.deepEqual(handleBrokerRequest(approveReview, "relay", stranger, requests, 2002, operations).payload,
       { code: "REVIEW_UNAVAILABLE" });
     requests.revokeChangedTab(3, null);
+    assert.equal(operations.getFixtureFillAuthorization(owner, prepared.payload.operationId, 2003), null);
     assert.deepEqual(handleBrokerRequest(preflight, "facade", owner, requests, 2003, operations).payload,
       { code: "OPERATION_UNAVAILABLE" });
     assert.deepEqual(handleBrokerRequest(status, "facade", owner, requests, 2003, operations).payload,

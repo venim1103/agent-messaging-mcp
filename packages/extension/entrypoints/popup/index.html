@@ -89,6 +89,7 @@
       li strong {
         color: #8d571a;
         font-size: 12px;
+        overflow-wrap: anywhere;
       }
 
       li p {
@@ -117,6 +118,7 @@
       <button type="button" id="inspect">Inspect this chat</button>
       <button type="button" id="view-pending" hidden>View pending requests</button>
       <button type="button" id="view-fixture-reviews" hidden>Review fixture drafts</button>
+      <button type="button" id="view-fixture-fill-reviews" hidden>Review fixture draft fill</button>
       <button type="button" id="test-fixture-input" hidden>Test fixture input</button>
       <section id="gemini-draft-review" hidden>
         <h2>Unsent Gemini draft</h2>
@@ -135,7 +137,7 @@
         <ol id="pending-requests" aria-label="Pending request IDs"></ol>
       </section>
       <section id="fixture-review-result" hidden>
-        <h2>Prepared fixture drafts</h2>
+        <h2 id="fixture-review-heading">Prepared fixture drafts</h2>
         <ol id="fixture-reviews" aria-label="Prepared fixture drafts"></ol>
       </section>
     </main>

@@ -386,7 +386,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
   }
 });
 
-test("trusted fixture popup approves prepared text without editing the page", { timeout: 20000 }, async () => {
+test("trusted fixture popup keeps review and draft-fill consent separate without editing", { timeout: 20000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-review-test-"));
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
@@ -464,6 +464,10 @@ test("trusted fixture popup approves prepared text without editing the page", { 
     const prepared = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text,
       "b66b3997-9d43-4554-8399-267d1fe9f75c");
     assert.equal(prepared.kind, "message_prepared");
+    const prematureFill = await popup.evaluate((args) => chrome.runtime.sendMessage({
+      kind: "list_fixture_fill_reviews", ...args
+    }), reviewArgs);
+    assert.deepEqual(prematureFill, { ok: true, reviews: [], hasMore: false });
     await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
     await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
     assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
@@ -477,6 +481,18 @@ test("trusted fixture popup approves prepared text without editing the page", { 
     const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
       tabId: selected.tabId, documentId: selected.documentId };
     assert.deepEqual((await relay.listFixturePreparedReviews(target)).payload, { reviews: [], hasMore: false });
+    await popup.evaluate(() => document.querySelector("#view-fixture-fill-reviews").click());
+    await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
+    assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
+    assert.equal(await popup.getByRole("button", { name: "Allow draft fill (no send)" }).count(), 1);
+    assert.equal(await popup.getByRole("button", { name: "Approve draft (no send)" }).count(), 0);
+    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+    await popup.getByText(`Allowed fixture draft fill ${prepared.payload.operationId}. Editor unchanged. No message was sent.`)
+      .waitFor({ timeout: 4000 });
+    assert.deepEqual((await relay.listFixtureFillReviews(target)).payload, { reviews: [], hasMore: false });
+    assert.equal(await fixture.locator("#message").inputValue(), "");
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
     const checked = await facade.checkFixturePreflight(prepared.payload.operationId);
     if (checked.kind !== "fixture_preflight") throw new Error(`Expected fixture preflight: ${JSON.stringify(checked.payload)}`);
     assert.equal(checked.payload.ok, true, JSON.stringify(checked.payload));
