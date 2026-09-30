@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createBrokerCredentials } from "./broker-roles.js";
 import { startBrokerSocket } from "./broker-ipc.js";
 import { recoverStaleBrokerRuntime } from "./broker-recovery.js";
+import { openPrivateOperationDatabase } from "./message-operations.js";
 
 async function main(): Promise<void> {
   const parent = join(homedir(), ".config/agent-messaging-mcp");
@@ -14,12 +15,15 @@ async function main(): Promise<void> {
   }
 
   await recoverStaleBrokerRuntime(parent);
-  const broker = await startBrokerSocket(join(parent, "broker"), createBrokerCredentials());
+  const database = openPrivateOperationDatabase(parent);
+  const broker = await startBrokerSocket(join(parent, "broker"), createBrokerCredentials(), database)
+    .catch((error: unknown) => { database.close(); throw error; });
   let stopping = false;
   const stop = () => {
     if (stopping) return;
     stopping = true;
-    broker.close().then(() => process.exit(0)).catch(() => process.exit(1));
+    broker.close().then(() => { database.close(); process.exit(0); })
+      .catch(() => { database.close(); process.exit(1); });
   };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);

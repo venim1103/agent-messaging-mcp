@@ -32,6 +32,8 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.equal(ready, true, "Broker did not start");
     assert.equal((await stat(directory)).mode & 0o777, 0o700);
     assert.equal((await stat(join(directory, "facade.key"))).mode & 0o777, 0o600);
+    const databasePath = join(home, ".config/agent-messaging-mcp/operations.sqlite");
+    assert.equal((await stat(databasePath)).mode & 0o777, 0o600);
     const facadeKey = await readFile(join(directory, "facade.key"), "utf8");
     assert.match(facadeKey, /^[0-9a-f]{64}$/);
     const facade = await connectBroker("facade", directory);
@@ -294,8 +296,26 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     const [code] = await exit;
     assert.equal(code, 0);
     await assert.rejects(stat(directory), { code: "ENOENT" });
+    assert.equal((await stat(databasePath)).isFile(), true);
   } finally {
     broker.kill("SIGTERM");
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("invalid private operation database leaves no broker runtime behind", { timeout: 5000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-bad-db-"));
+  try {
+    const parent = join(home, ".config/agent-messaging-mcp");
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    await writeFile(join(parent, "operations.sqlite"), "invalid sqlite file", { mode: 0o600 });
+    const broker = spawn(process.execPath, [fileURLToPath(new URL("./broker-process.js", import.meta.url))], {
+      env: { ...process.env, HOME: home }, stdio: "ignore"
+    });
+    const [code] = await once(broker, "exit");
+    assert.equal(code, 1);
+    await assert.rejects(stat(join(parent, "broker")), { code: "ENOENT" });
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

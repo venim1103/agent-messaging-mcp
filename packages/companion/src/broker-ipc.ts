@@ -1,21 +1,25 @@
 import { chmod, mkdir, rmdir, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { authenticateBrokerRole, type BrokerCredentials } from "./broker-roles.js";
 import { handleBrokerRequest } from "./broker-requests.js";
+import { PreparedMessageOperations } from "./message-operations.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
 
 export const BROKER_IDLE_TIMEOUT_MS = PENDING_REQUEST_TTL_MS * 2 + 30_000;
 
-export async function startBrokerSocket(runtimeDirectory: string, credentials: BrokerCredentials) {
-  await mkdir(runtimeDirectory, { mode: 0o700 });
+export async function startBrokerSocket(runtimeDirectory: string, credentials: BrokerCredentials,
+  operationDatabase?: DatabaseSync) {
   const socketPath = join(runtimeDirectory, "broker.sock");
   const facadeKeyPath = join(runtimeDirectory, "facade.key");
   const relayKeyPath = join(runtimeDirectory, "relay.key");
   const clients = new Set<Socket>();
   const requests = new PendingConnectionRequests();
+  const operations = operationDatabase ? new PreparedMessageOperations(requests, operationDatabase) : undefined;
+  await mkdir(runtimeDirectory, { mode: 0o700 });
   const server = createServer((socket) => {
     if (clients.size >= 16) {
       socket.destroy();
@@ -26,6 +30,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
     socket.on("close", () => {
       clients.delete(socket);
       requests.disconnect(owner);
+      operations?.disconnect(owner);
     });
     socket.on("error", () => socket.destroy());
     const timeout = setTimeout(() => socket.destroy(), 5000);
