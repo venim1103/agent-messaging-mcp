@@ -512,6 +512,41 @@ test("draft-fill consent is separate from no-send review and consumed once for i
   }
 });
 
+test("manual fixture review can pause beyond old windows without removing expiry or one-shot checks", () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("manual fixture tester");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic delayed fixture fill",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    assert.equal(prepared.expiresAt, 2001 + 3 * 60_000);
+    const reviewedAt = 2001 + 75_000;
+    const [review] = ledger.listFixtureReviews(target, reviewedAt).reviews;
+    assert.ok(review, "Prepared preview should survive a 75-second manual pause");
+    const approved = ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, reviewedAt);
+    assert.equal(approved.expiresAt, Math.min(prepared.expiresAt, reviewedAt + 2 * 60_000));
+    const fillReviewedAt = reviewedAt + 45_000;
+    const [fillReview] = ledger.listFixtureFillReviews(target, fillReviewedAt).reviews;
+    assert.ok(fillReview, "Separate fill review should survive a further 45-second pause");
+    const consent = ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, fillReviewedAt);
+    assert.ok(consent.expiresAt <= prepared.expiresAt && consent.expiresAt <= approved.expiresAt);
+    assert.ok(ledger.getFixtureFillAuthorization(owner, prepared.operationId, fillReviewedAt + 1));
+    assert.ok(ledger.consumeFixtureFillApproval(owner, prepared.operationId, fillReviewedAt + 1));
+    assert.equal(ledger.consumeFixtureFillApproval(owner, prepared.operationId, fillReviewedAt + 2), null);
+    assert.equal(ledger.getFixtureFillAuthorization(owner, prepared.operationId, prepared.expiresAt), null);
+    assert.equal(ledger.getOperation(owner, prepared.operationId, prepared.expiresAt).state, "expired");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
 test("renewing no-send approval cannot revive an expired fill-review token", () => {
   const database = new DatabaseSync(":memory:");
   const requests = new PendingConnectionRequests();

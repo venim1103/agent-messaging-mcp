@@ -126,7 +126,7 @@ server.registerTool("chat_wait_for_events", {
 });
 
 server.registerTool("chat_prepare_message", {
-  description: "Prepare an immutable fixture-only preview and private status-recovery token for an owned connection. The draft expires after 60 seconds. This cannot approve, fill, or send; Gemini preparation is unavailable.",
+  description: "Prepare an immutable fixture-only preview and private status-recovery token for an owned connection. The fixture draft expires after 3 minutes. This cannot approve, fill, or send; Gemini preparation is unavailable.",
   inputSchema: z.object({ connectionId: z.uuid(), expectedGeneration: z.literal(1),
     text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), idempotencyKey: z.uuid() }).strict()
 }, async ({ connectionId, expectedGeneration, text, idempotencyKey }) => {

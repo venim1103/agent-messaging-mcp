@@ -6,8 +6,8 @@ import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
 import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests, type FixtureTarget } from "./pending-connections.js";
 
-export const PREPARED_MESSAGE_TTL_MS = 60_000;
-export const FIXTURE_REVIEW_APPROVAL_TTL_MS = 30_000;
+export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
+export const FIXTURE_REVIEW_APPROVAL_TTL_MS = 2 * 60_000;
 export const PREPARED_KEY_RETENTION_MS = 24 * 60 * 60_000;
 export const MAX_PREPARED_MESSAGE_BYTES = 4_000;
 export const MAX_ACTIVE_PREPARED_MESSAGES = 100;

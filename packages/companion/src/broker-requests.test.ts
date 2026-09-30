@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { handleBrokerRequest } from "./broker-requests.js";
-import { PreparedMessageOperations } from "./message-operations.js";
+import { FIXTURE_REVIEW_APPROVAL_TTL_MS, PreparedMessageOperations } from "./message-operations.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS }
   from "./pending-connections.js";
@@ -111,7 +111,7 @@ test("only an owning facade prepares immutable fixture text without approval or 
       "fixture_review_approved");
     assert.deepEqual(handleBrokerRequest(status, "facade", owner, requests, 2002, operations).payload,
       { operationId: prepared.payload.operationId, state: "approved", expiresAt: prepared.payload.expiresAt,
-        approvalExpiresAt: 2002 + 30_000 });
+        approvalExpiresAt: 2002 + FIXTURE_REVIEW_APPROVAL_TTL_MS });
     const fillList = { ...envelope, kind: "list_fixture_fill_reviews", payload: { target } };
     assert.deepEqual(handleBrokerRequest(fillList, "facade", owner, requests, 2003, operations).payload,
       { code: "PERMISSION_DENIED" });
@@ -137,7 +137,7 @@ test("only an owning facade prepares immutable fixture text without approval or 
     const fillConsent = handleBrokerRequest(approveFill, "relay", stranger, requests, 2003, operations);
     if (fillConsent.kind !== "fixture_fill_review_approved") throw new Error("Expected separate fill consent");
     assert.equal(fillConsent.payload.state, "fill_approved");
-    assert.equal(fillConsent.payload.expiresAt, 2002 + 30_000);
+    assert.equal(fillConsent.payload.expiresAt, 2002 + FIXTURE_REVIEW_APPROVAL_TTL_MS);
     assert.deepEqual(handleBrokerRequest(approveFill, "relay", stranger, requests, 2003, operations).payload,
       { code: "FILL_REVIEW_UNAVAILABLE" });
     assert.equal(operations.getFixtureFillAuthorization(stranger, prepared.payload.operationId, 2003), null);
