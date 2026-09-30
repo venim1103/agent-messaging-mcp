@@ -159,6 +159,10 @@ test("expired preparation keys have bounded retention and metadata refuses exces
     const firstGrant = requests.approve(firstPending.requestId, target, 2000)!;
     const key = "a66b3997-9d43-4554-8399-267d1fe9f75c";
     const first = ledger.prepare(owner, firstGrant.connectionId, 1, "Synthetic", key, 2001);
+    ledger.createRecoveryReceipt(owner, first.operationId, 2002);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 1);
+    assert.throws(() => ledger.createRecoveryReceipt(owner, first.operationId, first.expiresAt),
+      /OPERATION_UNAVAILABLE/);
     assert.throws(() => ledger.prepare(owner, firstGrant.connectionId, 1, "Synthetic", key,
       first.expiresAt + 1), /OPERATION_EXPIRED/);
 
@@ -168,6 +172,7 @@ test("expired preparation keys have bounded retention and metadata refuses exces
     assert.equal(ledger.prepare(owner, laterGrant.connectionId, 1, "New draft", key, later).state,
       "awaiting_approval");
     assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, 1);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
     database.prepare(`WITH RECURSIVE sequence(number) AS (
       SELECT 1 UNION ALL SELECT number + 1 FROM sequence WHERE number < ?
     ) INSERT INTO prepared_message_operations
@@ -199,6 +204,12 @@ test("private dispatch intent persists before any submit and restart refuses reu
     const key = "a66b3997-9d43-4554-8399-267d1fe9f75c";
     const text = "Synthetic dispatch intent only";
     const prepared = ledger.prepare(owner, grant.connectionId, 1, text, key, 2001);
+    assert.throws(() => ledger.createRecoveryReceipt(Symbol("foreign"), prepared.operationId, 2002),
+      /OPERATION_UNAVAILABLE/);
+    const receipt = ledger.createRecoveryReceipt(owner, prepared.operationId, 2002);
+    assert.match(receipt.recoveryToken, /^[0-9a-f]{64}$/);
+    assert.deepEqual(ledger.createRecoveryReceipt(owner, prepared.operationId, 2002), receipt);
+    assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), { state: "unknown" });
     assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2002), /APPROVAL_REQUIRED/);
     const [review] = ledger.listFixtureReviews(target, 2002).reviews;
     assert.ok(review);
@@ -213,16 +224,28 @@ test("private dispatch intent persists before any submit and restart refuses reu
     assert.deepEqual(ledger.getOperation(owner, prepared.operationId, 2005), {
       operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2004
     });
+    assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), {
+      operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2004
+    });
+    assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, "0".repeat(64)), { state: "unknown" });
+    assert.deepEqual(ledger.recoverOperationStatus("b66b3997-9d43-4554-8399-267d1fe9f75c", receipt.recoveryToken),
+      { state: "unknown" });
+    assert.throws(() => ledger.createRecoveryReceipt(owner, prepared.operationId, 2005), /OPERATION_UNAVAILABLE/);
     assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005), /DISPATCH_UNCERTAIN/);
     assert.throws(() => ledger.prepare(owner, grant.connectionId, 1, text, key, 2005), /DISPATCH_UNCERTAIN/);
     assert.deepEqual(ledger.listFixtureReviews(target, 2005), { reviews: [], hasMore: false });
     assert.equal((await readFile(path)).includes(Buffer.from(text)), false);
     assert.equal((await readFile(path)).includes(Buffer.from(target.documentId)), false);
+    assert.equal((await readFile(path)).includes(Buffer.from(receipt.recoveryToken)), false);
 
     database.close();
     database = openPrivateOperationDatabase(home);
     assert.equal(database.prepare("PRAGMA synchronous").get()?.synchronous, 2);
     const restarted = new PreparedMessageOperations(new PendingConnectionRequests(), database);
+    assert.deepEqual(restarted.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), {
+      operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2004
+    });
+    assert.deepEqual(restarted.recoverOperationStatus(prepared.operationId, "invalid"), { state: "unknown" });
     assert.deepEqual(database.prepare("SELECT * FROM message_dispatch_attempts").all().map((row) => ({ ...row })), [
       { operation_id: prepared.operationId, started_at: 2004, state: "unknown" }
     ]);
@@ -232,6 +255,9 @@ test("private dispatch intent persists before any submit and restart refuses reu
     const nextPending = nextRequests.create(nextOwner, 1000);
     const nextGrant = nextRequests.approve(nextPending.requestId, target, 2000)!;
     const nextLedger = new PreparedMessageOperations(nextRequests, database);
+    assert.throws(() => nextLedger.createRecoveryReceipt(nextOwner, prepared.operationId, 2005),
+      /OPERATION_UNAVAILABLE/);
+    assert.throws(() => nextLedger.recordFixtureDispatchStart(nextOwner, prepared.operationId, 2005), /APPROVAL_REQUIRED/);
     assert.throws(() => nextLedger.prepare(nextOwner, nextGrant.connectionId, 1, text, key, 2005),
       /OPERATION_UNAVAILABLE/);
     assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, 1);
@@ -243,6 +269,9 @@ test("private dispatch intent persists before any submit and restart refuses reu
     assert.throws(() => nextLedger.prepare(nextOwner, laterGrant.connectionId, 1, text, key, later),
       /OPERATION_UNAVAILABLE/);
     assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, 1);
+    assert.deepEqual(nextLedger.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), {
+      operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2004
+    });
   } finally {
     database.close();
     await rm(home, { recursive: true, force: true });
@@ -263,12 +292,13 @@ test("abrupt process death leaves before-start safe and after-start uncertain", 
     const ledger = new PreparedMessageOperations(requests, database);
     const key = "a66b3997-9d43-4554-8399-267d1fe9f75c";
     const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic crash probe", key, 2001);
+    const receipt = ledger.createRecoveryReceipt(owner, prepared.operationId, 2002);
     if (process.argv[2] === "after") {
       const [review] = ledger.listFixtureReviews(target, 2002).reviews;
       ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
       ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004);
     }
-    process.stdout.write(JSON.stringify({ operationId: prepared.operationId, key }) + "\\n",
+    process.stdout.write(JSON.stringify({ ...receipt, key }) + "\\n",
       () => process.kill(process.pid, "SIGKILL"));
   `;
   for (const phase of ["before", "after"]) {
@@ -278,10 +308,14 @@ test("abrupt process death leaves before-start safe and after-start uncertain", 
         encoding: "utf8", timeout: 5000
       });
       assert.equal(child.signal, "SIGKILL", child.stderr);
-      const { operationId, key } = JSON.parse(child.stdout.trim()) as { operationId: string; key: string };
+      const { operationId, key, recoveryToken } = JSON.parse(child.stdout.trim()) as {
+        operationId: string; key: string; recoveryToken: string
+      };
       const database = openPrivateOperationDatabase(home);
       try {
-        new PreparedMessageOperations(new PendingConnectionRequests(), database);
+        const recovered = new PreparedMessageOperations(new PendingConnectionRequests(), database);
+        assert.deepEqual(recovered.recoverOperationStatus(operationId, recoveryToken), phase === "after"
+          ? { operationId, state: "dispatch_uncertain", startedAt: 2004 } : { state: "unknown" });
         assert.deepEqual(database.prepare("SELECT operation_id, state FROM message_dispatch_attempts").all()
           .map((row) => ({ ...row })), phase === "after" ? [{ operation_id: operationId, state: "unknown" }] : []);
         const owner = Symbol("fresh owner");
@@ -293,6 +327,7 @@ test("abrupt process death leaves before-start safe and after-start uncertain", 
         const restarted = new PreparedMessageOperations(requests, database);
         assert.throws(() => restarted.prepare(owner, grant.connectionId, 1, "Synthetic crash probe", key, 2005),
           /OPERATION_UNAVAILABLE/);
+        assert.equal((await readFile(join(home, "operations.sqlite"))).includes(Buffer.from(recoveryToken)), false);
       } finally {
         database.close();
       }
@@ -319,7 +354,13 @@ test("one unresolved fixture dispatch intent blocks a second approved operation"
     for (const review of ledger.listFixtureReviews(target, 2002).reviews) {
       ledger.approveFixtureReview(target, review.operationId, review.reviewId, 2003);
     }
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, first.operationId, 2004), /RECOVERY_REQUIRED/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    const firstReceipt = ledger.createRecoveryReceipt(owner, first.operationId, 2004);
+    const secondReceipt = ledger.createRecoveryReceipt(owner, second.operationId, 2004);
     ledger.recordFixtureDispatchStart(owner, first.operationId, 2004);
+    assert.deepEqual(ledger.recoverOperationStatus(first.operationId, secondReceipt.recoveryToken), { state: "unknown" });
+    assert.deepEqual(ledger.recoverOperationStatus(second.operationId, firstReceipt.recoveryToken), { state: "unknown" });
     assert.throws(() => ledger.recordFixtureDispatchStart(owner, second.operationId, 2005), /DISPATCH_UNCERTAIN/);
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
     assert.equal(ledger.getOperation(owner, second.operationId, 2005).state, "approved");

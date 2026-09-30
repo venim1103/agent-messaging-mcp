@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { closeSync, constants, lstatSync, openSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -51,6 +51,7 @@ export class PreparedMessageOperations {
   }>>();
   private readonly reviewTokens = new Map<string, string>();
   private readonly approvals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
+  private readonly recoveryReceipts = new Map<string, string>();
   private readonly digestKey = randomBytes(32);
 
   constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync) {
@@ -65,6 +66,10 @@ export class PreparedMessageOperations {
       expires_at INTEGER NOT NULL,
       state TEXT NOT NULL CHECK (state = 'awaiting_approval'),
       UNIQUE (idempotency_key)
+    )`);
+    database.exec(`CREATE TABLE IF NOT EXISTS message_operation_recovery (
+      operation_id TEXT PRIMARY KEY REFERENCES prepared_message_operations(operation_id) ON DELETE CASCADE,
+      token_digest TEXT NOT NULL CHECK (length(token_digest) = 64)
     )`);
     database.exec(`CREATE TABLE IF NOT EXISTS message_dispatch_attempts (
       operation_id TEXT PRIMARY KEY REFERENCES prepared_message_operations(operation_id) ON DELETE RESTRICT,
@@ -82,6 +87,7 @@ export class PreparedMessageOperations {
     this.contents.delete(operationId);
     this.reviewTokens.delete(operationId);
     this.approvals.delete(operationId);
+    this.recoveryReceipts.delete(operationId);
   }
 
   private discardExpired(now: number): void {
@@ -200,6 +206,47 @@ export class PreparedMessageOperations {
     return approval;
   }
 
+  createRecoveryReceipt(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.contents.get(operationId);
+    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    if (!operation || operation.owner !== owner || !live
+      || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
+      || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId
+      || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?").get(operationId)) {
+      throw new Error("OPERATION_UNAVAILABLE");
+    }
+    const retained = this.recoveryReceipts.get(operationId);
+    if (retained) return Object.freeze({ operationId, recoveryToken: retained });
+    if (this.database.prepare("SELECT 1 FROM message_operation_recovery WHERE operation_id = ?").get(operationId)) {
+      throw new Error("OPERATION_UNAVAILABLE");
+    }
+    const recoveryToken = randomBytes(32).toString("hex");
+    const digest = createHash("sha256").update(JSON.stringify([operationId, recoveryToken])).digest("hex");
+    this.database.prepare("INSERT INTO message_operation_recovery (operation_id, token_digest) VALUES (?, ?)")
+      .run(operationId, digest);
+    this.recoveryReceipts.set(operationId, recoveryToken);
+    return Object.freeze({ operationId, recoveryToken });
+  }
+
+  recoverOperationStatus(operationId: string, recoveryToken: string) {
+    if (typeof operationId !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(operationId)
+      || typeof recoveryToken !== "string" || !/^[0-9a-f]{64}$/.test(recoveryToken)) {
+      return { state: "unknown" as const };
+    }
+    const record = this.database.prepare(`SELECT recovery.token_digest, attempt.started_at
+      FROM message_operation_recovery AS recovery
+      JOIN message_dispatch_attempts AS attempt ON attempt.operation_id = recovery.operation_id
+      WHERE recovery.operation_id = ?`).get(operationId) as {
+        token_digest: string; started_at: number
+      } | undefined;
+    if (!record || !/^[0-9a-f]{64}$/.test(record.token_digest)) return { state: "unknown" as const };
+    const supplied = createHash("sha256").update(JSON.stringify([operationId, recoveryToken])).digest();
+    if (!timingSafeEqual(supplied, Buffer.from(record.token_digest, "hex"))) return { state: "unknown" as const };
+    return { operationId, state: "dispatch_uncertain" as const, startedAt: record.started_at };
+  }
+
   recordFixtureDispatchStart(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const ownerId = this.owners.get(owner);
@@ -215,6 +262,9 @@ export class PreparedMessageOperations {
       || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
       || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId) {
       throw new Error("APPROVAL_REQUIRED");
+    }
+    if (!this.database.prepare("SELECT 1 FROM message_operation_recovery WHERE operation_id = ?").get(operationId)) {
+      throw new Error("RECOVERY_REQUIRED");
     }
     this.database.exec("BEGIN IMMEDIATE");
     try {
