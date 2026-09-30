@@ -271,6 +271,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     };
     return {
       role,
+      get closed() { return socket.destroyed; },
       requestConnection: () => request("request_connection", {}),
       getConnection: (requestId: string) => request("get_connection", { requestId }),
       readFixtureSnapshot: (connectionId: string, limit?: number) =>

@@ -269,6 +269,25 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     await clientOne.close();
     const disconnected = await clientTwo.callTool({ name: "chat_get_connection", arguments: { requestId: handle.requestId } });
     assert.deepEqual(disconnected.structuredContent, { state: "unknown" });
+
+    broker.kill("SIGTERM");
+    if (brokerExit) await brokerExit;
+    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
+    brokerExit = once(broker, "exit");
+    ready = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      try {
+        ready = (await stat(join(brokerDirectory, "broker.sock"))).isSocket();
+        if (ready) break;
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      await setTimeout(25);
+    }
+    assert.equal(ready, true, "Restarted broker did not start");
+    const afterRestart = await clientTwo.callTool({ name: "chat_request_connection", arguments: {} });
+    assert.equal(afterRestart.isError, undefined, "First request after broker restart should reconnect");
+    assert.equal((afterRestart.structuredContent as { state: string }).state, "pending");
   } finally {
     await clientOne.close();
     await clientTwo.close();

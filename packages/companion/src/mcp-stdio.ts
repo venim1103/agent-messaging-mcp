@@ -10,6 +10,7 @@ const runtimeDirectory = join(homedir(), ".config/agent-messaging-mcp/broker");
 let broker: Awaited<ReturnType<typeof connectBroker>> | undefined;
 
 async function pendingBroker() {
+  if (broker?.closed) broker = undefined;
   return broker ??= await connectBroker("facade", runtimeDirectory);
 }
 

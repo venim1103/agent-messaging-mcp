@@ -248,6 +248,7 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
       { code: "CONNECTION_NOT_FOUND" });
     otherFacade.close();
     facade.close();
+    assert.equal(facade.closed, true);
     assert.deepEqual((await relay.listPending() as typeof listed).payload.requests, []);
     relay.close();
 
