@@ -67,6 +67,12 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
       { direction: "incoming", text: "OK" },
       { direction: "outgoing", text: "OK" }
     ] });
+    await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = ""; });
+    assert.deepEqual(await page.evaluate(captureGeminiSnapshot), { messages: [
+      { direction: "outgoing", text: "First line\nSecond line \u00e9" },
+      { direction: "outgoing", text: "OK" }
+    ] });
+    await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = "OK"; });
     await page.locator("main").evaluate((main) => {
       const duplicate = main.querySelector("infinite-scroller").cloneNode(true);
       main.append(duplicate);

@@ -125,8 +125,10 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
       if (content.length !== 1) return null;
       text = content[0]!.innerText.trim();
     }
+    if (!text && row.localName === "model-response") continue;
     if (!text || text.length > 2048) return null;
     messages.push({ direction: row.localName === "user-query" ? "outgoing" : "incoming", text });
   }
-  return new TextEncoder().encode(JSON.stringify(messages)).length <= 64 * 1024 ? { messages } : null;
+  return messages.length && new TextEncoder().encode(JSON.stringify(messages)).length <= 64 * 1024
+    ? { messages } : null;
 }

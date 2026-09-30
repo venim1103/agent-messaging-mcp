@@ -446,12 +446,28 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     ]);
     assert.equal("url" in read.payload, false);
     assert.equal(JSON.stringify(read.payload).includes("Private draft"), false);
+    await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = ""; });
+    let streaming;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const next = await facade.readApprovedEvents(state.payload.connectionId, read.payload.cursor, 1);
+      if (next.kind !== "gemini_events" || next.payload.state !== "ok") {
+        throw new Error("Expected a valid Gemini event during an empty streaming row");
+      }
+      if (next.payload.events.length) { streaming = next.payload; break; }
+      await setTimeout(25);
+    }
+    assert.ok(streaming, "An empty streaming row did not publish its remaining visible messages");
+    assert.deepEqual(streaming.events[0]?.payload.messages, [
+      { direction: "outgoing", text: "Synthetic question", identityQuality: "uncertain", generationState: "unknown" }
+    ]);
+    const whileStreaming = await facade.getConnection(created.payload.requestId);
+    assert.equal(whileStreaming.payload.state, "ready_readonly");
     await page.locator("model-response-content p").evaluate((paragraph) => {
       paragraph.textContent = "Later synthetic answer";
     });
     let observed;
     for (let attempt = 0; attempt < 80; attempt++) {
-      const next = await facade.readApprovedEvents(state.payload.connectionId, read.payload.cursor, 1);
+      const next = await facade.readApprovedEvents(state.payload.connectionId, streaming.cursor, 1);
       if (next.kind !== "gemini_events" || next.payload.state !== "ok") {
         throw new Error("Expected a live Gemini event cursor");
       }
@@ -459,7 +475,7 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
       await setTimeout(25);
     }
     assert.ok(observed, "Gemini timeline mutation did not reach the owner buffer");
-    assert.equal(observed.cursor.sequence, read.payload.cursor.sequence + 1);
+    assert.equal(observed.cursor.sequence, streaming.cursor.sequence + 1);
     assert.deepEqual(observed.events[0]?.payload.messages, [
       { direction: "outgoing", text: "Synthetic question", identityQuality: "uncertain", generationState: "unknown" },
       { direction: "incoming", text: "Later synthetic answer", identityQuality: "uncertain", generationState: "unknown" }
