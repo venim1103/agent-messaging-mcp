@@ -2,7 +2,9 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { closeSync, constants, lstatSync, openSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { PendingConnectionRequests, type FixtureTarget } from "./pending-connections.js";
+import * as z from "zod/v4";
+import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
+import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests, type FixtureTarget } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 60_000;
 export const FIXTURE_REVIEW_APPROVAL_TTL_MS = 30_000;
@@ -11,6 +13,12 @@ export const MAX_PREPARED_MESSAGE_BYTES = 4_000;
 export const MAX_ACTIVE_PREPARED_MESSAGES = 100;
 export const MAX_RECORDED_PREPARED_MESSAGES = 10_000;
 export const MAX_PREPARED_REVIEWS = 8;
+const fixtureObservationSchema = z.strictObject({
+  kind: z.literal("fixture_snapshot"),
+  messages: z.array(z.strictObject({ id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+    direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
+  })).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
+});
 
 export function openPrivateOperationDatabase(directory: string): DatabaseSync {
   const owner = process.getuid?.();
@@ -43,6 +51,16 @@ type PreparedMessage = Readonly<{
 type PreparedReview = Readonly<Pick<PreparedMessage, "operationId" | "expiresAt" | "preview"> & {
   reviewId: string
 }>;
+type FixtureDispatchBaseline = Readonly<{
+  capturedAt: number;
+  cursor: Readonly<{ epoch: string; sequence: number }>;
+  messageIds: ReadonlyArray<string>;
+}>;
+type FixtureDispatchStatus = Readonly<{
+  operationId: string; state: "dispatch_uncertain"; startedAt: number
+}> | Readonly<{
+  operationId: string; state: "observed_in_ui"; startedAt: number; observedAt: number; messageId: string
+}>;
 
 export class PreparedMessageOperations {
   private readonly owners = new Map<symbol, string>();
@@ -52,6 +70,8 @@ export class PreparedMessageOperations {
   private readonly reviewTokens = new Map<string, string>();
   private readonly approvals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
   private readonly recoveryReceipts = new Map<string, string>();
+  private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
+  private readonly ambiguousEvidence = new Set<string>();
   private readonly digestKey = randomBytes(32);
 
   constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync) {
@@ -76,7 +96,26 @@ export class PreparedMessageOperations {
       started_at INTEGER NOT NULL,
       state TEXT NOT NULL CHECK (state IN ('dispatching', 'unknown'))
     )`);
+    database.exec(`CREATE TABLE IF NOT EXISTS message_dispatch_evidence (
+      operation_id TEXT PRIMARY KEY REFERENCES message_dispatch_attempts(operation_id) ON DELETE RESTRICT,
+      observed_at INTEGER NOT NULL,
+      message_id TEXT NOT NULL CHECK (length(message_id) BETWEEN 1 AND 128)
+    )`);
     database.exec("UPDATE message_dispatch_attempts SET state = 'unknown' WHERE state = 'dispatching'");
+  }
+
+  private dispatchStatus(operationId: string): FixtureDispatchStatus | null {
+    const record = this.database.prepare(`SELECT attempt.started_at, evidence.observed_at, evidence.message_id
+      FROM message_dispatch_attempts AS attempt
+      LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+      WHERE attempt.operation_id = ?`).get(operationId) as {
+        started_at: number; observed_at: number | null; message_id: string | null
+      } | undefined;
+    if (!record) return null;
+    return record.observed_at !== null && record.message_id !== null
+      ? { operationId, state: "observed_in_ui", startedAt: record.started_at,
+        observedAt: record.observed_at, messageId: record.message_id }
+      : { operationId, state: "dispatch_uncertain", startedAt: record.started_at };
   }
 
   private digest(value: string): string {
@@ -88,6 +127,8 @@ export class PreparedMessageOperations {
     this.reviewTokens.delete(operationId);
     this.approvals.delete(operationId);
     this.recoveryReceipts.delete(operationId);
+    this.dispatchBaselines.delete(operationId);
+    this.ambiguousEvidence.delete(operationId);
   }
 
   private discardExpired(now: number): void {
@@ -244,7 +285,26 @@ export class PreparedMessageOperations {
     if (!record || !/^[0-9a-f]{64}$/.test(record.token_digest)) return { state: "unknown" as const };
     const supplied = createHash("sha256").update(JSON.stringify([operationId, recoveryToken])).digest();
     if (!timingSafeEqual(supplied, Buffer.from(record.token_digest, "hex"))) return { state: "unknown" as const };
-    return { operationId, state: "dispatch_uncertain" as const, startedAt: record.started_at };
+    return this.dispatchStatus(operationId) ?? { state: "unknown" as const };
+  }
+
+  recordFixtureDispatchBaseline(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.contents.get(operationId);
+    const approval = this.approvals.get(operationId);
+    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    if (!operation || operation.owner !== owner || !approval || approval.expiresAt <= now || !live
+      || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
+      || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId
+      || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?").get(operationId)) {
+      throw new Error("APPROVAL_REQUIRED");
+    }
+    const snapshot = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+    if (!snapshot || snapshot === "not_ready" || snapshot.capturedAt > now) throw new Error("OBSERVATION_UNAVAILABLE");
+    const baseline = Object.freeze({ capturedAt: snapshot.capturedAt, cursor: snapshot.cursor,
+      messageIds: Object.freeze(snapshot.messages.map((message) => message.id)) });
+    this.dispatchBaselines.set(operationId, baseline);
+    return Object.freeze({ operationId, capturedAt: baseline.capturedAt, cursor: baseline.cursor });
   }
 
   recordFixtureDispatchStart(owner: symbol, operationId: string, now = Date.now()) {
@@ -266,9 +326,19 @@ export class PreparedMessageOperations {
     if (!this.database.prepare("SELECT 1 FROM message_operation_recovery WHERE operation_id = ?").get(operationId)) {
       throw new Error("RECOVERY_REQUIRED");
     }
+    const baseline = this.dispatchBaselines.get(operationId);
+    if (baseline) {
+      const current = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+      if (!current || current === "not_ready" || current.capturedAt > now
+        || current.cursor.epoch !== baseline.cursor.epoch || current.cursor.sequence !== baseline.cursor.sequence) {
+        throw new Error("OBSERVATION_UNAVAILABLE");
+      }
+    }
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      if (this.database.prepare("SELECT 1 FROM message_dispatch_attempts LIMIT 1").get()) {
+      if (this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
+        LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+        WHERE evidence.operation_id IS NULL LIMIT 1`).get()) {
         throw new Error("DISPATCH_UNCERTAIN");
       }
       this.database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, state)
@@ -283,6 +353,46 @@ export class PreparedMessageOperations {
     return Object.freeze({ operationId, state: "dispatching" as const, startedAt: now });
   }
 
+  reconcileFixtureObservation(owner: symbol, operationId: string, now = Date.now()) {
+    const status = this.getOperation(owner, operationId, now);
+    if (status.state !== "dispatch_uncertain") return status;
+    const operation = this.contents.get(operationId);
+    const baseline = this.dispatchBaselines.get(operationId);
+    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    if (!operation || operation.owner !== owner || !baseline || !live || this.ambiguousEvidence.has(operationId)
+      || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
+      || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId) return status;
+    const snapshot = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+    if (!snapshot || snapshot === "not_ready" || snapshot.capturedAt < status.startedAt || snapshot.capturedAt > now
+      || snapshot.cursor.epoch !== baseline.cursor.epoch || snapshot.cursor.sequence <= baseline.cursor.sequence) return status;
+    const events = this.requests.readFixtureEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
+    if (!events || events === "not_ready" || events.state !== "ok"
+      || events.cursor.sequence !== snapshot.cursor.sequence) return status;
+    const known = new Set(baseline.messageIds);
+    const matchingIds = new Set<string>();
+    for (const event of events.events) {
+      const observation = fixtureObservationSchema.safeParse(event.payload);
+      if (!observation.success) return status;
+      for (const message of observation.data.messages) {
+        if (!known.has(message.id) && message.direction === "outgoing" && message.text === operation.text) {
+          matchingIds.add(message.id);
+        }
+      }
+    }
+    if (matchingIds.size > 1) {
+      this.ambiguousEvidence.add(operationId);
+      return status;
+    }
+    const matches = snapshot.messages.filter((message) => !known.has(message.id)
+      && message.direction === "outgoing" && message.text === operation.text);
+    if (matches.length > 1) this.ambiguousEvidence.add(operationId);
+    if (matches.length !== 1 || !matches[0]) return status;
+    this.database.prepare(`INSERT INTO message_dispatch_evidence (operation_id, observed_at, message_id)
+      VALUES (?, ?, ?) ON CONFLICT (operation_id) DO NOTHING`)
+      .run(operationId, snapshot.capturedAt, matches[0].id);
+    return this.dispatchStatus(operationId) ?? status;
+  }
+
   getOperation(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const ownerId = this.owners.get(owner);
@@ -292,9 +402,8 @@ export class PreparedMessageOperations {
         owner_id: string; connection_id: string; expires_at: number
       } | undefined;
     if (!record || record.owner_id !== ownerId) return { state: "unknown" as const };
-    const attempt = this.database.prepare(`SELECT started_at, state FROM message_dispatch_attempts
-      WHERE operation_id = ?`).get(operationId) as { started_at: number; state: string } | undefined;
-    if (attempt) return { operationId, state: "dispatch_uncertain" as const, startedAt: attempt.started_at };
+    const dispatch = this.dispatchStatus(operationId);
+    if (dispatch) return dispatch;
     if (record.expires_at <= now) return { operationId, state: "expired" as const };
     if (!this.requests.getApprovedTarget(owner, record.connection_id, now)) {
       return { operationId, state: "stale" as const };

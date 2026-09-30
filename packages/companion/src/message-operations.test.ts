@@ -293,15 +293,22 @@ test("abrupt process death leaves before-start safe and after-start uncertain", 
     const key = "a66b3997-9d43-4554-8399-267d1fe9f75c";
     const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic crash probe", key, 2001);
     const receipt = ledger.createRecoveryReceipt(owner, prepared.operationId, 2002);
-    if (process.argv[2] === "after") {
+    if (process.argv[2] !== "before") {
       const [review] = ledger.listFixtureReviews(target, 2002).reviews;
       ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+      requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Old row" }], 2003);
+      ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2003);
       ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004);
+      if (process.argv[2] === "observed") {
+        requests.publishFixtureSnapshot(target,
+          [{ id: "fixture-3", direction: "outgoing", text: "Synthetic crash probe" }], 2005);
+        ledger.reconcileFixtureObservation(owner, prepared.operationId, 2006);
+      }
     }
     process.stdout.write(JSON.stringify({ ...receipt, key }) + "\\n",
       () => process.kill(process.pid, "SIGKILL"));
   `;
-  for (const phase of ["before", "after"]) {
+  for (const phase of ["before", "after", "observed"]) {
     const home = await mkdtemp(join(tmpdir(), `agent-messaging-crash-${phase}-`));
     try {
       const child = spawnSync(process.execPath, ["--input-type=module", "-e", childScript, home, phase], {
@@ -314,10 +321,11 @@ test("abrupt process death leaves before-start safe and after-start uncertain", 
       const database = openPrivateOperationDatabase(home);
       try {
         const recovered = new PreparedMessageOperations(new PendingConnectionRequests(), database);
-        assert.deepEqual(recovered.recoverOperationStatus(operationId, recoveryToken), phase === "after"
-          ? { operationId, state: "dispatch_uncertain", startedAt: 2004 } : { state: "unknown" });
+        assert.deepEqual(recovered.recoverOperationStatus(operationId, recoveryToken), phase === "observed"
+          ? { operationId, state: "observed_in_ui", startedAt: 2004, observedAt: 2005, messageId: "fixture-3" }
+          : phase === "after" ? { operationId, state: "dispatch_uncertain", startedAt: 2004 } : { state: "unknown" });
         assert.deepEqual(database.prepare("SELECT operation_id, state FROM message_dispatch_attempts").all()
-          .map((row) => ({ ...row })), phase === "after" ? [{ operation_id: operationId, state: "unknown" }] : []);
+          .map((row) => ({ ...row })), phase !== "before" ? [{ operation_id: operationId, state: "unknown" }] : []);
         const owner = Symbol("fresh owner");
         const requests = new PendingConnectionRequests();
         const target = { origin: "http://127.0.0.1:8787" as const,
@@ -366,5 +374,163 @@ test("one unresolved fixture dispatch intent blocks a second approved operation"
     assert.equal(ledger.getOperation(owner, second.operationId, 2005).state, "approved");
   } finally {
     database.close();
+  }
+});
+
+test("fixture dispatch baselines require a fresh owned snapshot and trusted approval", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("approved fixture writer");
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const ledger = new PreparedMessageOperations(requests, database);
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic approved text",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    assert.throws(() => ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2002), /APPROVAL_REQUIRED/);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    assert.throws(() => ledger.recordFixtureDispatchBaseline(Symbol("other owner"), prepared.operationId, 2004),
+      /APPROVAL_REQUIRED/);
+    assert.throws(() => ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004),
+      /OBSERVATION_UNAVAILABLE/);
+    requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: prepared.preview.text }], 2004);
+    const snapshot = requests.getFixtureSnapshot(owner, grant.connectionId, 2004);
+    if (!snapshot || snapshot === "not_ready") throw new Error("Expected a baseline snapshot");
+    assert.deepEqual(ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2005), {
+      operationId: prepared.operationId, capturedAt: snapshot.capturedAt, cursor: snapshot.cursor
+    });
+    assert.throws(() => ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2003),
+      /OBSERVATION_UNAVAILABLE/);
+    requests.revokeChangedTab(3, null);
+    assert.throws(() => ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2006), /APPROVAL_REQUIRED/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("only one new exact outgoing fixture row records durable UI evidence", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-evidence-"));
+  let database = openPrivateOperationDatabase(home);
+  try {
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("fixture writer");
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const ledger = new PreparedMessageOperations(requests, database);
+    const text = "Synthetic evidence\nexact approved text";
+    const key = "b66b3997-9d43-4554-8399-267d1fe9f75c";
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, text, key, 2001);
+    const receipt = ledger.createRecoveryReceipt(owner, prepared.operationId, 2001);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    const before = [{ id: "fixture-2", direction: "outgoing" as const, text }];
+    requests.publishFixtureSnapshot(target, before, 2003);
+    ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
+    ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005);
+    assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2006).state, "dispatch_uncertain");
+    assert.deepEqual(ledger.reconcileFixtureObservation(Symbol("other owner"), prepared.operationId, 2006),
+      { state: "unknown" });
+    requests.publishFixtureSnapshot(target, [...before, { id: "fixture-3", direction: "incoming", text }], 2006);
+    assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2007).state, "dispatch_uncertain");
+    requests.publishFixtureSnapshot(target, [...before, { id: "fixture-3", direction: "outgoing", text: `${text}!` }], 2007);
+    assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2008).state, "dispatch_uncertain");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 0);
+    requests.publishFixtureSnapshot(target, [...before, { id: "fixture-3", direction: "outgoing", text }], 2009);
+    const observed = ledger.reconcileFixtureObservation(owner, prepared.operationId, 2010);
+    assert.deepEqual(observed, { operationId: prepared.operationId, state: "observed_in_ui",
+      startedAt: 2005, observedAt: 2009, messageId: "fixture-3" });
+    assert.deepEqual(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2011), observed);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 1);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2011), /DISPATCH_UNCERTAIN/);
+    assert.throws(() => ledger.prepare(owner, grant.connectionId, 1, text, key, 2011), /DISPATCH_UNCERTAIN/);
+    const next = ledger.prepare(owner, grant.connectionId, 1, "Another synthetic operation",
+      "c66b3997-9d43-4554-8399-267d1fe9f75c", 2011);
+    ledger.createRecoveryReceipt(owner, next.operationId, 2011);
+    const [nextReview] = ledger.listFixtureReviews(target, 2012).reviews;
+    assert.ok(nextReview);
+    ledger.approveFixtureReview(target, next.operationId, nextReview.reviewId, 2013);
+    ledger.recordFixtureDispatchBaseline(owner, next.operationId, 2013);
+    assert.equal(ledger.recordFixtureDispatchStart(owner, next.operationId, 2014).state, "dispatching");
+    assert.equal((await readFile(join(home, "operations.sqlite"))).includes(Buffer.from(text)), false);
+    assert.equal((await readFile(join(home, "operations.sqlite"))).includes(Buffer.from(receipt.recoveryToken)), false);
+    database.close();
+    database = openPrivateOperationDatabase(home);
+    const restarted = new PreparedMessageOperations(new PendingConnectionRequests(), database);
+    assert.deepEqual(restarted.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), observed);
+    assert.deepEqual(restarted.getOperation(Symbol("new owner"), prepared.operationId), { state: "unknown" });
+  } finally {
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous rows, observation gaps, and revoked fixture grants stay uncertain", () => {
+  for (const failure of ["ambiguity", "ambiguity_history", "historical_matches", "epoch", "overflow", "revoked",
+    "no_baseline", "changed_baseline", "old_baseline", "trimmed_text"]) {
+    const database = new DatabaseSync(":memory:");
+    try {
+      const requests = new PendingConnectionRequests();
+      const owner = Symbol("fixture writer");
+      const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 3, documentId: "CHROME-doc_opaque-42" };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approve(pending.requestId, target, 2000)!;
+      const ledger = new PreparedMessageOperations(requests, database);
+      const text = failure === "trimmed_text" ? " Synthetic matched row " : "Synthetic matched row";
+      const prepared = ledger.prepare(owner, grant.connectionId, 1, text,
+        "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+      ledger.createRecoveryReceipt(owner, prepared.operationId, 2001);
+      const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+      assert.ok(review);
+      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+      requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Before" }], 2000);
+      if (failure !== "no_baseline") ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
+      if (failure === "changed_baseline") {
+        requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Changed" }], 2005);
+        assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2006), /OBSERVATION_UNAVAILABLE/);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+        continue;
+      }
+      if (failure === "old_baseline") {
+        assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 32001), /OBSERVATION_UNAVAILABLE/);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+        continue;
+      }
+      ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005);
+      if (failure === "epoch") requests.markFixtureObservationGap(target, 2006);
+      if (failure === "overflow") {
+        for (let index = 0; index < 33; index++) {
+          requests.publishFixtureSnapshot(target,
+            [{ id: "fixture-2", direction: "outgoing", text: `Revision ${index}` }], 2006);
+        }
+      }
+      if (failure === "ambiguity" || failure === "ambiguity_history") {
+        requests.publishFixtureSnapshot(target, [{ id: "fixture-3", direction: "outgoing", text },
+          { id: "fixture-4", direction: "outgoing", text }], 2006);
+      }
+      if (failure === "historical_matches") {
+        requests.publishFixtureSnapshot(target, [{ id: "fixture-4", direction: "outgoing", text }], 2006);
+      }
+      if (failure === "ambiguity") {
+        assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2007).state,
+          "dispatch_uncertain", failure);
+      }
+      requests.publishFixtureSnapshot(target, [{ id: "fixture-3", direction: "outgoing",
+        text: failure === "trimmed_text" ? text.trim() : text }], 2008);
+      if (failure === "revoked") requests.revokeChangedTab(3, null);
+      assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2009).state,
+        "dispatch_uncertain", failure);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 0, failure);
+    } finally {
+      database.close();
+    }
   }
 });

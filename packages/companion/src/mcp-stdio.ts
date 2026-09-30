@@ -137,7 +137,7 @@ server.registerTool("chat_prepare_message", {
 });
 
 server.registerTool("chat_get_operation", {
-  description: "Read an owned fixture operation state. An optional recoveryToken from preparation recovers only dispatch_uncertain status after restart, not browser access, approval, or permission to resend. No commit tool exists.",
+  description: "Read fixture operation status. A recoveryToken can recover dispatch_uncertain or observed_in_ui metadata after restart, not browser access, approval, or resend permission. UI evidence is not service acceptance or delivery. No commit tool exists.",
   inputSchema: z.object({ operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   annotations: { readOnlyHint: true }
 }, async ({ operationId, recoveryToken }) => {

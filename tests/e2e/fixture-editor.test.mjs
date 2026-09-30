@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
 import { captureFixtureSnapshot, observeFixtureMessages } from "../../packages/extension/lib/fixture-observation.ts";
+import { PreparedMessageOperations } from "../../packages/companion/dist/message-operations.js";
+import { PendingConnectionRequests } from "../../packages/companion/dist/pending-connections.js";
 import { createFixtureServer } from "../fixtures/server.mjs";
 
 test("browser input reaches the rich editor without accepting synthetic input", async () => {
@@ -92,6 +95,63 @@ test("fixture observation captures bounded rows and notices changes without read
     await page.goto("about:blank");
     assert.equal(await page.evaluate(captureFixtureSnapshot), null);
   } finally {
+    await browser.close();
+  }
+});
+
+test("fixture browser evidence distinguishes a new outgoing row from existing identical text", async () => {
+  const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  const database = new DatabaseSync(":memory:");
+  try {
+    const page = await browser.newPage();
+    await page.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
+      status: 200, contentType: "text/html; charset=utf-8", body: html
+    }));
+    await page.goto("http://127.0.0.1:8787/");
+    const text = "Synthetic fixture evidence\nExact multiline text";
+    const editor = page.getByRole("textbox", { name: "Message" });
+    const send = page.getByRole("button", { name: "Send" });
+    await editor.fill(text);
+    await send.click();
+    const before = await page.evaluate(captureFixtureSnapshot);
+    assert.ok(before);
+    assert.equal(before.messages[2].id, "fixture-3");
+    assert.equal(before.messages[2].text, text);
+
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("synthetic fixture owner");
+    const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+      tabId: 3, documentId: "CHROME-doc_synthetic-fixture" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000);
+    assert.ok(grant);
+    const ledger = new PreparedMessageOperations(requests, database);
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, text,
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    ledger.createRecoveryReceipt(owner, prepared.operationId, 2002);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    requests.publishFixtureSnapshot(target, before.messages, 2003);
+    ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
+    ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005);
+    assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2006).state, "dispatch_uncertain");
+
+    await editor.fill(text);
+    await send.click();
+    const after = await page.evaluate(captureFixtureSnapshot);
+    assert.ok(after);
+    assert.equal(after.messages.length, 4);
+    requests.publishFixtureSnapshot(target, after.messages, 2010);
+    assert.deepEqual(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2011), {
+      operationId: prepared.operationId, state: "observed_in_ui", startedAt: 2005,
+      observedAt: 2010, messageId: "fixture-4"
+    });
+    assert.equal(await editor.inputValue(), "");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get().count, 1);
+  } finally {
+    database.close();
     await browser.close();
   }
 });

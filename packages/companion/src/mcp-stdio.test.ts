@@ -381,7 +381,7 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
   }
 });
 
-test("a recovery receipt reveals only uncertain status to a fresh MCP process", { timeout: 8000 }, async () => {
+test("a recovery receipt reveals only dispatch metadata to a fresh MCP process", { timeout: 8000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-receipt-"));
   const parent = join(home, ".config/agent-messaging-mcp");
   const client = new Client({ name: "recovery-client", version: "0.0.1" });
@@ -405,7 +405,21 @@ test("a recovery receipt reveals only uncertain status to a fresh MCP process", 
     const [review] = ledger.listFixtureReviews(target).reviews;
     assert.ok(review);
     ledger.approveFixtureReview(target, prepared.operationId, review.reviewId);
+    requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Old synthetic row" }]);
+    ledger.recordFixtureDispatchBaseline(owner, prepared.operationId);
     const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId);
+    requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Old synthetic row" },
+      { id: "fixture-3", direction: "outgoing", text: prepared.preview.text }]);
+    const observed = ledger.reconcileFixtureObservation(owner, prepared.operationId);
+    assert.equal(observed.state, "observed_in_ui");
+    const unresolved = ledger.prepare(owner, grant.connectionId, 1, "Other synthetic unresolved operation",
+      "c66b3997-9d43-4554-8399-267d1fe9f75c");
+    const unresolvedReceipt = ledger.createRecoveryReceipt(owner, unresolved.operationId);
+    const [nextReview] = ledger.listFixtureReviews(target).reviews;
+    assert.ok(nextReview);
+    ledger.approveFixtureReview(target, unresolved.operationId, nextReview.reviewId);
+    ledger.recordFixtureDispatchBaseline(owner, unresolved.operationId);
+    const unresolvedStart = ledger.recordFixtureDispatchStart(owner, unresolved.operationId);
     database.close();
     database = undefined;
 
@@ -433,8 +447,13 @@ test("a recovery receipt reveals only uncertain status to a fresh MCP process", 
       ...status.arguments, recoveryToken: receipt.recoveryToken
     } });
     assert.equal(recovered.isError, undefined);
-    assert.deepEqual(recovered.structuredContent, { operationId: prepared.operationId,
-      state: "dispatch_uncertain", startedAt: started.startedAt });
+    assert.deepEqual(recovered.structuredContent, observed);
+    assert.equal((recovered.structuredContent as { startedAt: number }).startedAt, started.startedAt);
+    const uncertain = await client.callTool({ name: "chat_get_operation", arguments: {
+      operationId: unresolved.operationId, recoveryToken: unresolvedReceipt.recoveryToken
+    } });
+    assert.deepEqual(uncertain.structuredContent, { operationId: unresolved.operationId,
+      state: "dispatch_uncertain", startedAt: unresolvedStart.startedAt });
     assert.deepEqual((await client.callTool(status)).structuredContent, { state: "unknown" });
     const read = await client.callTool({ name: "chat_read_messages", arguments: { connectionId: grant.connectionId } });
     assert.equal(read.isError, true);

@@ -156,7 +156,10 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ operationId: z.uuid(), state: z.literal("approved"),
         expiresAt: z.number().int().safe(), approvalExpiresAt: z.number().int().safe() }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("dispatch_uncertain"),
-        startedAt: z.number().int().safe() })
+        startedAt: z.number().int().safe() }),
+      z.strictObject({ operationId: z.uuid(), state: z.literal("observed_in_ui"),
+        startedAt: z.number().int().safe(), observedAt: z.number().int().safe(),
+        messageId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/) })
     ])
   }),
   z.strictObject({
