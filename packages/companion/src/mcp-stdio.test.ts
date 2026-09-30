@@ -23,7 +23,7 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
       "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_read_messages",
-      "chat_wait_for_events", "chat_prepare_message", "chat_disconnect"
+      "chat_wait_for_events", "chat_prepare_message", "chat_get_operation", "chat_disconnect"
     ]);
     assert.ok(tools.every((tool) => /^[a-z0-9_-]+$/.test(tool.name)));
 
@@ -114,6 +114,25 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal(preview.state, "awaiting_approval");
     assert.equal(preview.connectionId, connectionId);
     assert.deepEqual(preview.preview, { target: "fixture-alpha", text: draft.text });
+    assert.deepEqual((await clientTwo.callTool({ name: "chat_get_operation", arguments: {
+      operationId: preview.operationId
+    } })).structuredContent, { state: "unknown" });
+    assert.deepEqual((await clientOne.callTool({ name: "chat_get_operation", arguments: {
+      operationId: preview.operationId
+    } })).structuredContent, { operationId: preview.operationId,
+      state: "awaiting_approval", expiresAt: preview.expiresAt });
+    const reviewed = await relay.listFixturePreparedReviews(target);
+    if (reviewed.kind !== "fixture_prepared_reviews") throw new Error("Expected test fixture review");
+    const reviewId = reviewed.payload.reviews[0]?.reviewId;
+    assert.ok(reviewId);
+    assert.equal((await relay.approveFixtureReview(target, preview.operationId, reviewId)).kind,
+      "fixture_review_approved");
+    const approvedState = (await clientOne.callTool({ name: "chat_get_operation", arguments: {
+      operationId: preview.operationId
+    } })).structuredContent as { operationId: string; state: string; approvalExpiresAt: number };
+    assert.equal(approvedState.state, "approved");
+    assert.equal(approvedState.operationId, preview.operationId);
+    assert.ok(approvedState.approvalExpiresAt <= preview.expiresAt);
     assert.deepEqual((await clientOne.callTool({ name: "chat_prepare_message", arguments: draft })).structuredContent,
       preview);
     const conflict = await clientOne.callTool({ name: "chat_prepare_message", arguments: {
@@ -197,6 +216,9 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal(expired.isError, true);
     assert.deepEqual(expired.structuredContent, { code: "CURSOR_EXPIRED", resnapshot: true });
     assert.deepEqual((await relay.revokeFixture(3, null)).payload, { count: 1 });
+    assert.deepEqual((await clientOne.callTool({ name: "chat_get_operation", arguments: {
+      operationId: preview.operationId
+    } })).structuredContent, { operationId: preview.operationId, state: "stale" });
     assert.equal((await clientOne.callTool({ name: "chat_prepare_message", arguments: draft })).isError, true);
     const staleRead = await clientOne.callTool({ name: "chat_read_messages", arguments: { connectionId } });
     assert.equal(staleRead.isError, true);

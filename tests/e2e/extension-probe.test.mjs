@@ -386,7 +386,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
   }
 });
 
-test("trusted fixture popup reviews prepared text without editing the page", { timeout: 20000 }, async () => {
+test("trusted fixture popup approves prepared text without editing the page", { timeout: 20000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-review-test-"));
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
@@ -400,6 +400,7 @@ test("trusted fixture popup reviews prepared text without editing the page", { t
   let broker;
   let brokerExit;
   let facade;
+  let relay;
   try {
     context = await chromium.launchPersistentContext(profile, {
       executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
@@ -467,10 +468,24 @@ test("trusted fixture popup reviews prepared text without editing the page", { t
     await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
     assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
     assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
-    assert.equal(await popup.locator("#fixture-reviews button").count(), 0);
+    assert.equal(await popup.getByRole("button", { name: "Approve draft (no send)" }).count(), 1);
+    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+    await popup.getByText(`Approved fixture draft ${prepared.payload.operationId}. No message was sent.`)
+      .waitFor({ timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-reviews pre").count(), 0);
+    relay = await connectBroker("relay", brokerDirectory);
+    const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+      tabId: selected.tabId, documentId: selected.documentId };
+    assert.deepEqual((await relay.listFixturePreparedReviews(target)).payload, { reviews: [], hasMore: false });
     assert.equal(await fixture.locator("#message").inputValue(), "");
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
 
+    const second = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, "Second fixture draft",
+      "c66b3997-9d43-4554-8399-267d1fe9f75c");
+    assert.equal(second.kind, "message_prepared");
+    await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
+    await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), "Second fixture draft");
     await fixture.evaluate(() => document.querySelector("main").dataset.conversationId = "fixture-beta");
     await popup.locator("#fixture-review-result").waitFor({ state: "hidden", timeout: 4000 });
     assert.equal(await popup.locator("#fixture-review-result").isHidden(), true);
@@ -481,6 +496,7 @@ test("trusted fixture popup reviews prepared text without editing the page", { t
     assert.equal(afterSwitch.ok, false);
   } finally {
     facade?.close();
+    relay?.close();
     broker?.kill("SIGTERM");
     if (brokerExit) await brokerExit;
     await context?.close();

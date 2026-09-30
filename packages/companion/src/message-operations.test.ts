@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
   MAX_PREPARED_REVIEWS, MAX_RECORDED_PREPARED_MESSAGES, openPrivateOperationDatabase, PreparedMessageOperations,
-  PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS }
+  PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS, FIXTURE_REVIEW_APPROVAL_TTL_MS }
   from "./message-operations.js";
 import { PendingConnectionRequests } from "./pending-connections.js";
 
@@ -45,8 +45,12 @@ test("fixture preparation persists no text and cannot dispatch without a trusted
     assert.equal(prepared.expiresAt, 2001 + PREPARED_MESSAGE_TTL_MS);
     assert.deepEqual(ledger.listFixtureReviews({ ...target, documentId: "other-document" }, 2002),
       { reviews: [], hasMore: false });
-    assert.deepEqual(ledger.listFixtureReviews(target, 2002), { reviews: [{ operationId: prepared.operationId,
-      expiresAt: prepared.expiresAt, preview: prepared.preview }], hasMore: false });
+    const firstReview = ledger.listFixtureReviews(target, 2002);
+    assert.equal(firstReview.hasMore, false);
+    assert.deepEqual(firstReview.reviews.map(({ reviewId, ...preview }) => preview), [{
+      operationId: prepared.operationId, expiresAt: prepared.expiresAt, preview: prepared.preview
+    }]);
+    assert.match(firstReview.reviews[0]!.reviewId, /^[0-9a-f-]{36}$/);
     assert.deepEqual(ledger.prepare(owner, grant.connectionId, 1, text, key, 2002), prepared);
     assert.throws(() => ledger.prepare(owner, grant.connectionId, 1, `${text}!`, key, 2002), /IDEMPOTENCY_CONFLICT/);
     assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, 1);
@@ -82,6 +86,63 @@ test("fixture preparation persists no text and cannot dispatch without a trusted
   } finally {
     database.close();
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("fixture approval consumes one exact-document review token and never dispatches", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const requests = new PendingConnectionRequests();
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("fixture owner");
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic approved preview",
+      "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    assert.deepEqual(ledger.getOperation(Symbol("other owner"), prepared.operationId, 2002), { state: "unknown" });
+    assert.deepEqual(ledger.getOperation(owner, prepared.operationId, 2002), { operationId: prepared.operationId,
+      state: "awaiting_approval", expiresAt: prepared.expiresAt });
+    assert.throws(() => ledger.approveFixtureReview(target, prepared.operationId,
+      undefined as unknown as string, 2002), /REVIEW_UNAVAILABLE/);
+    const [oldReview] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(oldReview);
+    assert.throws(() => ledger.approveFixtureReview(target, prepared.operationId,
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2003), /REVIEW_UNAVAILABLE/);
+    assert.throws(() => ledger.approveFixtureReview({ ...target, documentId: "other-document" },
+      prepared.operationId, oldReview.reviewId, 2003), /REVIEW_UNAVAILABLE/);
+    const [review] = ledger.listFixtureReviews(target, 2004).reviews;
+    assert.ok(review);
+    assert.throws(() => ledger.approveFixtureReview(target, prepared.operationId,
+      oldReview.reviewId, 2005), /REVIEW_UNAVAILABLE/);
+    const approved = ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2005);
+    assert.deepEqual(approved, { operationId: prepared.operationId, state: "approved", approvedAt: 2005,
+      expiresAt: 2005 + FIXTURE_REVIEW_APPROVAL_TTL_MS });
+    assert.deepEqual(ledger.getOperation(owner, prepared.operationId, 2006), { operationId: prepared.operationId,
+      state: "approved", expiresAt: prepared.expiresAt, approvalExpiresAt: approved.expiresAt });
+    assert.deepEqual(ledger.listFixtureReviews(target, 2006), { reviews: [], hasMore: false });
+    assert.throws(() => ledger.approveFixtureReview(target, prepared.operationId,
+      review.reviewId, 2006), /REVIEW_UNAVAILABLE/);
+    assert.deepEqual(ledger.getOperation(owner, prepared.operationId, approved.expiresAt), {
+      operationId: prepared.operationId, state: "awaiting_approval", expiresAt: prepared.expiresAt
+    });
+    const [afterExpiry] = ledger.listFixtureReviews(target, approved.expiresAt).reviews;
+    assert.ok(afterExpiry);
+    requests.revokeChangedTab(3, null);
+    assert.deepEqual(ledger.getOperation(owner, prepared.operationId, approved.expiresAt + 1), {
+      operationId: prepared.operationId, state: "stale"
+    });
+    assert.throws(() => ledger.approveFixtureReview(target, prepared.operationId,
+      afterExpiry.reviewId, approved.expiresAt + 1), /REVIEW_UNAVAILABLE/);
+    assert.deepEqual(ledger.listFixtureReviews(target, approved.expiresAt + 1), { reviews: [], hasMore: false });
+    assert.deepEqual(ledger.getOperation(owner, prepared.operationId, prepared.expiresAt), {
+      operationId: prepared.operationId, state: "expired"
+    });
+    ledger.disconnect(owner);
+    assert.deepEqual(ledger.getOperation(owner, prepared.operationId, prepared.expiresAt), { state: "unknown" });
+  } finally {
+    database.close();
   }
 });
 

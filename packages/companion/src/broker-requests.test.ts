@@ -63,12 +63,25 @@ test("only an owning facade prepares immutable fixture text without approval or 
     if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture text");
     assert.equal(prepared.payload.state, "awaiting_approval");
     assert.equal(prepared.payload.preview.text, owned.payload.text);
+    const status = { ...envelope, kind: "get_prepared_operation", payload: {
+      operationId: prepared.payload.operationId
+    } };
+    assert.deepEqual(handleBrokerRequest(status, "relay", stranger, requests, 2002, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(status, "facade", stranger, requests, 2002, operations).payload,
+      { state: "unknown" });
+    assert.deepEqual(handleBrokerRequest(status, "facade", owner, requests, 2002, operations).payload,
+      { operationId: prepared.payload.operationId, state: "awaiting_approval",
+        expiresAt: prepared.payload.expiresAt });
     const list = { ...envelope, kind: "list_fixture_prepared_reviews", payload: { target } };
     assert.deepEqual(handleBrokerRequest(list, "facade", owner, requests, 2002, operations).payload,
       { code: "PERMISSION_DENIED" });
-    assert.deepEqual(handleBrokerRequest(list, "relay", stranger, requests, 2002, operations).payload,
-      { reviews: [{ operationId: prepared.payload.operationId, expiresAt: prepared.payload.expiresAt,
-        preview: prepared.payload.preview }], hasMore: false });
+    const listed = handleBrokerRequest(list, "relay", stranger, requests, 2002, operations);
+    if (listed.kind !== "fixture_prepared_reviews") throw new Error("Expected fixture review listing");
+    const reviewId = listed.payload.reviews[0]?.reviewId;
+    assert.ok(reviewId);
+    assert.deepEqual(listed.payload, { reviews: [{ operationId: prepared.payload.operationId, reviewId,
+      expiresAt: prepared.payload.expiresAt, preview: prepared.payload.preview }], hasMore: false });
     assert.deepEqual(handleBrokerRequest({ ...list, payload: { target: { ...target,
       documentId: "other-document" } } }, "relay", stranger, requests, 2002, operations).payload,
     { reviews: [], hasMore: false });
@@ -78,7 +91,24 @@ test("only an owning facade prepares immutable fixture text without approval or 
       "facade", owner, requests, 2002, operations).payload, { code: "IDEMPOTENCY_CONFLICT" });
     assert.throws(() => handleBrokerRequest({ ...owned, payload: { ...owned.payload, approved: true } },
       "facade", owner, requests, 2002, operations));
+    const approveReview = { ...envelope, kind: "approve_fixture_review", payload: {
+      target, operationId: prepared.payload.operationId, reviewId
+    } };
+    assert.deepEqual(handleBrokerRequest(approveReview, "facade", owner, requests, 2002, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest({ ...approveReview, payload: { ...approveReview.payload,
+      target: { ...target, documentId: "other-document" } } }, "relay", stranger, requests, 2002, operations).payload,
+    { code: "REVIEW_UNAVAILABLE" });
+    assert.equal(handleBrokerRequest(approveReview, "relay", stranger, requests, 2002, operations).kind,
+      "fixture_review_approved");
+    assert.deepEqual(handleBrokerRequest(status, "facade", owner, requests, 2002, operations).payload,
+      { operationId: prepared.payload.operationId, state: "approved", expiresAt: prepared.payload.expiresAt,
+        approvalExpiresAt: 2002 + 30_000 });
+    assert.deepEqual(handleBrokerRequest(approveReview, "relay", stranger, requests, 2002, operations).payload,
+      { code: "REVIEW_UNAVAILABLE" });
     requests.revokeChangedTab(3, null);
+    assert.deepEqual(handleBrokerRequest(status, "facade", owner, requests, 2003, operations).payload,
+      { operationId: prepared.payload.operationId, state: "stale" });
     assert.deepEqual(handleBrokerRequest(list, "relay", stranger, requests, 2003, operations).payload,
       { reviews: [], hasMore: false });
     assert.deepEqual(handleBrokerRequest(owned, "facade", owner, requests, 2003, operations).payload,

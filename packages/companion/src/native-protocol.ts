@@ -70,6 +70,23 @@ export function parseNativeFixturePreparedReviews(message: unknown, now = Date.n
   return result.data;
 }
 
+const fixtureReviewApprovalSchema = z.strictObject({
+  kind: z.literal("approve_fixture_review"),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  requestId: z.uuid(),
+  connectionGeneration: z.literal(0),
+  deadlineMs: z.number().int().safe(),
+  payload: z.strictObject({ target: fixtureTargetSchema, operationId: z.uuid(), reviewId: z.uuid() })
+});
+
+export function parseNativeFixtureReviewApproval(message: unknown, now = Date.now()) {
+  const result = fixtureReviewApprovalSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture review approval");
+  }
+  return result.data;
+}
+
 const fixtureApprovalSchema = z.strictObject({
   kind: z.literal("approve_fixture"),
   protocolVersion: z.literal(PROTOCOL_VERSION),

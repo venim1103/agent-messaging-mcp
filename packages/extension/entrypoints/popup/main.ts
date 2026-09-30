@@ -20,7 +20,9 @@ type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: n
 type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
 type FixtureReviewsResult = { ok: true; reviews: { operationId: string; expiresAt: number;
-  preview: { target: "fixture-alpha"; text: string } }[]; hasMore: boolean }
+  reviewId: string; preview: { target: "fixture-alpha"; text: string } }[]; hasMore: boolean }
+  | { ok: false; error: string };
+type FixtureReviewApprovalResult = { ok: true; operationId: string; expiresAt: number }
   | { ok: false; error: string };
 
 const fixtureOrigin = "http://127.0.0.1:8787";
@@ -175,7 +177,38 @@ fixtureReviewButton.addEventListener("click", async () => {
       expiry.textContent = `${Math.max(0, Math.ceil((review.expiresAt - Date.now()) / 1000))} seconds remaining`;
       const text = document.createElement("pre");
       text.textContent = review.preview.text;
-      row.append(label, expiry, text);
+      const approve = document.createElement("button");
+      approve.type = "button";
+      approve.textContent = "Approve draft (no send)";
+      approve.addEventListener("click", async () => {
+        approve.disabled = true;
+        try {
+          const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+          if (!selectedFixtureTab || tab?.id !== selectedFixtureTab.id || tab.url !== selectedFixtureTab.url
+            || !row.isConnected || fixtureReviewResult.hidden || text.textContent !== review.preview.text
+            || Date.now() >= review.expiresAt) {
+            clearFixtureReviews();
+            status.textContent = "Fixture or draft changed. No approval recorded.";
+            return;
+          }
+          const approved = await browser.runtime.sendMessage({ kind: "approve_fixture_review",
+            tabId: tab.id, expectedUrl: selectedFixtureTab.url, operationId: review.operationId,
+            reviewId: review.reviewId }) as FixtureReviewApprovalResult;
+          if (!approved.ok) {
+            clearFixtureReviews();
+            status.textContent = `${approved.error}. No message was sent.`;
+            return;
+          }
+          row.remove();
+          status.textContent = `Approved fixture draft ${approved.operationId}. No message was sent.`;
+        } catch {
+          clearFixtureReviews();
+          status.textContent = "Fixture draft approval unavailable. No message was sent.";
+        } finally {
+          approve.disabled = false;
+        }
+      });
+      row.append(label, expiry, text, approve);
       fixtureReviews.append(row);
     }
     fixtureReviewResult.hidden = false;
@@ -186,7 +219,7 @@ fixtureReviewButton.addEventListener("click", async () => {
       }, Math.max(0, Math.min(...response.reviews.map((review) => review.expiresAt)) - Date.now()));
     }
     status.textContent = response.reviews.length
-      ? `${response.reviews.length} prepared fixture draft(s)${response.hasMore ? "; more pending" : ""}. Awaiting review.`
+      ? `${response.reviews.length} prepared fixture draft(s)${response.hasMore ? "; more pending" : ""}. Awaiting approval.`
       : "No prepared drafts for this fixture document.";
   } catch {
     status.textContent = "Fixture draft review unavailable.";

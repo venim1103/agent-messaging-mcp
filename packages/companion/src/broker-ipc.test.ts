@@ -69,12 +69,30 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
     if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture draft");
     assert.equal(prepared.payload.state, "awaiting_approval");
     assert.deepEqual(prepared.payload.preview, { target: "fixture-alpha", text });
+    assert.deepEqual((await otherFacade.getPreparedOperation(prepared.payload.operationId)).payload,
+      { state: "unknown" });
+    assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload,
+      { operationId: prepared.payload.operationId, state: "awaiting_approval",
+        expiresAt: prepared.payload.expiresAt });
     const listed = await relay.listFixturePreparedReviews(target);
     assert.equal(listed.kind, "fixture_prepared_reviews");
-    assert.deepEqual(listed.payload, { reviews: [{ operationId: prepared.payload.operationId,
+    if (listed.kind !== "fixture_prepared_reviews") throw new Error("Expected reviewed fixture preview");
+    const reviewId = listed.payload.reviews[0]?.reviewId;
+    assert.ok(reviewId);
+    assert.deepEqual(listed.payload, { reviews: [{ operationId: prepared.payload.operationId, reviewId,
       expiresAt: prepared.payload.expiresAt, preview: prepared.payload.preview }], hasMore: false });
     assert.deepEqual((await relay.listFixturePreparedReviews({ ...target,
       documentId: "other-document" })).payload, { reviews: [], hasMore: false });
+    assert.deepEqual((await relay.approveFixtureReview({ ...target, documentId: "other-document" },
+      prepared.payload.operationId, reviewId)).payload, { code: "REVIEW_UNAVAILABLE" });
+    const approved = await relay.approveFixtureReview(target, prepared.payload.operationId, reviewId);
+    assert.equal(approved.kind, "fixture_review_approved");
+    assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload,
+      { operationId: prepared.payload.operationId, state: "approved", expiresAt: prepared.payload.expiresAt,
+        approvalExpiresAt: approved.payload.expiresAt });
+    assert.deepEqual((await relay.approveFixtureReview(target, prepared.payload.operationId,
+      reviewId)).payload, { code: "REVIEW_UNAVAILABLE" });
+    assert.deepEqual((await relay.listFixturePreparedReviews(target)).payload, { reviews: [], hasMore: false });
     const retry = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text, idempotencyKey);
     if (retry.kind !== "message_prepared") throw new Error("Expected same prepared draft");
     assert.equal(retry.payload.operationId, prepared.payload.operationId);

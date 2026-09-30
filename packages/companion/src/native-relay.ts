@@ -5,7 +5,7 @@ import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
-  parseNativeFixturePreparedReviews,
+  parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeGeminiSnapshot,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
@@ -49,6 +49,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "list_fixture_prepared_reviews" ? parseNativeFixturePreparedReviews(message)
                   : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "approve_fixture_review" ? parseNativeFixtureReviewApproval(message)
+                  : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "list_gemini_read_challenges" ? parseNativeGeminiReadChallenges(message)
                     : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "mark_fixture_observation_gap" ? parseNativeFixtureGap(message)
@@ -59,7 +61,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
           let kind: "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
-            | "fixture_approved" | "gemini_approved" | "fixture_revoked"
+            | "fixture_approved" | "fixture_review_approved" | "gemini_approved" | "fixture_revoked"
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
@@ -69,8 +71,9 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | { challenges: ReadonlyArray<{ challengeId: string; target: {
               origin: string; conversationId: string; url: string; tabId: number; documentId: string
             }; expiresAt: number }>; activeTabIds: ReadonlyArray<number> }
-            | { reviews: ReadonlyArray<{ operationId: string; expiresAt: number;
+            | { reviews: ReadonlyArray<{ operationId: string; reviewId: string; expiresAt: number;
               preview: { target: "fixture-alpha"; text: string } }>; hasMore: boolean }
+            | { operationId: string; state: "approved"; approvedAt: number; expiresAt: number }
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"));
@@ -89,6 +92,16 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               if (result.kind !== "fixture_prepared_reviews") throw new Error("Broker refused fixture reviews");
               kind = "fixture_prepared_reviews";
               payload = result.payload;
+            } else if (request.kind === "approve_fixture_review") {
+              const result = await client.approveFixtureReview(request.payload.target, request.payload.operationId,
+                request.payload.reviewId);
+              if (result.kind === "fixture_review_approved") {
+                kind = "fixture_review_approved";
+                payload = result.payload;
+              } else if (result.kind === "error" && result.payload.code === "REVIEW_UNAVAILABLE") {
+                kind = "error";
+                payload = { code: "REVIEW_UNAVAILABLE" };
+              } else throw new Error("Broker refused fixture review approval");
             } else if (request.kind === "list_gemini_read_challenges") {
               const result = await client.listGeminiReadChallenges();
               if (result.kind !== "gemini_read_challenges") throw new Error("Broker refused Gemini read challenges");
@@ -163,7 +176,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
       }
     } catch (error) {
       invalid = true;
-      const reason = error instanceof Error && /^Invalid native (handshake|pending list request|fixture (approval|reset|revocation|snapshot|gap|read challenge list|prepared review list)|frame size)$/.test(error.message)
+      const reason = error instanceof Error && /^Invalid native (handshake|pending list request|fixture (approval|review approval|reset|revocation|snapshot|gap|read challenge list|prepared review list)|frame size)$/.test(error.message)
         ? error.message : error instanceof SyntaxError ? "Invalid JSON" : "Invalid schema";
       const deadline = deadlineMs === undefined ? "missing" : String(Math.trunc(deadlineMs - Date.now()));
       process.stderr.write(`Invalid native host message: ${reason}; deadline delta ${deadline}ms\n`);

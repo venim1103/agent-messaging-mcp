@@ -56,12 +56,18 @@ const requestSchema = z.discriminatedUnion("kind", [
     connectionId: z.uuid(), expectedGeneration: z.literal(1),
     text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), idempotencyKey: z.uuid()
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("get_prepared_operation"), payload: z.strictObject({
+    operationId: z.uuid()
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("disconnect_fixture"), payload: z.strictObject({
     connectionId: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_fixture_read_challenges"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("list_fixture_prepared_reviews"), payload: z.strictObject({
     target: fixtureTarget
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("approve_fixture_review"), payload: z.strictObject({
+    target: fixtureTarget, operationId: z.uuid(), reviewId: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_gemini_read_challenges"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("list_pending"), payload: z.strictObject({}) }),
@@ -125,6 +131,22 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
         payload: operations.listFixtureReviews(request.payload.target, now) }
       : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
   }
+  if (request.kind === "approve_fixture_review") {
+    if (role !== "relay") return { ...response, kind: "error" as const,
+      payload: { code: "PERMISSION_DENIED" } };
+    if (!operations) return { ...response, kind: "error" as const,
+      payload: { code: "PREPARATION_UNAVAILABLE" } };
+    try {
+      return { ...response, kind: "fixture_review_approved" as const,
+        payload: operations.approveFixtureReview(request.payload.target, request.payload.operationId,
+          request.payload.reviewId, now) };
+    } catch (error) {
+      if (error instanceof Error && error.message === "REVIEW_UNAVAILABLE") {
+        return { ...response, kind: "error" as const, payload: { code: "REVIEW_UNAVAILABLE" } };
+      }
+      throw error;
+    }
+  }
   if (request.kind === "list_gemini_read_challenges") {
     return role === "relay"
       ? { ...response, kind: "gemini_read_challenges" as const,
@@ -186,6 +208,12 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   }
   if (role !== "facade") {
     return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "get_prepared_operation") {
+    return operations
+      ? { ...response, kind: "prepared_operation_state" as const,
+        payload: operations.getOperation(owner, request.payload.operationId, now) }
+      : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
   }
   if (request.kind === "prepare_fixture_message") {
     if (!operations) return { ...response, kind: "error" as const,

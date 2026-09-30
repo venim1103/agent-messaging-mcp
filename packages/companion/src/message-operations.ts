@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { PendingConnectionRequests, type FixtureTarget } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 60_000;
+export const FIXTURE_REVIEW_APPROVAL_TTL_MS = 30_000;
 export const PREPARED_KEY_RETENTION_MS = 24 * 60 * 60_000;
 export const MAX_PREPARED_MESSAGE_BYTES = 4_000;
 export const MAX_ACTIVE_PREPARED_MESSAGES = 100;
@@ -39,13 +40,17 @@ type PreparedMessage = Readonly<{
   expiresAt: number;
   preview: Readonly<{ target: "fixture-alpha"; text: string }>;
 }>;
-type PreparedReview = Readonly<Pick<PreparedMessage, "operationId" | "expiresAt" | "preview">>;
+type PreparedReview = Readonly<Pick<PreparedMessage, "operationId" | "expiresAt" | "preview"> & {
+  reviewId: string
+}>;
 
 export class PreparedMessageOperations {
   private readonly owners = new Map<symbol, string>();
   private readonly contents = new Map<string, Readonly<{
     owner: symbol; connectionId: string; target: FixtureTarget; text: string; expiresAt: number
   }>>();
+  private readonly reviewTokens = new Map<string, string>();
+  private readonly approvals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
   private readonly digestKey = randomBytes(32);
 
   constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync) {
@@ -66,9 +71,18 @@ export class PreparedMessageOperations {
     return createHmac("sha256", this.digestKey).update(value).digest("hex");
   }
 
+  private release(operationId: string): void {
+    this.contents.delete(operationId);
+    this.reviewTokens.delete(operationId);
+    this.approvals.delete(operationId);
+  }
+
   private discardExpired(now: number): void {
     for (const [operationId, operation] of this.contents) {
-      if (operation.expiresAt <= now) this.contents.delete(operationId);
+      if (operation.expiresAt <= now) this.release(operationId);
+    }
+    for (const [operationId, approval] of this.approvals) {
+      if (approval.expiresAt <= now) this.approvals.delete(operationId);
     }
   }
 
@@ -128,29 +142,77 @@ export class PreparedMessageOperations {
     reviews: ReadonlyArray<PreparedReview>; hasMore: boolean
   }> {
     this.discardExpired(now);
-    const reviews: PreparedReview[] = [];
+    const reviews: Omit<PreparedReview, "reviewId">[] = [];
     for (const [operationId, operation] of this.contents) {
+      if (this.approvals.has(operationId)) continue;
       if (operation.target.tabId !== target.tabId || operation.target.documentId !== target.documentId
         || operation.target.origin !== target.origin || operation.target.conversationId !== target.conversationId) {
         continue;
       }
+      this.reviewTokens.delete(operationId);
       const live = this.requests.getApprovedTarget(operation.owner, operation.connectionId, now);
       if (!live || live.tabId !== target.tabId || live.documentId !== target.documentId
         || live.origin !== target.origin || live.conversationId !== target.conversationId) {
-        this.contents.delete(operationId);
+        this.release(operationId);
         continue;
       }
       reviews.push(Object.freeze({ operationId, expiresAt: operation.expiresAt,
         preview: Object.freeze({ target: "fixture-alpha", text: operation.text }) }));
     }
-    return Object.freeze({ reviews: Object.freeze(reviews.slice(-MAX_PREPARED_REVIEWS).reverse()),
+    return Object.freeze({ reviews: Object.freeze(reviews.slice(-MAX_PREPARED_REVIEWS).reverse().map((review) => {
+      const reviewId = randomUUID();
+      this.reviewTokens.set(review.operationId, reviewId);
+      return Object.freeze({ ...review, reviewId });
+    })),
       hasMore: reviews.length > MAX_PREPARED_REVIEWS });
+  }
+
+  approveFixtureReview(target: FixtureTarget, operationId: string, reviewId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.contents.get(operationId);
+    const live = operation && this.requests.getApprovedTarget(operation.owner, operation.connectionId, now);
+    if (!operation || !live || this.approvals.has(operationId)
+      || typeof reviewId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(reviewId)
+      || this.reviewTokens.get(operationId) !== reviewId
+      || operation.target.origin !== target.origin || operation.target.conversationId !== target.conversationId
+      || operation.target.tabId !== target.tabId || operation.target.documentId !== target.documentId
+      || live.origin !== target.origin || live.conversationId !== target.conversationId
+      || live.tabId !== target.tabId || live.documentId !== target.documentId) {
+      throw new Error("REVIEW_UNAVAILABLE");
+    }
+    this.reviewTokens.delete(operationId);
+    const approval = Object.freeze({ operationId, state: "approved" as const, approvedAt: now,
+      expiresAt: Math.min(operation.expiresAt, now + FIXTURE_REVIEW_APPROVAL_TTL_MS) });
+    this.approvals.set(operationId, approval);
+    return approval;
+  }
+
+  getOperation(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const ownerId = this.owners.get(owner);
+    if (!ownerId) return { state: "unknown" as const };
+    const record = this.database.prepare(`SELECT owner_id, connection_id, expires_at
+      FROM prepared_message_operations WHERE operation_id = ?`).get(operationId) as {
+        owner_id: string; connection_id: string; expires_at: number
+      } | undefined;
+    if (!record || record.owner_id !== ownerId) return { state: "unknown" as const };
+    if (record.expires_at <= now) return { operationId, state: "expired" as const };
+    if (!this.requests.getApprovedTarget(owner, record.connection_id, now)) {
+      return { operationId, state: "stale" as const };
+    }
+    const retained = this.contents.get(operationId);
+    if (!retained || retained.owner !== owner) return { state: "unknown" as const };
+    const approval = this.approvals.get(operationId);
+    return approval
+      ? { operationId, state: "approved" as const, expiresAt: record.expires_at,
+        approvalExpiresAt: approval.expiresAt }
+      : { operationId, state: "awaiting_approval" as const, expiresAt: record.expires_at };
   }
 
   disconnect(owner: symbol): void {
     this.owners.delete(owner);
     for (const [operationId, operation] of this.contents) {
-      if (operation.owner === owner) this.contents.delete(operationId);
+      if (operation.owner === owner) this.release(operationId);
     }
   }
 }

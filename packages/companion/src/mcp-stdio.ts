@@ -136,6 +136,21 @@ server.registerTool("chat_prepare_message", {
   }
 });
 
+server.registerTool("chat_get_operation", {
+  description: "Read the owning client's fixture-only prepared operation state. Approval is short-lived and does not send; a revoked grant is stale and no commit tool exists.",
+  inputSchema: z.object({ operationId: z.uuid() }).strict(),
+  annotations: { readOnlyHint: true }
+}, async ({ operationId }) => {
+  try {
+    const result = await (await pendingBroker()).getPreparedOperation(operationId);
+    if (result.kind === "error") return blocked(result.payload.code);
+    if (result.kind !== "prepared_operation_state") return unavailable();
+    return { content: [{ type: "text", text: JSON.stringify(result.payload) }], structuredContent: result.payload };
+  } catch {
+    return unavailable();
+  }
+});
+
 server.registerTool("chat_disconnect", {
   description: "Revoke an owned read-only browser-chat connection without closing its tab. Pending reads are cancelled and subsequent access is denied.",
   inputSchema: z.object({ connectionId: z.uuid() }).strict()

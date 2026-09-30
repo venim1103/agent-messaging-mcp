@@ -111,10 +111,16 @@ const replySchema = z.discriminatedUnion("kind", [
     kind: z.literal("fixture_prepared_reviews"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ reviews: z.array(z.strictObject({
-      operationId: z.uuid(), expiresAt: z.number().int().safe(),
+      operationId: z.uuid(), reviewId: z.uuid(), expiresAt: z.number().int().safe(),
       preview: z.strictObject({ target: z.literal("fixture-alpha"),
         text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES) })
     })).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_review_approved"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), state: z.literal("approved"),
+      approvedAt: z.number().int().safe(), expiresAt: z.number().int().safe() })
   }),
   z.strictObject({
     kind: z.literal("gemini_read_challenges"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -136,6 +142,19 @@ const replySchema = z.discriminatedUnion("kind", [
       state: z.literal("awaiting_approval"), expiresAt: z.number().int().safe(),
       preview: z.strictObject({ target: z.literal("fixture-alpha"),
         text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES) }) })
+  }),
+  z.strictObject({
+    kind: z.literal("prepared_operation_state"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.discriminatedUnion("state", [
+      z.strictObject({ state: z.literal("unknown") }),
+      z.strictObject({ operationId: z.uuid(), state: z.literal("expired") }),
+      z.strictObject({ operationId: z.uuid(), state: z.literal("stale") }),
+      z.strictObject({ operationId: z.uuid(), state: z.literal("awaiting_approval"),
+        expiresAt: z.number().int().safe() }),
+      z.strictObject({ operationId: z.uuid(), state: z.literal("approved"),
+        expiresAt: z.number().int().safe(), approvalExpiresAt: z.number().int().safe() })
+    ])
   }),
   z.strictObject({
     kind: z.literal("fixture_gap_marked"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -195,7 +214,7 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ code: z.enum(["PERMISSION_DENIED", "TOO_MANY_PENDING", "APPROVAL_INVALID",
       "OBSERVATION_UNAVAILABLE", "CONNECTION_NOT_FOUND", "PREPARATION_UNAVAILABLE", "GENERATION_MISMATCH",
       "INVALID_MESSAGE_TEXT", "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED",
-      "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED"]) })
+      "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED", "REVIEW_UNAVAILABLE"]) })
   })
 ]);
 
@@ -256,15 +275,16 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
-      | "disconnect_fixture" | "prepare_fixture_message"
+      | "disconnect_fixture" | "prepare_fixture_message" | "get_prepared_operation"
       | "list_pending" | "list_fixture_read_challenges" | "list_fixture_prepared_reviews"
+      | "approve_fixture_review"
       | "list_gemini_read_challenges"
       | "approve_fixture" | "approve_gemini"
       | "publish_fixture_snapshot" | "publish_gemini_snapshot"
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap"
       | "mark_gemini_observation_gap", payload: object) => {
       if (kind === "list_pending" || kind === "list_fixture_read_challenges"
-        || kind === "list_fixture_prepared_reviews"
+        || kind === "list_fixture_prepared_reviews" || kind === "approve_fixture_review"
         || kind === "list_gemini_read_challenges"
         || kind === "approve_fixture" || kind === "approve_gemini" || kind === "revoke_fixture"
         || kind === "revoke_all_fixture" || kind === "publish_fixture_snapshot"
@@ -329,9 +349,12 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       disconnectFixture: (connectionId: string) => request("disconnect_fixture", { connectionId }),
       prepareFixtureMessage: (connectionId: string, expectedGeneration: 1, text: string, idempotencyKey: string) =>
         request("prepare_fixture_message", { connectionId, expectedGeneration, text, idempotencyKey }),
+      getPreparedOperation: (operationId: string) => request("get_prepared_operation", { operationId }),
       listPending: () => request("list_pending", {}),
       listFixtureReadChallenges: () => request("list_fixture_read_challenges", {}),
       listFixturePreparedReviews: (target: FixtureTarget) => request("list_fixture_prepared_reviews", { target }),
+      approveFixtureReview: (target: FixtureTarget, operationId: string, reviewId: string) =>
+        request("approve_fixture_review", { target, operationId, reviewId }),
       listGeminiReadChallenges: () => request("list_gemini_read_challenges", {}),
       approveFixture: (pendingRequestId: string, target: FixtureTarget) =>
         request("approve_fixture", { pendingRequestId, target }),
