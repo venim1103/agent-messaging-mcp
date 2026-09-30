@@ -225,7 +225,7 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     } catch (error) {
       if (error instanceof Error && ["CONNECTION_NOT_FOUND", "GENERATION_MISMATCH", "INVALID_MESSAGE_TEXT",
         "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED", "OPERATION_UNAVAILABLE",
-        "TOO_MANY_PREPARED"].includes(error.message)) {
+        "TOO_MANY_PREPARED", "DISPATCH_UNCERTAIN"].includes(error.message)) {
         return { ...response, kind: "error" as const, payload: { code: error.message } };
       }
       throw error;

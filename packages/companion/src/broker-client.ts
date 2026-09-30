@@ -153,7 +153,9 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ operationId: z.uuid(), state: z.literal("awaiting_approval"),
         expiresAt: z.number().int().safe() }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("approved"),
-        expiresAt: z.number().int().safe(), approvalExpiresAt: z.number().int().safe() })
+        expiresAt: z.number().int().safe(), approvalExpiresAt: z.number().int().safe() }),
+      z.strictObject({ operationId: z.uuid(), state: z.literal("dispatch_uncertain"),
+        startedAt: z.number().int().safe() })
     ])
   }),
   z.strictObject({
@@ -214,7 +216,7 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ code: z.enum(["PERMISSION_DENIED", "TOO_MANY_PENDING", "APPROVAL_INVALID",
       "OBSERVATION_UNAVAILABLE", "CONNECTION_NOT_FOUND", "PREPARATION_UNAVAILABLE", "GENERATION_MISMATCH",
       "INVALID_MESSAGE_TEXT", "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED",
-      "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED", "REVIEW_UNAVAILABLE"]) })
+      "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED", "REVIEW_UNAVAILABLE", "DISPATCH_UNCERTAIN"]) })
   })
 ]);
 

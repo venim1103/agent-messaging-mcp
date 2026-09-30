@@ -54,6 +54,7 @@ export class PreparedMessageOperations {
   private readonly digestKey = randomBytes(32);
 
   constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync) {
+    database.exec("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL");
     database.exec(`CREATE TABLE IF NOT EXISTS prepared_message_operations (
       operation_id TEXT PRIMARY KEY,
       owner_id TEXT NOT NULL,
@@ -65,6 +66,12 @@ export class PreparedMessageOperations {
       state TEXT NOT NULL CHECK (state = 'awaiting_approval'),
       UNIQUE (idempotency_key)
     )`);
+    database.exec(`CREATE TABLE IF NOT EXISTS message_dispatch_attempts (
+      operation_id TEXT PRIMARY KEY REFERENCES prepared_message_operations(operation_id) ON DELETE RESTRICT,
+      started_at INTEGER NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('dispatching', 'unknown'))
+    )`);
+    database.exec("UPDATE message_dispatch_attempts SET state = 'unknown' WHERE state = 'dispatching'");
   }
 
   private digest(value: string): string {
@@ -100,7 +107,8 @@ export class PreparedMessageOperations {
       throw new Error("INVALID_IDEMPOTENCY_KEY");
     }
 
-    this.database.prepare("DELETE FROM prepared_message_operations WHERE expires_at <= ?")
+    this.database.prepare(`DELETE FROM prepared_message_operations WHERE expires_at <= ?
+      AND operation_id NOT IN (SELECT operation_id FROM message_dispatch_attempts)`)
       .run(now - PREPARED_KEY_RETENTION_MS);
     const ownerId = this.owners.get(owner) ?? randomUUID();
     this.owners.set(owner, ownerId);
@@ -116,6 +124,8 @@ export class PreparedMessageOperations {
       if (existing.owner_id !== ownerId) throw new Error("OPERATION_UNAVAILABLE");
       if (existing.connection_id !== connectionId || existing.content_digest !== contentDigest
         || existing.target_digest !== targetDigest) throw new Error("IDEMPOTENCY_CONFLICT");
+      if (this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?")
+        .get(existing.operation_id)) throw new Error("DISPATCH_UNCERTAIN");
       if (existing.expires_at <= now) throw new Error("OPERATION_EXPIRED");
       const retained = this.contents.get(existing.operation_id);
       if (!retained || retained.owner !== owner) throw new Error("OPERATION_UNAVAILABLE");
@@ -145,6 +155,8 @@ export class PreparedMessageOperations {
     const reviews: Omit<PreparedReview, "reviewId">[] = [];
     for (const [operationId, operation] of this.contents) {
       if (this.approvals.has(operationId)) continue;
+      if (this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?")
+        .get(operationId)) continue;
       if (operation.target.tabId !== target.tabId || operation.target.documentId !== target.documentId
         || operation.target.origin !== target.origin || operation.target.conversationId !== target.conversationId) {
         continue;
@@ -172,6 +184,7 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     const live = operation && this.requests.getApprovedTarget(operation.owner, operation.connectionId, now);
     if (!operation || !live || this.approvals.has(operationId)
+      || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?").get(operationId)
       || typeof reviewId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(reviewId)
       || this.reviewTokens.get(operationId) !== reviewId
       || operation.target.origin !== target.origin || operation.target.conversationId !== target.conversationId
@@ -187,6 +200,39 @@ export class PreparedMessageOperations {
     return approval;
   }
 
+  recordFixtureDispatchStart(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const ownerId = this.owners.get(owner);
+    const record = this.database.prepare("SELECT owner_id FROM prepared_message_operations WHERE operation_id = ?")
+      .get(operationId) as { owner_id: string } | undefined;
+    if (!record || record.owner_id !== ownerId) throw new Error("APPROVAL_REQUIRED");
+    if (this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?")
+      .get(operationId)) throw new Error("DISPATCH_UNCERTAIN");
+    const operation = this.contents.get(operationId);
+    const approval = this.approvals.get(operationId);
+    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    if (!operation || operation.owner !== owner || !approval || approval.expiresAt <= now || !live
+      || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
+      || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId) {
+      throw new Error("APPROVAL_REQUIRED");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      if (this.database.prepare("SELECT 1 FROM message_dispatch_attempts LIMIT 1").get()) {
+        throw new Error("DISPATCH_UNCERTAIN");
+      }
+      this.database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, state)
+        VALUES (?, ?, 'dispatching')`).run(operationId, now);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    this.approvals.delete(operationId);
+    this.reviewTokens.delete(operationId);
+    return Object.freeze({ operationId, state: "dispatching" as const, startedAt: now });
+  }
+
   getOperation(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const ownerId = this.owners.get(owner);
@@ -196,6 +242,9 @@ export class PreparedMessageOperations {
         owner_id: string; connection_id: string; expires_at: number
       } | undefined;
     if (!record || record.owner_id !== ownerId) return { state: "unknown" as const };
+    const attempt = this.database.prepare(`SELECT started_at, state FROM message_dispatch_attempts
+      WHERE operation_id = ?`).get(operationId) as { started_at: number; state: string } | undefined;
+    if (attempt) return { operationId, state: "dispatch_uncertain" as const, startedAt: attempt.started_at };
     if (record.expires_at <= now) return { operationId, state: "expired" as const };
     if (!this.requests.getApprovedTarget(owner, record.connection_id, now)) {
       return { operationId, state: "stale" as const };

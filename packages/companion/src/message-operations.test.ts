@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { chmod, lstat, readFile, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -178,6 +179,150 @@ test("expired preparation keys have bounded retention and metadata refuses exces
       "b66b3997-9d43-4554-8399-267d1fe9f75c", later + 1), /TOO_MANY_PREPARED/);
     assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count,
       MAX_RECORDED_PREPARED_MESSAGES);
+  } finally {
+    database.close();
+  }
+});
+
+test("private dispatch intent persists before any submit and restart refuses reuse", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-dispatch-journal-"));
+  const path = join(home, "operations.sqlite");
+  let database = openPrivateOperationDatabase(home);
+  try {
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("prepared fixture owner");
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const ledger = new PreparedMessageOperations(requests, database);
+    const key = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+    const text = "Synthetic dispatch intent only";
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, text, key, 2001);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2002), /APPROVAL_REQUIRED/);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    assert.throws(() => ledger.recordFixtureDispatchStart(Symbol("foreign"), prepared.operationId, 2004),
+      /APPROVAL_REQUIRED/);
+    const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004);
+    assert.deepEqual(started, { operationId: prepared.operationId, state: "dispatching", startedAt: 2004 });
+    assert.deepEqual(database.prepare("SELECT * FROM message_dispatch_attempts").all().map((row) => ({ ...row })), [
+      { operation_id: prepared.operationId, started_at: 2004, state: "dispatching" }
+    ]);
+    assert.deepEqual(ledger.getOperation(owner, prepared.operationId, 2005), {
+      operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2004
+    });
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005), /DISPATCH_UNCERTAIN/);
+    assert.throws(() => ledger.prepare(owner, grant.connectionId, 1, text, key, 2005), /DISPATCH_UNCERTAIN/);
+    assert.deepEqual(ledger.listFixtureReviews(target, 2005), { reviews: [], hasMore: false });
+    assert.equal((await readFile(path)).includes(Buffer.from(text)), false);
+    assert.equal((await readFile(path)).includes(Buffer.from(target.documentId)), false);
+
+    database.close();
+    database = openPrivateOperationDatabase(home);
+    assert.equal(database.prepare("PRAGMA synchronous").get()?.synchronous, 2);
+    const restarted = new PreparedMessageOperations(new PendingConnectionRequests(), database);
+    assert.deepEqual(database.prepare("SELECT * FROM message_dispatch_attempts").all().map((row) => ({ ...row })), [
+      { operation_id: prepared.operationId, started_at: 2004, state: "unknown" }
+    ]);
+    assert.equal(database.prepare("PRAGMA foreign_keys").get()?.foreign_keys, 1);
+    const nextOwner = Symbol("new broker owner");
+    const nextRequests = new PendingConnectionRequests();
+    const nextPending = nextRequests.create(nextOwner, 1000);
+    const nextGrant = nextRequests.approve(nextPending.requestId, target, 2000)!;
+    const nextLedger = new PreparedMessageOperations(nextRequests, database);
+    assert.throws(() => nextLedger.prepare(nextOwner, nextGrant.connectionId, 1, text, key, 2005),
+      /OPERATION_UNAVAILABLE/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, 1);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+    assert.equal(restarted.getOperation(nextOwner, prepared.operationId, 2005).state, "unknown");
+    const later = prepared.expiresAt + PREPARED_KEY_RETENTION_MS + 1;
+    const laterPending = nextRequests.create(nextOwner, later - 2);
+    const laterGrant = nextRequests.approve(laterPending.requestId, target, later - 1)!;
+    assert.throws(() => nextLedger.prepare(nextOwner, laterGrant.connectionId, 1, text, key, later),
+      /OPERATION_UNAVAILABLE/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, 1);
+  } finally {
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("abrupt process death leaves before-start safe and after-start uncertain", async () => {
+  const childScript = `
+    import { openPrivateOperationDatabase, PreparedMessageOperations } from ${JSON.stringify(new URL("./message-operations.js", import.meta.url).href)};
+    import { PendingConnectionRequests } from ${JSON.stringify(new URL("./pending-connections.js", import.meta.url).href)};
+    const database = openPrivateOperationDatabase(process.argv[1]);
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("crash fixture owner");
+    const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000);
+    const ledger = new PreparedMessageOperations(requests, database);
+    const key = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic crash probe", key, 2001);
+    if (process.argv[2] === "after") {
+      const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+      ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004);
+    }
+    process.stdout.write(JSON.stringify({ operationId: prepared.operationId, key }) + "\\n",
+      () => process.kill(process.pid, "SIGKILL"));
+  `;
+  for (const phase of ["before", "after"]) {
+    const home = await mkdtemp(join(tmpdir(), `agent-messaging-crash-${phase}-`));
+    try {
+      const child = spawnSync(process.execPath, ["--input-type=module", "-e", childScript, home, phase], {
+        encoding: "utf8", timeout: 5000
+      });
+      assert.equal(child.signal, "SIGKILL", child.stderr);
+      const { operationId, key } = JSON.parse(child.stdout.trim()) as { operationId: string; key: string };
+      const database = openPrivateOperationDatabase(home);
+      try {
+        new PreparedMessageOperations(new PendingConnectionRequests(), database);
+        assert.deepEqual(database.prepare("SELECT operation_id, state FROM message_dispatch_attempts").all()
+          .map((row) => ({ ...row })), phase === "after" ? [{ operation_id: operationId, state: "unknown" }] : []);
+        const owner = Symbol("fresh owner");
+        const requests = new PendingConnectionRequests();
+        const target = { origin: "http://127.0.0.1:8787" as const,
+          conversationId: "fixture-alpha" as const, tabId: 3, documentId: "CHROME-doc_opaque-42" };
+        const pending = requests.create(owner, 1000);
+        const grant = requests.approve(pending.requestId, target, 2000)!;
+        const restarted = new PreparedMessageOperations(requests, database);
+        assert.throws(() => restarted.prepare(owner, grant.connectionId, 1, "Synthetic crash probe", key, 2005),
+          /OPERATION_UNAVAILABLE/);
+      } finally {
+        database.close();
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test("one unresolved fixture dispatch intent blocks a second approved operation", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("fixture writer");
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const ledger = new PreparedMessageOperations(requests, database);
+    const first = ledger.prepare(owner, grant.connectionId, 1, "First synthetic draft",
+      "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    const second = ledger.prepare(owner, grant.connectionId, 1, "Second synthetic draft",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    for (const review of ledger.listFixtureReviews(target, 2002).reviews) {
+      ledger.approveFixtureReview(target, review.operationId, review.reviewId, 2003);
+    }
+    ledger.recordFixtureDispatchStart(owner, first.operationId, 2004);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, second.operationId, 2005), /DISPATCH_UNCERTAIN/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+    assert.equal(ledger.getOperation(owner, second.operationId, 2005).state, "approved");
   } finally {
     database.close();
   }
