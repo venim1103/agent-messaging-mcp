@@ -169,7 +169,8 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
       { accepted: false });
     assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload,
       { operationId: prepared.payload.operationId, state: "approved", expiresAt: prepared.payload.expiresAt,
-        approvalExpiresAt: approved.payload.expiresAt });
+        approvalExpiresAt: approved.payload.expiresAt, draftFill: { state: "failed", code: "DRAFT_PRESENT",
+          completedAt: fillResult.payload.completedAt } });
     assert.deepEqual((await relay.approveFixtureReview(target, prepared.payload.operationId,
       reviewId)).payload, { code: "REVIEW_UNAVAILABLE" });
     assert.deepEqual((await relay.listFixturePreparedReviews(target)).payload, { reviews: [], hasMore: false });
@@ -189,6 +190,11 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
     const unanswered = await facade.fillFixtureDraft(silent.payload.operationId);
     if (unanswered.kind !== "fixture_fill" || unanswered.payload.ok) throw new Error("Expected unknown browser fill outcome");
     assert.equal(unanswered.payload.code, "FILL_UNCERTAIN");
+    const unansweredStatus = await facade.getPreparedOperation(silent.payload.operationId);
+    if (unansweredStatus.kind !== "prepared_operation_state" || unansweredStatus.payload.state !== "approved") {
+      throw new Error("Expected owned unanswered fill status");
+    }
+    assert.equal(unansweredStatus.payload.draftFill?.state, "uncertain");
     assert.deepEqual((await facade.fillFixtureDraft(silent.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
     const retry = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text, idempotencyKey);
     if (retry.kind !== "message_prepared") throw new Error("Expected same prepared draft");

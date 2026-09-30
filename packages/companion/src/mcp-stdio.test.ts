@@ -25,9 +25,12 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
       "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_read_messages",
-      "chat_wait_for_events", "chat_prepare_message", "chat_get_operation", "chat_disconnect"
+      "chat_wait_for_events", "chat_prepare_message", "chat_fill_draft", "chat_get_operation", "chat_disconnect"
     ]);
     assert.ok(tools.every((tool) => /^[a-z0-9_-]+$/.test(tool.name)));
+    const fillTool = tools.find((tool) => tool.name === "chat_fill_draft");
+    assert.equal(fillTool?.annotations?.readOnlyHint, false);
+    assert.equal(fillTool?.annotations?.idempotentHint, false);
 
     const result = await client.callTool({ name: "browser_chat_feasibility", arguments: {} });
     assert.equal(result.isError, undefined);
@@ -56,6 +59,11 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     const unavailable = await clientOne.callTool({ name: "chat_request_connection", arguments: {} });
     assert.equal(unavailable.isError, true);
     assert.match(unavailable.content[0]?.type === "text" ? unavailable.content[0].text : "", /BROKER_UNAVAILABLE/);
+    const unavailableFillId = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+    const unavailableFill = await clientOne.callTool({ name: "chat_fill_draft", arguments: { operationId: unavailableFillId } });
+    assert.equal(unavailableFill.isError, true);
+    assert.deepEqual(unavailableFill.structuredContent, { operationId: unavailableFillId, ok: false,
+      code: "FILL_UNCERTAIN", retryAllowed: false });
 
     broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
     brokerExit = once(broker, "exit");
@@ -124,6 +132,10 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
       operationId: preview.operationId
     } })).structuredContent, { operationId: preview.operationId,
       state: "awaiting_approval", expiresAt: preview.expiresAt });
+    const noReviewFill = await clientOne.callTool({ name: "chat_fill_draft", arguments: { operationId: preview.operationId } });
+    assert.equal(noReviewFill.isError, true);
+    assert.deepEqual(noReviewFill.structuredContent, { operationId: preview.operationId, ok: false,
+      code: "FILL_UNAVAILABLE", retryAllowed: false });
     const reviewed = await relay.listFixturePreparedReviews(target);
     if (reviewed.kind !== "fixture_prepared_reviews") throw new Error("Expected test fixture review");
     assert.equal(JSON.stringify(reviewed.payload).includes(preview.recoveryToken), false);
@@ -137,6 +149,65 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal(approvedState.state, "approved");
     assert.equal(approvedState.operationId, preview.operationId);
     assert.ok(approvedState.approvalExpiresAt <= preview.expiresAt);
+    const noFillConsent = await clientOne.callTool({ name: "chat_fill_draft", arguments: { operationId: preview.operationId } });
+    assert.equal(noFillConsent.isError, true);
+    assert.deepEqual(noFillConsent.structuredContent, { operationId: preview.operationId, ok: false,
+      code: "FILL_UNAVAILABLE", retryAllowed: false });
+    for (const extra of [{ approved: true }, { text: "Changed" }, { tabId: 3 }, { recoveryToken: preview.recoveryToken }]) {
+      const invalidFill = await clientOne.callTool({ name: "chat_fill_draft", arguments: { operationId: preview.operationId, ...extra } });
+      assert.equal(invalidFill.isError, true);
+    }
+    const fillReviewed = await relay.listFixtureFillReviews(target);
+    if (fillReviewed.kind !== "fixture_fill_reviews") throw new Error("Expected separate fixture fill review");
+    const fillReviewId = fillReviewed.payload.reviews[0]?.reviewId;
+    assert.ok(fillReviewId);
+    assert.equal((await relay.approveFixtureFillReview(target, preview.operationId, fillReviewId)).kind,
+      "fixture_fill_review_approved");
+    const hiddenFill = await clientTwo.callTool({ name: "chat_fill_draft", arguments: { operationId: preview.operationId } });
+    assert.equal(hiddenFill.isError, true);
+    assert.deepEqual(hiddenFill.structuredContent, { operationId: preview.operationId, ok: false,
+      code: "FILL_UNAVAILABLE", retryAllowed: false });
+    const fillApprovedStatus = await clientOne.callTool({ name: "chat_get_operation", arguments: { operationId: preview.operationId } });
+    assert.equal((fillApprovedStatus.structuredContent as { draftFill: { state: string } }).draftFill.state, "fill_approved");
+    const filling = clientOne.callTool({ name: "chat_fill_draft", arguments: { operationId: preview.operationId } });
+    let fillAttemptId: string | undefined;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const watch = await relay.listFixtureReadChallenges();
+      if (watch.kind !== "fixture_read_challenges") throw new Error("Expected native fill watch");
+      fillAttemptId = watch.payload.draftFills[0]?.attemptId;
+      if (fillAttemptId) {
+        assert.equal(watch.payload.draftFills[0]?.text, draft.text);
+        assert.deepEqual(watch.payload.draftFills[0]?.target, target);
+        assert.equal(JSON.stringify(watch.payload).includes(preview.recoveryToken), false);
+        break;
+      }
+      await setTimeout(10);
+    }
+    assert.ok(fillAttemptId);
+    assert.deepEqual((await relay.completeFixtureFill(target, fillAttemptId, { ok: true, editor: "textarea" })).payload,
+      { accepted: true });
+    const fillResult = await filling;
+    assert.equal(fillResult.isError, false);
+    const fillPayload = fillResult.structuredContent as { operationId: string; ok: boolean; editor: string;
+      completedAt: number; retryAllowed: boolean };
+    assert.equal(fillPayload.operationId, preview.operationId);
+    assert.equal(fillPayload.ok, true);
+    assert.equal(fillPayload.editor, "textarea");
+    assert.equal(fillPayload.retryAllowed, false);
+    assert.equal(Number.isSafeInteger(fillPayload.completedAt), true);
+    const filledState = await clientOne.callTool({ name: "chat_get_operation", arguments: { operationId: preview.operationId } });
+    assert.deepEqual((filledState.structuredContent as { draftFill: unknown }).draftFill, {
+      state: "filled", completedAt: fillPayload.completedAt, editor: "textarea"
+    });
+    assert.equal(JSON.stringify(filledState).includes(draft.text), false);
+    assert.equal(JSON.stringify(filledState).includes(target.documentId), false);
+    assert.equal(JSON.stringify(filledState).includes(preview.recoveryToken), false);
+    assert.deepEqual((await clientTwo.callTool({ name: "chat_get_operation", arguments: { operationId: preview.operationId } }))
+      .structuredContent, { state: "unknown" });
+    const fillReplay = await clientOne.callTool({ name: "chat_fill_draft", arguments: { operationId: preview.operationId } });
+    assert.equal(fillReplay.isError, true);
+    assert.deepEqual(fillReplay.structuredContent, { operationId: preview.operationId, ok: false,
+      code: "FILL_UNAVAILABLE", retryAllowed: false });
     assert.deepEqual((await clientOne.callTool({ name: "chat_prepare_message", arguments: draft })).structuredContent,
       preview);
     const conflict = await clientOne.callTool({ name: "chat_prepare_message", arguments: {

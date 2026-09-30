@@ -5,7 +5,8 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
-import { fixtureFillStatusSchema, fixturePreflightStatusSchema, MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS,
+import { fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
+  MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS,
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureFillResult, type FixturePreflightResult } from "./message-operations.js";
 import type { FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
@@ -194,9 +195,10 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ operationId: z.uuid(), state: z.literal("expired") }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("stale") }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("awaiting_approval"),
-        expiresAt: z.number().int().safe() }),
+        expiresAt: z.number().int().safe(), draftFill: fixtureDraftFillStateSchema.optional() }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("approved"),
-        expiresAt: z.number().int().safe(), approvalExpiresAt: z.number().int().safe() }),
+        expiresAt: z.number().int().safe(), approvalExpiresAt: z.number().int().safe(),
+        draftFill: fixtureDraftFillStateSchema.optional() }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("dispatch_uncertain"),
         startedAt: z.number().int().safe() }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("observed_in_ui"),

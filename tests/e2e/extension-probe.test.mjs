@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { chromium } from "playwright-core";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
@@ -401,6 +403,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
 
 test("trusted fixture popup separates consent from one-shot exact-document draft fill", { timeout: 30000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-review-test-"));
+  let mcpClient;
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
   const manifestPath = join(unpacked, "manifest.json");
@@ -642,7 +645,47 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
         delete globalThis.fixtureOriginalExecute;
       });
     }
+    mcpClient = new Client({ name: "fixture-browser-fill-test", version: "0.0.1" });
+    const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
+    await mcpClient.connect(new StdioClientTransport({ command: process.execPath, args: [mcpEntry],
+      env: { ...process.env, HOME: profile } }));
+    const mcpPending = await mcpClient.callTool({ name: "chat_request_connection", arguments: {} });
+    assert.equal(mcpPending.isError, undefined);
+    const mcpGrant = await popup.evaluate((args) => chrome.runtime.sendMessage({ kind: "approve_fixture", ...args }), {
+      tabId: selected.tabId, expectedUrl: richUrl, pendingRequestId: mcpPending.structuredContent.requestId
+    });
+    assert.equal(mcpGrant.ok, true, JSON.stringify(mcpGrant));
+    const mcpConnection = await mcpClient.callTool({ name: "chat_get_connection",
+      arguments: { requestId: mcpPending.structuredContent.requestId } });
+    assert.equal(mcpConnection.structuredContent.state, "ready_readonly");
+    const mcpPrepared = await mcpClient.callTool({ name: "chat_prepare_message", arguments: {
+      connectionId: mcpConnection.structuredContent.connectionId, expectedGeneration: 1,
+      text: "Exact MCP fixture draft\nStill unsent", idempotencyKey: "a76b3997-9d43-4554-8399-267d1fe9f75c"
+    } });
+    assert.equal(mcpPrepared.isError, undefined);
+    await approveFillCandidate(mcpPrepared.structuredContent);
+    const mcpFilled = await mcpClient.callTool({ name: "chat_fill_draft",
+      arguments: { operationId: mcpPrepared.structuredContent.operationId } });
+    assert.equal(mcpFilled.isError, false, JSON.stringify(mcpFilled.structuredContent));
+    assert.equal(mcpFilled.structuredContent.ok, true);
+    assert.equal(mcpFilled.structuredContent.retryAllowed, false);
+    assert.equal(await fixture.locator("#rich-message").innerText(), mcpPrepared.structuredContent.preview.text);
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    const mcpFillState = await mcpClient.callTool({ name: "chat_get_operation",
+      arguments: { operationId: mcpPrepared.structuredContent.operationId } });
+    assert.deepEqual(mcpFillState.structuredContent.draftFill, { state: "filled", editor: "rich",
+      completedAt: mcpFilled.structuredContent.completedAt });
+    assert.equal(JSON.stringify(mcpFillState).includes(mcpPrepared.structuredContent.preview.text), false);
+    assert.equal(JSON.stringify(mcpFillState).includes(mcpPrepared.structuredContent.recoveryToken), false);
+    const mcpReplay = await mcpClient.callTool({ name: "chat_fill_draft",
+      arguments: { operationId: mcpPrepared.structuredContent.operationId } });
+    assert.equal(mcpReplay.isError, true);
+    assert.equal(mcpReplay.structuredContent.code, "FILL_UNAVAILABLE");
+    const mcpDisconnected = await mcpClient.callTool({ name: "chat_disconnect",
+      arguments: { connectionId: mcpConnection.structuredContent.connectionId } });
+    assert.deepEqual(mcpDisconnected.structuredContent, { disconnected: true });
   } finally {
+    await mcpClient?.close().catch(() => {});
     facade?.close();
     relay?.close();
     broker?.kill("SIGTERM");

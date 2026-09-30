@@ -37,6 +37,14 @@ export const fixtureFillStatusSchema = z.discriminatedUnion("ok", [
   fixtureFillResultSchema.options[0].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() }),
   fixtureFillResultSchema.options[1].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() })
 ]);
+export const fixtureDraftFillStateSchema = z.discriminatedUnion("state", [
+  z.strictObject({ state: z.literal("fill_approved"), expiresAt: z.number().int().safe() }),
+  z.strictObject({ state: z.literal("filling"), startedAt: z.number().int().safe(), expiresAt: z.number().int().safe() }),
+  z.strictObject({ state: z.literal("filled"), completedAt: z.number().int().safe(), editor: z.enum(["textarea", "rich"]) }),
+  z.strictObject({ state: z.literal("failed"), completedAt: z.number().int().safe(), code: z.enum(["TARGET_CHANGED",
+    "UNSUPPORTED_MESSAGE_TEXT", "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "SUBMIT_UNAVAILABLE", "FILL_UNAVAILABLE"]) }),
+  z.strictObject({ state: z.literal("uncertain"), completedAt: z.number().int().safe() })
+]);
 const fixtureObservationSchema = z.strictObject({
   kind: z.literal("fixture_snapshot"),
   messages: z.array(z.strictObject({ id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
@@ -91,6 +99,7 @@ type PendingFixturePreflight = {
   timer: ReturnType<typeof setTimeout>; resolve: (status: FixturePreflightStatus | null) => void
 };
 type FixtureFillStatus = z.infer<typeof fixtureFillStatusSchema>;
+type FixtureDraftFillState = z.infer<typeof fixtureDraftFillStateSchema>;
 type PendingFixtureFill = {
   owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number;
   timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureFillStatus | null) => void
@@ -106,6 +115,7 @@ export class PreparedMessageOperations {
   private readonly fillReviewTokens = new Map<string, Readonly<{ reviewId: string; expiresAt: number }>>();
   private readonly fillApprovals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
   private readonly consumedFillApprovals = new Set<string>();
+  private readonly fillStates = new Map<string, Readonly<FixtureDraftFillState>>();
   private readonly recoveryReceipts = new Map<string, string>();
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
   private readonly ambiguousEvidence = new Set<string>();
@@ -174,6 +184,7 @@ export class PreparedMessageOperations {
     this.fillReviewTokens.delete(operationId);
     this.fillApprovals.delete(operationId);
     this.consumedFillApprovals.delete(operationId);
+    this.fillStates.delete(operationId);
     this.recoveryReceipts.delete(operationId);
     this.dispatchBaselines.delete(operationId);
     this.ambiguousEvidence.delete(operationId);
@@ -356,6 +367,7 @@ export class PreparedMessageOperations {
     this.fillApprovals.delete(operationId);
     this.fillReviewTokens.delete(operationId);
     this.consumedFillApprovals.add(operationId);
+    this.fillStates.set(operationId, Object.freeze({ state: "uncertain", completedAt: now }));
     return authorization;
   }
 
@@ -447,11 +459,17 @@ export class PreparedMessageOperations {
     return true;
   }
 
-  private finishFillCheck(attemptId: string, status: FixtureFillStatus | null): void {
+  private finishFillCheck(attemptId: string, status: FixtureFillStatus | null, now = Date.now()): void {
     const pending = this.fillChecks.get(attemptId);
     if (!pending) return;
     this.fillChecks.delete(attemptId);
     clearTimeout(pending.timer);
+    const state: FixtureDraftFillState = status?.ok
+      ? { state: "filled", completedAt: status.completedAt, editor: status.editor }
+      : !status || status.code === "FILL_UNCERTAIN"
+        ? { state: "uncertain", completedAt: status?.completedAt ?? now }
+        : { state: "failed", completedAt: status.completedAt, code: status.code };
+    this.fillStates.set(pending.operationId, Object.freeze(state));
     pending.resolve(status);
   }
 
@@ -468,13 +486,14 @@ export class PreparedMessageOperations {
     const timer = setTimeout(() => this.finishFillCheck(attemptId, null), expiresAt - now);
     this.fillChecks.set(attemptId, { owner, operationId, target: authorization.target,
       text: authorization.text, expiresAt, timer, resolve });
+    this.fillStates.set(operationId, Object.freeze({ state: "filling", startedAt: now, expiresAt }));
     return { attemptId, result };
   }
 
   listFixtureFillChallenges(now = Date.now()) {
     for (const [attemptId, pending] of this.fillChecks) {
       if (pending.expiresAt <= now || this.getOperation(pending.owner, pending.operationId, now).state !== "approved") {
-        this.finishFillCheck(attemptId, null);
+        this.finishFillCheck(attemptId, null, now);
       }
     }
     return [...this.fillChecks].map(([attemptId, pending]) => Object.freeze({
@@ -616,11 +635,18 @@ export class PreparedMessageOperations {
     }
     const retained = this.contents.get(operationId);
     if (!retained || retained.owner !== owner) return { state: "unknown" as const };
+    for (const [attemptId, pending] of this.fillChecks) {
+      if (pending.operationId === operationId && pending.expiresAt <= now) this.finishFillCheck(attemptId, null, now);
+    }
     const approval = this.approvals.get(operationId);
+    const fillConsent = this.fillApprovals.get(operationId);
+    const draftFill = this.fillStates.get(operationId)
+      ?? (fillConsent ? Object.freeze({ state: "fill_approved" as const, expiresAt: fillConsent.expiresAt }) : undefined);
+    const fill = draftFill ? { draftFill } : {};
     return approval
       ? { operationId, state: "approved" as const, expiresAt: record.expires_at,
-        approvalExpiresAt: approval.expiresAt }
-      : { operationId, state: "awaiting_approval" as const, expiresAt: record.expires_at };
+        approvalExpiresAt: approval.expiresAt, ...fill }
+      : { operationId, state: "awaiting_approval" as const, expiresAt: record.expires_at, ...fill };
   }
 
   disconnect(owner: symbol): void {

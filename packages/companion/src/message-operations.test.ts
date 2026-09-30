@@ -491,6 +491,9 @@ test("draft-fill consent is separate from no-send review and consumed once for i
     const consent = ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2006);
     assert.equal(consent.state, "fill_approved");
     assert.equal(consent.expiresAt, 2003 + FIXTURE_REVIEW_APPROVAL_TTL_MS);
+    const consentStatus = ledger.getOperation(owner, prepared.operationId, 2007);
+    if (consentStatus.state !== "approved") throw new Error("Expected owned no-send approval");
+    assert.deepEqual(consentStatus.draftFill, { state: "fill_approved", expiresAt: consent.expiresAt });
     assert.equal(ledger.getFixtureFillAuthorization(Symbol("other owner"), prepared.operationId, 2007), null);
     assert.deepEqual(ledger.consumeFixtureFillApproval(owner, prepared.operationId, 2007), {
       operationId: prepared.operationId, target, text: prepared.preview.text, expiresAt: consent.expiresAt
@@ -609,6 +612,10 @@ test("fixture fill queue consumes separate owner consent before one exact-target
     assert.equal(ledger.requestFixtureFill(Symbol("foreign"), prepared.operationId, 2006), null);
     const filling = ledger.requestFixtureFill(owner, prepared.operationId, 2006);
     if (!filling || filling === "busy") throw new Error("Expected one owner fill attempt");
+    const fillingStatus = ledger.getOperation(owner, prepared.operationId, 2006);
+    if (fillingStatus.state !== "approved") throw new Error("Expected an owned in-flight fill");
+    assert.deepEqual(fillingStatus.draftFill, { state: "filling", startedAt: 2006, expiresAt: 6006 });
+    assert.deepEqual(ledger.getOperation(Symbol("foreign"), prepared.operationId, 2006), { state: "unknown" });
     assert.equal(ledger.getFixtureFillAuthorization(owner, prepared.operationId, 2006), null);
     assert.equal(ledger.requestFixtureFill(owner, prepared.operationId, 2007), null);
     assert.deepEqual(ledger.listFixtureFillChallenges(2007), [{ attemptId: filling.attemptId,
@@ -630,12 +637,23 @@ test("fixture fill queue consumes separate owner consent before one exact-target
     assert.equal(ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "textarea" }, 2011), true);
     assert.deepEqual(await filling.result, { operationId: prepared.operationId, completedAt: 2011,
       ok: true, editor: "textarea" });
+    const filledStatus = ledger.getOperation(owner, prepared.operationId, 2011);
+    if (filledStatus.state !== "approved") throw new Error("Expected owned fill readback");
+    assert.deepEqual(filledStatus.draftFill, { state: "filled", completedAt: 2011, editor: "textarea" });
+    assert.equal(JSON.stringify(filledStatus).includes(prepared.preview.text), false);
+    assert.equal(JSON.stringify(filledStatus).includes(target.documentId), false);
     assert.equal(ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "textarea" }, 2012), false);
     assert.equal(ledger.requestFixtureFill(owner, prepared.operationId, 2012), null);
     const next = ledger.requestFixtureFill(owner, second.operationId, 2012);
     if (!next || next === "busy") throw new Error("Expected serialized second attempt");
+    const deadlineStatus = ledger.getOperation(owner, second.operationId, 6012);
+    if (deadlineStatus.state !== "approved") throw new Error("Expected owned fill deadline status");
+    assert.deepEqual(deadlineStatus.draftFill, { state: "uncertain", completedAt: 6012 });
     assert.deepEqual(ledger.listFixtureFillChallenges(6012), []);
     assert.equal(await next.result, null);
+    const unknownStatus = ledger.getOperation(owner, second.operationId, 6013);
+    if (unknownStatus.state !== "approved") throw new Error("Expected owned uncertain fill");
+    assert.deepEqual(unknownStatus.draftFill, { state: "uncertain", completedAt: 6012 });
     assert.equal(ledger.requestFixtureFill(owner, second.operationId, 6013), null);
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
   } finally {
