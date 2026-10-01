@@ -490,6 +490,51 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     }), reviewArgs);
     assert.equal(before.ok, false);
 
+    for (const scenario of [
+      { selector: "#view-fixture-reviews", outcome: "empty" },
+      { selector: "#view-fixture-fill-reviews", outcome: "empty" },
+      { selector: "#view-fixture-reviews", outcome: "refused" },
+      { selector: "#view-fixture-fill-reviews", outcome: "rejected" }
+    ]) {
+      await popup.evaluate(() => {
+        globalThis.fixtureOriginalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
+        chrome.runtime.sendMessage = (...args) => ["list_fixture_prepared_reviews", "list_fixture_fill_reviews"]
+          .includes(args[0]?.kind) ? new Promise((resolve, reject) => {
+            globalThis.fixtureResolveReview = resolve;
+            globalThis.fixtureRejectReview = reject;
+          }) : globalThis.fixtureOriginalSendMessage(...args);
+      });
+      let changedTab;
+      try {
+        await popup.evaluate((selector) => document.querySelector(selector).click(), scenario.selector);
+        await popup.waitForFunction(() => typeof globalThis.fixtureResolveReview === "function", undefined, { timeout: 4000 });
+        changedTab = await context.newPage();
+        await changedTab.goto("about:blank");
+        await popup.getByText("Selected fixture changed. Draft review cleared.", { exact: true })
+          .waitFor({ state: "visible", timeout: 4000 });
+        await popup.evaluate((outcome) => {
+          if (outcome === "rejected") globalThis.fixtureRejectReview(new Error("Late fixture review failure"));
+          else globalThis.fixtureResolveReview(outcome === "empty" ? { ok: true, reviews: [], hasMore: false }
+            : { ok: false, error: "Late fixture review refused" });
+        }, scenario.outcome);
+        await popup.waitForFunction(() => !document.querySelector("#view-fixture-reviews").disabled, undefined, { timeout: 4000 });
+        assert.equal(await popup.locator("#fixture-review-result").evaluate((element) => element.hidden), true);
+        assert.equal(await popup.locator("#fixture-reviews pre").count(), 0);
+        assert.equal(await popup.locator("#status").textContent(), "Selected fixture changed. Draft review cleared.");
+      } finally {
+        await popup.evaluate(() => {
+          chrome.runtime.sendMessage = globalThis.fixtureOriginalSendMessage;
+          delete globalThis.fixtureOriginalSendMessage;
+          delete globalThis.fixtureResolveReview;
+          delete globalThis.fixtureRejectReview;
+        });
+        await changedTab?.close();
+        await fixture.bringToFront();
+        await popup.reload();
+        await popup.getByRole("button", { name: "Review fixture drafts" }).waitFor({ state: "visible" });
+      }
+    }
+
     const created = await facade.requestConnection();
     if (created.kind !== "connection_requested") throw new Error("Expected fixture request");
     const approved = await popup.evaluate(({ tabId, expectedUrl, pendingRequestId }) => chrome.runtime.sendMessage({

@@ -109,8 +109,10 @@ if (!inspectButton || !pendingButton || !fixtureReviewButton || !fixtureFillRevi
 let selectedFixtureTab: { id: number; url: string } | null = null;
 let selectedGeminiTab: { id: number; url: string } | null = null;
 let fixtureReviewExpiry: ReturnType<typeof setTimeout> | undefined;
+let fixtureReviewGeneration = 0;
 
 function clearFixtureReviews() {
+  fixtureReviewGeneration++;
   if (!fixtureReviewResult || !fixtureReviews) return;
   fixtureReviewResult.hidden = true;
   fixtureReviews.replaceChildren();
@@ -160,10 +162,12 @@ const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
   fixtureReviewButton.disabled = true;
   fixtureFillReviewButton.disabled = true;
   clearFixtureReviews();
+  const reviewGeneration = fixtureReviewGeneration;
   fixtureReviewHeading.textContent = purpose === "fill" ? "Fixture draft-fill consent" : "Prepared fixture drafts";
   status.textContent = "Checking the selected fixture draft...";
   try {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (reviewGeneration !== fixtureReviewGeneration) return;
     if (!selectedFixtureTab || tab?.id !== selectedFixtureTab.id || tab.url !== selectedFixtureTab.url) {
       status.textContent = "Selected fixture changed. No draft shown.";
       return;
@@ -171,6 +175,7 @@ const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
     const response = await browser.runtime.sendMessage({
       kind: purpose === "fill" ? "list_fixture_fill_reviews" : "list_fixture_prepared_reviews",
       tabId: tab.id, expectedUrl: selectedFixtureTab.url }) as FixtureReviewsResult;
+    if (reviewGeneration !== fixtureReviewGeneration) return;
     if (!response.ok) {
       status.textContent = response.error;
       return;
@@ -231,7 +236,7 @@ const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
       ? `${response.reviews.length} prepared fixture draft(s)${response.hasMore ? "; more pending" : ""}. Awaiting approval.`
       : "No prepared drafts for this fixture document.";
   } catch {
-    status.textContent = "Fixture draft review unavailable.";
+    if (reviewGeneration === fixtureReviewGeneration) status.textContent = "Fixture draft review unavailable.";
   } finally {
     fixtureReviewButton.disabled = false;
     fixtureFillReviewButton.disabled = false;
