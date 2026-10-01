@@ -251,7 +251,9 @@ test("a new facade recovers uncertain status without inheriting a browser grant"
   const [review] = ledger.listFixtureReviews(target).reviews;
   assert.ok(review);
   ledger.approveFixtureReview(target, prepared.operationId, review.reviewId);
-  const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId);
+  const started = { startedAt: Date.now() };
+  database.prepare("INSERT INTO message_dispatch_attempts (operation_id, started_at, state) VALUES (?, ?, 'dispatching')")
+    .run(prepared.operationId, started.startedAt);
   ledger.disconnect(owner);
 
   const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);

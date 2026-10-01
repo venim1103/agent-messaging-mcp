@@ -10,7 +10,187 @@ import { MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
   PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS, FIXTURE_REVIEW_APPROVAL_TTL_MS,
   FIXTURE_PREFLIGHT_TIMEOUT_MS, MAX_PENDING_FIXTURE_PREFLIGHTS }
   from "./message-operations.js";
-import { PendingConnectionRequests } from "./pending-connections.js";
+import { PendingConnectionRequests, type FixtureTarget } from "./pending-connections.js";
+
+function approveSyntheticSend(ledger: PreparedMessageOperations, owner: symbol, operationId: string,
+  target: FixtureTarget, now: number) {
+  const status = ledger.getOperation(owner, operationId, now);
+  if (!("draftFill" in status) || status.draftFill?.state !== "filled") {
+    const review = ledger.listFixtureFillReviews(target, now).reviews.find(candidate => candidate.operationId === operationId);
+    assert.ok(review);
+    ledger.approveFixtureFillReview(target, operationId, review.reviewId, now);
+    const filling = ledger.requestFixtureFill(owner, operationId, now);
+    if (!filling || filling === "busy") throw new Error("Expected synthetic fixture fill");
+    assert.equal(ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "textarea" }, now), true);
+  }
+  const review = ledger.listFixtureSendReviews(target, now).reviews.find(candidate => candidate.operationId === operationId);
+  assert.ok(review);
+  ledger.approveFixtureSendReview(target, operationId, review.reviewId, now);
+}
+
+function checkSyntheticDispatch(ledger: PreparedMessageOperations, owner: symbol, operationId: string,
+  target: FixtureTarget, text: string, now: number) {
+  const check = ledger.requestFixtureDispatchCheck(owner, operationId, now);
+  assert.equal(ledger.completeFixtureDispatchCheck(target, operationId, check.checkId,
+    { ok: true, editor: "textarea", draftText: text, selected: true, writable: true, submitReady: true }, now), true);
+  return check.checkId;
+}
+
+test("journal start requires a fresh baseline and exact current draft after distinct send consent", () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("internal fixture writer");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic guarded intent",
+      "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    approveSyntheticSend(ledger, owner, prepared.operationId, target, 2004);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004), /RECOVERY_REQUIRED/);
+    ledger.createRecoveryReceipt(owner, prepared.operationId, 2004);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004), /OBSERVATION_UNAVAILABLE/);
+    requests.publishFixtureSnapshot(target, [], 2003);
+    ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
+    assert.throws(() => ledger.requestFixtureDispatchCheck(owner, prepared.operationId, 2004), /OBSERVATION_UNAVAILABLE/);
+    requests.publishFixtureSnapshot(target, [], 2004);
+    ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004), /DISPATCH_CHECK_REQUIRED/);
+    const check = ledger.requestFixtureDispatchCheck(owner, prepared.operationId, 2004);
+    const exact = { ok: true as const, editor: "textarea" as const, draftText: prepared.preview.text,
+      selected: true as const, writable: true as const, submitReady: true as const };
+    assert.equal(ledger.completeFixtureDispatchCheck({ ...target, documentId: "changed" }, prepared.operationId,
+      check.checkId, exact, 2005), false);
+    assert.equal(ledger.completeFixtureDispatchCheck(target, prepared.operationId, check.checkId,
+      { ...exact, draftText: "User changed this draft" }, 2005), false);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005, check.checkId),
+      /DISPATCH_CHECK_REQUIRED/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    const currentCheck = checkSyntheticDispatch(ledger, owner, prepared.operationId, target, prepared.preview.text, 2006);
+    assert.equal(ledger.completeFixtureDispatchCheck(target, prepared.operationId, currentCheck, exact, 2006), false);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2007, check.checkId),
+      /DISPATCH_CHECK_REQUIRED/);
+    const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2007, currentCheck);
+    assert.equal(started.state, "dispatching");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+    assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2007), null);
+    assert.equal(ledger.consumeFixtureDispatchAuthorization(Symbol("foreign"), prepared.operationId, 2007), null);
+    assert.deepEqual(ledger.consumeFixtureDispatchAuthorization(owner, prepared.operationId, 2007), {
+      operationId: prepared.operationId, attemptId: prepared.operationId, target, text: prepared.preview.text,
+      expiresAt: 6004
+    });
+    assert.equal(ledger.consumeFixtureDispatchAuthorization(owner, prepared.operationId, 2008), null);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2008, currentCheck), /DISPATCH_UNCERTAIN/);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("journal checks reject stale, replaced, malformed, and revoked proof without durable intent", () => {
+  for (const failure of ["expired", "future", "replaced", "recaptured", "changed", "gap", "revoked", "foreign",
+    "wrong_operation", "failure", "malformed", "inactive", "read_only", "blocked_submit", "journal_failure"]) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("guarded fixture writer");
+    const ledger = new PreparedMessageOperations(requests, database);
+    try {
+      const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 3, documentId: "CHROME-doc_opaque-42" };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approve(pending.requestId, target, 2000)!;
+      const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic guarded dispatch",
+        "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+      const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+      assert.ok(review);
+      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+      approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
+      ledger.createRecoveryReceipt(owner, prepared.operationId, 2003);
+      requests.publishFixtureSnapshot(target, [], 2003);
+      ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2003);
+      const check = ledger.requestFixtureDispatchCheck(owner, prepared.operationId, 2004);
+      const exact = { ok: true as const, editor: "rich" as const, draftText: prepared.preview.text,
+        selected: true as const, writable: true as const, submitReady: true as const };
+      if (["failure", "malformed", "inactive", "read_only", "blocked_submit"].includes(failure)) {
+        const observation = failure === "failure" ? { ok: false, code: "DRAFT_CHANGED" }
+          : failure === "malformed" ? { ...exact, approved: true }
+          : { ...exact, [failure === "inactive" ? "selected" : failure === "read_only" ? "writable" : "submitReady"]: false };
+        assert.equal(ledger.completeFixtureDispatchCheck(target, prepared.operationId, check.checkId,
+          observation as typeof exact, 2004), false, failure);
+      } else {
+        assert.equal(ledger.completeFixtureDispatchCheck(target, prepared.operationId, check.checkId, exact, 2004), true);
+      }
+      if (failure === "replaced") ledger.requestFixtureDispatchCheck(owner, prepared.operationId, 2005);
+      if (failure === "recaptured") ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2005);
+      if (failure === "changed") requests.publishFixtureSnapshot(target,
+        [{ id: "fixture-3", direction: "outgoing", text: "A changed timeline" }], 2005);
+      if (failure === "gap") requests.markFixtureObservationGap(target, 2005);
+      if (failure === "revoked") requests.revokeChangedTab(3, null);
+      if (failure === "journal_failure") database.exec(`CREATE TRIGGER reject_dispatch BEFORE INSERT ON message_dispatch_attempts
+        BEGIN SELECT RAISE(ABORT, 'synthetic journal failure'); END`);
+      assert.throws(() => ledger.recordFixtureDispatchStart(failure === "foreign" ? Symbol("foreign") : owner,
+        failure === "wrong_operation" ? "b66b3997-9d43-4554-8399-267d1fe9f75c" : prepared.operationId,
+        failure === "expired" ? 6003 : failure === "future" ? 2002 : 2005, check.checkId),
+        /APPROVAL_REQUIRED|OBSERVATION_UNAVAILABLE|DISPATCH_CHECK_REQUIRED|synthetic journal failure/, failure);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0, failure);
+      assert.equal(ledger.consumeFixtureDispatchAuthorization(owner, prepared.operationId, 2005), null, failure);
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
+test("durable intent never recovers submit authority after expiry, revocation, disconnect, restart, or UI echo", () => {
+  for (const failure of ["expired", "revoked", "disconnected", "restarted", "echo", "future"]) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("one-shot fixture writer");
+    const ledger = new PreparedMessageOperations(requests, database);
+    try {
+      const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 3, documentId: "CHROME-doc_opaque-42" };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approve(pending.requestId, target, 2000)!;
+      const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic durable guard",
+        "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+      const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+      assert.ok(review);
+      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+      approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
+      const receipt = ledger.createRecoveryReceipt(owner, prepared.operationId, 2003);
+      requests.publishFixtureSnapshot(target, [], 2003);
+      ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2003);
+      const checkId = checkSyntheticDispatch(ledger, owner, prepared.operationId, target, prepared.preview.text, 2004);
+      ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005, checkId);
+      assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2005), null);
+      if (failure === "revoked") requests.revokeChangedTab(3, null);
+      if (failure === "disconnected") ledger.disconnect(owner);
+      if (failure === "restarted") {
+        const restarted = new PreparedMessageOperations(requests, database);
+        assert.equal(restarted.consumeFixtureDispatchAuthorization(owner, prepared.operationId, 2006), null);
+      }
+      if (failure === "echo") {
+        requests.publishFixtureSnapshot(target, [{ id: "fixture-3", direction: "outgoing", text: prepared.preview.text }], 2006);
+        assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2006).state, "observed_in_ui");
+      }
+      assert.equal(ledger.consumeFixtureDispatchAuthorization(owner, prepared.operationId,
+        failure === "expired" ? 6003 : failure === "future" ? 2004 : 2006), null, failure);
+      assert.equal(ledger.consumeFixtureDispatchAuthorization(owner, prepared.operationId, 2007), null, failure);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      assert.equal(ledger.recoverOperationStatus(prepared.operationId, receipt.recoveryToken).state,
+        failure === "echo" ? "observed_in_ui" : "dispatch_uncertain");
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
 
 test("fixture preparation persists no text and cannot dispatch without a trusted approval path", async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-prepare-"));
@@ -217,7 +397,11 @@ test("private dispatch intent persists before any submit and restart refuses reu
     ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
     assert.throws(() => ledger.recordFixtureDispatchStart(Symbol("foreign"), prepared.operationId, 2004),
       /APPROVAL_REQUIRED/);
-    const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004);
+    approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
+    requests.publishFixtureSnapshot(target, [], 2003);
+    ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2003);
+    const checkId = checkSyntheticDispatch(ledger, owner, prepared.operationId, target, text, 2003);
+    const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004, checkId);
     assert.deepEqual(started, { operationId: prepared.operationId, state: "dispatching", startedAt: 2004 });
     assert.deepEqual(database.prepare("SELECT * FROM message_dispatch_attempts").all().map((row) => ({ ...row })), [
       { operation_id: prepared.operationId, started_at: 2004, state: "dispatching" }
@@ -297,9 +481,18 @@ test("abrupt process death leaves before-start safe and after-start uncertain", 
     if (process.argv[2] !== "before") {
       const [review] = ledger.listFixtureReviews(target, 2002).reviews;
       ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+      const [fillReview] = ledger.listFixtureFillReviews(target, 2003).reviews;
+      ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2003);
+      const filling = ledger.requestFixtureFill(owner, prepared.operationId, 2003);
+      ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "textarea" }, 2003);
+      const [sendReview] = ledger.listFixtureSendReviews(target, 2003).reviews;
+      ledger.approveFixtureSendReview(target, prepared.operationId, sendReview.reviewId, 2003);
       requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Old row" }], 2003);
       ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2003);
-      ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004);
+      const check = ledger.requestFixtureDispatchCheck(owner, prepared.operationId, 2003);
+      ledger.completeFixtureDispatchCheck(target, prepared.operationId, check.checkId,
+        { ok: true, editor: "textarea", draftText: prepared.preview.text, selected: true, writable: true, submitReady: true }, 2003);
+      ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004, check.checkId);
       if (process.argv[2] === "observed") {
         requests.publishFixtureSnapshot(target,
           [{ id: "fixture-3", direction: "outgoing", text: "Synthetic crash probe" }], 2005);
@@ -363,14 +556,20 @@ test("one unresolved fixture dispatch intent blocks a second approved operation"
     for (const review of ledger.listFixtureReviews(target, 2002).reviews) {
       ledger.approveFixtureReview(target, review.operationId, review.reviewId, 2003);
     }
+    for (const prepared of [first, second]) approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
+    requests.publishFixtureSnapshot(target, [], 2003);
+    ledger.recordFixtureDispatchBaseline(owner, first.operationId, 2003);
+    ledger.recordFixtureDispatchBaseline(owner, second.operationId, 2003);
+    const firstCheck = checkSyntheticDispatch(ledger, owner, first.operationId, target, first.preview.text, 2003);
+    const secondCheck = checkSyntheticDispatch(ledger, owner, second.operationId, target, second.preview.text, 2003);
     assert.throws(() => ledger.recordFixtureDispatchStart(owner, first.operationId, 2004), /RECOVERY_REQUIRED/);
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
     const firstReceipt = ledger.createRecoveryReceipt(owner, first.operationId, 2004);
     const secondReceipt = ledger.createRecoveryReceipt(owner, second.operationId, 2004);
-    ledger.recordFixtureDispatchStart(owner, first.operationId, 2004);
+    ledger.recordFixtureDispatchStart(owner, first.operationId, 2004, firstCheck);
     assert.deepEqual(ledger.recoverOperationStatus(first.operationId, secondReceipt.recoveryToken), { state: "unknown" });
     assert.deepEqual(ledger.recoverOperationStatus(second.operationId, firstReceipt.recoveryToken), { state: "unknown" });
-    assert.throws(() => ledger.recordFixtureDispatchStart(owner, second.operationId, 2005), /DISPATCH_UNCERTAIN/);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, second.operationId, 2005, secondCheck), /DISPATCH_UNCERTAIN/);
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
     assert.equal(ledger.getOperation(owner, second.operationId, 2005).state, "approved");
   } finally {
@@ -512,6 +711,148 @@ test("draft-fill consent is separate from no-send review and consumed once for i
   }
 });
 
+test("send consent is distinct from no-send review and fill consent and requires completed fill", async () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("fixture send reviewer");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic explicit send review",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    assert.deepEqual(ledger.listFixtureSendReviews(target, 2002), { reviews: [], hasMore: false });
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2004), null);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004),
+      /SEND_APPROVAL_REQUIRED/);
+    assert.throws(() => ledger.approveFixtureSendReview(target, prepared.operationId, review.reviewId, 2004),
+      /SEND_REVIEW_UNAVAILABLE/);
+    const [fillReview] = ledger.listFixtureFillReviews(target, 2004).reviews;
+    assert.ok(fillReview);
+    ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2005);
+    assert.deepEqual(ledger.listFixtureSendReviews(target, 2005), { reviews: [], hasMore: false });
+    const filling = ledger.requestFixtureFill(owner, prepared.operationId, 2006);
+    if (!filling || filling === "busy") throw new Error("Expected synthetic fixture fill");
+    assert.deepEqual(ledger.listFixtureSendReviews(target, 2006), { reviews: [], hasMore: false });
+    assert.equal(ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "textarea" }, 2007), true);
+    assert.ok((await filling.result)?.ok);
+    assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2008), null);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2008),
+      /SEND_APPROVAL_REQUIRED/);
+    assert.deepEqual(ledger.listFixtureSendReviews({ ...target, documentId: "other" }, 2008),
+      { reviews: [], hasMore: false });
+    const [oldSendReview] = ledger.listFixtureSendReviews(target, 2008).reviews;
+    const [sendReview] = ledger.listFixtureSendReviews(target, 2009).reviews;
+    assert.ok(oldSendReview && sendReview);
+    for (const token of [review.reviewId, fillReview.reviewId, oldSendReview.reviewId]) {
+      assert.throws(() => ledger.approveFixtureSendReview(target, prepared.operationId, token, 2010),
+        /SEND_REVIEW_UNAVAILABLE/);
+    }
+    assert.throws(() => ledger.approveFixtureSendReview({ ...target, tabId: 4 }, prepared.operationId,
+      sendReview.reviewId, 2010), /SEND_REVIEW_UNAVAILABLE/);
+    const consent = ledger.approveFixtureSendReview(target, prepared.operationId, sendReview.reviewId, 2010);
+    assert.equal(consent.state, "send_approved");
+    assert.ok(consent.expiresAt <= prepared.expiresAt && consent.expiresAt <= sendReview.expiresAt);
+    assert.deepEqual(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2011), {
+      operationId: prepared.operationId, target, text: prepared.preview.text, expiresAt: consent.expiresAt
+    });
+    assert.equal(ledger.getFixtureSendAuthorization(Symbol("foreign owner"), prepared.operationId, 2011), null);
+    assert.throws(() => ledger.approveFixtureSendReview(target, prepared.operationId, sendReview.reviewId, 2011),
+      /SEND_REVIEW_UNAVAILABLE/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    requests.revokeChangedTab(3, null);
+    assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2012), null);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("send-review expiry cannot be revived by ordinary review renewal or a new ledger", async () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("fixture send reviewer");
+  const ledger = new PreparedMessageOperations(requests, database);
+  try {
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic send-review expiry",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+    assert.ok(review);
+    ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    const [fillReview] = ledger.listFixtureFillReviews(target, 2004).reviews;
+    assert.ok(fillReview);
+    ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2005);
+    const filling = ledger.requestFixtureFill(owner, prepared.operationId, 2006);
+    if (!filling || filling === "busy") throw new Error("Expected synthetic fill attempt");
+    assert.equal(ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "rich" }, 2007), true);
+    await filling.result;
+    const [expiredSendReview] = ledger.listFixtureSendReviews(target, 2008).reviews;
+    assert.ok(expiredSendReview);
+    const renewedAt = expiredSendReview.expiresAt + 1;
+    const [renewedReview] = ledger.listFixtureReviews(target, renewedAt).reviews;
+    assert.ok(renewedReview);
+    ledger.approveFixtureReview(target, prepared.operationId, renewedReview.reviewId, renewedAt);
+    assert.throws(() => ledger.approveFixtureSendReview(target, prepared.operationId,
+      expiredSendReview.reviewId, renewedAt), /SEND_REVIEW_UNAVAILABLE/);
+    const [freshSendReview] = ledger.listFixtureSendReviews(target, renewedAt).reviews;
+    assert.ok(freshSendReview);
+    const consent = ledger.approveFixtureSendReview(target, prepared.operationId, freshSendReview.reviewId, renewedAt);
+    assert.ok(ledger.getFixtureSendAuthorization(owner, prepared.operationId, renewedAt + 1));
+    const restarted = new PreparedMessageOperations(requests, database);
+    assert.equal(restarted.getFixtureSendAuthorization(owner, prepared.operationId, renewedAt + 1), null);
+    assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, consent.expiresAt), null);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("failed and uncertain fixture fills cannot offer send authority", async () => {
+  for (const result of [{ ok: false as const, code: "DRAFT_PRESENT" as const },
+    { ok: false as const, code: "FILL_UNCERTAIN" as const }]) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("fixture owner");
+    const ledger = new PreparedMessageOperations(requests, database);
+    try {
+      const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 3, documentId: "CHROME-doc_opaque-42" };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approve(pending.requestId, target, 2000)!;
+      const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic failed fill",
+        "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+      const [review] = ledger.listFixtureReviews(target, 2002).reviews;
+      assert.ok(review);
+      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+      const [fillReview] = ledger.listFixtureFillReviews(target, 2004).reviews;
+      assert.ok(fillReview);
+      ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2005);
+      const filling = ledger.requestFixtureFill(owner, prepared.operationId, 2006);
+      if (!filling || filling === "busy") throw new Error("Expected synthetic refused fill");
+      assert.equal(ledger.completeFixtureFill(target, filling.attemptId, result, 2007), true);
+      await filling.result;
+      assert.deepEqual(ledger.listFixtureSendReviews(target, 2008), { reviews: [], hasMore: false });
+      assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2008), null);
+      assert.throws(() => ledger.approveFixtureSendReview(target, prepared.operationId, fillReview.reviewId, 2008),
+        /SEND_REVIEW_UNAVAILABLE/);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
 test("manual fixture review can pause beyond old windows without removing expiry or one-shot checks", () => {
   const database = new DatabaseSync(":memory:");
   const requests = new PendingConnectionRequests();
@@ -614,7 +955,11 @@ test("expired, revoked, or writer-blocked fill consent cannot authorize a draft 
         const [blockingReview] = ledger.listFixtureReviews(target, 2007).reviews;
         assert.ok(blockingReview);
         ledger.approveFixtureReview(target, blocking.operationId, blockingReview.reviewId, 2008);
-        ledger.recordFixtureDispatchStart(owner, blocking.operationId, 2009);
+        approveSyntheticSend(ledger, owner, blocking.operationId, target, 2008);
+        requests.publishFixtureSnapshot(target, [], 2008);
+        ledger.recordFixtureDispatchBaseline(owner, blocking.operationId, 2008);
+        const checkId = checkSyntheticDispatch(ledger, owner, blocking.operationId, target, blocking.preview.text, 2008);
+        ledger.recordFixtureDispatchStart(owner, blocking.operationId, 2009, checkId);
         assert.equal(ledger.consumeFixtureFillApproval(owner, prepared.operationId, 2010), null);
         assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
       }
@@ -782,10 +1127,12 @@ test("only one new exact outgoing fixture row records durable UI evidence", asyn
     const [review] = ledger.listFixtureReviews(target, 2002).reviews;
     assert.ok(review);
     ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
     const before = [{ id: "fixture-2", direction: "outgoing" as const, text }];
     requests.publishFixtureSnapshot(target, before, 2003);
     ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
-    ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005);
+    const checkId = checkSyntheticDispatch(ledger, owner, prepared.operationId, target, text, 2004);
+    ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005, checkId);
     assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2006).state, "dispatch_uncertain");
     assert.deepEqual(ledger.reconcileFixtureObservation(Symbol("other owner"), prepared.operationId, 2006),
       { state: "unknown" });
@@ -808,8 +1155,11 @@ test("only one new exact outgoing fixture row records durable UI evidence", asyn
     const [nextReview] = ledger.listFixtureReviews(target, 2012).reviews;
     assert.ok(nextReview);
     ledger.approveFixtureReview(target, next.operationId, nextReview.reviewId, 2013);
+    approveSyntheticSend(ledger, owner, next.operationId, target, 2013);
+    requests.publishFixtureSnapshot(target, [...before, { id: "fixture-3", direction: "outgoing", text }], 2013);
     ledger.recordFixtureDispatchBaseline(owner, next.operationId, 2013);
-    assert.equal(ledger.recordFixtureDispatchStart(owner, next.operationId, 2014).state, "dispatching");
+    const nextCheck = checkSyntheticDispatch(ledger, owner, next.operationId, target, next.preview.text, 2013);
+    assert.equal(ledger.recordFixtureDispatchStart(owner, next.operationId, 2014, nextCheck).state, "dispatching");
     assert.equal((await readFile(join(home, "operations.sqlite"))).includes(Buffer.from(text)), false);
     assert.equal((await readFile(join(home, "operations.sqlite"))).includes(Buffer.from(receipt.recoveryToken)), false);
     database.close();
@@ -825,7 +1175,7 @@ test("only one new exact outgoing fixture row records durable UI evidence", asyn
 
 test("ambiguous rows, observation gaps, and revoked fixture grants stay uncertain", () => {
   for (const failure of ["ambiguity", "ambiguity_history", "historical_matches", "epoch", "overflow", "revoked",
-    "no_baseline", "changed_baseline", "old_baseline", "trimmed_text"]) {
+    "no_baseline", "changed_baseline", "old_baseline", "unsupported_text"]) {
     const database = new DatabaseSync(":memory:");
     try {
       const requests = new PendingConnectionRequests();
@@ -835,15 +1185,23 @@ test("ambiguous rows, observation gaps, and revoked fixture grants stay uncertai
       const pending = requests.create(owner, 1000);
       const grant = requests.approve(pending.requestId, target, 2000)!;
       const ledger = new PreparedMessageOperations(requests, database);
-      const text = failure === "trimmed_text" ? " Synthetic matched row " : "Synthetic matched row";
+      const text = failure === "unsupported_text" ? " Synthetic matched row " : "Synthetic matched row";
       const prepared = ledger.prepare(owner, grant.connectionId, 1, text,
         "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
       ledger.createRecoveryReceipt(owner, prepared.operationId, 2001);
       const [review] = ledger.listFixtureReviews(target, 2002).reviews;
       assert.ok(review);
       ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
-      requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Before" }], 2000);
+      approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
+      requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Before" }], 2003);
       if (failure !== "no_baseline") ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
+      if (failure === "no_baseline" || failure === "unsupported_text") {
+        assert.throws(() => ledger.requestFixtureDispatchCheck(owner, prepared.operationId, 2004),
+          failure === "no_baseline" ? /OBSERVATION_UNAVAILABLE/ : /UNSUPPORTED_MESSAGE_TEXT/);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+        continue;
+      }
+      const checkId = checkSyntheticDispatch(ledger, owner, prepared.operationId, target, text, 2004);
       if (failure === "changed_baseline") {
         requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Changed" }], 2005);
         assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2006), /OBSERVATION_UNAVAILABLE/);
@@ -855,7 +1213,7 @@ test("ambiguous rows, observation gaps, and revoked fixture grants stay uncertai
         assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
         continue;
       }
-      ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005);
+      ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005, checkId);
       if (failure === "epoch") requests.markFixtureObservationGap(target, 2006);
       if (failure === "overflow") {
         for (let index = 0; index < 33; index++) {
@@ -875,7 +1233,7 @@ test("ambiguous rows, observation gaps, and revoked fixture grants stay uncertai
           "dispatch_uncertain", failure);
       }
       requests.publishFixtureSnapshot(target, [{ id: "fixture-3", direction: "outgoing",
-        text: failure === "trimmed_text" ? text.trim() : text }], 2008);
+        text }], 2008);
       if (failure === "revoked") requests.revokeChangedTab(3, null);
       assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2009).state,
         "dispatch_uncertain", failure);

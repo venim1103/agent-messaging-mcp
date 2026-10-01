@@ -8,6 +8,7 @@ import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests, type FixtureT
 
 export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
 export const FIXTURE_REVIEW_APPROVAL_TTL_MS = 2 * 60_000;
+export const FIXTURE_SEND_APPROVAL_TTL_MS = 2 * 60_000;
 export const PREPARED_KEY_RETENTION_MS = 24 * 60 * 60_000;
 export const MAX_PREPARED_MESSAGE_BYTES = 4_000;
 export const MAX_ACTIVE_PREPARED_MESSAGES = 100;
@@ -17,6 +18,15 @@ export const FIXTURE_PREFLIGHT_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_PREFLIGHTS = 16;
 export const FIXTURE_FILL_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_FILLS = 1;
+export const FIXTURE_DISPATCH_CHECK_TIMEOUT_MS = 4_000;
+const fixtureDispatchCheckResultSchema = z.discriminatedUnion("ok", [
+  z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]),
+    draftText: z.string().max(2048), selected: z.literal(true), writable: z.literal(true),
+    submitReady: z.literal(true) }),
+  z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "COMPOSER_UNAVAILABLE",
+    "DRAFT_CHANGED", "SUBMIT_UNAVAILABLE"]) })
+]);
+type FixtureDispatchCheckResult = z.infer<typeof fixtureDispatchCheckResultSchema>;
 export const fixturePreflightResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]) }),
   z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
@@ -88,6 +98,13 @@ type FixtureDispatchBaseline = Readonly<{
   cursor: Readonly<{ epoch: string; sequence: number }>;
   messageIds: ReadonlyArray<string>;
 }>;
+type FixtureDispatchCheck = Readonly<{
+  checkId: string; owner: symbol; target: FixtureTarget; text: string; createdAt: number; expiresAt: number;
+  baseline: FixtureDispatchBaseline; checkedAt: number | null
+}>;
+type FixtureDispatchAuthorization = Readonly<{
+  owner: symbol; operationId: string; target: FixtureTarget; text: string; startedAt: number; expiresAt: number
+}>;
 type FixtureDispatchStatus = Readonly<{
   operationId: string; state: "dispatch_uncertain"; startedAt: number
 }> | Readonly<{
@@ -116,8 +133,12 @@ export class PreparedMessageOperations {
   private readonly fillApprovals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
   private readonly consumedFillApprovals = new Set<string>();
   private readonly fillStates = new Map<string, Readonly<FixtureDraftFillState>>();
+  private readonly sendReviewTokens = new Map<string, Readonly<{ reviewId: string; expiresAt: number }>>();
+  private readonly sendApprovals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
   private readonly recoveryReceipts = new Map<string, string>();
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
+  private readonly dispatchChecks = new Map<string, FixtureDispatchCheck>();
+  private readonly dispatchAuthorizations = new Map<string, FixtureDispatchAuthorization>();
   private readonly ambiguousEvidence = new Set<string>();
   private readonly preflightChecks = new Map<string, PendingFixturePreflight>();
   private readonly fillChecks = new Map<string, PendingFixtureFill>();
@@ -185,8 +206,12 @@ export class PreparedMessageOperations {
     this.fillApprovals.delete(operationId);
     this.consumedFillApprovals.delete(operationId);
     this.fillStates.delete(operationId);
+    this.sendReviewTokens.delete(operationId);
+    this.sendApprovals.delete(operationId);
     this.recoveryReceipts.delete(operationId);
     this.dispatchBaselines.delete(operationId);
+    this.dispatchChecks.delete(operationId);
+    this.dispatchAuthorizations.delete(operationId);
     this.ambiguousEvidence.delete(operationId);
   }
 
@@ -199,6 +224,15 @@ export class PreparedMessageOperations {
     }
     for (const [operationId, approval] of this.fillApprovals) {
       if (approval.expiresAt <= now) this.fillApprovals.delete(operationId);
+    }
+    for (const [operationId, approval] of this.sendApprovals) {
+      if (approval.expiresAt <= now) this.sendApprovals.delete(operationId);
+    }
+    for (const [operationId, check] of this.dispatchChecks) {
+      if (check.expiresAt <= now) this.dispatchChecks.delete(operationId);
+    }
+    for (const [operationId, authorization] of this.dispatchAuthorizations) {
+      if (authorization.expiresAt <= now) this.dispatchAuthorizations.delete(operationId);
     }
   }
 
@@ -371,6 +405,57 @@ export class PreparedMessageOperations {
     return authorization;
   }
 
+  listFixtureSendReviews(target: FixtureTarget, now = Date.now()) {
+    this.discardExpired(now);
+    const reviews: PreparedReview[] = [];
+    for (const [operationId, operation] of this.contents) {
+      if (operation.target.origin !== target.origin || operation.target.conversationId !== target.conversationId
+        || operation.target.tabId !== target.tabId || operation.target.documentId !== target.documentId) continue;
+      this.sendReviewTokens.delete(operationId);
+      if (this.getOperation(operation.owner, operationId, now).state !== "approved"
+        || this.fillStates.get(operationId)?.state !== "filled" || this.sendApprovals.has(operationId)) continue;
+      const approval = this.approvals.get(operationId)!;
+      const reviewId = randomUUID();
+      reviews.push(Object.freeze({ operationId, reviewId,
+        expiresAt: Math.min(operation.expiresAt, approval.expiresAt, now + FIXTURE_SEND_APPROVAL_TTL_MS),
+        preview: Object.freeze({ target: "fixture-alpha", text: operation.text }) }));
+    }
+    const selected = reviews.slice(-MAX_PREPARED_REVIEWS).reverse();
+    for (const review of selected) this.sendReviewTokens.set(review.operationId,
+      Object.freeze({ reviewId: review.reviewId, expiresAt: review.expiresAt }));
+    return Object.freeze({ reviews: Object.freeze(selected), hasMore: reviews.length > MAX_PREPARED_REVIEWS });
+  }
+
+  approveFixtureSendReview(target: FixtureTarget, operationId: string, reviewId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.contents.get(operationId);
+    const approval = this.approvals.get(operationId);
+    const review = this.sendReviewTokens.get(operationId);
+    if (!operation || !approval || this.getOperation(operation.owner, operationId, now).state !== "approved"
+      || this.fillStates.get(operationId)?.state !== "filled" || this.sendApprovals.has(operationId)
+      || typeof reviewId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(reviewId)
+      || review?.reviewId !== reviewId || review.expiresAt <= now
+      || operation.target.origin !== target.origin || operation.target.conversationId !== target.conversationId
+      || operation.target.tabId !== target.tabId || operation.target.documentId !== target.documentId) {
+      throw new Error("SEND_REVIEW_UNAVAILABLE");
+    }
+    const consent = Object.freeze({ operationId, state: "send_approved" as const, approvedAt: now,
+      expiresAt: Math.min(operation.expiresAt, approval.expiresAt, review.expiresAt) });
+    this.sendReviewTokens.delete(operationId);
+    this.sendApprovals.set(operationId, consent);
+    return consent;
+  }
+
+  getFixtureSendAuthorization(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.contents.get(operationId);
+    const consent = this.sendApprovals.get(operationId);
+    if (!operation || operation.owner !== owner || !consent || consent.expiresAt <= now
+      || this.fillStates.get(operationId)?.state !== "filled"
+      || this.getOperation(owner, operationId, now).state !== "approved") return null;
+    return Object.freeze({ operationId, target: operation.target, text: operation.text, expiresAt: consent.expiresAt });
+  }
+
   createRecoveryReceipt(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const operation = this.contents.get(operationId);
@@ -529,10 +614,62 @@ export class PreparedMessageOperations {
     const baseline = Object.freeze({ capturedAt: snapshot.capturedAt, cursor: snapshot.cursor,
       messageIds: Object.freeze(snapshot.messages.map((message) => message.id)) });
     this.dispatchBaselines.set(operationId, baseline);
+    this.dispatchChecks.delete(operationId);
     return Object.freeze({ operationId, capturedAt: baseline.capturedAt, cursor: baseline.cursor });
   }
 
-  recordFixtureDispatchStart(owner: symbol, operationId: string, now = Date.now()) {
+  private freshDispatchBaseline(owner: symbol, operationId: string, now: number) {
+    const operation = this.contents.get(operationId);
+    const consent = this.sendApprovals.get(operationId);
+    const baseline = this.dispatchBaselines.get(operationId);
+    const current = operation && this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+    if (!consent || !baseline || baseline.capturedAt < consent.approvedAt || baseline.capturedAt > now
+      || baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS <= now
+      || !current || current === "not_ready" || current.capturedAt > now
+      || current.capturedAt < baseline.capturedAt
+      || current.cursor.epoch !== baseline.cursor.epoch || current.cursor.sequence !== baseline.cursor.sequence) {
+      throw new Error("OBSERVATION_UNAVAILABLE");
+    }
+    return baseline;
+  }
+
+  requestFixtureDispatchCheck(owner: symbol, operationId: string, now = Date.now()) {
+    const authorization = this.getFixtureSendAuthorization(owner, operationId, now);
+    if (!authorization) throw new Error("SEND_APPROVAL_REQUIRED");
+    if (authorization.text.length > 2048 || authorization.text.trim() !== authorization.text
+      || authorization.text.includes("\r")) throw new Error("UNSUPPORTED_MESSAGE_TEXT");
+    const baseline = this.freshDispatchBaseline(owner, operationId, now);
+    const check = Object.freeze({ checkId: randomUUID(), owner, target: authorization.target,
+      text: authorization.text, createdAt: now,
+      expiresAt: Math.min(authorization.expiresAt, now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS,
+        baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS), baseline, checkedAt: null });
+    this.dispatchChecks.set(operationId, check);
+    return Object.freeze({ operationId, checkId: check.checkId, target: check.target,
+      text: check.text, expiresAt: check.expiresAt });
+  }
+
+  completeFixtureDispatchCheck(target: FixtureTarget, operationId: string, checkId: string,
+    observation: FixtureDispatchCheckResult, now = Date.now()): boolean {
+    this.discardExpired(now);
+    const check = this.dispatchChecks.get(operationId);
+    const parsed = fixtureDispatchCheckResultSchema.safeParse(observation);
+    if (!check || check.checkId !== checkId || check.checkedAt !== null || check.createdAt > now
+      || check.expiresAt <= now || !parsed.success
+      || check.target.origin !== target.origin || check.target.conversationId !== target.conversationId
+      || check.target.tabId !== target.tabId || check.target.documentId !== target.documentId) return false;
+    this.dispatchChecks.delete(operationId);
+    if (!parsed.data.ok || parsed.data.draftText !== check.text
+      || !this.getFixtureSendAuthorization(check.owner, operationId, now)) return false;
+    try {
+      if (this.freshDispatchBaseline(check.owner, operationId, now) !== check.baseline) return false;
+    } catch {
+      return false;
+    }
+    this.dispatchChecks.set(operationId, Object.freeze({ ...check, checkedAt: now }));
+    return true;
+  }
+
+  recordFixtureDispatchStart(owner: symbol, operationId: string, now = Date.now(), checkId?: string) {
     this.discardExpired(now);
     const ownerId = this.owners.get(owner);
     const record = this.database.prepare("SELECT owner_id FROM prepared_message_operations WHERE operation_id = ?")
@@ -548,16 +685,15 @@ export class PreparedMessageOperations {
       || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId) {
       throw new Error("APPROVAL_REQUIRED");
     }
+    if (!this.getFixtureSendAuthorization(owner, operationId, now)) throw new Error("SEND_APPROVAL_REQUIRED");
     if (!this.database.prepare("SELECT 1 FROM message_operation_recovery WHERE operation_id = ?").get(operationId)) {
       throw new Error("RECOVERY_REQUIRED");
     }
-    const baseline = this.dispatchBaselines.get(operationId);
-    if (baseline) {
-      const current = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
-      if (!current || current === "not_ready" || current.capturedAt > now
-        || current.cursor.epoch !== baseline.cursor.epoch || current.cursor.sequence !== baseline.cursor.sequence) {
-        throw new Error("OBSERVATION_UNAVAILABLE");
-      }
+    const baseline = this.freshDispatchBaseline(owner, operationId, now);
+    const check = this.dispatchChecks.get(operationId);
+    if (!check || check.owner !== owner || check.checkId !== checkId || check.baseline !== baseline
+      || check.checkedAt === null || check.checkedAt > now || check.expiresAt <= now) {
+      throw new Error("DISPATCH_CHECK_REQUIRED");
     }
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -575,7 +711,35 @@ export class PreparedMessageOperations {
     }
     this.approvals.delete(operationId);
     this.reviewTokens.delete(operationId);
+    this.sendApprovals.delete(operationId);
+    this.sendReviewTokens.delete(operationId);
+    this.dispatchChecks.delete(operationId);
+    this.dispatchAuthorizations.set(operationId, Object.freeze({ owner, operationId,
+      target: operation.target, text: operation.text, startedAt: now, expiresAt: check.expiresAt }));
     return Object.freeze({ operationId, state: "dispatching" as const, startedAt: now });
+  }
+
+  consumeFixtureDispatchAuthorization(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const authorization = this.dispatchAuthorizations.get(operationId);
+    if (!authorization || authorization.owner !== owner) return null;
+    this.dispatchAuthorizations.delete(operationId);
+    const operation = this.contents.get(operationId);
+    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    const baseline = this.dispatchBaselines.get(operationId);
+    const current = operation && this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+    const intent = this.database.prepare("SELECT started_at, state FROM message_dispatch_attempts WHERE operation_id = ?")
+      .get(operationId) as { started_at: number; state: string } | undefined;
+    if (!live || live.origin !== authorization.target.origin || live.conversationId !== authorization.target.conversationId
+      || live.tabId !== authorization.target.tabId || live.documentId !== authorization.target.documentId
+      || authorization.startedAt > now || authorization.expiresAt <= now
+      || intent?.state !== "dispatching" || intent.started_at !== authorization.startedAt
+      || !baseline || baseline.capturedAt > now || baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS <= now
+      || !current || current === "not_ready" || current.capturedAt > now || current.capturedAt < baseline.capturedAt
+      || current.cursor.epoch !== baseline.cursor.epoch || current.cursor.sequence !== baseline.cursor.sequence
+      || this.database.prepare("SELECT 1 FROM message_dispatch_evidence WHERE operation_id = ?").get(operationId)) return null;
+    return Object.freeze({ operationId, attemptId: operationId, target: authorization.target,
+      text: authorization.text, expiresAt: authorization.expiresAt });
   }
 
   reconcileFixtureObservation(owner: symbol, operationId: string, now = Date.now()) {

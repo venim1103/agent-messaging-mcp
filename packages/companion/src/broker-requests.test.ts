@@ -244,7 +244,8 @@ test("a facade receipt recovers only uncertain operation status after an owner r
     assert.ok(review);
     assert.equal(JSON.stringify(review).includes(prepared.payload.recoveryToken), false);
     operations.approveFixtureReview(target, prepared.payload.operationId, review.reviewId, 2003);
-    operations.recordFixtureDispatchStart(owner, prepared.payload.operationId, 2004);
+    database.prepare("INSERT INTO message_dispatch_attempts (operation_id, started_at, state) VALUES (?, ?, 'dispatching')")
+      .run(prepared.payload.operationId, 2004);
 
     const restartedRequests = new PendingConnectionRequests();
     const restarted = new PreparedMessageOperations(restartedRequests, database);

@@ -478,7 +478,9 @@ test("a recovery receipt reveals only dispatch metadata to a fresh MCP process",
     ledger.approveFixtureReview(target, prepared.operationId, review.reviewId);
     requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Old synthetic row" }]);
     ledger.recordFixtureDispatchBaseline(owner, prepared.operationId);
-    const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId);
+    const started = { startedAt: Date.now() };
+    database.prepare("INSERT INTO message_dispatch_attempts (operation_id, started_at, state) VALUES (?, ?, 'dispatching')")
+      .run(prepared.operationId, started.startedAt);
     requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Old synthetic row" },
       { id: "fixture-3", direction: "outgoing", text: prepared.preview.text }]);
     const observed = ledger.reconcileFixtureObservation(owner, prepared.operationId);
@@ -490,7 +492,9 @@ test("a recovery receipt reveals only dispatch metadata to a fresh MCP process",
     assert.ok(nextReview);
     ledger.approveFixtureReview(target, unresolved.operationId, nextReview.reviewId);
     ledger.recordFixtureDispatchBaseline(owner, unresolved.operationId);
-    const unresolvedStart = ledger.recordFixtureDispatchStart(owner, unresolved.operationId);
+    const unresolvedStart = { startedAt: Date.now() };
+    database.prepare("INSERT INTO message_dispatch_attempts (operation_id, started_at, state) VALUES (?, ?, 'dispatching')")
+      .run(unresolved.operationId, unresolvedStart.startedAt);
     database.close();
     database = undefined;
 

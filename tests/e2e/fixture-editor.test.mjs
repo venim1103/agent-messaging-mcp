@@ -133,12 +133,33 @@ test("fixture browser evidence distinguishes a new outgoing row from existing id
     const [review] = ledger.listFixtureReviews(target, 2002).reviews;
     assert.ok(review);
     ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
+    const [fillReview] = ledger.listFixtureFillReviews(target, 2003).reviews;
+    assert.ok(fillReview);
+    ledger.approveFixtureFillReview(target, prepared.operationId, fillReview.reviewId, 2003);
+    const filling = ledger.requestFixtureFill(owner, prepared.operationId, 2003);
+    assert.ok(filling && filling !== "busy");
+    await editor.fill(text);
+    assert.equal(await editor.inputValue(), text);
+    assert.equal(ledger.completeFixtureFill(target, filling.attemptId, { ok: true, editor: "textarea" }, 2003), true);
+    assert.equal((await filling.result).ok, true);
+    const [sendReview] = ledger.listFixtureSendReviews(target, 2003).reviews;
+    assert.ok(sendReview);
+    ledger.approveFixtureSendReview(target, prepared.operationId, sendReview.reviewId, 2003);
     requests.publishFixtureSnapshot(target, before.messages, 2003);
     ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
-    ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005);
+    const check = ledger.requestFixtureDispatchCheck(owner, prepared.operationId, 2004);
+    const inspected = await page.evaluate(inspectFixturePreflight,
+      { expectedUrl: "http://127.0.0.1:8787/", text, draftState: "prepared" });
+    assert.deepEqual(inspected, { ok: true, editor: "textarea" });
+    assert.equal(ledger.completeFixtureDispatchCheck(target, prepared.operationId, check.checkId,
+      { ok: true, editor: inspected.editor, draftText: await editor.inputValue(),
+        selected: await page.evaluate(() => document.visibilityState === "visible"),
+        writable: await editor.isEditable(), submitReady: await send.isEnabled() }, 2004), true);
+    ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005, check.checkId);
     assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2006).state, "dispatch_uncertain");
+    assert.equal(ledger.consumeFixtureDispatchAuthorization(owner, prepared.operationId, 2006)?.attemptId,
+      prepared.operationId);
 
-    await editor.fill(text);
     await send.click();
     const after = await page.evaluate(captureFixtureSnapshot);
     assert.ok(after);
@@ -268,6 +289,48 @@ test("read-only fixture preflight protects drafts and rejects blocked or changed
           { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
       }
       const textbox = page.getByRole("textbox", { name: "Message" });
+      const preparedInput = { ...input, draftState: "prepared" };
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, preparedInput), { ok: false, code: "DRAFT_PRESENT" });
+      for (const draftState of ["unknown", null, true]) {
+        assert.deepEqual(await page.evaluate(inspectFixturePreflight, { ...input, draftState }),
+          { ok: false, code: "COMPOSER_UNAVAILABLE" });
+      }
+      await textbox.fill(input.text);
+      await textbox.evaluate((element) => element.blur());
+      const filledBefore = await page.evaluate(() => ({ focus: document.activeElement?.id,
+        selection: window.getSelection()?.toString(), rows: document.querySelector("ol#messages").innerText,
+        scroll: window.scrollY }));
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "DRAFT_PRESENT" });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, { ...input, draftState: "empty" }),
+        { ok: false, code: "DRAFT_PRESENT" });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, preparedInput), { ok: true, editor });
+      assert.equal(editor === "rich" ? await textbox.innerText() : await textbox.inputValue(), input.text);
+      assert.deepEqual(await page.evaluate(() => ({ focus: document.activeElement?.id,
+        selection: window.getSelection()?.toString(), rows: document.querySelector("ol#messages").innerText,
+        scroll: window.scrollY })), filledBefore);
+      await page.getByRole("button", { name: "Send" }).evaluate((button) => { button.disabled = true; });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, preparedInput), { ok: false, code: "SUBMIT_UNAVAILABLE" });
+      await page.getByRole("button", { name: "Send" }).evaluate((button) => { button.disabled = false; });
+      await textbox.evaluate((element) => {
+        if (element instanceof HTMLTextAreaElement) element.readOnly = true;
+        else element.setAttribute("aria-readonly", "true");
+      });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, preparedInput), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+      await textbox.evaluate((element) => {
+        if (element instanceof HTMLTextAreaElement) element.readOnly = false;
+        else element.removeAttribute("aria-readonly");
+      });
+      await page.evaluate(() => {
+        const overlay = document.createElement("div");
+        overlay.id = "prepared-overlay";
+        Object.assign(overlay.style, { position: "fixed", inset: "0", zIndex: "9999", background: "white" });
+        document.body.append(overlay);
+      });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, preparedInput), { ok: false, code: "SUBMIT_UNAVAILABLE" });
+      await page.locator("#prepared-overlay").evaluate((overlay) => overlay.remove());
+      await textbox.fill(`${input.text}!`);
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, preparedInput), { ok: false, code: "DRAFT_PRESENT" });
+      assert.equal(editor === "rich" ? await textbox.innerText() : await textbox.inputValue(), `${input.text}!`);
       await textbox.fill("User draft");
       assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "DRAFT_PRESENT" });
       assert.equal(editor === "rich" ? await textbox.innerText() : await textbox.inputValue(), "User draft");
@@ -324,6 +387,7 @@ test("read-only fixture preflight protects drafts and rejects blocked or changed
       await page.goto(expectedUrl);
       await page.getByRole("button", { name: "Switch chat" }).click();
       assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "TARGET_CHANGED" });
+      assert.deepEqual(await page.evaluate(inspectFixturePreflight, preparedInput), { ok: false, code: "TARGET_CHANGED" });
     }
     await page.goto("about:blank");
     assert.deepEqual(await page.evaluate(inspectFixturePreflight, { expectedUrl: "http://127.0.0.1:8787/", text: "Synthetic" }),

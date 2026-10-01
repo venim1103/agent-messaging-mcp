@@ -28,7 +28,9 @@ export function captureFixtureSnapshot(): { messages: FixtureMessage[] } | null 
   return new TextEncoder().encode(JSON.stringify(messages)).length <= 64 * 1024 ? { messages } : null;
 }
 
-export function inspectFixturePreflight(input: { expectedUrl: string; text: string }): FixturePreflight {
+export function inspectFixturePreflight(input: {
+  expectedUrl: string; text: string; draftState?: "empty" | "prepared"
+}): FixturePreflight {
   const fixtureUrl = "http://127.0.0.1:8787/";
   const richUrl = `${fixtureUrl}?editor=rich`;
   if (!input || (input.expectedUrl !== fixtureUrl && input.expectedUrl !== richUrl)
@@ -37,6 +39,9 @@ export function inspectFixturePreflight(input: { expectedUrl: string; text: stri
     || input.text.length > 2048 || new TextEncoder().encode(input.text).length > 4000) {
     return { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" };
   }
+  const draftState = input.draftState === undefined ? "empty" : input.draftState;
+  if (draftState !== "empty" && draftState !== "prepared") return { ok: false, code: "COMPOSER_UNAVAILABLE" };
+  if (draftState === "prepared" && document.visibilityState !== "visible") return { ok: false, code: "TARGET_CHANGED" };
   const roots = document.querySelectorAll<HTMLElement>("main[data-conversation-id]");
   if (roots.length !== 1 || roots[0]?.dataset.conversationId !== "fixture-alpha") return { ok: false, code: "TARGET_CHANGED" };
   const visible = (element: HTMLElement) => element.getClientRects().length > 0
@@ -56,13 +61,18 @@ export function inspectFixturePreflight(input: { expectedUrl: string; text: stri
     if (!(editor instanceof HTMLTextAreaElement) || editor.id !== "message" || editor.matches(":disabled") || editor.readOnly) {
       return { ok: false, code: "COMPOSER_UNAVAILABLE" };
     }
-    if (editor.value.length > 0) return { ok: false, code: "DRAFT_PRESENT" };
+    if (draftState === "prepared" ? editor.value !== input.text : editor.value.length > 0) {
+      return { ok: false, code: "DRAFT_PRESENT" };
+    }
   } else {
     if (editor.id !== "rich-message" || !editor.isContentEditable || editor.getAttribute("aria-readonly") === "true") {
       return { ok: false, code: "COMPOSER_UNAVAILABLE" };
     }
     const placeholder = editor.childNodes.length === 1 && editor.firstChild instanceof HTMLBRElement;
-    if (editor.textContent?.length || (editor.childNodes.length > 0 && !placeholder)) return { ok: false, code: "DRAFT_PRESENT" };
+    if (draftState === "prepared" ? editor.innerText !== input.text
+      : editor.textContent?.length || (editor.childNodes.length > 0 && !placeholder)) {
+      return { ok: false, code: "DRAFT_PRESENT" };
+    }
   }
   const buttons = form.querySelectorAll("button[type=submit]");
   const button = buttons[0];

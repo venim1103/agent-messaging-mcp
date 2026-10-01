@@ -152,6 +152,24 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
       assert.fail(`Fixture grant ${requestId} was not revoked by the restarted extension`);
     }
 
+    async function createSettledTab() {
+      return worker.evaluate(async () => {
+        const tab = await chrome.tabs.create({ url: "about:blank", active: false });
+        await new Promise((resolve) => {
+          const finished = () => {
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            resolve();
+          };
+          const onUpdated = (updatedTabId, changes) => {
+            if (updatedTabId === tab.id && changes.status === "complete") finished();
+          };
+          chrome.tabs.onUpdated.addListener(onUpdated);
+          void chrome.tabs.get(tab.id).then((current) => { if (current.status === "complete") finished(); });
+        });
+        return tab;
+      });
+    }
+
     const beforeReload = await grant(3);
     const beforeWake = await facade.getConnection(beforeReload);
     if (beforeWake.kind !== "connection_state" || beforeWake.payload.state !== "ready_readonly") {
@@ -226,8 +244,6 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await manager.waitForFunction((id) => new Promise((resolve) =>
       chrome.developerPrivate.getExtensionInfo(id, (info) => resolve(info?.state === "ENABLED"))),
     extensionId, { timeout: 8000 });
-    await waitForStale(beforeReload);
-    await waitForStale(geminiBeforeReload.payload.requestId);
     const wake = await context.newPage();
     await wake.goto(`chrome-extension://${extensionId}/popup.html`);
     await wake.evaluate(() => chrome.runtime.sendMessage({ kind: "list_fixture_pending", tabId: 1 }));
@@ -235,6 +251,8 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
       (await chrome.storage.session.get("fixture-reset-done"))["fixture-reset-done"]);
     await wake.close();
     assert.equal(reloadedMarker, true);
+    await waitForStale(beforeReload);
+    await waitForStale(geminiBeforeReload.payload.requestId);
     const runtimeErrors = await manager.evaluate((id) => new Promise((resolve) =>
       chrome.developerPrivate.getExtensionInfo(id, (info) => resolve(
         info?.runtimeErrors?.map((error) => error.message) ?? []
@@ -251,7 +269,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     assert.equal(await worker.evaluate(async () =>
       (await chrome.storage.session.get("fixture-reset-done"))["fixture-reset-done"]), true);
 
-    const trackedTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
+    const trackedTab = await createSettledTab();
     const beforeTabClose = await grant(trackedTab.id);
     await worker.evaluate(({ tabId }) => chrome.storage.session.set({
       [`fixture-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, expiresAt: Date.now() + 10_000 }
@@ -259,7 +277,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await worker.evaluate((tabId) => chrome.tabs.remove(tabId), trackedTab.id);
     await waitForStale(beforeTabClose);
 
-    const geminiTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
+    const geminiTab = await createSettledTab();
     const geminiPending = await facade.requestConnection();
     if (geminiPending.kind !== "connection_requested") throw new Error("Expected a synthetic Gemini request");
     const geminiApproved = await relay.approveGemini(geminiPending.payload.requestId, {
@@ -275,7 +293,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await worker.evaluate((tabId) => chrome.tabs.remove(tabId), geminiTab.id);
     await waitForStale(geminiPending.payload.requestId);
 
-    const unapprovedTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
+    const unapprovedTab = await createSettledTab();
     const beforeDeniedRead = await grant(unapprovedTab.id);
     const deniedState = await facade.getConnection(beforeDeniedRead);
     if (deniedState.kind !== "connection_state" || deniedState.payload.state !== "ready_readonly") {
@@ -284,7 +302,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await worker.evaluate(({ tabId }) => chrome.storage.session.set({
       [`fixture-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, expiresAt: Date.now() + 30_000 }
     }), { tabId: unapprovedTab.id });
-    const unapprovedGeminiTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
+    const unapprovedGeminiTab = await createSettledTab();
     const unapprovedGemini = await facade.requestConnection();
     if (unapprovedGemini.kind !== "connection_requested") throw new Error("Expected a Gemini read request");
     const geminiTarget = { origin: "https://gemini.google.com", conversationId: "disposable-chat",
@@ -297,20 +315,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await worker.evaluate(({ tabId, url }) => chrome.storage.session.set({
       [`gemini-grant-${tabId}`]: { documentId: `CHROME-doc_${tabId}`, url, expiresAt: Date.now() + 30_000 }
     }), { tabId: unapprovedGeminiTab.id, url: geminiTarget.url });
-    const disconnectedTab = await worker.evaluate(() => chrome.tabs.create({ url: "about:blank", active: false }));
-    await worker.evaluate(async (tabId) => {
-      await new Promise((resolve) => {
-        const finished = () => {
-          chrome.tabs.onUpdated.removeListener(onUpdated);
-          resolve();
-        };
-        const onUpdated = (updatedTabId, changes) => {
-          if (updatedTabId === tabId && changes.status === "complete") finished();
-        };
-        chrome.tabs.onUpdated.addListener(onUpdated);
-        void chrome.tabs.get(tabId).then((tab) => { if (tab.status === "complete") finished(); });
-      });
-    }, disconnectedTab.id);
+    const disconnectedTab = await createSettledTab();
     const beforeDisconnect = await grant(disconnectedTab.id);
     const disconnectState = await facade.getConnection(beforeDisconnect);
     if (disconnectState.kind !== "connection_state" || disconnectState.payload.state !== "ready_readonly") {

@@ -254,6 +254,10 @@ Sending has external effects. A successful DOM click is not sufficient evidence 
 
 Default policy is approval for each send. A later explicitly granted autonomous mode can be limited to one conversation, a short lifetime, and a small message/rate budget. The agent must not be able to widen that grant itself.
 
+The prototype's ordinary **Approve draft (no send)** review and separate **Allow draft fill (no send)** consent are not authorization for this send flow. Submission needs distinct trusted send consent and a fresh exact current-draft check; past confirmed fill metadata cannot replace either guard. Its public operation state `approved` currently refers only to no-send review, not the future send permission described below.
+
+The prototype's internal journal start now requires separate send consent, a fresh post-consent baseline, and one-shot exact-document/current-draft proof before durable intent. Its memory-only dispatch authorization is consumed at most once and is not recovered by receipts or UI evidence. A read-only fixture inspector primitive can compare exact prepared text in either supported editor while preserving drafts and focus; default preflight still requires an empty editor. The prepared mode is synthetic-tested but has no dispatch-check transport or worker handler. This is an unexposed ledger guard, not a browser submit implementation: trusted browser completion, immediate activation rechecks, and browser-side operation deduplication are still required.
+
 ### Result states
 
 | State | What the caller may infer |
@@ -293,7 +297,7 @@ Keep the public tool list small and stable. Per-connection capabilities are retu
 | `chat_get_operation` | Operation ID, optional status-recovery secret | Current status and evidence; receipt recovery cannot restore approval or permit replay |
 | `chat_disconnect` | Connection handle | Revokes access and cancels pending work |
 
-Tool names use lowercase letters, digits, underscores, and hyphens for VS Code host compatibility. The prepare/commit/operation tools above are planned, not implemented. Use shared Zod schemas, bounded inputs, output schemas, and structured tool results. Include a serialized text representation where needed for older clients. Mark reads appropriately; mark sending as a non-read-only external action. Tool annotations help clients present risk but are not access controls.
+Tool names use lowercase letters, digits, underscores, and hyphens for VS Code host compatibility. This table describes the intended interface, not a claim that every argument/capability is implemented. The prototype implements fixture-only `chat_prepare_message`, owned/receipt-recovered `chat_get_operation`, and the additional `chat_fill_draft` for one separately approved unsent fixture edit. `chat_commit_message` remains planned and does not exist. See [HANDOFF.md](HANDOFF.md) for current capabilities and verification. Use shared Zod schemas, bounded inputs, output schemas, and structured tool results. Include a serialized text representation where needed for older clients. Mark reads appropriately; mark sending as a non-read-only external action. Tool annotations help clients present risk but are not access controls.
 
 Domain failures should be actionable, for example `CONVERSATION_CHANGED`, `DRAFT_PRESENT`, `APPROVAL_REQUIRED`, `ADAPTER_STALE`, `BROWSER_DISCONNECTED`, `CURSOR_EXPIRED`, and `SEND_OUTCOME_UNKNOWN`. Return structured error details with whether a safe retry is possible. A transport failure after dispatch does not become a known send failure.
 
