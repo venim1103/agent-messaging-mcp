@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import { endianness } from "node:os";
 
 export const MAX_NATIVE_FRAME_BYTES = 256 * 1024;
@@ -46,6 +47,7 @@ export class NativeFrameDecoder {
       offset += copied;
       if (this.bodyBytes < this.body.length) break;
 
+      if (!isUtf8(this.body)) throw new Error("Invalid native frame encoding");
       messages.push(JSON.parse(this.body.toString("utf8")) as unknown);
       this.headerBytes = 0;
       this.body = null;

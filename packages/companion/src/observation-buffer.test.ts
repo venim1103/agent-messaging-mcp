@@ -31,6 +31,48 @@ test("two readers retain independent cursors and published events cannot be chan
   assert.deepEqual(buffer.read(nextPage.cursor).events, [repeated]);
 });
 
+test("nested payloads remain detached and frozen while returned pages stay reader-local", () => {
+  const buffer = new ObservationBuffer();
+  const start = buffer.bookmark();
+  const payload = { messages: [{ text: "Original", metadata: { labels: ["fixture"] } }] };
+  const event = buffer.append(payload);
+  payload.messages[0]!.text = "Changed";
+  payload.messages[0]!.metadata.labels.push("caller mutation");
+  assert.deepEqual(event.payload, { messages: [{ text: "Original", metadata: { labels: ["fixture"] } }] });
+  assert.equal(Object.isFrozen(payload.messages), false);
+  const published = event.payload as { messages: { text: string; metadata: { labels: string[] } }[] };
+  assert.equal(Object.isFrozen(published.messages), true);
+  assert.equal(Object.isFrozen(published.messages[0]), true);
+  assert.equal(Object.isFrozen(published.messages[0]!.metadata), true);
+  assert.equal(Object.isFrozen(published.messages[0]!.metadata.labels), true);
+  assert.throws(() => { published.messages[0]!.text = "Reader mutation"; }, TypeError);
+  assert.throws(() => published.messages[0]!.metadata.labels.push("reader mutation"), TypeError);
+  const firstPage = buffer.read(start);
+  if (firstPage.state !== "ok") throw new Error("Expected a retained observation page");
+  firstPage.events.splice(0);
+  assert.deepEqual(buffer.read(start).events, [event]);
+  assert.throws(() => { (firstPage.cursor as { sequence: number }).sequence = 999; }, TypeError);
+  assert.equal(buffer.bookmark().sequence, event.sequence);
+});
+
+test("rejected payloads neither advance cursors nor evict a retained event", () => {
+  const buffer = new ObservationBuffer({ maxEvents: 1 });
+  const start = buffer.bookmark();
+  const retained = buffer.append({ text: "Must remain" });
+  const beforeRejection = buffer.bookmark();
+  for (const invalid of [undefined, NaN, Infinity, -Infinity, 1n, Symbol("not JSON"),
+    () => "not JSON", { text: undefined }, { nested: { callback: () => "not JSON" } },
+    { text: "x".repeat(MAX_EVENT_BYTES) }]) {
+    assert.throws(() => buffer.append(invalid));
+    assert.deepEqual(buffer.bookmark(), beforeRejection);
+    assert.deepEqual(buffer.read(start).events, [retained]);
+  }
+  const replacement = buffer.append({ text: "Valid next event" });
+  assert.equal(replacement.sequence, retained.sequence + 1);
+  assert.deepEqual(buffer.read(start), { state: "expired", resnapshot: true });
+  assert.deepEqual(buffer.read(beforeRejection).events, [replacement]);
+});
+
 test("eviction or epoch changes expire cursors with a resnapshot path", () => {
   const buffer = new ObservationBuffer({ maxEvents: 2 });
   const before = buffer.bookmark();

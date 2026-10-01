@@ -22,3 +22,29 @@ test("rejects oversized frames before reading their bodies", () => {
   assert.throws(() => new NativeFrameDecoder().push(header), /Invalid native frame size/);
   assert.throws(() => encodeNativeFrame({ text: "x".repeat(MAX_NATIVE_FRAME_BYTES) }), /Invalid native frame size/);
 });
+
+test("rejects malformed UTF-8 instead of silently replacing message bytes", () => {
+  for (const malformed of [
+    [0x80], [0xc0, 0xaf], [0xe2, 0x82], [0xe2, 0x28, 0xa1],
+    [0xed, 0xa0, 0x80], [0xf4, 0x90, 0x80, 0x80]
+  ]) {
+    const body = Buffer.concat([Buffer.from('{"text":"'), Buffer.from(malformed), Buffer.from('"}')]);
+    const frame = Buffer.concat([Buffer.alloc(4), body]);
+    if (endianness() === "LE") frame.writeUInt32LE(body.length);
+    else frame.writeUInt32BE(body.length);
+    assert.throws(() => new NativeFrameDecoder().push(frame), /Invalid native frame encoding/);
+    const fragmented = new NativeFrameDecoder();
+    assert.deepEqual(fragmented.push(frame.subarray(0, frame.length - 1)), []);
+    assert.throws(() => fragmented.push(frame.subarray(frame.length - 1)), /Invalid native frame encoding/);
+  }
+});
+
+test("accepts valid Unicode and explicit replacement characters across every byte boundary", () => {
+  const message = { text: "A\u20ac\uD83D\uDE00\ufffd" };
+  const frame = encodeNativeFrame(message);
+  for (let boundary = 1; boundary < frame.length; boundary++) {
+    const decoder = new NativeFrameDecoder();
+    assert.deepEqual(decoder.push(frame.subarray(0, boundary)), []);
+    assert.deepEqual(decoder.push(frame.subarray(boundary)), [message]);
+  }
+});
