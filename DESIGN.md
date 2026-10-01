@@ -256,6 +256,8 @@ Default policy is approval for each send. A later explicitly granted autonomous 
 
 The prototype's ordinary **Approve draft (no send)** review and separate **Allow draft fill (no send)** consent are not authorization for this send flow. Submission needs distinct trusted send consent and a fresh exact current-draft check; past confirmed fill metadata cannot replace either guard. Its public operation state `approved` currently refers only to no-send review, not the future send permission described below.
 
+Separate fixture-send review now has a private authenticated-relay-only native/broker path. It offers bounded exact previews only after completed fill, rejects facade approval and tokens from other review purposes, and pins the displayed expiry. This is transport for future trusted UI, not a human send-approval check: no popup/worker command or public commit tool invokes it, and approval itself neither starts a journal intent nor performs a browser action.
+
 The prototype's internal journal start now requires separate send consent, a fresh post-consent baseline, and one-shot exact-document/current-draft proof before durable intent. Its memory-only dispatch authorization is consumed at most once and is not recovered by receipts or UI evidence. A read-only fixture inspector primitive can compare exact prepared text in either supported editor while preserving drafts and focus; default preflight still requires an empty editor. The prepared mode is synthetic-tested but has no dispatch-check transport or worker handler. This is an unexposed ledger guard, not a browser submit implementation: trusted browser completion, immediate activation rechecks, and browser-side operation deduplication are still required.
 
 ### Result states
