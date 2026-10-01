@@ -6,7 +6,7 @@ import { endianness, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { connectBroker } from "./broker-client.js";
+import { brokerRequestDeadline, connectBroker } from "./broker-client.js";
 import { BROKER_IDLE_TIMEOUT_MS, startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials } from "./broker-roles.js";
 import { PreparedMessageOperations } from "./message-operations.js";
@@ -43,15 +43,35 @@ async function exchange(socket: Socket, message: unknown): Promise<unknown> {
   });
 }
 
+test("broker forwarding clips local budgets without renewing an upstream deadline", async () => {
+  assert.equal(brokerRequestDeadline(1000), 6000);
+  assert.equal(brokerRequestDeadline(1000, 31_000), 6000);
+  assert.equal(brokerRequestDeadline(1000, 2000), 2000);
+  assert.equal(brokerRequestDeadline(1500, 2000), 2000);
+  assert.equal(brokerRequestDeadline(1999, 2000), 2000);
+  for (const invalid of [0, 999, 1000, 31_001, NaN, Infinity, -Infinity, 2000.5, Number.MAX_SAFE_INTEGER]) {
+    assert.throws(() => brokerRequestDeadline(1000, invalid), /Invalid broker request deadline/);
+  }
+  assert.throws(() => brokerRequestDeadline(2000, 2000), /Invalid broker request deadline/);
+  for (const invalidNow of [NaN, Infinity, -Infinity, 1000.5, Number.MAX_SAFE_INTEGER]) {
+    assert.throws(() => brokerRequestDeadline(invalidNow), /Invalid broker request deadline/);
+  }
+  await assert.rejects(connectBroker("relay", "must-not-be-accessed", 1), /Invalid broker request deadline/);
+});
+
 test("authenticated fixture preparation remains owner-bound and cannot dispatch", async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-prepare-ipc-"));
   const directory = join(home, "broker");
   const database = new DatabaseSync(":memory:");
   const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
-  const facade = await connectBroker("facade", directory);
-  const otherFacade = await connectBroker("facade", directory);
-  const relay = await connectBroker("relay", directory);
+  const clients: Awaited<ReturnType<typeof connectBroker>>[] = [];
   try {
+    const facade = await connectBroker("facade", directory);
+    clients.push(facade);
+    const otherFacade = await connectBroker("facade", directory);
+    clients.push(otherFacade);
+    const relay = await connectBroker("relay", directory);
+    clients.push(relay);
     const pending = await facade.requestConnection();
     if (pending.kind !== "connection_requested") throw new Error("Expected pending fixture approval");
     const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
@@ -225,9 +245,7 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
     }
     assert.equal(cleared, true, "Closed facade left a pending preflight");
   } finally {
-    facade.close();
-    otherFacade.close();
-    relay.close();
+    for (const client of clients) client.close();
     await broker.close();
     database.close();
     await rm(home, { recursive: true, force: true });
@@ -257,9 +275,12 @@ test("a new facade recovers uncertain status without inheriting a browser grant"
   ledger.disconnect(owner);
 
   const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
-  const facade = await connectBroker("facade", directory);
-  const relay = await connectBroker("relay", directory);
+  const clients: Awaited<ReturnType<typeof connectBroker>>[] = [];
   try {
+    const facade = await connectBroker("facade", directory);
+    clients.push(facade);
+    const relay = await connectBroker("relay", directory);
+    clients.push(relay);
     assert.deepEqual((await facade.getPreparedOperation(prepared.operationId)).payload, { state: "unknown" });
     assert.deepEqual((await facade.getPreparedOperation(prepared.operationId, "0".repeat(64))).payload,
       { state: "unknown" });
@@ -273,8 +294,7 @@ test("a new facade recovers uncertain status without inheriting a browser grant"
       { code: "CONNECTION_NOT_FOUND" });
     assert.throws(() => relay.getPreparedOperation(prepared.operationId, receipt.recoveryToken), /role cannot perform/);
   } finally {
-    facade.close();
-    relay.close();
+    for (const client of clients) client.close();
     await broker.close();
     database.close();
     await rm(home, { recursive: true, force: true });

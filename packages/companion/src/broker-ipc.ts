@@ -111,7 +111,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
             protocolVersion: PROTOCOL_VERSION,
             requestId: hello.requestId,
             connectionGeneration: 0,
-            deadlineMs: Date.now() + 10_000,
+            deadlineMs: hello.deadlineMs,
             payload: { role: hello.role }
           }));
         }

@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
+import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
@@ -101,7 +101,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | { accepted: boolean }
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
-            client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"));
+            client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"), request.deadlineMs);
             if (request.kind === "list_pending") {
               const result = await client.listPending();
               if (result.kind !== "pending_list") throw new Error("Broker refused pending list");
@@ -225,7 +225,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               kind = "fixture_snapshot_published";
               payload = result.payload;
             }
-          } catch {
+          } catch (error) {
+            process.stderr.write(`Native relay broker failure: ${nativeBrokerFailureReason(error)}\n`);
             kind = "error";
             payload = { code: "BROKER_UNAVAILABLE" };
           } finally {

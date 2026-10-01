@@ -15,7 +15,7 @@ test("facade and relay roles require distinct validated credentials", () => {
     deadlineMs: 20_000, role: "facade", credential: credentials.facade, payload: {}
   };
   assert.deepEqual(authenticateBrokerRole(facadeHello, credentials, 1000), {
-    role: "facade", requestId: facadeHello.requestId
+    role: "facade", requestId: facadeHello.requestId, deadlineMs: facadeHello.deadlineMs
   });
   assert.equal(authenticateBrokerRole({ ...facadeHello, role: "relay" }, credentials, 1000), null);
   assert.equal(authenticateBrokerRole({ ...facadeHello, credential: credentials.relay }, credentials, 1000), null);
@@ -27,6 +27,6 @@ test("facade and relay roles require distinct validated credentials", () => {
 
   const relayHello = { ...facadeHello, role: "relay", credential: credentials.relay };
   assert.deepEqual(authenticateBrokerRole(relayHello, credentials, 1000), {
-    role: "relay", requestId: relayHello.requestId
+    role: "relay", requestId: relayHello.requestId, deadlineMs: relayHello.deadlineMs
   });
 });

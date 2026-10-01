@@ -285,7 +285,18 @@ const replySchema = z.discriminatedUnion("kind", [
   })
 ]);
 
-export async function connectBroker(role: BrokerRole, runtimeDirectory: string) {
+export function brokerRequestDeadline(now: number, upstreamDeadlineMs?: number): number {
+  const localDeadline = now + 5000;
+  if (!Number.isSafeInteger(now) || !Number.isSafeInteger(localDeadline)
+    || (upstreamDeadlineMs !== undefined && (!Number.isSafeInteger(upstreamDeadlineMs)
+      || upstreamDeadlineMs <= now || upstreamDeadlineMs > now + 30_000))) {
+    throw new Error("Invalid broker request deadline");
+  }
+  return Math.min(localDeadline, upstreamDeadlineMs ?? localDeadline);
+}
+
+export async function connectBroker(role: BrokerRole, runtimeDirectory: string, upstreamDeadlineMs?: number) {
+  brokerRequestDeadline(Date.now(), upstreamDeadlineMs);
   const directory = await stat(runtimeDirectory);
   const keyPath = join(runtimeDirectory, `${role}.key`);
   const key = await stat(keyPath);
@@ -304,9 +315,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
   try {
     await once(socket, "connect");
     const requestId = randomUUID();
+    const startedAt = Date.now();
+    const deadlineMs = brokerRequestDeadline(startedAt, upstreamDeadlineMs);
     const decoder = new NativeFrameDecoder();
     const response = new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => socket.destroy(new Error("Broker authentication timed out")), 5000);
+      const timer = setTimeout(() => socket.destroy(new Error("Broker authentication timed out")), deadlineMs - startedAt);
       const cleanup = () => {
         clearTimeout(timer);
         socket.off("data", onData);
@@ -331,10 +344,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
     });
     socket.write(encodeNativeFrame({
       kind: "hello", protocolVersion: PROTOCOL_VERSION, requestId, connectionGeneration: 0,
-      deadlineMs: Date.now() + 5000, role, credential, payload: {}
+      deadlineMs, role, credential, payload: {}
     }));
     const reply = helloResult.parse(await response);
     if (reply.requestId !== requestId || reply.payload.role !== role
+      || reply.deadlineMs !== deadlineMs
       || reply.deadlineMs <= Date.now() || reply.deadlineMs > Date.now() + 30_000) {
       throw new Error("Broker returned a mismatched hello");
     }
@@ -371,10 +385,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       const operation = nextRequest.then(async () => {
         if (socket.destroyed) throw new Error("Broker connection closed");
         const requestId = randomUUID();
-        const deadlineMs = Date.now() + 5000;
+        const startedAt = Date.now();
+        const deadlineMs = brokerRequestDeadline(startedAt, upstreamDeadlineMs);
         const decoder = new NativeFrameDecoder();
         const response = new Promise<unknown>((resolve, reject) => {
-          const timer = setTimeout(() => socket.destroy(new Error("Broker request timed out")), 5000);
+          const timer = setTimeout(() => socket.destroy(new Error("Broker request timed out")), deadlineMs - startedAt);
           const cleanup = () => {
             clearTimeout(timer);
             socket.off("data", onData);
@@ -401,6 +416,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
           connectionGeneration: 0, deadlineMs, payload }));
         const reply = replySchema.parse(await response);
         if (reply.requestId !== requestId || reply.deadlineMs !== deadlineMs) throw new Error("Mismatched broker reply");
+        if (reply.deadlineMs <= Date.now()) throw new Error("Broker reply expired");
         return reply;
       });
       nextRequest = operation.then(() => {}, () => {});

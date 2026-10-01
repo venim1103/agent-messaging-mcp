@@ -4,7 +4,7 @@ import { PROTOCOL_VERSION } from "./native-protocol.js";
 
 export type BrokerRole = "facade" | "relay";
 export type BrokerCredentials = Readonly<Record<BrokerRole, string>>;
-export type AuthenticatedHello = Readonly<{ role: BrokerRole; requestId: string }>;
+export type AuthenticatedHello = Readonly<{ role: BrokerRole; requestId: string; deadlineMs: number }>;
 
 const helloSchema = z.strictObject({
   kind: z.literal("hello"),
@@ -28,5 +28,5 @@ export function authenticateBrokerRole(message: unknown, credentials: BrokerCred
   const expected = Buffer.from(credentials[parsed.data.role], "hex");
   const received = Buffer.from(parsed.data.credential, "hex");
   return expected.length === received.length && timingSafeEqual(expected, received)
-    ? { role: parsed.data.role, requestId: parsed.data.requestId } : null;
+    ? { role: parsed.data.role, requestId: parsed.data.requestId, deadlineMs: parsed.data.deadlineMs } : null;
 }

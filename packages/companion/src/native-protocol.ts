@@ -6,6 +6,13 @@ import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
 export const NATIVE_HOST_NAME = "com.agent_messaging_mcp.bridge";
 export const PROTOCOL_VERSION = 1;
 
+export function nativeBrokerFailureReason(error: unknown): string {
+  if (error instanceof Error && ["Invalid broker request deadline", "Broker reply expired",
+    "Broker returned a mismatched hello", "Mismatched broker reply", "Broker authentication timed out",
+    "Broker request timed out"].includes(error.message)) return error.message;
+  return error instanceof z.ZodError ? "Invalid broker response" : "Broker request failed";
+}
+
 const pendingListSchema = z.strictObject({
   kind: z.literal("list_pending"),
   protocolVersion: z.literal(PROTOCOL_VERSION),

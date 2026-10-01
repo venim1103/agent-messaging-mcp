@@ -7,9 +7,10 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import * as z from "zod/v4";
 import { connectBroker } from "./broker-client.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
-import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, parseNativeFixtureGap,
+import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
@@ -31,6 +32,26 @@ const request = {
   deadlineMs: now + 10_000,
   payload: {}
 };
+
+test("native broker diagnostics disclose only exact fixed reasons, never private error contents", () => {
+  const sensitive = "draft=private-message; credential=private-token; document=private-identity";
+  const knownReasons = ["Invalid broker request deadline", "Broker reply expired",
+    "Broker returned a mismatched hello", "Mismatched broker reply", "Broker authentication timed out",
+    "Broker request timed out"];
+  for (const reason of knownReasons) {
+    assert.equal(nativeBrokerFailureReason(new Error(reason, { cause: new Error(sensitive) })), reason);
+    assert.equal(nativeBrokerFailureReason(new Error(`${reason}\n${sensitive}`)), "Broker request failed");
+    assert.equal(nativeBrokerFailureReason(new Error(`${sensitive}: ${reason}`)), "Broker request failed");
+  }
+  for (const error of [new Error(sensitive, { cause: new Error(sensitive) }), new SyntaxError(sensitive),
+    new Error(sensitive.repeat(1024)), Object.assign(new Error(sensitive), { name: "ZodError" }),
+    sensitive, null, undefined, 42,
+    { name: "ZodError", message: sensitive, toString() { throw new Error("Unexpected error coercion"); } }]) {
+    assert.equal(nativeBrokerFailureReason(error), "Broker request failed");
+  }
+  const schemaError = new z.ZodError([{ code: "custom", path: [sensitive], message: sensitive }]);
+  assert.equal(nativeBrokerFailureReason(schemaError), "Invalid broker response");
+});
 
 test("accepts only a bounded, exact handshake and the registered caller", () => {
   assert.equal(isNativeCaller(origin, origin), true);
@@ -429,6 +450,41 @@ test("native fixture snapshots accept only bounded rows from the exact local fix
   }
 });
 
+test("spawned native relay rejects private malformed input without stdout or diagnostic disclosure", { timeout: 4000 }, async () => {
+  const sensitive = "private-draft-and-credential-and-browser-identity";
+  const malformedJson = Buffer.from(`{"draftText":"${sensitive}",`, "utf8");
+  const header = Buffer.alloc(4);
+  header.writeUInt32LE(malformedJson.length, 0);
+  const scenarios = [
+    { frame: encodeNativeFrame({ ...request, payload: { draftText: sensitive, credential: sensitive } }),
+      reason: "Invalid native handshake" },
+    { frame: encodeNativeFrame({ ...request, kind: "list_pending", payload: { documentId: sensitive } }),
+      reason: "Invalid native pending list request" },
+    { frame: Buffer.concat([header, malformedJson]), reason: "Invalid JSON" }
+  ];
+  for (const scenario of scenarios) {
+    const host = spawn(process.execPath, [fileURLToPath(new URL("./native-relay.js", import.meta.url)), origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PATH: "/usr/bin:/bin" }
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    host.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    host.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    try {
+      host.stdin.end(scenario.frame);
+      const [exitCode] = await once(host, "close");
+      const diagnostic = Buffer.concat(stderr).toString();
+      assert.equal(exitCode, 1, diagnostic);
+      assert.equal(Buffer.concat(stdout).length, 0);
+      assert.equal(diagnostic.includes(sensitive), false);
+      assert.equal(diagnostic.startsWith(`Invalid native host message: ${scenario.reason}; deadline delta `), true);
+      assert.match(diagnostic, /; deadline delta (?:missing|-?\d+)ms\n$/);
+    } finally {
+      host.kill();
+    }
+  }
+});
+
 test("spawned native relay replies with a framed version and no other stdout", async () => {
   const host = spawn(process.execPath, [new URL("./native-relay.js", import.meta.url).pathname, origin, origin], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -577,6 +633,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(approvalReviewReply.payload.operationId, prepared.payload.operationId);
     assert.equal(approvalReviewReply.payload.state, "approved");
 
+    let lastExchangeDiagnostic = "";
     const exchangeFillReview = async (message: unknown) => {
       const fillHost = spawn(process.execPath, [relayEntry, origin, origin], {
         stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
@@ -587,7 +644,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
       fillHost.stderr.on("data", (chunk: Buffer) => fillErrors.push(chunk));
       fillHost.stdin.end(encodeNativeFrame(message));
       const [fillExit] = await once(fillHost, "exit");
-      assert.equal(fillExit, 0, Buffer.concat(fillErrors).toString());
+      lastExchangeDiagnostic = Buffer.concat(fillErrors).toString();
+      assert.equal(fillExit, 0, lastExchangeDiagnostic);
       return new NativeFrameDecoder().push(Buffer.concat(fillOutput));
     };
     const [fillListing] = await exchangeFillReview({ ...request, kind: "list_fixture_fill_reviews",
@@ -686,12 +744,13 @@ test("native relay lists only live broker pending IDs over real framing", { time
       const [wrongPurpose] = await exchangeFillReview({ ...sendApprovalRequest, deadlineMs: Date.now() + 10_000,
         payload: { ...sendApprovalRequest.payload, reviewId: wrongReviewId } }) as [{ kind: string; payload: { code: string } }];
       assert.equal(wrongPurpose.kind, "error");
-      assert.deepEqual(wrongPurpose.payload, { code: "SEND_REVIEW_UNAVAILABLE" });
+      assert.deepEqual(wrongPurpose.payload, { code: "SEND_REVIEW_UNAVAILABLE" }, lastExchangeDiagnostic);
     }
     const [sendConsent] = await exchangeFillReview({ ...sendApprovalRequest, deadlineMs: Date.now() + 10_000 }) as [{
       kind: string; payload: { operationId: string; state: string; approvedAt: number; expiresAt: number }
     }];
-    assert.equal(sendConsent.kind, "fixture_send_review_approved");
+    assert.equal(sendConsent.kind, "fixture_send_review_approved",
+      `${JSON.stringify(sendConsent.payload)} ${lastExchangeDiagnostic}`);
     assert.equal(sendConsent.payload.operationId, prepared.payload.operationId);
     assert.equal(sendConsent.payload.state, "send_approved");
     assert.equal(sendConsent.payload.expiresAt, sendReview.expiresAt);
