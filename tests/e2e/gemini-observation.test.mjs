@@ -17,7 +17,7 @@ test("Gemini URL eligibility accepts bounded saved chats and rejects unsupported
 });
 
 test("reviewed Gemini parser captures only bounded visible message content", async () => {
-  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
   try {
     const page = await browser.newPage();
     await page.route("https://gemini.google.com/**", (route) => route.fulfill({

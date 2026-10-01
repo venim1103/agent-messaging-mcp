@@ -16,7 +16,7 @@ test("browser input reaches the rich editor without accepting synthetic input", 
   let browser;
 
   try {
-    browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+    browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
     const page = await browser.newPage();
     const url = `http://127.0.0.1:${server.address().port}/`;
     await page.goto(`${url}?editor=rich`);
@@ -59,7 +59,7 @@ test("browser input reaches the rich editor without accepting synthetic input", 
 
 test("fixture observation captures bounded rows and notices changes without reading another chat", async () => {
   const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
-  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
   try {
     const page = await browser.newPage();
     await page.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
@@ -101,7 +101,7 @@ test("fixture observation captures bounded rows and notices changes without read
 
 test("fixture browser evidence distinguishes a new outgoing row from existing identical text", async () => {
   const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
-  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
   const database = new DatabaseSync(":memory:");
   try {
     const page = await browser.newPage();
@@ -179,7 +179,7 @@ test("fixture browser evidence distinguishes a new outgoing row from existing id
 
 test("fixture native insertText preserves multiline text and produces trusted input", async () => {
   const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
-  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
   try {
     const page = await browser.newPage();
     await page.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
@@ -209,7 +209,7 @@ test("fixture native insertText preserves multiline text and produces trusted in
 
 test("one-shot fixture draft fill preserves user input and never activates Send", async () => {
   const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
-  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
   try {
     const page = await browser.newPage();
     await page.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
@@ -269,7 +269,7 @@ test("one-shot fixture draft fill preserves user input and never activates Send"
 
 test("read-only fixture preflight protects drafts and rejects blocked or changed controls", async () => {
   const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
-  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
   try {
     const page = await browser.newPage();
     await page.route("http://127.0.0.1:8787/**", (route) => route.fulfill({
@@ -336,6 +336,24 @@ test("read-only fixture preflight protects drafts and rejects blocked or changed
       assert.equal(editor === "rich" ? await textbox.innerText() : await textbox.inputValue(), "User draft");
       await textbox.fill(" ");
       assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "DRAFT_PRESENT" });
+      if (editor === "rich") {
+        await textbox.evaluate((element) => element.replaceChildren(document.createTextNode("\n")));
+        assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "DRAFT_PRESENT" });
+        assert.equal(await textbox.textContent(), "\n");
+        await textbox.evaluate((element) => {
+          const line = document.createElement("div");
+          line.append(document.createElement("br"));
+          element.replaceChildren(line);
+        });
+        assert.equal(await textbox.innerText(), "\n");
+        assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: false, code: "DRAFT_PRESENT" });
+        assert.equal(await textbox.evaluate((element) => element.innerHTML), "<div><br></div>");
+        await textbox.evaluate((element) => element.replaceChildren(document.createElement("br")));
+        assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: true, editor });
+        await textbox.evaluate((element) => element.replaceChildren());
+        assert.equal(await textbox.innerText(), "");
+        assert.deepEqual(await page.evaluate(inspectFixturePreflight, input), { ok: true, editor });
+      }
       await textbox.fill("");
       await textbox.evaluate((element) => {
         if (element instanceof HTMLTextAreaElement) element.readOnly = true;

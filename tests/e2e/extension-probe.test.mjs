@@ -21,6 +21,7 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
   let context;
   try {
     context = await chromium.launchPersistentContext(profile, {
+      chromiumSandbox: true,
       executablePath: "/usr/bin/chromium",
       headless: true,
       args: [
@@ -61,6 +62,14 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
     assert.equal(handshake.reply.kind, "handshake_result");
     assert.equal(handshake.reply.requestId, handshake.requestId);
     assert.deepEqual(handshake.reply.payload, { protocolVersion: 1 });
+    const sandbox = await context.newPage();
+    await sandbox.goto("chrome://sandbox/");
+    const sandboxStatus = await sandbox.locator("tr").evaluateAll((rows) => Object.fromEntries(rows
+      .map((row) => Array.from(row.querySelectorAll("td"), (cell) => cell.textContent.trim()))
+      .filter((cells) => cells.length === 2)));
+    assert.equal(sandboxStatus["Seccomp-BPF sandbox"], "Yes", JSON.stringify(sandboxStatus));
+    assert.ok(["Namespace", "SUID"].includes(sandboxStatus["Layer 1 Sandbox"]),
+      JSON.stringify(sandboxStatus));
   } finally {
     await context?.close();
     await rm(profile, { recursive: true, force: true });
@@ -72,6 +81,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
   const directory = join(profile, ".config/agent-messaging-mcp/broker");
   const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
   const launch = () => chromium.launchPersistentContext(profile, {
+    chromiumSandbox: true,
     executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
     ignoreDefaultArgs: ["--disable-extensions"],
     args: ["--enable-unsafe-extension-debugging"]
@@ -424,6 +434,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
   let relay;
   try {
     context = await chromium.launchPersistentContext(profile, {
+      chromiumSandbox: true,
       executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`]
     });
@@ -464,6 +475,14 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     const popup = await context.newPage();
     await fixture.bringToFront();
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+    const waitForPopupResult = async (locator) => {
+      try {
+        await locator.waitFor({ state: "visible", timeout: 4000 });
+      } catch (error) {
+        const status = await popup.locator("#status").textContent();
+        throw new Error(`Fixture popup did not produce the expected result; status: ${status}`, { cause: error });
+      }
+    };
     await popup.getByRole("button", { name: "Review fixture drafts" }).waitFor({ state: "visible" });
     const reviewArgs = { tabId: selected.tabId, expectedUrl: url };
     const before = await popup.evaluate((args) => chrome.runtime.sendMessage({
@@ -490,27 +509,25 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     }), reviewArgs);
     assert.deepEqual(prematureFill, { ok: true, reviews: [], hasMore: false });
     await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
-    await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
     assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
     assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
     assert.equal(await popup.getByRole("button", { name: "Approve draft (no send)" }).count(), 1);
     await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-    await popup.getByText(`Approved fixture draft ${prepared.payload.operationId}. No message was sent.`)
-      .waitFor({ timeout: 4000 });
+    await waitForPopupResult(popup.getByText(`Approved fixture draft ${prepared.payload.operationId}. No message was sent.`));
     assert.equal(await popup.locator("#fixture-reviews pre").count(), 0);
     relay = await connectBroker("relay", brokerDirectory);
     const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
       tabId: selected.tabId, documentId: selected.documentId };
     assert.deepEqual((await relay.listFixturePreparedReviews(target)).payload, { reviews: [], hasMore: false });
     await popup.evaluate(() => document.querySelector("#view-fixture-fill-reviews").click());
-    await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
     assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
     assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
     assert.equal(await popup.getByRole("button", { name: "Allow draft fill (no send)" }).count(), 1);
     assert.equal(await popup.getByRole("button", { name: "Approve draft (no send)" }).count(), 0);
     await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-    await popup.getByText(`Allowed fixture draft fill ${prepared.payload.operationId}. Editor unchanged. No message was sent.`)
-      .waitFor({ timeout: 4000 });
+    await waitForPopupResult(popup.getByText(`Allowed fixture draft fill ${prepared.payload.operationId}. Editor unchanged. No message was sent.`));
     assert.deepEqual((await relay.listFixtureFillReviews(target)).payload, { reviews: [], hasMore: false });
     assert.equal(await fixture.locator("#message").inputValue(), "");
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
@@ -562,10 +579,10 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
         ["view-fixture-fill-reviews", `Allowed fixture draft fill ${candidate.operationId}. Editor unchanged. No message was sent.`]
       ]) {
         await popup.evaluate((id) => document.getElementById(id).click(), buttonId);
-        await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+        await waitForPopupResult(popup.locator("#fixture-reviews pre"));
         assert.equal(await popup.locator("#fixture-reviews pre").textContent(), candidate.preview.text);
         await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-        await popup.getByText(statusText).waitFor({ timeout: 4000 });
+        await waitForPopupResult(popup.getByText(statusText));
       }
     };
 
@@ -586,7 +603,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       "d66b3997-9d43-4554-8399-267d1fe9f75c");
     assert.equal(third.kind, "message_prepared");
     await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
-    await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
     assert.equal(await popup.locator("#fixture-reviews pre").textContent(), "Third fixture draft");
     await fixture.evaluate(() => document.querySelector("main").dataset.conversationId = "fixture-beta");
     await popup.locator("#fixture-review-result").waitFor({ state: "hidden", timeout: 4000 });
@@ -650,6 +667,8 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
         delete globalThis.fixtureOriginalExecute;
       });
     }
+    await fixture.locator("#rich-message").evaluate((editor) => editor.replaceChildren());
+    assert.equal(await fixture.locator("#rich-message").innerText(), "");
     mcpClient = new Client({ name: "fixture-browser-fill-test", version: "0.0.1" });
     const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
     await mcpClient.connect(new StdioClientTransport({ command: process.execPath, args: [mcpEntry],
@@ -716,6 +735,7 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
   let facade;
   try {
     context = await chromium.launchPersistentContext(profile, {
+      chromiumSandbox: true,
       executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`]
     });
@@ -783,9 +803,8 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     let streaming;
     for (let attempt = 0; attempt < 80; attempt++) {
       const next = await facade.readApprovedEvents(state.payload.connectionId, read.payload.cursor, 1);
-      if (next.kind !== "gemini_events" || next.payload.state !== "ok") {
-        throw new Error("Expected a valid Gemini event during an empty streaming row");
-      }
+      assert.equal(next.kind, "gemini_events", "Expected Gemini events during an empty streaming row");
+      assert.equal(next.payload.state, "ok", "Expected a valid Gemini cursor during an empty streaming row");
       if (next.payload.events.length) { streaming = next.payload; break; }
       await setTimeout(25);
     }
@@ -801,9 +820,8 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     let observed;
     for (let attempt = 0; attempt < 80; attempt++) {
       const next = await facade.readApprovedEvents(state.payload.connectionId, streaming.cursor, 1);
-      if (next.kind !== "gemini_events" || next.payload.state !== "ok") {
-        throw new Error("Expected a live Gemini event cursor");
-      }
+      assert.equal(next.kind, "gemini_events", "Expected Gemini events after a timeline mutation");
+      assert.equal(next.payload.state, "ok", "Expected a live Gemini event cursor");
       if (next.payload.events.length) { observed = next.payload; break; }
       await setTimeout(25);
     }
