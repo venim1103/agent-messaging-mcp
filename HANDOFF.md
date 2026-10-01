@@ -4,7 +4,7 @@ Updated: 2026-10-01.
 
 This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **The opt-in broker and user-approved fixture-only connection work. Each MCP fixture read waits for a bounded exact-document browser challenge; real toolbar-approved reads, a chat switch, and a fixture message-to-MCP event wait passed. One explicitly authorized disposable Gemini chat returned an exact-document read and later rendered events after a prompt sent manually by the user; its owner disconnected. Gemini worker-wake gaps are synthetic-tested only. The connector has not sent a real-site message.** VS Code tool executions run in the Podman devcontainer, and the user confirmed that its Chromium fixture window is visible on Windows.
 
-The latest exact full gate passed build/typecheck, **92 unit tests and 12 isolated Chromium tests**, covering the bounded-data work and pending private transport together. Earlier checkpoints and failures are recorded below. The external clock fault remains deferred and unresolved; this green run is not a clock repair claim.
+The latest exact full gate passed build/typecheck, **92 unit tests and 12 isolated Chromium tests**, covering bounded-data checkpoint `fa212fc` and the following private transport checkpoint together. Earlier checkpoints and failures are recorded below. The external clock fault remains deferred and unresolved; this green run is not a clock repair claim.
 
 ## Resume Snapshot (2026-10-01)
 
@@ -47,7 +47,7 @@ The external clock fault is deferred, not repaired. A future host diagnostic sti
 
 ## Latest Private Transport Checkpoint (2026-10-01)
 
-The user renewed autonomous continuation with scoped tested commits and no automatic push. This pending slice adds only separate authenticated relay send-review transport on top of `c09dd80`; no extension popup/worker command, public MCP approval/commit tool, dispatch-start transport, or browser submit handler is added.
+The user renewed autonomous continuation with scoped tested commits and no automatic push. This checkpoint adds only separate authenticated relay send-review transport, committed separately after bounded-data checkpoint `fa212fc` and findings-only checkpoint `7b48246`. No extension popup/worker command, public MCP approval/commit tool, dispatch-start transport, or browser submit handler is added.
 
 - Private broker/client/native commands `list_fixture_send_reviews` and `approve_fixture_send_review` reuse the ledger's purpose-specific tokens and completed-fill prerequisite. Both broker authorization and client role guards reject facade callers. Strict native envelopes retain existing deadlines and accept only an exact fixture target plus operation/review IDs; selectors, approved/send flags, replacement text, recovery secrets, and other-provider targets are refused.
 - Relay-only responses use distinct `fixture_send_reviews` / `fixture_send_review_approved` kinds, bounded previews, and the original displayed/clipped expiry. Wrong-purpose, refreshed, replayed, expired, and changed-target tokens remain governed by the ledger. Reviews never include recovery tokens. A successful approval is memory-only consent, not dispatch, current-draft proof, or a delivery claim; public owned operation metadata remains unchanged.

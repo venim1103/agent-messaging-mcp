@@ -111,6 +111,16 @@ export function parseNativeFixtureFillReviews(message: unknown, now = Date.now()
   return result.data;
 }
 
+const fixtureSendReviewsSchema = fixturePreparedReviewsSchema.extend({ kind: z.literal("list_fixture_send_reviews") });
+
+export function parseNativeFixtureSendReviews(message: unknown, now = Date.now()) {
+  const result = fixtureSendReviewsSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture send review list");
+  }
+  return result.data;
+}
+
 const fixtureReviewApprovalSchema = z.strictObject({
   kind: z.literal("approve_fixture_review"),
   protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -134,6 +144,16 @@ export function parseNativeFixtureFillReviewApproval(message: unknown, now = Dat
   const result = fixtureFillReviewApprovalSchema.safeParse(message);
   if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
     throw new Error("Invalid native fixture fill review approval");
+  }
+  return result.data;
+}
+
+const fixtureSendReviewApprovalSchema = fixtureReviewApprovalSchema.extend({ kind: z.literal("approve_fixture_send_review") });
+
+export function parseNativeFixtureSendReviewApproval(message: unknown, now = Date.now()) {
+  const result = fixtureSendReviewApprovalSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture send review approval");
   }
   return result.data;
 }

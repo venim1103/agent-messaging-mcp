@@ -146,6 +146,21 @@ const replySchema = z.discriminatedUnion("kind", [
       approvedAt: z.number().int().safe(), expiresAt: z.number().int().safe() })
   }),
   z.strictObject({
+    kind: z.literal("fixture_send_reviews"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ reviews: z.array(z.strictObject({
+      operationId: z.uuid(), reviewId: z.uuid(), expiresAt: z.number().int().safe(),
+      preview: z.strictObject({ target: z.literal("fixture-alpha"),
+        text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES) })
+    })).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_send_review_approved"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), state: z.literal("send_approved"),
+      approvedAt: z.number().int().safe(), expiresAt: z.number().int().safe() })
+  }),
+  z.strictObject({
     kind: z.literal("fixture_preflight"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: fixturePreflightStatusSchema
@@ -265,6 +280,7 @@ const replySchema = z.discriminatedUnion("kind", [
       "OBSERVATION_UNAVAILABLE", "CONNECTION_NOT_FOUND", "PREPARATION_UNAVAILABLE", "GENERATION_MISMATCH",
       "INVALID_MESSAGE_TEXT", "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED",
       "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED", "REVIEW_UNAVAILABLE", "FILL_REVIEW_UNAVAILABLE",
+      "SEND_REVIEW_UNAVAILABLE",
       "DISPATCH_UNCERTAIN", "PREFLIGHT_UNAVAILABLE", "FILL_UNAVAILABLE"]) })
   })
 ]);
@@ -332,6 +348,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       | "list_pending" | "list_fixture_read_challenges" | "list_fixture_prepared_reviews"
       | "approve_fixture_review"
       | "list_fixture_fill_reviews" | "approve_fixture_fill_review"
+      | "list_fixture_send_reviews" | "approve_fixture_send_review"
       | "list_gemini_read_challenges"
       | "approve_fixture" | "approve_gemini"
       | "publish_fixture_snapshot" | "publish_gemini_snapshot"
@@ -340,6 +357,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       if (kind === "list_pending" || kind === "list_fixture_read_challenges"
         || kind === "list_fixture_prepared_reviews" || kind === "approve_fixture_review"
         || kind === "list_fixture_fill_reviews" || kind === "approve_fixture_fill_review"
+        || kind === "list_fixture_send_reviews" || kind === "approve_fixture_send_review"
         || kind === "complete_fixture_preflight"
         || kind === "complete_fixture_fill"
         || kind === "list_gemini_read_challenges"
@@ -423,6 +441,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string) 
       listFixtureFillReviews: (target: FixtureTarget) => request("list_fixture_fill_reviews", { target }),
       approveFixtureFillReview: (target: FixtureTarget, operationId: string, reviewId: string) =>
         request("approve_fixture_fill_review", { target, operationId, reviewId }),
+      listFixtureSendReviews: (target: FixtureTarget) => request("list_fixture_send_reviews", { target }),
+      approveFixtureSendReview: (target: FixtureTarget, operationId: string, reviewId: string) =>
+        request("approve_fixture_send_review", { target, operationId, reviewId }),
       listGeminiReadChallenges: () => request("list_gemini_read_challenges", {}),
       approveFixture: (pendingRequestId: string, target: FixtureTarget) =>
         request("approve_fixture", { pendingRequestId, target }),

@@ -35,6 +35,100 @@ test("only a relay marks a gap for the exact approved Gemini URL and document", 
     "relay", Symbol("relay"), requests, 2002));
 });
 
+test("only the relay grants distinct fixture send consent after completed fill without dispatch", () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  try {
+    const operations = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("fixture owner");
+    const stranger = Symbol("other facade");
+    const relay = Symbol("trusted relay");
+    const envelope = { protocolVersion: PROTOCOL_VERSION,
+      requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approve(pending.requestId, target, 2000)!;
+    const prepared = handleBrokerRequest({ ...envelope, kind: "prepare_fixture_message", payload: {
+      connectionId: grant.connectionId, expectedGeneration: 1, text: "Synthetic send review only",
+      idempotencyKey: "b66b3997-9d43-4554-8399-267d1fe9f75c"
+    } }, "facade", owner, requests, 2001, operations);
+    if (prepared.kind !== "message_prepared") throw new Error("Expected prepared text");
+    const operationId = prepared.payload.operationId;
+    const listing = { ...envelope, kind: "list_fixture_send_reviews", payload: { target } };
+    assert.deepEqual(handleBrokerRequest(listing, "relay", relay, requests, 2002, operations).payload,
+      { reviews: [], hasMore: false });
+    const ordinary = operations.listFixtureReviews(target, 2002).reviews[0]!;
+    operations.approveFixtureReview(target, operationId, ordinary.reviewId, 2002);
+    const fill = operations.listFixtureFillReviews(target, 2003).reviews[0]!;
+    operations.approveFixtureFillReview(target, operationId, fill.reviewId, 2003);
+    assert.deepEqual(handleBrokerRequest(listing, "relay", relay, requests, 2003, operations).payload,
+      { reviews: [], hasMore: false });
+    const attempt = operations.requestFixtureFill(owner, operationId, 2003);
+    if (!attempt || attempt === "busy") throw new Error("Expected consented fill");
+    assert.equal(operations.completeFixtureFill(target, attempt.attemptId, { ok: true, editor: "textarea" }, 2004), true);
+    for (const facade of [owner, stranger]) {
+      assert.deepEqual(handleBrokerRequest(listing, "facade", facade, requests, 2005, operations).payload,
+        { code: "PERMISSION_DENIED" });
+    }
+    assert.deepEqual(handleBrokerRequest(listing, "relay", relay, requests, 2005).payload,
+      { code: "PREPARATION_UNAVAILABLE" });
+    const listed = handleBrokerRequest(listing, "relay", relay, requests, 2005, operations);
+    if (listed.kind !== "fixture_send_reviews") throw new Error("Expected separate send review");
+    const review = listed.payload.reviews[0]!;
+    assert.deepEqual(listed.payload, { reviews: [{ operationId, reviewId: review.reviewId,
+      expiresAt: 2002 + FIXTURE_REVIEW_APPROVAL_TTL_MS, preview: prepared.payload.preview }], hasMore: false });
+    assert.notEqual(review.reviewId, ordinary.reviewId);
+    assert.notEqual(review.reviewId, fill.reviewId);
+    assert.equal(JSON.stringify(listed.payload).includes(prepared.payload.recoveryToken), false);
+    const approval = { ...envelope, kind: "approve_fixture_send_review", payload: {
+      target, operationId, reviewId: review.reviewId
+    } };
+    for (const facade of [owner, stranger]) {
+      assert.deepEqual(handleBrokerRequest(approval, "facade", facade, requests, 2006, operations).payload,
+        { code: "PERMISSION_DENIED" });
+    }
+    assert.deepEqual(handleBrokerRequest(approval, "relay", relay, requests, 2006).payload,
+      { code: "PREPARATION_UNAVAILABLE" });
+    for (const reviewId of [ordinary.reviewId, fill.reviewId]) {
+      assert.deepEqual(handleBrokerRequest({ ...approval, payload: { ...approval.payload, reviewId } },
+        "relay", relay, requests, 2006, operations).payload, { code: "SEND_REVIEW_UNAVAILABLE" });
+    }
+    const otherTarget = { ...target, documentId: "CHROME-doc_changed" };
+    assert.deepEqual(handleBrokerRequest({ ...listing, payload: { target: otherTarget } },
+      "relay", relay, requests, 2006, operations).payload, { reviews: [], hasMore: false });
+    assert.deepEqual(handleBrokerRequest({ ...approval, payload: { ...approval.payload, target: otherTarget } },
+      "relay", relay, requests, 2006, operations).payload, { code: "SEND_REVIEW_UNAVAILABLE" });
+    for (const extra of [{ approved: true }, { text: "Changed" }, { selector: "button" },
+      { recoveryToken: prepared.payload.recoveryToken }]) {
+      assert.throws(() => handleBrokerRequest({ ...approval, payload: { ...approval.payload, ...extra } },
+        "relay", relay, requests, 2006, operations));
+    }
+    const renewed = handleBrokerRequest(listing, "relay", relay, requests, 2007, operations);
+    if (renewed.kind !== "fixture_send_reviews") throw new Error("Expected refreshed send review");
+    assert.deepEqual(handleBrokerRequest(approval, "relay", relay, requests, 2008, operations).payload,
+      { code: "SEND_REVIEW_UNAVAILABLE" });
+    const currentApproval = { ...approval, payload: { ...approval.payload, reviewId: renewed.payload.reviews[0]!.reviewId } };
+    const consent = handleBrokerRequest(currentApproval, "relay", relay, requests, 2008, operations);
+    if (consent.kind !== "fixture_send_review_approved") throw new Error("Expected distinct send consent");
+    assert.deepEqual(consent.payload, { operationId, state: "send_approved", approvedAt: 2008,
+      expiresAt: 2002 + FIXTURE_REVIEW_APPROVAL_TTL_MS });
+    assert.equal(operations.getFixtureSendAuthorization(stranger, operationId, 2008), null);
+    assert.ok(operations.getFixtureSendAuthorization(owner, operationId, 2008));
+    assert.deepEqual(handleBrokerRequest(currentApproval, "relay", relay, requests, 2009, operations).payload,
+      { code: "SEND_REVIEW_UNAVAILABLE" });
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM message_dispatch_attempts").get() as { count: number }).count, 0);
+    assert.throws(() => handleBrokerRequest({ ...envelope, kind: "record_fixture_dispatch_start", payload: { operationId } },
+      "facade", owner, requests, 2009, operations));
+    requests.revokeAllFixtures();
+    assert.equal(operations.getFixtureSendAuthorization(owner, operationId, 2010), null);
+    assert.deepEqual(handleBrokerRequest(listing, "relay", relay, requests, 2010, operations).payload,
+      { reviews: [], hasMore: false });
+  } finally {
+    database.close();
+  }
+});
+
 test("only an owning facade prepares immutable fixture text without approval or dispatch", () => {
   const requests = new PendingConnectionRequests();
   const database = new DatabaseSync(":memory:");

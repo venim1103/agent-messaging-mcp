@@ -13,6 +13,7 @@ import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, pars
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
+  parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeFixtureReset, parseNativeFixtureRevocation,
   parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
@@ -165,6 +166,44 @@ test("native fixture fill consent refuses no-send tokens, arbitrary controls, an
     { ...approval, payload: { ...approval.payload, text: "Changed approved text" } },
     { ...approval, payload: { ...approval.payload, send: true } }
   ]) assert.throws(() => parseNativeFixtureFillReviewApproval(invalid, now), /Invalid native fixture fill review approval/);
+});
+
+test("native fixture send review accepts only distinct commands and exact bounded targets", () => {
+  const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+    documentId: "CHROME-doc_opaque-42" };
+  const listing = { ...request, kind: "list_fixture_send_reviews", payload: { target } };
+  assert.deepEqual(parseNativeFixtureSendReviews(listing, now), listing);
+  for (const invalid of [
+    { ...listing, kind: "list_fixture_prepared_reviews" },
+    { ...listing, kind: "list_fixture_fill_reviews" },
+    { ...listing, protocolVersion: 2 },
+    { ...listing, connectionGeneration: 1 },
+    { ...listing, deadlineMs: now },
+    { ...listing, deadlineMs: now + 30_001 },
+    { ...listing, payload: { target, approved: true } },
+    { ...listing, payload: { target, text: "Changed text" } },
+    { ...listing, payload: { target: { ...target, selector: "button" } } },
+    { ...listing, payload: { target: { ...target, origin: "https://gemini.google.com" } } },
+    { ...listing, payload: { target: { ...target, tabId: 0 } } },
+    { ...listing, payload: { target: { ...target, documentId: "x".repeat(129) } } }
+  ]) assert.throws(() => parseNativeFixtureSendReviews(invalid, now), /Invalid native fixture send review list/);
+  const approval = { ...listing, kind: "approve_fixture_send_review", payload: { target,
+    operationId: "a66b3997-9d43-4554-8399-267d1fe9f75c", reviewId: "b66b3997-9d43-4554-8399-267d1fe9f75c" } };
+  assert.deepEqual(parseNativeFixtureSendReviewApproval(approval, now), approval);
+  for (const invalid of [
+    { ...approval, kind: "approve_fixture_review" },
+    { ...approval, kind: "approve_fixture_fill_review" },
+    { ...approval, deadlineMs: now },
+    { ...approval, deadlineMs: now + 30_001 },
+    { ...approval, connectionGeneration: 1 },
+    { ...approval, payload: { ...approval.payload, operationId: "wrong" } },
+    { ...approval, payload: { ...approval.payload, reviewId: "" } },
+    { ...approval, payload: { ...approval.payload, text: "Changed text" } },
+    { ...approval, payload: { ...approval.payload, approved: true } },
+    { ...approval, payload: { ...approval.payload, send: true } },
+    { ...approval, payload: { ...approval.payload, recoveryToken: "a".repeat(64) } },
+    { ...approval, payload: { ...approval.payload, target: { ...target, documentId: "line\nbreak" } } }
+  ]) assert.throws(() => parseNativeFixtureSendReviewApproval(invalid, now), /Invalid native fixture send review approval/);
 });
 
 test("native fixture preflight accepts only fixed results for an exact challenge target", () => {
@@ -576,6 +615,13 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(fillReplay.kind, "error");
     assert.equal(fillReplay.payload.code, "FILL_REVIEW_UNAVAILABLE");
 
+    const [beforeFilled] = await exchangeFillReview({ ...request, kind: "list_fixture_send_reviews",
+      deadlineMs: Date.now() + 10_000, payload: { target: approval.payload.target } }) as [{
+      kind: string; payload: { reviews: unknown[]; hasMore: boolean }
+    }];
+    assert.equal(beforeFilled.kind, "fixture_send_reviews");
+    assert.deepEqual(beforeFilled.payload, { reviews: [], hasMore: false });
+
     const filling = facade.fillFixtureDraft(prepared.payload.operationId);
     const fillObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
     let fillAttemptId: string | undefined;
@@ -610,6 +656,52 @@ test("native relay lists only live broker pending IDs over real framing", { time
     }];
     assert.equal(fillCompletionReplay.payload.accepted, false);
     assert.deepEqual((await facade.fillFixtureDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
+
+    const owningFacade = facade;
+    const sendTarget = { ...approval.payload.target, origin: "http://127.0.0.1:8787" as const,
+      conversationId: "fixture-alpha" as const };
+    assert.throws(() => owningFacade.listFixtureSendReviews(sendTarget), /Broker role cannot perform/);
+    assert.throws(() => owningFacade.approveFixtureSendReview(sendTarget, prepared.payload.operationId,
+      fillReview.reviewId), /Broker role cannot perform/);
+    const beforeSendReview = await facade.getPreparedOperation(prepared.payload.operationId);
+    const [sendListing] = await exchangeFillReview({ ...request, kind: "list_fixture_send_reviews",
+      deadlineMs: Date.now() + 10_000, payload: { target: approval.payload.target } }) as [{
+      kind: string; payload: { reviews: { operationId: string; reviewId: string; expiresAt: number;
+        preview: { target: string; text: string } }[]; hasMore: boolean }
+    }];
+    assert.equal(sendListing.kind, "fixture_send_reviews");
+    assert.equal(sendListing.payload.reviews.length, 1);
+    assert.equal(sendListing.payload.hasMore, false);
+    const [sendReview] = sendListing.payload.reviews;
+    assert.ok(sendReview);
+    assert.equal(sendReview.operationId, prepared.payload.operationId);
+    assert.deepEqual(sendReview.preview, prepared.payload.preview);
+    assert.equal(sendReview.expiresAt, approvalReviewReply.payload.expiresAt);
+    assert.notEqual(sendReview.reviewId, reviewId);
+    assert.notEqual(sendReview.reviewId, fillReview.reviewId);
+    assert.equal(JSON.stringify(sendListing).includes(prepared.payload.recoveryToken), false);
+    const sendApprovalRequest = { ...request, kind: "approve_fixture_send_review",
+      payload: { target: approval.payload.target, operationId: sendReview.operationId, reviewId: sendReview.reviewId } };
+    for (const wrongReviewId of [reviewId, fillReview.reviewId]) {
+      const [wrongPurpose] = await exchangeFillReview({ ...sendApprovalRequest, deadlineMs: Date.now() + 10_000,
+        payload: { ...sendApprovalRequest.payload, reviewId: wrongReviewId } }) as [{ kind: string; payload: { code: string } }];
+      assert.equal(wrongPurpose.kind, "error");
+      assert.deepEqual(wrongPurpose.payload, { code: "SEND_REVIEW_UNAVAILABLE" });
+    }
+    const [sendConsent] = await exchangeFillReview({ ...sendApprovalRequest, deadlineMs: Date.now() + 10_000 }) as [{
+      kind: string; payload: { operationId: string; state: string; approvedAt: number; expiresAt: number }
+    }];
+    assert.equal(sendConsent.kind, "fixture_send_review_approved");
+    assert.equal(sendConsent.payload.operationId, prepared.payload.operationId);
+    assert.equal(sendConsent.payload.state, "send_approved");
+    assert.equal(sendConsent.payload.expiresAt, sendReview.expiresAt);
+    assert.equal(Number.isSafeInteger(sendConsent.payload.approvedAt), true);
+    const [sendReplay] = await exchangeFillReview({ ...sendApprovalRequest, deadlineMs: Date.now() + 10_000 }) as [{
+      kind: string; payload: { code: string }
+    }];
+    assert.equal(sendReplay.kind, "error");
+    assert.deepEqual(sendReplay.payload, { code: "SEND_REVIEW_UNAVAILABLE" });
+    assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, beforeSendReview.payload);
 
     const checking = facade.checkFixturePreflight(prepared.payload.operationId);
     const preflightObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));

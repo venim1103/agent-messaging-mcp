@@ -7,6 +7,7 @@ import { handleNativeHandshake, isNativeCaller, parseNativeFixtureApproval, pars
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
+  parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeGeminiSnapshot,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
@@ -57,6 +58,10 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "approve_fixture_fill_review" ? parseNativeFixtureFillReviewApproval(message)
                   : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "list_fixture_send_reviews" ? parseNativeFixtureSendReviews(message)
+                  : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "approve_fixture_send_review" ? parseNativeFixtureSendReviewApproval(message)
+                  : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "complete_fixture_preflight" ? parseNativeFixturePreflight(message)
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "complete_fixture_fill" ? parseNativeFixtureFill(message)
@@ -73,6 +78,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           let kind: "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
             | "fixture_approved" | "fixture_review_approved" | "gemini_approved" | "fixture_revoked"
             | "fixture_fill_reviews" | "fixture_fill_review_approved"
+            | "fixture_send_reviews" | "fixture_send_review_approved"
             | "fixture_fill_recorded" | "fixture_preflight_recorded"
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "error";
@@ -91,7 +97,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             }; expiresAt: number }>; activeTabIds: ReadonlyArray<number> }
             | { reviews: ReadonlyArray<{ operationId: string; reviewId: string; expiresAt: number;
               preview: { target: "fixture-alpha"; text: string } }>; hasMore: boolean }
-            | { operationId: string; state: "approved" | "fill_approved"; approvedAt: number; expiresAt: number }
+            | { operationId: string; state: "approved" | "fill_approved" | "send_approved"; approvedAt: number; expiresAt: number }
             | { accepted: boolean }
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
@@ -136,6 +142,21 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 kind = "error";
                 payload = { code: "FILL_REVIEW_UNAVAILABLE" };
               } else throw new Error("Broker refused fixture fill review approval");
+            } else if (request.kind === "list_fixture_send_reviews") {
+              const result = await client.listFixtureSendReviews(request.payload.target);
+              if (result.kind !== "fixture_send_reviews") throw new Error("Broker refused fixture send reviews");
+              kind = "fixture_send_reviews";
+              payload = result.payload;
+            } else if (request.kind === "approve_fixture_send_review") {
+              const result = await client.approveFixtureSendReview(request.payload.target, request.payload.operationId,
+                request.payload.reviewId);
+              if (result.kind === "fixture_send_review_approved") {
+                kind = "fixture_send_review_approved";
+                payload = result.payload;
+              } else if (result.kind === "error" && result.payload.code === "SEND_REVIEW_UNAVAILABLE") {
+                kind = "error";
+                payload = { code: "SEND_REVIEW_UNAVAILABLE" };
+              } else throw new Error("Broker refused fixture send review approval");
             } else if (request.kind === "complete_fixture_preflight") {
               const result = await client.completeFixturePreflight(request.payload.target, request.payload.challengeId,
                 request.payload.observation);
