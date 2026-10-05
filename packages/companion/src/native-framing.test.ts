@@ -1,7 +1,66 @@
 import assert from "node:assert/strict";
 import { endianness } from "node:os";
+import { Writable } from "node:stream";
 import { test } from "node:test";
-import { encodeNativeFrame, MAX_NATIVE_FRAME_BYTES, NativeFrameDecoder } from "./native-framing.js";
+import { setImmediate } from "node:timers/promises";
+import { encodeNativeFrame, MAX_NATIVE_FRAME_BYTES, NativeFrameDecoder, writeNativeFrame } from "./native-framing.js";
+
+test("frame output waits for drain and preserves bytes without retaining listeners", async () => {
+  const chunks: Buffer[] = [];
+  let releaseWrite: () => void = () => {};
+  const output = new Writable({ highWaterMark: 1, write(chunk: Buffer, _encoding, complete) {
+    chunks.push(Buffer.from(chunk));
+    releaseWrite = () => complete();
+  } });
+  try {
+    const message = { text: "Unicode \u20ac\uD83D\uDE00" };
+    let settled = false;
+    const writing = writeNativeFrame(output, message).then(() => { settled = true; });
+    await setImmediate();
+    assert.equal(settled, false);
+    releaseWrite();
+    await writing;
+    assert.deepEqual(new NativeFrameDecoder().push(Buffer.concat(chunks)), [message]);
+    for (const event of ["drain", "error", "close"]) assert.equal(output.listenerCount(event), 0);
+  } finally {
+    output.destroy();
+  }
+});
+
+test("frame output rejects close and error while draining and removes listeners", async () => {
+  for (const error of [undefined, new Error("Synthetic output failure")]) {
+    const output = new Writable({ highWaterMark: 1, write() {} });
+    try {
+      const writing = writeNativeFrame(output, { text: "Must settle" });
+      const rejected = assert.rejects(writing, error ? /Synthetic output failure/ : /Native frame output closed/);
+      output.destroy(error);
+      await rejected;
+      for (const event of ["drain", "error", "close"]) assert.equal(output.listenerCount(event), 0);
+    } finally {
+      output.destroy();
+    }
+  }
+});
+
+test("frame output refuses closed streams and excess bytes before writing", async (context) => {
+  for (const state of ["open", "ended", "destroyed"]) {
+    const output = new Writable({ write(_chunk, _encoding, complete) { complete(); } });
+    if (state === "ended") output.end();
+    if (state === "destroyed") output.destroy();
+    const write = context.mock.method(output, "write", () => {
+      assert.fail("Refused output must not reach the stream");
+    });
+    try {
+      const message = { text: "x".repeat(MAX_NATIVE_FRAME_BYTES) };
+      await assert.rejects(writeNativeFrame(output, message), state === "open"
+        ? /Invalid native frame size/ : /Native frame output closed/);
+      assert.equal(write.mock.callCount(), 0);
+    } finally {
+      write.mock.restore();
+      output.destroy();
+    }
+  }
+});
 
 test("decodes partial headers, partial bodies, and adjacent Unicode frames", () => {
   const first = { text: "hello \uD83D\uDE00" };

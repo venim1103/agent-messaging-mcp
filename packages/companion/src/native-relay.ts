@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
-import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
+import { NativeFrameDecoder, writeNativeFrame } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
@@ -27,6 +27,25 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
   let pendingRequests = 0;
   let invalid = false;
 
+  function failNativeOutput(): void {
+    if (invalid) return;
+    invalid = true;
+    process.stderr.write("Native relay failed to write a response\n");
+    process.exitCode = 1;
+    process.stdin.destroy();
+  }
+
+  process.stdout.on("error", failNativeOutput);
+  process.stdout.on("close", failNativeOutput);
+
+  function queueNativeReply(reply: () => void | Promise<void>): void {
+    if (pendingRequests >= MAX_BROKER_PENDING_REQUESTS) throw new Error("Invalid native request queue");
+    pendingRequests++;
+    nativeReply = nativeReply.then(async () => {
+      if (!invalid) await reply();
+    }).catch(failNativeOutput).finally(() => { pendingRequests--; });
+  }
+
   process.stdin.on("data", (chunk: Buffer) => {
     let deadlineMs: number | undefined;
     try {
@@ -34,7 +53,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
         deadlineMs = typeof message === "object" && message !== null && "deadlineMs" in message
           && typeof message.deadlineMs === "number" ? message.deadlineMs : undefined;
         if (typeof message === "object" && message !== null && "kind" in message && message.kind === "handshake") {
-          process.stdout.write(encodeNativeFrame(handleNativeHandshake(message)));
+          const response = handleNativeHandshake(message);
+          queueNativeReply(() => writeNativeFrame(process.stdout, response));
           continue;
         }
         const request = typeof message === "object" && message !== null && "kind" in message
@@ -74,10 +94,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                     : typeof message === "object" && message !== null && "kind" in message
                       && message.kind === "mark_gemini_observation_gap" ? parseNativeGeminiGap(message)
               : parseNativePendingList(message);
-              if (pendingRequests >= MAX_BROKER_PENDING_REQUESTS) throw new Error("Invalid native request queue");
-              pendingRequests++;
-        nativeReply = nativeReply.then(async () => {
-          if (invalid) return;
+              queueNativeReply(async () => {
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
           let kind: "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
             | "fixture_approved" | "fixture_review_approved" | "gemini_approved" | "fixture_revoked"
@@ -236,15 +253,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           } finally {
             client?.close();
           }
-          if (!invalid) process.stdout.write(encodeNativeFrame({
+          if (!invalid) await writeNativeFrame(process.stdout, {
             kind, protocolVersion: PROTOCOL_VERSION, requestId: request.requestId,
             connectionGeneration: 0, deadlineMs: request.deadlineMs, payload
-          }));
-        }).catch(() => {
-          process.stderr.write("Native relay failed to encode a pending response\n");
-          process.exitCode = 1;
-          process.stdin.destroy();
-        }).finally(() => { pendingRequests--; });
+          });
+        });
       }
     } catch (error) {
       invalid = true;

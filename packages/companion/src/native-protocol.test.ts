@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -546,6 +547,52 @@ test("spawned native relay bounds queued broker work without disclosing payloads
   }
 });
 
+test("spawned native relay bounds handshakes with forwarding work and preserves reply order", { timeout: 4000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-native-handshake-queue-"));
+  try {
+    for (const mixed of [false, true]) {
+      for (const count of [MAX_BROKER_PENDING_REQUESTS, MAX_BROKER_PENDING_REQUESTS + 1]) {
+        const messages = Array.from({ length: count }, (_, index) => ({ ...request, requestId: randomUUID(),
+          kind: mixed && index % 2 === 0 ? "list_pending" : "handshake", deadlineMs: Date.now() + 10_000 }));
+        const host = spawn(process.execPath, [fileURLToPath(new URL("./native-relay.js", import.meta.url)), origin, origin], {
+          stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+        });
+        const stdout: Buffer[] = [];
+        const stderr: Buffer[] = [];
+        host.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+        host.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+        try {
+          host.stdin.end(Buffer.concat(messages.map((message) => encodeNativeFrame(message))));
+          const [exitCode] = await once(host, "close");
+          const diagnostic = Buffer.concat(stderr).toString();
+          if (count === MAX_BROKER_PENDING_REQUESTS) {
+            assert.equal(exitCode, 0, diagnostic);
+            const replies = new NativeFrameDecoder().push(Buffer.concat(stdout)) as {
+              kind: string; requestId: string; deadlineMs: number; payload: unknown
+            }[];
+            assert.equal(replies.length, messages.length);
+            for (let index = 0; index < messages.length; index++) {
+              assert.equal(replies[index]?.requestId, messages[index]?.requestId);
+              assert.equal(replies[index]?.deadlineMs, messages[index]?.deadlineMs);
+              assert.equal(replies[index]?.kind, messages[index]?.kind === "handshake" ? "handshake_result" : "error");
+              assert.deepEqual(replies[index]?.payload, messages[index]?.kind === "handshake"
+                ? { protocolVersion: PROTOCOL_VERSION } : { code: "BROKER_UNAVAILABLE" });
+            }
+          } else {
+            assert.equal(exitCode, 1);
+            assert.equal(Buffer.concat(stdout).length, 0);
+            assert.match(diagnostic, /^Invalid native host message: Invalid native request queue; deadline delta -?\d+ms\n$/);
+          }
+        } finally {
+          host.kill();
+        }
+      }
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("spawned native relay refuses truncated input without disclosing unfinished payloads", { timeout: 4000 }, async () => {
   const sensitive = "private-unfinished-draft-and-credential";
   const frame = encodeNativeFrame({ draftText: sensitive, credential: sensitive });
@@ -566,6 +613,26 @@ test("spawned native relay refuses truncated input without disclosing unfinished
     } finally {
       host.kill();
     }
+  }
+});
+
+test("spawned native relay handles a closed stdout pipe with a fixed diagnostic", { timeout: 4000 }, async () => {
+  const host = spawn(process.execPath, [fileURLToPath(new URL("./native-relay.js", import.meta.url)), origin, origin], {
+    stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PATH: "/usr/bin:/bin" }
+  });
+  const stderr: Buffer[] = [];
+  host.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+  try {
+    const stdoutClosed = once(host.stdout, "close");
+    host.stdout.destroy();
+    await stdoutClosed;
+    const closed = once(host, "close");
+    host.stdin.end(encodeNativeFrame({ ...request, deadlineMs: Date.now() + 10_000 }));
+    const [exitCode] = await closed;
+    assert.equal(exitCode, 1);
+    assert.equal(Buffer.concat(stderr).toString(), "Native relay failed to write a response\n");
+  } finally {
+    host.kill();
   }
 });
 

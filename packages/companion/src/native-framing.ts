@@ -1,5 +1,6 @@
 import { isUtf8 } from "node:buffer";
 import { endianness } from "node:os";
+import type { Writable } from "node:stream";
 
 export const MAX_NATIVE_FRAME_BYTES = 256 * 1024;
 const littleEndian = endianness() === "LE";
@@ -16,6 +17,24 @@ export function encodeNativeFrame(message: unknown): Buffer {
   else frame.writeUInt32BE(bodyLength, 0);
   frame.write(serialized, 4, bodyLength, "utf8");
   return frame;
+}
+
+export async function writeNativeFrame(output: Writable, message: unknown): Promise<void> {
+  if (output.destroyed || output.writableEnded) throw new Error("Native frame output closed");
+  if (output.write(encodeNativeFrame(message))) return;
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      output.off("drain", onDrain);
+      output.off("error", onError);
+      output.off("close", onClose);
+    };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    const onClose = () => { cleanup(); reject(new Error("Native frame output closed")); };
+    output.once("drain", onDrain);
+    output.once("error", onError);
+    output.once("close", onClose);
+  });
 }
 
 export class NativeFrameDecoder {

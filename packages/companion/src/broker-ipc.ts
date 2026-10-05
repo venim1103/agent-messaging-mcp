@@ -5,29 +5,11 @@ import { DatabaseSync } from "node:sqlite";
 import { authenticateBrokerRole, MAX_BROKER_PENDING_REQUESTS, type BrokerCredentials } from "./broker-roles.js";
 import { handleBrokerRequest } from "./broker-requests.js";
 import { PreparedMessageOperations } from "./message-operations.js";
-import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
+import { NativeFrameDecoder, writeNativeFrame as writeBrokerResponse } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
 
 export const BROKER_IDLE_TIMEOUT_MS = PENDING_REQUEST_TTL_MS * 2 + 30_000;
-
-async function writeBrokerResponse(socket: Socket, message: unknown): Promise<void> {
-  if (socket.destroyed) throw new Error("Broker connection closed");
-  if (socket.write(encodeNativeFrame(message))) return;
-  await new Promise<void>((resolve, reject) => {
-    const cleanup = () => {
-      socket.off("drain", onDrain);
-      socket.off("error", onError);
-      socket.off("close", onClose);
-    };
-    const onDrain = () => { cleanup(); resolve(); };
-    const onError = (error: Error) => { cleanup(); reject(error); };
-    const onClose = () => { cleanup(); reject(new Error("Broker connection closed")); };
-    socket.once("drain", onDrain);
-    socket.once("error", onError);
-    socket.once("close", onClose);
-  });
-}
 
 export async function startBrokerSocket(runtimeDirectory: string, credentials: BrokerCredentials,
   operationDatabase?: DatabaseSync) {
