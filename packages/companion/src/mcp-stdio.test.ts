@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -12,6 +13,38 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { connectBroker } from "./broker-client.js";
 import { openPrivateOperationDatabase, PreparedMessageOperations } from "./message-operations.js";
 import { PendingConnectionRequests } from "./pending-connections.js";
+
+async function brokerSocketReady(socketPath: string): Promise<boolean> {
+  try {
+    const info = await stat(socketPath);
+    return info.isSocket() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0;
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    return false;
+  }
+}
+
+test("broker readiness rejects a socket until its permissions are private", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-readiness-"));
+  const socketPath = join(home, "broker.sock");
+  const server = createServer();
+  try {
+    assert.equal(await brokerSocketReady(socketPath), false);
+    assert.equal(await brokerSocketReady(home), false);
+    const listening = once(server, "listening");
+    server.listen(socketPath);
+    await listening;
+    await chmod(socketPath, 0o666);
+    assert.equal(await brokerSocketReady(socketPath), false);
+    await chmod(socketPath, 0o600);
+    assert.equal(await brokerSocketReady(socketPath), true);
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("official SDK stdio client discovers and calls the diagnostic tool", async () => {
   const client = new Client({ name: "browser-chat-test", version: "0.0.1" });
@@ -69,12 +102,8 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     brokerExit = once(broker, "exit");
     let ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
-      try {
-        ready = (await stat(join(brokerDirectory, "broker.sock"))).isSocket();
-        if (ready) break;
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      }
+      ready = await brokerSocketReady(join(brokerDirectory, "broker.sock"));
+      if (ready) break;
       await setTimeout(25);
     }
     assert.equal(ready, true, "Broker did not start");
@@ -431,12 +460,8 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     brokerExit = once(broker, "exit");
     ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
-      try {
-        ready = (await stat(join(brokerDirectory, "broker.sock"))).isSocket();
-        if (ready) break;
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      }
+      ready = await brokerSocketReady(join(brokerDirectory, "broker.sock"));
+      if (ready) break;
       await setTimeout(25);
     }
     assert.equal(ready, true, "Restarted broker did not start");
@@ -502,12 +527,8 @@ test("a recovery receipt reveals only dispatch metadata to a fresh MCP process",
     brokerExit = once(broker, "exit");
     let ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
-      try {
-        ready = (await stat(join(parent, "broker/broker.sock"))).isSocket();
-        if (ready) break;
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      }
+      ready = await brokerSocketReady(join(parent, "broker/broker.sock"));
+      if (ready) break;
       await setTimeout(25);
     }
     assert.equal(ready, true, "Recovery broker did not start");
