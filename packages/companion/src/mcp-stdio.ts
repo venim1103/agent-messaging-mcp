@@ -9,10 +9,17 @@ import { MAX_PREPARED_MESSAGE_BYTES } from "./message-operations.js";
 const server = new McpServer({ name: "browser-chat-feasibility", version: "0.0.1" });
 const runtimeDirectory = join(homedir(), ".config/agent-messaging-mcp/broker");
 let broker: Awaited<ReturnType<typeof connectBroker>> | undefined;
+let connectingBroker: ReturnType<typeof connectBroker> | undefined;
 
 async function pendingBroker() {
   if (broker?.closed) broker = undefined;
-  return broker ??= await connectBroker("facade", runtimeDirectory);
+  if (broker) return broker;
+  const connection = connectingBroker ??= connectBroker("facade", runtimeDirectory);
+  try {
+    return broker ??= await connection;
+  } finally {
+    if (connectingBroker === connection) connectingBroker = undefined;
+  }
 }
 
 function unavailable() {

@@ -11,6 +11,8 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { connectBroker } from "./broker-client.js";
+import { startBrokerSocket } from "./broker-ipc.js";
+import { createBrokerCredentials } from "./broker-roles.js";
 import { openPrivateOperationDatabase, PreparedMessageOperations } from "./message-operations.js";
 import { PendingConnectionRequests } from "./pending-connections.js";
 
@@ -73,6 +75,48 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     }]);
   } finally {
     await client.close();
+  }
+});
+
+test("concurrent first MCP calls retain one broker owner without sharing it with another facade", { timeout: 5000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-concurrent-"));
+  const parent = join(home, ".config/agent-messaging-mcp");
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const broker = await startBrokerSocket(join(parent, "broker"), createBrokerCredentials());
+  const client = new Client({ name: "concurrent-owner", version: "0.0.1" });
+  const other = new Client({ name: "other-owner", version: "0.0.1" });
+  const options = { command: process.execPath,
+    args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))], env: { ...process.env, HOME: home } };
+  try {
+    await client.connect(new StdioClientTransport(options));
+    const created = await Promise.all(Array.from({ length: 8 }, () => client.callTool({
+      name: "chat_request_connection", arguments: {}
+    })));
+    const handles = created.map((result) => {
+      assert.equal(result.isError, undefined);
+      const handle = result.structuredContent as { requestId: string; state: string };
+      assert.equal(handle.state, "pending");
+      return handle;
+    });
+    assert.equal(new Set(handles.map((handle) => handle.requestId)).size, handles.length);
+    const owned = await Promise.all(handles.map((handle) => client.callTool({
+      name: "chat_get_connection", arguments: { requestId: handle.requestId }
+    })));
+    for (let index = 0; index < handles.length; index++) {
+      assert.equal(owned[index]?.isError, undefined);
+      assert.deepEqual(owned[index]?.structuredContent, handles[index]);
+    }
+    await other.connect(new StdioClientTransport(options));
+    for (const handle of handles) {
+      const foreign = await other.callTool({ name: "chat_get_connection", arguments: { requestId: handle.requestId } });
+      assert.equal(foreign.isError, undefined);
+      assert.deepEqual(foreign.structuredContent, { state: "unknown" });
+    }
+  } finally {
+    await client.close();
+    await other.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
   }
 });
 
