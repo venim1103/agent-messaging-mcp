@@ -252,4 +252,15 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
       process.stdin.destroy();
     }
   });
+
+  process.stdin.on("end", () => {
+    if (invalid) return;
+    try {
+      decoder.finish();
+    } catch {
+      invalid = true;
+      process.stderr.write("Invalid native host message: Incomplete native frame\n");
+      process.exitCode = 1;
+    }
+  });
 }

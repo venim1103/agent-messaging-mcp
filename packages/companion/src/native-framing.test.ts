@@ -14,6 +14,31 @@ test("decodes partial headers, partial bodies, and adjacent Unicode frames", () 
   assert.deepEqual(decoder.push(frames.subarray(7)), [first, second]);
 });
 
+test("end-of-stream refuses incomplete headers and bodies at every byte boundary", () => {
+  const message = { text: "Private \u20ac\uD83D\uDE00" };
+  const frame = encodeNativeFrame(message);
+  for (let length = 1; length < frame.length; length++) {
+    const decoder = new NativeFrameDecoder();
+    assert.deepEqual(decoder.push(frame.subarray(0, length)), []);
+    assert.throws(() => decoder.finish(), /Incomplete native frame/);
+  }
+  const adjacent = new NativeFrameDecoder();
+  assert.deepEqual(adjacent.push(Buffer.concat([frame, frame.subarray(0, frame.length - 1)])), [message]);
+  assert.throws(() => adjacent.finish(), /Incomplete native frame/);
+});
+
+test("end-of-stream accepts empty input and complete fragmented adjacent frames", () => {
+  assert.doesNotThrow(() => new NativeFrameDecoder().finish());
+  const first = { text: "First" };
+  const second = { text: "Second" };
+  const frames = Buffer.concat([encodeNativeFrame(first), encodeNativeFrame(second)]);
+  const decoder = new NativeFrameDecoder();
+  const messages: unknown[] = [];
+  for (const byte of frames) messages.push(...decoder.push(Buffer.from([byte])));
+  assert.deepEqual(messages, [first, second]);
+  assert.doesNotThrow(() => decoder.finish());
+});
+
 test("rejects oversized frames before reading their bodies", () => {
   const header = Buffer.alloc(4);
   if (endianness() === "LE") header.writeUInt32LE(MAX_NATIVE_FRAME_BYTES + 1);

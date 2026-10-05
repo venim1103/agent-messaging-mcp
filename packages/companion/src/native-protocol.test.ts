@@ -485,6 +485,29 @@ test("spawned native relay rejects private malformed input without stdout or dia
   }
 });
 
+test("spawned native relay refuses truncated input without disclosing unfinished payloads", { timeout: 4000 }, async () => {
+  const sensitive = "private-unfinished-draft-and-credential";
+  const frame = encodeNativeFrame({ draftText: sensitive, credential: sensitive });
+  for (const length of [1, 3, 4, frame.length - 1]) {
+    const host = spawn(process.execPath, [fileURLToPath(new URL("./native-relay.js", import.meta.url)), origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PATH: "/usr/bin:/bin" }
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    host.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    host.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    try {
+      host.stdin.end(frame.subarray(0, length));
+      const [exitCode] = await once(host, "close");
+      assert.equal(exitCode, 1, `Truncated input at byte ${length}`);
+      assert.equal(Buffer.concat(stdout).length, 0);
+      assert.equal(Buffer.concat(stderr).toString(), "Invalid native host message: Incomplete native frame\n");
+    } finally {
+      host.kill();
+    }
+  }
+});
+
 test("spawned native relay replies with a framed version and no other stdout", async () => {
   const host = spawn(process.execPath, [new URL("./native-relay.js", import.meta.url).pathname, origin, origin], {
     stdio: ["pipe", "pipe", "pipe"],

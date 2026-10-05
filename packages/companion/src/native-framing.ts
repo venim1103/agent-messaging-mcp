@@ -23,6 +23,10 @@ export class NativeFrameDecoder {
   private body: Buffer | null = null;
   private bodyBytes = 0;
 
+  finish(): void {
+    if (this.headerBytes !== 0 || this.body !== null) throw new Error("Incomplete native frame");
+  }
+
   push(chunk: Buffer): unknown[] {
     const messages: unknown[] = [];
     let offset = 0;
