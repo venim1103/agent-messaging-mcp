@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
+import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeGeminiGap,
@@ -23,6 +24,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
 } else {
   const decoder = new NativeFrameDecoder();
   let nativeReply: Promise<void> = Promise.resolve();
+  let pendingRequests = 0;
   let invalid = false;
 
   process.stdin.on("data", (chunk: Buffer) => {
@@ -72,6 +74,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                     : typeof message === "object" && message !== null && "kind" in message
                       && message.kind === "mark_gemini_observation_gap" ? parseNativeGeminiGap(message)
               : parseNativePendingList(message);
+              if (pendingRequests >= MAX_BROKER_PENDING_REQUESTS) throw new Error("Invalid native request queue");
+              pendingRequests++;
         nativeReply = nativeReply.then(async () => {
           if (invalid) return;
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
@@ -240,11 +244,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           process.stderr.write("Native relay failed to encode a pending response\n");
           process.exitCode = 1;
           process.stdin.destroy();
-        });
+        }).finally(() => { pendingRequests--; });
       }
     } catch (error) {
       invalid = true;
-      const reason = error instanceof Error && /^Invalid native (handshake|pending list request|fixture (approval|review approval|reset|revocation|snapshot|gap|read challenge list|prepared review list)|frame size)$/.test(error.message)
+      const reason = error instanceof Error && /^Invalid native (handshake|pending list request|request queue|fixture (approval|review approval|reset|revocation|snapshot|gap|read challenge list|prepared review list)|frame size)$/.test(error.message)
         ? error.message : error instanceof SyntaxError ? "Invalid JSON" : "Invalid schema";
       const deadline = deadlineMs === undefined ? "missing" : String(Math.trunc(deadlineMs - Date.now()));
       process.stderr.write(`Invalid native host message: ${reason}; deadline delta ${deadline}ms\n`);

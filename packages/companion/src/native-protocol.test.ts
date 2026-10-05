@@ -9,6 +9,7 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import * as z from "zod/v4";
 import { connectBroker } from "./broker-client.js";
+import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeGeminiGap,
@@ -482,6 +483,66 @@ test("spawned native relay rejects private malformed input without stdout or dia
     } finally {
       host.kill();
     }
+  }
+});
+
+test("spawned native relay bounds queued broker work without disclosing payloads and reuses capacity", { timeout: 4000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-native-queue-"));
+  const sensitive = "private-native-queued-message-and-credential";
+  const message = { ...request, kind: "publish_fixture_snapshot", deadlineMs: Date.now() + 10_000, payload: {
+    target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "CHROME-doc_opaque-42" },
+    messages: [{ id: "fixture-1", direction: "incoming", text: sensitive }]
+  } };
+  const frame = encodeNativeFrame(message);
+  try {
+    for (const count of [MAX_BROKER_PENDING_REQUESTS, MAX_BROKER_PENDING_REQUESTS + 1]) {
+      const host = spawn(process.execPath, [fileURLToPath(new URL("./native-relay.js", import.meta.url)), origin, origin], {
+        stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      });
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      const decoder = new NativeFrameDecoder();
+      const replies: unknown[] = [];
+      let receivedBatch: () => void = () => {};
+      const firstBatch = new Promise<void>((resolve) => { receivedBatch = resolve; });
+      host.stdout.on("data", (chunk: Buffer) => {
+        stdout.push(chunk);
+        replies.push(...decoder.push(chunk));
+        if (replies.length >= MAX_BROKER_PENDING_REQUESTS) receivedBatch();
+      });
+      host.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      try {
+        const burst = Buffer.concat(Array.from({ length: count }, () => frame));
+        if (count === MAX_BROKER_PENDING_REQUESTS) {
+          host.stdin.write(burst);
+          await firstBatch;
+          host.stdin.end(frame);
+        } else {
+          host.stdin.end(burst);
+        }
+        const [exitCode] = await once(host, "close");
+        const diagnostic = Buffer.concat(stderr).toString();
+        assert.equal(diagnostic.includes(sensitive), false);
+        assert.equal(Buffer.concat(stdout).toString().includes(sensitive), false);
+        if (count === MAX_BROKER_PENDING_REQUESTS) {
+          assert.equal(exitCode, 0);
+          assert.equal(replies.length, count + 1);
+          for (const reply of replies as { kind: string; payload: unknown }[]) {
+            assert.equal(reply.kind, "error");
+            assert.deepEqual(reply.payload, { code: "BROKER_UNAVAILABLE" });
+          }
+        } else {
+          assert.equal(exitCode, 1);
+          assert.equal(Buffer.concat(stdout).length, 0);
+          assert.match(diagnostic, /^Invalid native host message: Invalid native request queue; deadline delta -?\d+ms\n$/);
+        }
+      } finally {
+        host.kill();
+      }
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });
 
