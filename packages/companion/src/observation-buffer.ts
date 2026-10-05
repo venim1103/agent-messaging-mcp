@@ -5,10 +5,23 @@ export const MAX_OBSERVATION_EVENTS = 1000;
 export const MAX_OBSERVATION_BYTES = 5 * 1024 * 1024;
 export const MAX_EVENT_BYTES = 256 * 1024;
 export const MAX_RETURNED_EVENTS = 100;
+export const MAX_OBSERVATION_DEPTH = 32;
 
 type Cursor = Readonly<{ epoch: string; sequence: number }>;
 type JsonValue = z.infer<ReturnType<typeof z.json>>;
 type ObservationEvent = Readonly<{ epoch: string; sequence: number; payload: JsonValue }>;
+
+function assertNestingDepth(value: unknown): void {
+  const pending = [{ value, depth: 0 }];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (current.depth > MAX_OBSERVATION_DEPTH) throw new Error("Observation payload exceeds nesting limit");
+    if (!current.value || typeof current.value !== "object") continue;
+    for (const child of Object.values(current.value)) {
+      pending.push({ value: child, depth: current.depth + 1 });
+    }
+  }
+}
 
 function freeze(value: JsonValue): JsonValue {
   if (value && typeof value === "object") {
@@ -40,6 +53,7 @@ export class ObservationBuffer {
   }
 
   append(payload: unknown): ObservationEvent {
+    assertNestingDepth(payload);
     const parsed = z.json().parse(payload);
     const serialized = JSON.stringify({ epoch: this.epoch, sequence: this.sequence + 1, payload: parsed });
     const size = Buffer.byteLength(serialized, "utf8");

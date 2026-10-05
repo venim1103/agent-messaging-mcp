@@ -1,10 +1,17 @@
 # Implementation Handoff
 
-Updated: 2026-10-01.
+Updated: 2026-10-05.
 
 This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **The opt-in broker and user-approved fixture-only connection work. Each MCP fixture read waits for a bounded exact-document browser challenge; real toolbar-approved reads, a chat switch, and a fixture message-to-MCP event wait passed. One explicitly authorized disposable Gemini chat returned an exact-document read and later rendered events after a prompt sent manually by the user; its owner disconnected. Gemini worker-wake gaps are synthetic-tested only. The connector has not sent a real-site message.** VS Code tool executions run in the Podman devcontainer, and the user confirmed that its Chromium fixture window is visible on Windows.
 
-The latest exact full gate passed build/typecheck, **95/95 unit tests and 12/12 sandboxed isolated Chromium tests**. Companion deadline/privacy hardening is committed as `64f50fa`; browser sandbox verification, rich-editor test isolation, and strict refusal diagnostics as `a9d74c7`; popup review invalidation as `6455b56`. The latest counts validate the tree through `6455b56`, including the earlier two source checkpoints. Earlier failures remain recorded below. The external clock fault stays deferred and unresolved; this green gate is not a clock-repair claim.
+The latest exact full gate passed build/typecheck, **97/97 unit tests and 12/12 sandboxed isolated Chromium tests**, including the observation nesting checkpoint below. Companion deadline/privacy hardening is committed as `64f50fa`; browser sandbox verification, rich-editor test isolation, and strict refusal diagnostics as `a9d74c7`; popup review invalidation as `6455b56`. Earlier failures remain recorded below. The external clock fault stays deferred and unresolved; this green gate is not a clock-repair claim.
+
+## Observation Nesting Checkpoint (2026-10-05)
+
+- After a computer restart, the user deferred clock repair to IT and renewed autonomous synthetic-only continuation. Preserve the untracked standalone clock diagnostic; no clock, NTP, Hyper-V, VPN, domain-policy, or deadline setting was changed during this checkpoint.
+- A deterministic regression reproduced `RangeError: Maximum call stack size exceeded` when deeply nested JSON reached the observation buffer's recursive validator. An iterative precheck now refuses payloads exceeding 32 nesting levels before validation or publication, including cyclic arrays and objects. Existing event-count and UTF-8 byte limits, detached immutable events, and reader-local pages remain unchanged.
+- The focused observation suite passed **8/8**, covering array/object exact-depth boundaries, controlled deep/cyclic refusal, unchanged bookmarks/history after rejection, and the next valid publication. The exact required full gate passed build, both typechecks, **97/97 units**, and **12/12 sandboxed browsers**. Editor diagnostics are clean; this does not establish clock repair.
+- The local fixture and private broker were restarted; fixture HTTP returned 200 and both processes were confirmed running. No installed-profile browser, real chat, human approval, send UI, dispatch transport, public submit, retry policy, or connector submission was opened or added. The broker must use the rebuilt companion modules before any subsequent coordinated check.
 
 ## Resume Snapshot (2026-10-01)
 
