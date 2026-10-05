@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { once } from "node:events";
+import { on, once } from "node:events";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { setTimeout } from "node:timers/promises";
+import { setImmediate, setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import * as z from "zod/v4";
 import { connectBroker } from "./broker-client.js";
@@ -487,6 +487,28 @@ test("spawned native relay rejects private malformed input without stdout or dia
   }
 });
 
+test("spawned native relay keeps malformed deadline diagnostics bounded and private", { timeout: 4000 }, async () => {
+  const sensitive = "private-malformed-deadline-draft-and-credential";
+  for (const deadlineMs of [Number.MAX_VALUE, -Number.MAX_VALUE, 0.5, Number.MIN_VALUE, -Number.MAX_SAFE_INTEGER]) {
+    const host = spawn(process.execPath, [fileURLToPath(new URL("./native-relay.js", import.meta.url)), origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PATH: "/usr/bin:/bin" }
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    host.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    host.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    try {
+      host.stdin.end(encodeNativeFrame({ ...request, deadlineMs, payload: { draftText: sensitive, credential: sensitive } }));
+      const [exitCode] = await once(host, "close");
+      assert.equal(exitCode, 1);
+      assert.equal(Buffer.concat(stdout).length, 0);
+      assert.equal(Buffer.concat(stderr).toString(), "Invalid native host message: Invalid native handshake; deadline delta missingms\n");
+    } finally {
+      host.kill();
+    }
+  }
+});
+
 test("spawned native relay bounds queued broker work without disclosing payloads and reuses capacity", { timeout: 4000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-native-queue-"));
   const sensitive = "private-native-queued-message-and-credential";
@@ -658,13 +680,17 @@ test("spawned native relay replies with a framed version and no other stdout", a
   assert.deepEqual(replies, [handleNativeHandshake(handshake, Date.now())]);
 });
 
-test("native relay lists only live broker pending IDs over real framing", { timeout: 8000 }, async () => {
+test("native relay lists only live broker pending IDs over real framing", { timeout: 8000 }, async (context) => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-native-pending-"));
   const brokerEntry = fileURLToPath(new URL("./broker-process.js", import.meta.url));
   const relayEntry = fileURLToPath(new URL("./native-relay.js", import.meta.url));
   const broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
   const brokerExit = once(broker, "exit");
   let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let reviewPort: ReturnType<typeof spawn> | undefined;
+  let reviewPortClose: ReturnType<typeof once> | undefined;
+  const stopReviewHost = () => { reviewPort?.kill(); };
+  context.signal.addEventListener("abort", stopReviewHost, { once: true });
 
   try {
     const socketPath = join(home, ".config/agent-messaging-mcp/broker/broker.sock");
@@ -785,19 +811,29 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(approvalReviewReply.payload.state, "approved");
 
     let lastExchangeDiagnostic = "";
+    const fillHost = spawn(process.execPath, [relayEntry, origin, origin], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+    });
+    reviewPort = fillHost;
+    reviewPortClose = once(fillHost, "close");
+    const fillErrors: Buffer[] = [];
+    fillHost.stderr.on("data", (chunk: Buffer) => fillErrors.push(chunk));
+    fillHost.stdin.on("error", stopReviewHost);
     const exchangeFillReview = async (message: unknown) => {
-      const fillHost = spawn(process.execPath, [relayEntry, origin, origin], {
-        stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
-      });
-      const fillOutput: Buffer[] = [];
-      const fillErrors: Buffer[] = [];
-      fillHost.stdout.on("data", (chunk: Buffer) => fillOutput.push(chunk));
-      fillHost.stderr.on("data", (chunk: Buffer) => fillErrors.push(chunk));
-      fillHost.stdin.end(encodeNativeFrame(message));
-      const [fillExit] = await once(fillHost, "exit");
-      lastExchangeDiagnostic = Buffer.concat(fillErrors).toString();
-      assert.equal(fillExit, 0, lastExchangeDiagnostic);
-      return new NativeFrameDecoder().push(Buffer.concat(fillOutput));
+      const diagnosticOffset = fillErrors.length;
+      const decoder = new NativeFrameDecoder();
+      const chunks = on(fillHost.stdout, "data", { close: ["end", "close"], signal: context.signal });
+      fillHost.stdin.write(encodeNativeFrame(message));
+      for await (const [chunk] of chunks) {
+        const replies = decoder.push(chunk as Buffer);
+        if (!replies.length) continue;
+        assert.equal(replies.length, 1);
+        assert.equal((replies[0] as { requestId: string }).requestId, request.requestId);
+        await setImmediate();
+        lastExchangeDiagnostic = Buffer.concat(fillErrors.slice(diagnosticOffset)).toString();
+        return replies;
+      }
+      throw new Error("Native review port closed without a response");
     };
     const [fillListing] = await exchangeFillReview({ ...request, kind: "list_fixture_fill_reviews",
       deadlineMs: Date.now() + 10_000, payload: { target: approval.payload.target } }) as [{
@@ -912,6 +948,9 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(sendReplay.kind, "error");
     assert.deepEqual(sendReplay.payload, { code: "SEND_REVIEW_UNAVAILABLE" });
     assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, beforeSendReview.payload);
+    fillHost.stdin.end();
+    const [fillExit] = await reviewPortClose;
+    assert.equal(fillExit, 0, Buffer.concat(fillErrors).toString());
 
     const checking = facade.checkFixturePreflight(prepared.payload.operationId);
     const preflightObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
@@ -1309,6 +1348,9 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(replayedGemini.kind, "gemini_snapshot_published");
     assert.deepEqual(replayedGemini.payload, { count: 0 });
   } finally {
+    context.signal.removeEventListener("abort", stopReviewHost);
+    stopReviewHost();
+    if (reviewPortClose) await reviewPortClose;
     facade?.close();
     broker.kill("SIGTERM");
     await brokerExit;

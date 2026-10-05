@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { cp, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -15,6 +16,38 @@ import { planNativeRegistration, registerNative } from "../../packages/companion
 
 const extensionDirectory = fileURLToPath(new URL("../../packages/extension/.output/chrome-mv3/", import.meta.url));
 const nativeRelayPath = fileURLToPath(new URL("../../packages/companion/dist/native-relay.js", import.meta.url));
+
+async function brokerSocketReady(socketPath) {
+  try {
+    const info = await stat(socketPath);
+    return info.isSocket() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0;
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    return false;
+  }
+}
+
+test("extension broker readiness rejects a socket until its permissions are private", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-extension-readiness-"));
+  const socketPath = join(home, "broker.sock");
+  const server = createServer();
+  try {
+    assert.equal(await brokerSocketReady(socketPath), false);
+    assert.equal(await brokerSocketReady(home), false);
+    const listening = once(server, "listening");
+    server.listen(socketPath);
+    await listening;
+    await chmod(socketPath, 0o666);
+    assert.equal(await brokerSocketReady(socketPath), false);
+    await chmod(socketPath, 0o600);
+    assert.equal(await brokerSocketReady(socketPath), true);
+  } finally {
+    if (server.listening) {
+      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("isolated Chromium loads the extension, popup, and native host", { timeout: 15000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-extension-test-"));
@@ -110,7 +143,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     let ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
       try {
-        ready = (await stat(join(directory, "broker.sock"))).isSocket();
+        ready = await brokerSocketReady(join(directory, "broker.sock"));
         if (ready) break;
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
@@ -446,7 +479,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     let ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
       try {
-        ready = (await stat(join(brokerDirectory, "broker.sock"))).isSocket();
+        ready = await brokerSocketReady(join(brokerDirectory, "broker.sock"));
         if (ready) break;
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
@@ -792,7 +825,7 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     let ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
       try {
-        ready = (await stat(join(brokerDirectory, "broker.sock"))).isSocket();
+        ready = await brokerSocketReady(join(brokerDirectory, "broker.sock"));
         if (ready) break;
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
