@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { on, once } from "node:events";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
-import { connect, type Socket } from "node:net";
+import { connect, Socket } from "node:net";
 import { endianness, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -152,6 +152,89 @@ test("broker refuses excess queued commands behind a held read and revokes its o
     assert.deepEqual(watch.payload.activeTabIds, []);
     assert.equal(relay.closed, false);
   } finally {
+    for (const socket of sockets) socket.destroy();
+    relay?.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("broker waits for response drain before executing later commands and cleans up on close", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-drain-"));
+  const directory = join(home, "broker");
+  const credentials = createBrokerCredentials();
+  const broker = await startBrokerSocket(directory, credentials);
+  const sockets: Socket[] = [];
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  try {
+    relay = await connectBroker("relay", directory);
+    const facade = connect(broker.socketPath);
+    sockets.push(facade);
+    await once(facade, "connect");
+    const command = { protocolVersion: PROTOCOL_VERSION, requestId: "a66b3997-9d43-4554-8399-267d1fe9f75c",
+      connectionGeneration: 0, deadlineMs: Date.now() + 5000, payload: {} };
+    await exchange(facade, { ...command, kind: "hello", role: "facade", credential: credentials.facade });
+    const originalWrite = Socket.prototype.write;
+    let heldSocket: Socket | undefined;
+    let holdNextReply = true;
+    context.mock.method(Socket.prototype, "write", function (this: Socket, ...args: unknown[]) {
+      const written = Reflect.apply(originalWrite, this, args) as boolean;
+      if (!sockets.includes(this) && holdNextReply && Buffer.isBuffer(args[0])) {
+        const [response] = new NativeFrameDecoder().push(args[0]) as { kind: string }[];
+        if (response?.kind === "connection_state") {
+          heldSocket = this;
+          holdNextReply = false;
+          return false;
+        }
+      }
+      return written;
+    });
+    const get = { ...command, kind: "get_connection", payload: { requestId: command.requestId } };
+    assert.deepEqual((await exchange(facade, get) as { payload: unknown }).payload, { state: "unknown" });
+    assert.ok(heldSocket);
+    const burst = Buffer.concat(Array.from({ length: 2 }, () => encodeNativeFrame({ ...command, kind: "request_connection" })));
+    const incoming = on(heldSocket, "data", { close: ["close"], signal: context.signal });
+    facade.write(burst);
+    let received = 0;
+    for await (const [chunk] of incoming) {
+      received += (chunk as Buffer).length;
+      if (received >= burst.length) break;
+    }
+    assert.equal(received, burst.length);
+    const beforeDrain = await relay.listPending();
+    if (beforeDrain.kind !== "pending_list") throw new Error("Expected pending metadata");
+    assert.deepEqual(beforeDrain.payload.requests, []);
+
+    heldSocket.emit("drain");
+    const afterDrain = await relay.listPending();
+    if (afterDrain.kind !== "pending_list") throw new Error("Expected pending metadata");
+    assert.equal(afterDrain.payload.requests.length, 2);
+    assert.equal(heldSocket.listenerCount("drain"), 0);
+
+    holdNextReply = true;
+    await exchange(facade, get);
+    assert.equal(heldSocket.listenerCount("drain"), 1);
+    const closed = once(heldSocket, "close");
+    facade.destroy();
+    await closed;
+    assert.equal(heldSocket.listenerCount("drain"), 0);
+    const afterClose = await relay.listPending();
+    if (afterClose.kind !== "pending_list") throw new Error("Expected pending metadata");
+    assert.deepEqual(afterClose.payload.requests, []);
+
+    const failingFacade = connect(broker.socketPath);
+    sockets.push(failingFacade);
+    await once(failingFacade, "connect");
+    await exchange(failingFacade, { ...command, kind: "hello", role: "facade", credential: credentials.facade });
+    holdNextReply = true;
+    await exchange(failingFacade, get);
+    assert.equal(heldSocket.listenerCount("drain"), 1);
+    const closedAfterError = new Promise<void>((resolve) => heldSocket!.once("close", () => resolve()));
+    heldSocket.emit("error", new Error("Synthetic response write failure"));
+    await closedAfterError;
+    assert.equal(heldSocket.listenerCount("drain"), 0);
+  } finally {
+    context.mock.restoreAll();
     for (const socket of sockets) socket.destroy();
     relay?.close();
     await broker.close();

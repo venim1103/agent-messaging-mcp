@@ -11,6 +11,24 @@ import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-con
 
 export const BROKER_IDLE_TIMEOUT_MS = PENDING_REQUEST_TTL_MS * 2 + 30_000;
 
+async function writeBrokerResponse(socket: Socket, message: unknown): Promise<void> {
+  if (socket.destroyed) throw new Error("Broker connection closed");
+  if (socket.write(encodeNativeFrame(message))) return;
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      socket.off("drain", onDrain);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+    };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    const onClose = () => { cleanup(); reject(new Error("Broker connection closed")); };
+    socket.once("drain", onDrain);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+  });
+}
+
 export async function startBrokerSocket(runtimeDirectory: string, credentials: BrokerCredentials,
   operationDatabase?: DatabaseSync) {
   const socketPath = join(runtimeDirectory, "broker.sock");
@@ -57,51 +75,51 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
               if (reply.kind === "fixture_fill_authorized") {
                 const pending = operations?.requestFixtureFill(owner, reply.payload.operationId);
                 if (!pending || pending === "busy") {
-                  socket.write(encodeNativeFrame({ ...reply, kind: "error", payload: { code: "FILL_UNAVAILABLE" } }));
+                  await writeBrokerResponse(socket, { ...reply, kind: "error", payload: { code: "FILL_UNAVAILABLE" } });
                   return;
                 }
                 const filled = await pending.result;
                 if (socket.destroyed) return;
-                socket.write(encodeNativeFrame({ ...reply, kind: "fixture_fill", payload: filled ?? {
+                await writeBrokerResponse(socket, { ...reply, kind: "fixture_fill", payload: filled ?? {
                   operationId: reply.payload.operationId, completedAt: Date.now(), ok: false, code: "FILL_UNCERTAIN"
-                } }));
+                } });
                 return;
               }
               if (reply.kind === "fixture_preflight_authorized") {
                 const pending = operations?.requestFixturePreflight(owner, reply.payload.operationId);
                 if (!pending || pending === "busy") {
-                  socket.write(encodeNativeFrame({ ...reply, kind: "error", payload: { code: "PREFLIGHT_UNAVAILABLE" } }));
+                  await writeBrokerResponse(socket, { ...reply, kind: "error", payload: { code: "PREFLIGHT_UNAVAILABLE" } });
                   return;
                 }
                 const checked = await pending.result;
                 if (socket.destroyed) return;
-                socket.write(encodeNativeFrame(checked
+                await writeBrokerResponse(socket, checked
                   ? { ...reply, kind: "fixture_preflight", payload: checked }
-                  : { ...reply, kind: "error", payload: { code: "PREFLIGHT_UNAVAILABLE" } }));
+                  : { ...reply, kind: "error", payload: { code: "PREFLIGHT_UNAVAILABLE" } });
                 return;
               }
               if (reply.kind !== "fixture_read_authorized" && reply.kind !== "gemini_read_authorized") {
-                socket.write(encodeNativeFrame(reply));
+                await writeBrokerResponse(socket, reply);
                 return;
               }
               const pending = reply.kind === "fixture_read_authorized"
                 ? requests.requestFreshFixtureRead(owner, reply.payload.connectionId)
                 : requests.requestFreshGeminiRead(owner, reply.payload.connectionId);
               if (!pending || pending === "busy") {
-                socket.write(encodeNativeFrame({ ...reply, kind: "error",
-                  payload: { code: pending === "busy" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } }));
+                await writeBrokerResponse(socket, { ...reply, kind: "error",
+                  payload: { code: pending === "busy" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } });
                 return;
               }
               const snapshot = await pending.result;
               if (socket.destroyed) return;
-              socket.write(encodeNativeFrame(snapshot && snapshot !== "not_ready"
+              await writeBrokerResponse(socket, snapshot && snapshot !== "not_ready"
                 ? { ...reply, kind: reply.kind === "fixture_read_authorized" ? "fixture_snapshot" : "gemini_snapshot", payload: {
                   ...snapshot, messages: snapshot.messages.slice(-reply.payload.limit),
                   omittedBefore: snapshot.messages.length > reply.payload.limit
                 } }
                 : { ...reply, kind: "error", payload: {
                   code: snapshot === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND"
-                } }));
+                } });
             }).catch(() => { socket.destroy(); }).finally(() => { pendingRequests--; });
             continue;
           }
@@ -112,14 +130,14 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
           }
           role = hello.role;
           clearTimeout(timeout);
-          socket.write(encodeNativeFrame({
+          responses = writeBrokerResponse(socket, {
             kind: "hello_result",
             protocolVersion: PROTOCOL_VERSION,
             requestId: hello.requestId,
             connectionGeneration: 0,
             deadlineMs: hello.deadlineMs,
             payload: { role: hello.role }
-          }));
+          }).catch(() => { socket.destroy(); });
         }
       } catch {
         socket.destroy();
