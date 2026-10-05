@@ -5,15 +5,16 @@ export const MAX_NATIVE_FRAME_BYTES = 256 * 1024;
 const littleEndian = endianness() === "LE";
 
 export function encodeNativeFrame(message: unknown): Buffer {
-  const body = Buffer.from(JSON.stringify(message), "utf8");
-  if (body.length === 0 || body.length > MAX_NATIVE_FRAME_BYTES) {
+  const serialized = JSON.stringify(message);
+  const bodyLength = Buffer.byteLength(serialized, "utf8");
+  if (bodyLength === 0 || bodyLength > MAX_NATIVE_FRAME_BYTES) {
     throw new Error("Invalid native frame size");
   }
 
-  const frame = Buffer.allocUnsafe(4 + body.length);
-  if (littleEndian) frame.writeUInt32LE(body.length, 0);
-  else frame.writeUInt32BE(body.length, 0);
-  body.copy(frame, 4);
+  const frame = Buffer.allocUnsafe(4 + bodyLength);
+  if (littleEndian) frame.writeUInt32LE(bodyLength, 0);
+  else frame.writeUInt32BE(bodyLength, 0);
+  frame.write(serialized, 4, bodyLength, "utf8");
   return frame;
 }
 
