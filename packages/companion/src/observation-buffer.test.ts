@@ -114,6 +114,54 @@ test("array and object nesting accepts the exact limit and refuses the next leve
   }
 });
 
+test("shared payload expansion is bounded before recursive validation and preserves history", () => {
+  const maxBytes = 256;
+  const buffer = new ObservationBuffer({ maxEvents: 1, maxBytes });
+  const start = buffer.bookmark();
+  const retained = buffer.append({ text: "Must remain" });
+  const beforeRejection = buffer.bookmark();
+  let visits = 0;
+  const leaf = Object.defineProperty({}, "text", {
+    enumerable: true,
+    get() {
+      visits++;
+      if (visits > maxBytes) throw new Error("Payload traversed past the byte budget");
+      return "x";
+    }
+  });
+  let expanded: unknown = leaf;
+  for (let depth = 0; depth < 12; depth++) expanded = [expanded, expanded];
+  assert.throws(() => buffer.append(expanded), /Observation event exceeds size limit/);
+  assert.ok(visits <= maxBytes);
+  assert.deepEqual(buffer.bookmark(), beforeRejection);
+  assert.deepEqual(buffer.read(start).events, [retained]);
+
+  const shared = { text: "Small shared value" };
+  const next = buffer.append([shared, shared]);
+  assert.deepEqual(next.payload, [shared, shared]);
+  assert.equal(next.sequence, retained.sequence + 1);
+  assert.notEqual((next.payload as object[])[0], (next.payload as object[])[1]);
+});
+
+test("over-wide objects and sparse arrays are refused before reading their values", () => {
+  const maxBytes = 128;
+  const buffer = new ObservationBuffer({ maxBytes });
+  const start = buffer.bookmark();
+  const retained = buffer.append({ text: "Keep" });
+  const beforeRejection = buffer.bookmark();
+  const wide = Object.fromEntries(Array.from({ length: maxBytes + 1 }, (_, index) => [`field${index}`, 0]));
+  Object.defineProperty(wide, "private", { enumerable: true,
+    get() { assert.fail("An oversized object's values must not be traversed"); } });
+  const sparse: unknown[] = new Array(maxBytes + 1);
+  Object.defineProperty(sparse, "0", {
+    get() { assert.fail("An oversized sparse array must not be traversed"); } });
+  for (const invalid of [wide, sparse]) {
+    assert.throws(() => buffer.append(invalid), /Observation event exceeds size limit/);
+    assert.deepEqual(buffer.bookmark(), beforeRejection);
+    assert.deepEqual(buffer.read(start).events, [retained]);
+  }
+});
+
 test("eviction or epoch changes expire cursors with a resnapshot path", () => {
   const buffer = new ObservationBuffer({ maxEvents: 2 });
   const before = buffer.bookmark();

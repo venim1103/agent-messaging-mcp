@@ -11,13 +11,20 @@ type Cursor = Readonly<{ epoch: string; sequence: number }>;
 type JsonValue = z.infer<ReturnType<typeof z.json>>;
 type ObservationEvent = Readonly<{ epoch: string; sequence: number; payload: JsonValue }>;
 
-function assertNestingDepth(value: unknown): void {
+function assertPayloadBounds(value: unknown, maxValues: number): void {
   const pending = [{ value, depth: 0 }];
+  let values = 1;
   while (pending.length > 0) {
     const current = pending.pop()!;
     if (current.depth > MAX_OBSERVATION_DEPTH) throw new Error("Observation payload exceeds nesting limit");
     if (!current.value || typeof current.value !== "object") continue;
-    for (const child of Object.values(current.value)) {
+    const keys = Array.isArray(current.value) ? undefined : Object.keys(current.value);
+    const childCount = keys?.length ?? (current.value as unknown[]).length;
+    values += childCount;
+    if (values > maxValues) throw new Error("Observation event exceeds size limit");
+    for (let index = 0; index < childCount; index++) {
+      const key = keys?.[index] ?? index;
+      const child = (current.value as Record<string, unknown>)[key];
       pending.push({ value: child, depth: current.depth + 1 });
     }
   }
@@ -53,7 +60,7 @@ export class ObservationBuffer {
   }
 
   append(payload: unknown): ObservationEvent {
-    assertNestingDepth(payload);
+    assertPayloadBounds(payload, Math.min(MAX_EVENT_BYTES, this.maxBytes));
     const parsed = z.json().parse(payload);
     const serialized = JSON.stringify({ epoch: this.epoch, sequence: this.sequence + 1, payload: parsed });
     const size = Buffer.byteLength(serialized, "utf8");
