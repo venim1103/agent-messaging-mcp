@@ -2,6 +2,8 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as z from "zod/v4";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 
+export const MAX_BROKER_PENDING_REQUESTS = 16;
+
 export type BrokerRole = "facade" | "relay";
 export type BrokerCredentials = Readonly<Record<BrokerRole, string>>;
 export type AuthenticatedHello = Readonly<{ role: BrokerRole; requestId: string; deadlineMs: number }>;

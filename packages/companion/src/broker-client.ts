@@ -4,7 +4,7 @@ import { readFile, stat } from "node:fs/promises";
 import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
-import type { BrokerRole } from "./broker-roles.js";
+import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
 import { fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS,
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureFillResult, type FixturePreflightResult } from "./message-operations.js";
@@ -353,6 +353,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       throw new Error("Broker returned a mismatched hello");
     }
     let nextRequest: Promise<void> = Promise.resolve();
+    let pendingRequests = 0;
     const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
@@ -382,6 +383,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         ? role !== "relay" : role !== "facade") {
         throw new Error("Broker role cannot perform this operation");
       }
+      if (pendingRequests >= MAX_BROKER_PENDING_REQUESTS) return Promise.reject(new Error("Broker request queue is full"));
+      pendingRequests++;
       const operation = nextRequest.then(async () => {
         if (socket.destroyed) throw new Error("Broker connection closed");
         const requestId = randomUUID();
@@ -419,8 +422,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         if (reply.deadlineMs <= Date.now()) throw new Error("Broker reply expired");
         return reply;
       });
-      nextRequest = operation.then(() => {}, () => {});
-      return operation;
+      const completed = operation.finally(() => { pendingRequests--; });
+      nextRequest = completed.then(() => {}, () => {});
+      return completed;
     };
     return {
       role,

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { once } from "node:events";
+import { on, once } from "node:events";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
 import { endianness, tmpdir } from "node:os";
@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { brokerRequestDeadline, connectBroker } from "./broker-client.js";
 import { BROKER_IDLE_TIMEOUT_MS, startBrokerSocket } from "./broker-ipc.js";
-import { createBrokerCredentials } from "./broker-roles.js";
+import { createBrokerCredentials, MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { PreparedMessageOperations } from "./message-operations.js";
 import { encodeNativeFrame, MAX_NATIVE_FRAME_BYTES, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
@@ -57,6 +57,106 @@ test("broker forwarding clips local budgets without renewing an upstream deadlin
     assert.throws(() => brokerRequestDeadline(invalidNow), /Invalid broker request deadline/);
   }
   await assert.rejects(connectBroker("relay", "must-not-be-accessed", 1), /Invalid broker request deadline/);
+});
+
+test("broker client bounds pending requests and releases capacity after completion", { timeout: 5000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-client-queue-"));
+  const directory = join(home, "broker");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials());
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  try {
+    facade = await connectBroker("facade", directory);
+    const requestId = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+    const accepted = Promise.all(Array.from({ length: MAX_BROKER_PENDING_REQUESTS }, () => facade!.getConnection(requestId)));
+    await assert.rejects(facade.getConnection(requestId), /Broker request queue is full/);
+    for (const response of await accepted) {
+      assert.equal(response.kind, "connection_state");
+      assert.deepEqual(response.payload, { state: "unknown" });
+    }
+    assert.equal(facade.closed, false);
+    assert.deepEqual((await facade.getConnection(requestId)).payload, { state: "unknown" });
+    const disconnected = Promise.allSettled(Array.from({ length: MAX_BROKER_PENDING_REQUESTS }, () => facade!.getConnection(requestId)));
+    facade.close();
+    assert.ok((await disconnected).every((result) => result.status === "rejected"));
+    await assert.rejects(facade.getConnection(requestId), /Broker connection closed/);
+  } finally {
+    facade?.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("broker refuses excess queued commands behind a held read and revokes its owner", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-server-queue-"));
+  const directory = join(home, "broker");
+  const credentials = createBrokerCredentials();
+  const broker = await startBrokerSocket(directory, credentials);
+  const sockets: Socket[] = [];
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  try {
+    relay = await connectBroker("relay", directory);
+    const facade = connect(broker.socketPath);
+    sockets.push(facade);
+    await once(facade, "connect");
+    const command = { protocolVersion: PROTOCOL_VERSION, requestId: "a66b3997-9d43-4554-8399-267d1fe9f75c",
+      connectionGeneration: 0, deadlineMs: Date.now() + 5000, payload: {} };
+    await exchange(facade, { ...command, kind: "hello", role: "facade", credential: credentials.facade });
+    const decoder = new NativeFrameDecoder();
+    const boundaryReplies: unknown[] = [];
+    const chunks = on(facade, "data", { close: ["close"], signal: context.signal });
+    facade.write(Buffer.concat(Array.from({ length: MAX_BROKER_PENDING_REQUESTS }, () => encodeNativeFrame({
+      ...command, kind: "get_connection", payload: { requestId: command.requestId }
+    }))));
+    for await (const [chunk] of chunks) {
+      boundaryReplies.push(...decoder.push(chunk as Buffer));
+      if (boundaryReplies.length >= MAX_BROKER_PENDING_REQUESTS) break;
+    }
+    assert.equal(boundaryReplies.length, MAX_BROKER_PENDING_REQUESTS);
+    for (const response of boundaryReplies as { kind: string; payload: unknown }[]) {
+      assert.equal(response.kind, "connection_state");
+      assert.deepEqual(response.payload, { state: "unknown" });
+    }
+    const created = await exchange(facade, { ...command, kind: "request_connection" }) as {
+      kind: string; payload: { requestId: string }
+    };
+    assert.equal(created.kind, "connection_requested");
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_opaque-42" };
+    assert.equal((await relay.approveFixture(created.payload.requestId, target)).kind, "fixture_approved");
+    const connection = await exchange(facade, { ...command, kind: "get_connection",
+      payload: { requestId: created.payload.requestId } }) as { payload: { connectionId: string } };
+    assert.ok(connection.payload.connectionId);
+    facade.write(encodeNativeFrame({ ...command, kind: "read_fixture_snapshot",
+      payload: { connectionId: connection.payload.connectionId } }));
+    let held = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const watch = await relay.listFixtureReadChallenges();
+      if (watch.kind !== "fixture_read_challenges") throw new Error("Expected held fixture read");
+      held = watch.payload.challenges.length === 1;
+      if (held) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(held, true, "Broker did not hold the read challenge");
+    const output: Buffer[] = [];
+    facade.on("data", (chunk: Buffer) => output.push(chunk));
+    const closed = once(facade, "close");
+    const flood = Array.from({ length: MAX_BROKER_PENDING_REQUESTS }, () => encodeNativeFrame({ ...command,
+      kind: "get_connection", payload: { requestId: created.payload.requestId } }));
+    flood.push(encodeNativeFrame({ ...command, kind: "evaluate" }));
+    facade.write(Buffer.concat(flood));
+    await closed;
+    assert.equal(Buffer.concat(output).length, 0, "An overloaded socket must not dispatch queued commands");
+    const watch = await relay.listFixtureReadChallenges();
+    if (watch.kind !== "fixture_read_challenges") throw new Error("Expected cleared fixture read");
+    assert.deepEqual(watch.payload.challenges, []);
+    assert.deepEqual(watch.payload.activeTabIds, []);
+    assert.equal(relay.closed, false);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    relay?.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("authenticated fixture preparation remains owner-bound and cannot dispatch", async () => {

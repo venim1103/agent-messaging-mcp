@@ -2,7 +2,7 @@ import { chmod, mkdir, rmdir, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { authenticateBrokerRole, type BrokerCredentials } from "./broker-roles.js";
+import { authenticateBrokerRole, MAX_BROKER_PENDING_REQUESTS, type BrokerCredentials } from "./broker-roles.js";
 import { handleBrokerRequest } from "./broker-requests.js";
 import { PreparedMessageOperations } from "./message-operations.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
@@ -39,11 +39,17 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
     const decoder = new NativeFrameDecoder();
     let role: "facade" | "relay" | null = null;
     let responses: Promise<void> = Promise.resolve();
+    let pendingRequests = 0;
 
     socket.on("data", (chunk: Buffer) => {
       try {
         for (const message of decoder.push(chunk)) {
           if (role) {
+            if (pendingRequests >= MAX_BROKER_PENDING_REQUESTS) {
+              socket.destroy();
+              return;
+            }
+            pendingRequests++;
             const authenticatedRole = role;
             responses = responses.then(async () => {
               if (socket.destroyed) return;
@@ -96,7 +102,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                 : { ...reply, kind: "error", payload: {
                   code: snapshot === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND"
                 } }));
-            }).catch(() => { socket.destroy(); });
+            }).catch(() => { socket.destroy(); }).finally(() => { pendingRequests--; });
             continue;
           }
           const hello = authenticateBrokerRole(message, credentials);
