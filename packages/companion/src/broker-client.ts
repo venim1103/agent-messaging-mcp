@@ -392,9 +392,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         const deadlineMs = brokerRequestDeadline(startedAt, upstreamDeadlineMs);
         const frame = encodeNativeFrame({ kind, protocolVersion: PROTOCOL_VERSION, requestId,
           connectionGeneration: 0, deadlineMs, payload });
+        const responseStartedAt = Date.now();
+        const responseTimeoutMs = brokerRequestDeadline(responseStartedAt, deadlineMs) - responseStartedAt;
         const decoder = new NativeFrameDecoder();
         const response = new Promise<unknown>((resolve, reject) => {
-          const timer = setTimeout(() => socket.destroy(new Error("Broker request timed out")), deadlineMs - startedAt);
+          const timer = setTimeout(() => socket.destroy(new Error("Broker request timed out")), responseTimeoutMs);
           const cleanup = () => {
             clearTimeout(timer);
             socket.off("data", onData);

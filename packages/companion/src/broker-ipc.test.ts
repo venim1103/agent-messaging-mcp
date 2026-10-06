@@ -84,6 +84,46 @@ test("broker client refuses oversized frames before installing response timers",
   }
 });
 
+test("broker client spends encoding time inside its original deadline", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-client-encoding-budget-"));
+  const directory = join(home, "broker");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials());
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  try {
+    facade = await connectBroker("facade", directory);
+    const requestId = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+    for (const spentMs of [100, 5000]) {
+      let now = Date.now();
+      const stringify = JSON.stringify;
+      context.mock.method(Date, "now", () => now);
+      context.mock.method(JSON, "stringify", (value: unknown, ...options: unknown[]) => {
+        if (typeof value === "object" && value !== null && "kind" in value && value.kind === "get_connection") {
+          now += spentMs;
+        }
+        return Reflect.apply(stringify, JSON, [value, ...options]);
+      });
+      const timers = context.mock.method(globalThis, "setTimeout");
+      const writes = context.mock.method(Socket.prototype, "write");
+      if (spentMs === 100) {
+        assert.deepEqual((await facade.getConnection(requestId)).payload, { state: "unknown" });
+        assert.equal(timers.mock.calls[0]?.arguments[1], 4900);
+      } else {
+        await assert.rejects(facade.getConnection(requestId), /Invalid broker request deadline/);
+        assert.equal(timers.mock.callCount(), 0);
+        assert.equal(writes.mock.callCount(), 0);
+      }
+      context.mock.restoreAll();
+      assert.equal(facade.closed, false);
+      assert.deepEqual((await facade.getConnection(requestId)).payload, { state: "unknown" });
+    }
+  } finally {
+    context.mock.restoreAll();
+    facade?.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("broker client bounds pending requests and releases capacity after completion", { timeout: 5000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-client-queue-"));
   const directory = join(home, "broker");

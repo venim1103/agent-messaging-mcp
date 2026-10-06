@@ -108,4 +108,6 @@ Prepared text now checks its existing UTF-8 byte cap before trimming, refusing o
 
 Client requests now encode before creating their response wait, so oversized-frame refusal leaves no unused response timer or listeners. An isolated regression verifies zero response timers and reuse of the same open client for a later explicit read. The unchanged exact full gate passed build/typecheck, **123/123 units**, and **13/13 e2e checks**. Absolute deadlines, byte/queue caps, authentication, sandbox, retry policy, browser access, and send authority remain unchanged.
 
+Encoding time also stays inside the original request deadline: the response wait uses the remaining budget, and expiry during encoding refuses before timers or wire submission. An isolated synthetic-elapsed-time regression verifies both cases and same-client reuse, without probing or changing host time. The unchanged exact full gate passed build/typecheck, **124/124 units**, and **13/13 e2e checks**. Wire deadlines, five-second maximum, upstream clipping, security checks, retry policy, and browser/send authority remain unchanged.
+
 Read [DESIGN.md](DESIGN.md) for the architecture and intended capabilities, [HANDOFF.md](HANDOFF.md) for setup details and test evidence, and [LICENSE](LICENSE) for licensing.
