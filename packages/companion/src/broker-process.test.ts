@@ -327,6 +327,7 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
   const first = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
   const firstExit = once(first, "exit");
   let second: ReturnType<typeof spawn> | undefined;
+  let secondExit: ReturnType<typeof once> | undefined;
 
   try {
     let ready = false;
@@ -347,6 +348,7 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
     assert.equal((await stat(directory)).isDirectory(), true);
 
     second = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
+    secondExit = once(second, "exit");
     let refreshed = false;
     for (let attempt = 0; attempt < 40; attempt++) {
       try {
@@ -365,7 +367,15 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
   } finally {
     first.kill("SIGKILL");
     second?.kill("SIGTERM");
-    await rm(home, { recursive: true, force: true });
+    try {
+      await firstExit;
+      if (secondExit) await secondExit;
+      assert.ok(first.exitCode !== null || first.signalCode !== null, "First broker must exit before home removal");
+      if (second) assert.ok(second.exitCode !== null || second.signalCode !== null,
+        "Second broker must exit before home removal");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   }
 });
 
