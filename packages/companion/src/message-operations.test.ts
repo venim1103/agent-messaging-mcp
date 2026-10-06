@@ -271,6 +271,42 @@ test("fixture preparation persists no text and cannot dispatch without a trusted
   }
 });
 
+test("prepared text refuses excess UTF-8 bytes before trimming and preserves exact-cap previews", (context) => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("bounded fixture preview owner");
+  const ledger = new PreparedMessageOperations(requests, database);
+  const pending = requests.create(owner, 1000);
+  const grant = requests.approve(pending.requestId, { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+    tabId: 3, documentId: "CHROME-doc_bounded-preview" }, 2000)!;
+  const texts = ["x".repeat(MAX_PREPARED_MESSAGE_BYTES),
+    "\uD83D\uDE00".repeat(Math.floor(MAX_PREPARED_MESSAGE_BYTES / 4)) + "x".repeat(MAX_PREPARED_MESSAGE_BYTES % 4)];
+  try {
+    for (const [index, text] of texts.entries()) {
+      const key = `a66b3997-9d43-4554-8399-${String(index).padStart(12, "0")}`;
+      const oversized = `${text}x`;
+      const originalTrim = String.prototype.trim;
+      const trim = context.mock.method(String.prototype, "trim", function (this: string) {
+        if (this.valueOf() === oversized) assert.fail("Oversized prepared text must not be trimmed");
+        return originalTrim.call(this);
+      });
+      try {
+        assert.throws(() => ledger.prepare(owner, grant.connectionId, 1, oversized, key, 2001), /INVALID_MESSAGE_TEXT/);
+      } finally {
+        trim.mock.restore();
+      }
+      assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, index);
+      const prepared = ledger.prepare(owner, grant.connectionId, 1, text, key, 2001);
+      assert.equal(Buffer.byteLength(prepared.preview.text, "utf8"), MAX_PREPARED_MESSAGE_BYTES);
+      assert.equal(prepared.preview.text, text);
+      assert.equal(prepared.state, "awaiting_approval");
+    }
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
 test("fixture approval consumes one exact-document review token and never dispatches", () => {
   const database = new DatabaseSync(":memory:");
   try {

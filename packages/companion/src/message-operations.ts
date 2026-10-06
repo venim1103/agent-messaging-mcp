@@ -242,7 +242,7 @@ export class PreparedMessageOperations {
     const target = this.requests.getApprovedTarget(owner, connectionId, now);
     if (!target) throw new Error("CONNECTION_NOT_FOUND");
     if (expectedGeneration !== 1) throw new Error("GENERATION_MISMATCH");
-    if (typeof text !== "string" || !text.trim() || Buffer.byteLength(text, "utf8") > MAX_PREPARED_MESSAGE_BYTES) {
+    if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > MAX_PREPARED_MESSAGE_BYTES || !text.trim()) {
       throw new Error("INVALID_MESSAGE_TEXT");
     }
     if (typeof idempotencyKey !== "string"
