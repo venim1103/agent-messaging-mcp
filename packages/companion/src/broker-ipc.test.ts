@@ -59,6 +59,31 @@ test("broker forwarding clips local budgets without renewing an upstream deadlin
   await assert.rejects(connectBroker("relay", "must-not-be-accessed", 1), /Invalid broker request deadline/);
 });
 
+test("broker client refuses oversized frames before installing response timers", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-client-encoding-"));
+  const directory = join(home, "broker");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials());
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  try {
+    facade = await connectBroker("facade", directory);
+    const requestId = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+    const timer = context.mock.method(globalThis, "setTimeout");
+    await assert.rejects(facade.prepareFixtureMessage(requestId, 1,
+      "x".repeat(MAX_NATIVE_FRAME_BYTES + 1), "oversized-wire-frame"), /Native frame/i);
+    const rejectedRequestTimers = timer.mock.callCount();
+    timer.mock.restore();
+    const response = await facade.getConnection(requestId);
+    assert.equal(response.kind, "connection_state");
+    assert.deepEqual(response.payload, { state: "unknown" });
+    assert.equal(facade.closed, false);
+    assert.equal(rejectedRequestTimers, 0);
+  } finally {
+    facade?.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("broker client bounds pending requests and releases capacity after completion", { timeout: 5000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-client-queue-"));
   const directory = join(home, "broker");

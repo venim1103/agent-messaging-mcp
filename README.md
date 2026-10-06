@@ -106,4 +106,6 @@ Initial broker-test failure cleanup now awaits its owned child's exit before hom
 
 Prepared text now checks its existing UTF-8 byte cap before trimming, refusing oversized inputs before normalization while preserving exact valid previews. ASCII/Unicode boundary and metadata-preservation checks pass; the ledger suite passed **24/24** and the unchanged exact gate passed build/typecheck, **122/122 units**, and **13/13 e2e checks**. On October 6 the user reported time synchronization may be fixed and reopened time-sensitive workflows. These current timed tests pass with original bounds, but host/browser synchronization itself remains unverified; no clock setting, permission, retry, or send route changed.
 
+Client requests now encode before creating their response wait, so oversized-frame refusal leaves no unused response timer or listeners. An isolated regression verifies zero response timers and reuse of the same open client for a later explicit read. The unchanged exact full gate passed build/typecheck, **123/123 units**, and **13/13 e2e checks**. Absolute deadlines, byte/queue caps, authentication, sandbox, retry policy, browser access, and send authority remain unchanged.
+
 Read [DESIGN.md](DESIGN.md) for the architecture and intended capabilities, [HANDOFF.md](HANDOFF.md) for setup details and test evidence, and [LICENSE](LICENSE) for licensing.

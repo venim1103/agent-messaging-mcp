@@ -390,6 +390,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         const requestId = randomUUID();
         const startedAt = Date.now();
         const deadlineMs = brokerRequestDeadline(startedAt, upstreamDeadlineMs);
+        const frame = encodeNativeFrame({ kind, protocolVersion: PROTOCOL_VERSION, requestId,
+          connectionGeneration: 0, deadlineMs, payload });
         const decoder = new NativeFrameDecoder();
         const response = new Promise<unknown>((resolve, reject) => {
           const timer = setTimeout(() => socket.destroy(new Error("Broker request timed out")), deadlineMs - startedAt);
@@ -415,8 +417,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
           socket.once("error", onError);
           socket.once("close", onClose);
         });
-        socket.write(encodeNativeFrame({ kind, protocolVersion: PROTOCOL_VERSION, requestId,
-          connectionGeneration: 0, deadlineMs, payload }));
+        socket.write(frame);
         const reply = replySchema.parse(await response);
         if (reply.requestId !== requestId || reply.deadlineMs !== deadlineMs) throw new Error("Mismatched broker reply");
         if (reply.deadlineMs <= Date.now()) throw new Error("Broker reply expired");
