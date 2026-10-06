@@ -94,4 +94,6 @@ Refusal-diagnostic formatting now logs only safe integer deadline values and sub
 
 The shared frame writer also handles `finish` while backpressured, preventing a pending wait on streams that do not auto-destroy or emit drain/close. It uses the existing fixed closed-output error and removes all settlement listeners. The framing suite passed **11/11** and its unchanged exact full gate passed build/typecheck, **116/116 units**, and **13/13 e2e checks**. This changes flow-control cleanup, not time budgets, delivery claims, permissions, or retry policy.
 
+Malformed fixture request URLs now return a fixed HTTP 400 response instead of rejecting the async handler or echoing the request target. The direct-handler regression and existing loopback route check passed **2/2**; the unchanged exact full gate passed build/typecheck, **117/117 units**, and **13/13 e2e checks**. Supported routes, host binding, permissions, deadlines, and retry policy remain unchanged.
+
 Read [DESIGN.md](DESIGN.md) for the architecture and intended capabilities, [HANDOFF.md](HANDOFF.md) for setup details and test evidence, and [LICENSE](LICENSE) for licensing.

@@ -6,7 +6,14 @@ const fixtureFile = new URL("./chat.html", import.meta.url);
 
 export function createFixtureServer() {
   return createServer(async (request, response) => {
-    const { pathname } = new URL(request.url, "http://127.0.0.1");
+    let pathname;
+    try {
+      ({ pathname } = new URL(request.url, "http://127.0.0.1"));
+    } catch {
+      response.writeHead(400);
+      response.end("Invalid request");
+      return;
+    }
     if (request.method !== "GET" || (pathname !== "/" && pathname !== "/chat.html")) {
       response.writeHead(404);
       response.end();
