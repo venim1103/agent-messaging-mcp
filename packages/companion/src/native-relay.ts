@@ -38,6 +38,14 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
   process.stdout.on("error", failNativeOutput);
   process.stdout.on("close", failNativeOutput);
 
+  process.stdin.on("error", () => {
+    if (invalid) return;
+    invalid = true;
+    process.stderr.write("Native relay failed to read a request\n");
+    process.exitCode = 1;
+    process.stdin.destroy();
+  });
+
   function queueNativeReply(reply: () => void | Promise<void>): void {
     if (pendingRequests >= MAX_BROKER_PENDING_REQUESTS) throw new Error("Invalid native request queue");
     pendingRequests++;
@@ -271,7 +279,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
     }
   });
 
-  process.stdin.on("end", () => {
+  function finishNativeInput(): void {
     if (invalid) return;
     try {
       decoder.finish();
@@ -280,5 +288,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
       process.stderr.write("Invalid native host message: Incomplete native frame\n");
       process.exitCode = 1;
     }
-  });
+  }
+
+  process.stdin.on("end", finishNativeInput);
+  process.stdin.on("close", finishNativeInput);
 }

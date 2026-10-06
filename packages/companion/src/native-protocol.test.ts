@@ -487,6 +487,41 @@ test("spawned native relay rejects private malformed input without stdout or dia
   }
 });
 
+test("spawned native relay handles input stream errors and premature close without disclosure", { timeout: 4000 }, async () => {
+  const sensitive = "private-input-stream-draft-and-credential";
+  const partial = encodeNativeFrame({ ...request, payload: { draftText: sensitive } }).subarray(0, -1);
+  const scenarios = [
+    { frame: Buffer.alloc(0), error: true, diagnostic: "Native relay failed to read a request\n" },
+    { frame: partial, error: true, diagnostic: "Native relay failed to read a request\n" },
+    { frame: partial, error: false, diagnostic: "Invalid native host message: Incomplete native frame\n" }
+  ];
+  for (const scenario of scenarios) {
+    const script = `
+      process.argv[2] = ${JSON.stringify(origin)};
+      process.argv[3] = ${JSON.stringify(origin)};
+      await import(${JSON.stringify(new URL("./native-relay.js", import.meta.url).href)});
+      process.stdin.emit("data", Buffer.from(${JSON.stringify([...scenario.frame])}));
+      process.stdin.destroy(${scenario.error ? `new Error(${JSON.stringify(sensitive)})` : ""});
+    `;
+    const host = spawn(process.execPath, ["--input-type=module", "-e", script], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PATH: "/usr/bin:/bin" }
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    host.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    host.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    try {
+      const [exitCode] = await once(host, "close");
+      assert.equal(exitCode, 1);
+      assert.equal(Buffer.concat(stdout).length, 0);
+      assert.equal(Buffer.concat(stderr).toString(), scenario.diagnostic);
+    } finally {
+      host.stdin.destroy();
+      host.kill();
+    }
+  }
+});
+
 test("spawned native relay keeps malformed deadline diagnostics bounded and private", { timeout: 4000 }, async () => {
   const sensitive = "private-malformed-deadline-draft-and-credential";
   for (const deadlineMs of [Number.MAX_VALUE, -Number.MAX_VALUE, 0.5, Number.MIN_VALUE, -Number.MAX_SAFE_INTEGER]) {

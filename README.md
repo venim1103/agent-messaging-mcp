@@ -98,4 +98,6 @@ Malformed fixture request URLs now return a fixed HTTP 400 response instead of r
 
 Wire input now decodes one frame at a time, allowing the existing broker/native queue refusal to stop parsing an unused batch suffix. The array-returning decoder API remains available; byte limits, UTF-8/EOF validation, original deadlines, and the 16-request caps are unchanged. A parser-count regression and **12/12** framing checks passed; the unchanged exact full gate passed build/typecheck, **118/118 units**, and **13/13 e2e checks**. This bounds work after refusal, not every transport buffer or atomic processing of an OS chunk.
 
+Native input errors now emit only a fixed diagnostic rather than an uncaught error/stack; partial input is checked on both end and close. Error/close simulations preserve single-diagnostic refusal and complete-input replies. Focused privacy and healthy-path checks passed **5/5**; the unchanged exact full gate passed build/typecheck, **119/119 units**, and **13/13 e2e checks**. Deadlines, byte/queue caps, permissions, and retry policy remain unchanged.
+
 Read [DESIGN.md](DESIGN.md) for the architecture and intended capabilities, [HANDOFF.md](HANDOFF.md) for setup details and test evidence, and [LICENSE](LICENSE) for licensing.
