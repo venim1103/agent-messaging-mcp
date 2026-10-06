@@ -38,6 +38,12 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
   process.stdout.on("error", failNativeOutput);
   process.stdout.on("close", failNativeOutput);
 
+  process.stderr.on("error", () => {
+    invalid = true;
+    process.exitCode = 1;
+    process.stdin.destroy();
+  });
+
   process.stdin.on("error", () => {
     if (invalid) return;
     invalid = true;

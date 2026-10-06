@@ -522,6 +522,33 @@ test("spawned native relay handles input stream errors and premature close witho
   }
 });
 
+test("spawned native relay fails closed when its diagnostic stream errors", { timeout: 4000 }, async () => {
+  const sensitive = "private-diagnostic-stream-draft-and-credential";
+  const script = `
+    process.argv[2] = ${JSON.stringify(origin)};
+    process.argv[3] = ${JSON.stringify(origin)};
+    process.on("uncaughtExceptionMonitor", () => process.stdout.write(${JSON.stringify("Unhandled diagnostic stream error\n")}));
+    await import(${JSON.stringify(new URL("./native-relay.js", import.meta.url).href)});
+    process.stderr.destroy(new Error(${JSON.stringify(sensitive)}));
+  `;
+  const host = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PATH: "/usr/bin:/bin" }
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  host.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+  host.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+  try {
+    const [exitCode] = await once(host, "close");
+    assert.equal(exitCode, 1);
+    assert.equal(Buffer.concat(stdout).length, 0);
+    assert.equal(Buffer.concat(stderr).length, 0);
+  } finally {
+    host.stdin.destroy();
+    host.kill();
+  }
+});
+
 test("spawned native relay keeps malformed deadline diagnostics bounded and private", { timeout: 4000 }, async () => {
   const sensitive = "private-malformed-deadline-draft-and-credential";
   for (const deadlineMs of [Number.MAX_VALUE, -Number.MAX_VALUE, 0.5, Number.MIN_VALUE, -Number.MAX_SAFE_INTEGER]) {
