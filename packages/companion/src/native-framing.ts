@@ -27,6 +27,7 @@ export async function writeNativeFrame(output: Writable, message: unknown): Prom
       output.off("drain", onDrain);
       output.off("error", onError);
       output.off("close", onClose);
+      output.off("finish", onClose);
     };
     const onDrain = () => { cleanup(); resolve(); };
     const onError = (error: Error) => { cleanup(); reject(error); };
@@ -34,6 +35,7 @@ export async function writeNativeFrame(output: Writable, message: unknown): Prom
     output.once("drain", onDrain);
     output.once("error", onError);
     output.once("close", onClose);
+    output.once("finish", onClose);
   });
 }
 

@@ -21,7 +21,7 @@ test("frame output waits for drain and preserves bytes without retaining listene
     releaseWrite();
     await writing;
     assert.deepEqual(new NativeFrameDecoder().push(Buffer.concat(chunks)), [message]);
-    for (const event of ["drain", "error", "close"]) assert.equal(output.listenerCount(event), 0);
+    for (const event of ["drain", "error", "close", "finish"]) assert.equal(output.listenerCount(event), 0);
   } finally {
     output.destroy();
   }
@@ -35,10 +35,40 @@ test("frame output rejects close and error while draining and removes listeners"
       const rejected = assert.rejects(writing, error ? /Synthetic output failure/ : /Native frame output closed/);
       output.destroy(error);
       await rejected;
-      for (const event of ["drain", "error", "close"]) assert.equal(output.listenerCount(event), 0);
+      for (const event of ["drain", "error", "close", "finish"]) assert.equal(output.listenerCount(event), 0);
     } finally {
       output.destroy();
     }
+  }
+});
+
+test("frame output rejects finish without close while draining and removes listeners", async () => {
+  let releaseWrite: () => void = () => {};
+  const output = new Writable({ highWaterMark: 1, autoDestroy: false,
+    write(_chunk, _encoding, complete) { releaseWrite = () => complete(); }
+  });
+  let settled = "pending";
+  let failure: unknown;
+  try {
+    const writing = writeNativeFrame(output, { text: "Must settle on finish" }).then(() => {
+      settled = "written";
+    }, (error: unknown) => {
+      settled = "rejected";
+      failure = error;
+    });
+    const finished = new Promise<void>((resolve) => output.once("finish", resolve));
+    output.end();
+    releaseWrite();
+    await finished;
+    await setImmediate();
+    assert.equal(output.destroyed, false);
+    assert.equal(settled, "rejected");
+    assert.ok(failure instanceof Error);
+    assert.equal(failure.message, "Native frame output closed");
+    await writing;
+    for (const event of ["drain", "error", "close", "finish"]) assert.equal(output.listenerCount(event), 0);
+  } finally {
+    output.destroy();
   }
 });
 
