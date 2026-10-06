@@ -43,14 +43,16 @@ export async function recoverStaleBrokerRuntime(parent: string): Promise<boolean
   const quarantined = join(parent, `broker-stale-${randomUUID()}`);
   await rename(directory, quarantined);
   const moved = await lstat(quarantined);
-  if (moved.dev !== info.dev || moved.ino !== info.ino) {
+  if (moved.dev !== info.dev || moved.ino !== info.ino || moved.uid !== info.uid || moved.mode !== info.mode) {
     await rename(quarantined, directory).catch(() => {});
     throw new Error("Broker runtime changed during recovery");
   }
   const movedFiles = expected.map((name) => join(quarantined, name));
   const currentFiles = await Promise.all(movedFiles.map((path) => lstat(path)));
-  if (currentFiles.some((file, index) => file.dev !== [socketInfo, facadeInfo, relayInfo][index]?.dev
-    || file.ino !== [socketInfo, facadeInfo, relayInfo][index]?.ino)) {
+  const originalFiles = [socketInfo, facadeInfo, relayInfo];
+  if (currentFiles.some((file, index) => file.dev !== originalFiles[index]?.dev
+    || file.ino !== originalFiles[index]?.ino || file.uid !== originalFiles[index]?.uid
+    || file.mode !== originalFiles[index]?.mode || file.size !== originalFiles[index]?.size)) {
     throw new Error("Broker runtime files changed during recovery");
   }
   for (const path of movedFiles) await unlink(path);

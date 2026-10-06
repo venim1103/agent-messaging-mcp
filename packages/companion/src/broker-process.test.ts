@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFileSync, chmodSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
@@ -299,6 +301,7 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     assert.equal((await stat(databasePath)).isFile(), true);
   } finally {
     broker.kill("SIGTERM");
+    await exit;
     await rm(home, { recursive: true, force: true });
   }
 });
@@ -347,8 +350,10 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
     assert.equal(signal, "SIGKILL");
     assert.equal((await stat(directory)).isDirectory(), true);
 
-    second = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
+    second = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: ["ignore", "ignore", "pipe"] });
     secondExit = once(second, "exit");
+    const secondErrors: Buffer[] = [];
+    second.stderr?.on("data", (chunk: Buffer) => secondErrors.push(chunk));
     let refreshed = false;
     for (let attempt = 0; attempt < 40; attempt++) {
       try {
@@ -361,7 +366,11 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
       }
       await setTimeout(25);
     }
-    assert.equal(refreshed, true, "Broker did not rotate its stale credential");
+    const errorText = Buffer.concat(secondErrors).toString();
+    const reason = ["Refusing to recover unsafe broker runtime files", "Broker runtime changed during recovery",
+      "Broker runtime files changed during recovery", "Broker is already running"]
+      .find((message) => errorText.includes(message)) ?? "unclassified";
+    assert.equal(refreshed, true, `Broker did not rotate its stale credential; exit=${second.exitCode}; reason=${reason}`);
     const client = await connectBroker("facade", directory);
     client.close();
   } finally {
@@ -374,6 +383,66 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
       if (second) assert.ok(second.exitCode !== null || second.signalCode !== null,
         "Second broker must exit before home removal");
     } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test("stale broker recovery refuses metadata changed during its liveness probe", { timeout: 4000 }, async (context) => {
+  for (const mutation of ["key permissions", "key size", "directory permissions"]) {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-recovery-race-"));
+    const directory = join(home, "broker");
+    await mkdir(directory, { mode: 0o700 });
+    const keyPath = join(directory, "facade.key");
+    const credential = "a".repeat(64);
+    await writeFile(keyPath, credential, { mode: 0o600 });
+    await writeFile(join(directory, "relay.key"), "b".repeat(64), { mode: 0o600 });
+    const script = `
+      import { createServer } from "node:net";
+      import { chmodSync } from "node:fs";
+      const socketPath = ${JSON.stringify(join(directory, "broker.sock"))};
+      createServer().listen(socketPath, () => {
+        chmodSync(socketPath, 0o600);
+        process.stdout.write("ready");
+      });
+    `;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "ignore"] });
+    const childExit = once(child, "exit");
+    try {
+      await once(child.stdout, "data");
+      child.kill("SIGKILL");
+      await childExit;
+      const originalEmit = Socket.prototype.emit;
+      let changed = false;
+      const emit = context.mock.method(Socket.prototype, "emit", function (this: Socket, event: string | symbol, ...args: unknown[]) {
+        if (!changed && event === "error" && args[0] instanceof Error && "code" in args[0]
+          && args[0].code === "ECONNREFUSED") {
+          changed = true;
+          if (mutation === "key permissions") chmodSync(keyPath, 0o666);
+          else if (mutation === "key size") appendFileSync(keyPath, "c");
+          else chmodSync(directory, 0o755);
+        }
+        return Reflect.apply(originalEmit, this, [event, ...args]) as boolean;
+      });
+      try {
+        await assert.rejects(recoverStaleBrokerRuntime(home), mutation === "directory permissions"
+          ? /Broker runtime changed during recovery/ : /Broker runtime files changed during recovery/);
+        assert.equal(changed, true);
+        let preserved = directory;
+        if (mutation !== "directory permissions") {
+          const entries = await readdir(home);
+          const quarantined = entries.find((name) => name.startsWith("broker-stale-"));
+          assert.ok(quarantined);
+          preserved = join(home, quarantined);
+        }
+        assert.equal(await readFile(join(preserved, "facade.key"), "utf8"), mutation === "key size"
+          ? `${credential}c` : credential);
+      } finally {
+        emit.mock.restore();
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await childExit;
       await rm(home, { recursive: true, force: true });
     }
   }
