@@ -103,6 +103,30 @@ test("decodes partial headers, partial bodies, and adjacent Unicode frames", () 
   assert.deepEqual(decoder.push(frames.subarray(7)), [first, second]);
 });
 
+test("stopping the frame consumer stops decoding at its queue boundary", (context) => {
+  const frames = Buffer.concat(Array.from({ length: 64 }, (_unused, index) => encodeNativeFrame({ index })));
+  const originalParse = JSON.parse;
+  for (const capacity of [0, 1, 16]) {
+    let decoded = 0;
+    let consumed = 0;
+    const parse = context.mock.method(JSON, "parse", (text: string) => {
+      decoded++;
+      return originalParse(text) as unknown;
+    });
+    try {
+      assert.throws(() => {
+        for (const _message of new NativeFrameDecoder().frames(frames)) {
+          if (consumed++ >= capacity) throw new Error("Synthetic queue overflow");
+        }
+      }, /Synthetic queue overflow/);
+      assert.equal(decoded, capacity + 1);
+      assert.equal(parse.mock.callCount(), capacity + 1);
+    } finally {
+      parse.mock.restore();
+    }
+  }
+});
+
 test("end-of-stream refuses incomplete headers and bodies at every byte boundary", () => {
   const message = { text: "Private \u20ac\uD83D\uDE00" };
   const frame = encodeNativeFrame(message);

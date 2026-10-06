@@ -49,7 +49,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
   process.stdin.on("data", (chunk: Buffer) => {
     let deadlineMs: number | undefined;
     try {
-      for (const message of decoder.push(chunk)) {
+      for (const message of decoder.frames(chunk)) {
         deadlineMs = typeof message === "object" && message !== null && "deadlineMs" in message
           && typeof message.deadlineMs === "number" && Number.isSafeInteger(message.deadlineMs) ? message.deadlineMs : undefined;
         if (typeof message === "object" && message !== null && "kind" in message && message.kind === "handshake") {

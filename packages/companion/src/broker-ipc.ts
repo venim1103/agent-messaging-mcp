@@ -43,7 +43,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
 
     socket.on("data", (chunk: Buffer) => {
       try {
-        for (const message of decoder.push(chunk)) {
+        for (const message of decoder.frames(chunk)) {
           if (role) {
             if (pendingRequests >= MAX_BROKER_PENDING_REQUESTS) {
               socket.destroy();

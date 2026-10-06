@@ -96,4 +96,6 @@ The shared frame writer also handles `finish` while backpressured, preventing a 
 
 Malformed fixture request URLs now return a fixed HTTP 400 response instead of rejecting the async handler or echoing the request target. The direct-handler regression and existing loopback route check passed **2/2**; the unchanged exact full gate passed build/typecheck, **117/117 units**, and **13/13 e2e checks**. Supported routes, host binding, permissions, deadlines, and retry policy remain unchanged.
 
+Wire input now decodes one frame at a time, allowing the existing broker/native queue refusal to stop parsing an unused batch suffix. The array-returning decoder API remains available; byte limits, UTF-8/EOF validation, original deadlines, and the 16-request caps are unchanged. A parser-count regression and **12/12** framing checks passed; the unchanged exact full gate passed build/typecheck, **118/118 units**, and **13/13 e2e checks**. This bounds work after refusal, not every transport buffer or atomic processing of an OS chunk.
+
 Read [DESIGN.md](DESIGN.md) for the architecture and intended capabilities, [HANDOFF.md](HANDOFF.md) for setup details and test evidence, and [LICENSE](LICENSE) for licensing.

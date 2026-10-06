@@ -50,7 +50,10 @@ export class NativeFrameDecoder {
   }
 
   push(chunk: Buffer): unknown[] {
-    const messages: unknown[] = [];
+    return Array.from(this.frames(chunk));
+  }
+
+  *frames(chunk: Buffer): Generator<unknown> {
     let offset = 0;
 
     while (offset < chunk.length) {
@@ -74,12 +77,11 @@ export class NativeFrameDecoder {
       if (this.bodyBytes < this.body.length) break;
 
       if (!isUtf8(this.body)) throw new Error("Invalid native frame encoding");
-      messages.push(JSON.parse(this.body.toString("utf8")) as unknown);
+      const message = JSON.parse(this.body.toString("utf8")) as unknown;
       this.headerBytes = 0;
       this.body = null;
       this.bodyBytes = 0;
+      yield message;
     }
-
-    return messages;
   }
 }
