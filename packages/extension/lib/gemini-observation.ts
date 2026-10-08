@@ -50,7 +50,7 @@ export function inspectGeminiDraft(input: { expectedUrl: string; text: string; d
 
 export function inspectGeminiSubmitControls(expectedUrl: string): { controls: {
   label: "send-message" | "send" | "unrecognized"; classMatch: boolean; type: "button" | "submit" | "other";
-  visible: boolean; disabled: boolean; ariaDisabled: boolean; inTimeline: boolean; sharesEditorForm: boolean;
+  visible: boolean; disabled: boolean; ariaDisabled: boolean; inTimeline: boolean; inMain: boolean; sharesEditorForm: boolean;
 }[]; hasMore: boolean } | null {
   if (window.top !== window || document.visibilityState !== "visible" || location.href !== expectedUrl
     || location.origin !== "https://gemini.google.com") return null;
@@ -70,7 +70,7 @@ export function inspectGeminiSubmitControls(expectedUrl: string): { controls: {
     .filter((editor) => visible(editor) && (editor.getAttribute("aria-label") === "Enter a prompt for Gemini"
       || editor.getAttribute("placeholder") === "Enter a prompt for Gemini"));
   const editorForm = editors.length === 1 ? editors[0]!.closest("form") : null;
-  const controls = [...region.querySelectorAll<HTMLButtonElement>(
+  const controls = [...document.querySelectorAll<HTMLButtonElement>(
     'button.send-button, button[aria-label="Send message"], button[aria-label="Send"]')];
   return { controls: controls.slice(0, 4).map((control) => ({
     label: control.getAttribute("aria-label") === "Send message" ? "send-message"
@@ -78,7 +78,8 @@ export function inspectGeminiSubmitControls(expectedUrl: string): { controls: {
     classMatch: control.classList.contains("send-button"),
     type: control.type === "button" || control.type === "submit" ? control.type : "other",
     visible: visible(control), disabled: control.disabled, ariaDisabled: control.getAttribute("aria-disabled") === "true",
-    inTimeline: timelines[0]!.contains(control), sharesEditorForm: editorForm !== null && control.form === editorForm
+    inTimeline: timelines[0]!.contains(control), inMain: region.contains(control),
+    sharesEditorForm: editorForm !== null && control.form === editorForm
   })), hasMore: controls.length > 4 };
 }
 

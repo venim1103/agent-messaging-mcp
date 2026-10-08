@@ -1273,10 +1273,11 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
       contentType: "text/html; charset=utf-8", body: `<!doctype html><html><head><meta charset="utf-8"><style>
         main, infinite-scroller, user-query, user-query-content, model-response, model-response-content { display:block }
       </style></head><body><main><div contenteditable="true" aria-label="Enter a prompt for Gemini">Private draft</div>
-        <button type="button" class="send-button" aria-label="Send message" onclick="window.controlActivations += 1">Private control text</button>
         <infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic question</p>
           </user-query-content></user-query><model-response><model-response-content><p>Synthetic answer</p>
-          </model-response-content></model-response></infinite-scroller></main><script>window.controlActivations = 0;</script></body></html>`
+          </model-response-content></model-response></infinite-scroller></main>
+        <button type="button" class="send-button" aria-label="Send message" onclick="window.controlActivations += 1">Private control text</button>
+        <script>window.controlActivations = 0;</script></body></html>`
     }));
     await page.goto(url);
     const selected = await worker.evaluate(async () => {
@@ -1293,15 +1294,15 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     const popup = await context.newPage();
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);
     await page.bringToFront();
-    const beforeInspection = await page.locator("main").innerHTML();
+    const beforeInspection = await page.locator("body").innerHTML();
     await popup.evaluate(() => document.getElementById("inspect").click());
     await popup.locator("#result").waitFor({ state: "visible", timeout: 4000 });
     const controlDiagnostic = await popup.locator("#messages").textContent();
     assert.ok(controlDiagnostic.includes("Send controls"));
-    assert.ok(controlDiagnostic.includes("send-message; send-button; button; visible; enabled; no aria-disabled; outside timeline; no shared editor form"));
+    assert.ok(controlDiagnostic.includes("send-message; send-button; button; visible; enabled; no aria-disabled; outside timeline; outside main; no shared editor form"));
     assert.equal(controlDiagnostic.includes("Private control text"), false);
     assert.equal(controlDiagnostic.includes("Private draft"), false);
-    assert.equal(await page.locator("main").innerHTML(), beforeInspection);
+    assert.equal(await page.locator("body").innerHTML(), beforeInspection);
     assert.equal(await page.evaluate(() => window.controlActivations), 0);
     assert.equal((await facade.getConnection(created.payload.requestId)).payload.state, "pending");
     const approved = await popup.evaluate(({ tabId, expectedUrl, pendingRequestId }) => chrome.runtime.sendMessage({

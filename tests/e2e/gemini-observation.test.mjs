@@ -40,11 +40,14 @@ test("read-only Gemini draft inspection refuses unsafe composers without editing
       return result;
     };
     const control = { label: "send-message", classMatch: true, type: "button", visible: true,
-      disabled: true, ariaDisabled: false, inTimeline: false, sharesEditorForm: true };
+      disabled: true, ariaDisabled: false, inTimeline: false, inMain: true, sharesEditorForm: true };
     assert.deepEqual(await inspectControls(), { controls: [control], hasMore: false });
     await page.locator("button").evaluate((button) => { button.disabled = false; });
     assert.deepEqual(await inspectControls(), { controls: [{ ...control, disabled: false }], hasMore: false });
     await page.locator("button").evaluate((button) => { button.disabled = true; });
+    await page.locator("button").evaluate((button) => document.body.append(button));
+    assert.deepEqual(await inspectControls(), { controls: [{ ...control, inMain: false, sharesEditorForm: false }], hasMore: false });
+    await page.reload();
     assert.equal(await inspectControls(expectedUrl.replace("hl=en", "hl=fr")), null);
     await page.locator("button").evaluate((button) => {
       button.setAttribute("aria-label", "Private arbitrary label");

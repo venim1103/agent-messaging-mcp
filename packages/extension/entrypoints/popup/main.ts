@@ -445,7 +445,8 @@ inspectButton.addEventListener("click", async () => {
         ["Send controls", submitShape ? submitShape.controls.map((control) =>
           `${control.label}; ${control.classMatch ? "send-button" : "no class match"}; ${control.type}; ${control.visible ? "visible" : "hidden"}; `
           + `${control.disabled ? "disabled" : "enabled"}; ${control.ariaDisabled ? "aria-disabled" : "no aria-disabled"}; `
-          + `${control.inTimeline ? "inside timeline" : "outside timeline"}; ${control.sharesEditorForm ? "shared editor form" : "no shared editor form"}`)
+          + `${control.inTimeline ? "inside timeline" : "outside timeline"}; ${control.inMain ? "inside main" : "outside main"}; `
+          + `${control.sharesEditorForm ? "shared editor form" : "no shared editor form"}`)
           .concat(submitShape.hasMore ? ["Additional matches omitted"] : []).join("\n") || "None matching"
           : "Unsupported or changed"],
         ["Rendered rows", preview.timelineCount === 1
