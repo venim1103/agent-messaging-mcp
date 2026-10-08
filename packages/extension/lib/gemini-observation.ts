@@ -141,6 +141,75 @@ export function fillGeminiDraft(input: { expectedUrl: string; text: string; oper
   }
 }
 
+export function submitGeminiDraft(input: { expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number }):
+  { ok: true; editor: "contenteditable"; activated: true } | { ok: false;
+    code: "DISPATCH_UNAVAILABLE" | "DISPATCH_UNCERTAIN" | "TARGET_CHANGED" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE" } {
+  const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
+    || input.attemptId !== input.operationId || !Number.isSafeInteger(input.expiresAt)) return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+  const scope = globalThis as typeof globalThis & { geminiSubmitAttempts?: Set<string> };
+  const attempts = scope.geminiSubmitAttempts ??= new Set<string>();
+  if (attempts.has(input.operationId) || attempts.size >= 100) return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+  attempts.add(input.operationId);
+  const now = Date.now();
+  if (input.expiresAt <= now || input.expiresAt > now + 4_000) return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+  if (typeof input.text !== "string" || input.text.length > 2048 || new TextEncoder().encode(input.text).length > 4000
+    || !input.text || input.text !== input.text.trim() || input.text.includes("\r")) return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+  if (window.top !== window || location.href !== input.expectedUrl || location.origin !== "https://gemini.google.com") return { ok: false, code: "TARGET_CHANGED" };
+  const url = new URL(location.href);
+  const route = url.pathname.split("/").filter(Boolean);
+  if (url.href.length > 512 || url.username || url.password || url.hash || route.length !== 2
+    || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return { ok: false, code: "TARGET_CHANGED" };
+  const inspect = () => {
+    if (location.href !== input.expectedUrl || document.visibilityState !== "visible") return { ok: false as const, code: "TARGET_CHANGED" as const };
+    const visible = (element: HTMLElement) => element.getClientRects().length > 0 && getComputedStyle(element).visibility === "visible";
+    const regions = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);
+    if (regions.length !== 1) return { ok: false as const, code: "TARGET_CHANGED" as const };
+    const root = regions[0]!;
+    const timelines = [...root.querySelectorAll<HTMLElement>("infinite-scroller")]
+      .filter((timeline) => visible(timeline) && [...timeline.querySelectorAll<HTMLElement>("user-query, model-response")].some(visible));
+    if (timelines.length !== 1) return { ok: false as const, code: "TARGET_CHANGED" as const };
+    const editors = [...document.querySelectorAll<HTMLElement>("[contenteditable=true]")].filter((element) => visible(element)
+      && (element.getAttribute("aria-label") === "Enter a prompt for Gemini" || element.getAttribute("placeholder") === "Enter a prompt for Gemini"));
+    const editor = editors.length === 1 ? editors[0] : undefined;
+    if (!editor || !root.contains(editor) || timelines[0]!.contains(editor) || !editor.isContentEditable
+      || editor.closest("[inert], [aria-hidden=true], [aria-disabled=true], [aria-readonly=true]")
+      || editor.parentElement?.closest("[contenteditable]")
+      || editor.querySelector("[contenteditable], input, textarea, [role=textbox]")) return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
+    if (editor.innerText !== input.text) return { ok: false as const, code: "DRAFT_CHANGED" as const };
+    const buttons = [...document.querySelectorAll<HTMLButtonElement>('button[aria-label="Send message"]')].filter(visible);
+    const button = buttons.length === 1 ? buttons[0] : undefined;
+    if (!button || !root.contains(button) || timelines[0]!.contains(button) || button.type !== "submit" || button.matches(":disabled")
+      || button.closest("[inert], [aria-hidden=true], [aria-disabled=true]")) return { ok: false as const, code: "SUBMIT_UNAVAILABLE" as const };
+    for (const [element, code] of [[editor, "COMPOSER_UNAVAILABLE"], [button, "SUBMIT_UNAVAILABLE"]] as const) {
+      for (let ancestor: HTMLElement | null = element; ancestor; ancestor = ancestor.parentElement) {
+        const style = getComputedStyle(ancestor);
+        if (style.visibility !== "visible" || Number(style.opacity) === 0) return { ok: false as const, code };
+      }
+      const rect = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      if (rect.width <= 0 || rect.height <= 0 || rect.left < 0 || rect.top < 0 || rect.right > innerWidth || rect.bottom > innerHeight
+        || !hit || (hit !== element && !element.contains(hit))) return { ok: false as const, code };
+    }
+    return { ok: true as const, root, timeline: timelines[0]!, editor, button };
+  };
+  let activated = false;
+  try {
+    const before = inspect();
+    if (!before.ok) return before;
+    HTMLElement.prototype.focus.call(before.button, { preventScroll: true });
+    const ready = inspect();
+    if (!ready.ok) return ready;
+    if (ready.root !== before.root || ready.timeline !== before.timeline || ready.editor !== before.editor || ready.button !== before.button
+      || document.activeElement !== ready.button || Date.now() >= input.expiresAt) return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+    activated = true;
+    HTMLElement.prototype.click.call(ready.button);
+    return { ok: true, editor: "contenteditable", activated: true };
+  } catch {
+    return { ok: false, code: activated ? "DISPATCH_UNCERTAIN" : "DISPATCH_UNAVAILABLE" };
+  }
+}
+
 export function inspectGeminiSubmitControls(expectedUrl: string): { controls: {
   label: "send-message" | "send" | "unrecognized"; classMatch: boolean; type: "button" | "submit" | "other";
   visible: boolean; disabled: boolean; ariaDisabled: boolean; inTimeline: boolean; inMain: boolean; sharesEditorForm: boolean;

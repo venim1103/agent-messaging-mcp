@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
 import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl,
-  observeGeminiIdentity, observeGeminiMessages }
+  observeGeminiIdentity, observeGeminiMessages, submitGeminiDraft }
   from "../../packages/extension/lib/gemini-observation.ts";
 
 test("read-only Gemini draft inspection refuses unsafe composers without editing or submitting", { timeout: 15000 }, async () => {
@@ -260,6 +260,103 @@ test("isolated one-shot Gemini draft fill uses native input and never activates 
       assert.equal(await page.evaluate(() => window.nativeInsertCalls), ["ready", "input-replaced", "input-ambiguous-root"].includes(scenario) ? 1 : 0, scenario);
       assert.equal(await page.evaluate(() => window.activations), 0, scenario);
       assert.equal(await page.locator("[contenteditable]").innerText(), actualText, scenario);
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test("isolated Gemini submit consumes its attempt and rechecks exact draft/control after focus", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    const expectedUrl = "https://gemini.google.com/app/disposable-chat?hl=en";
+    const text = "Synthetic one-shot submit";
+    await page.route("https://gemini.google.com/**", route => route.fulfill({ contentType: "text/html; charset=utf-8",
+      body: `<!doctype html><html><head><style>
+        main, infinite-scroller, user-query { display: block; }
+        [contenteditable] { min-height: 80px; width: 400px; border: 1px solid black; }
+      </style></head><body><main><infinite-scroller><user-query>Initial row</user-query></infinite-scroller>
+        <div contenteditable="true" aria-label="Enter a prompt for Gemini"></div>
+        <button type="submit" aria-label="Send message">Send</button></main><script>
+        window.activations = 0;
+        document.querySelector('button').onclick = () => {
+          window.activations += 1;
+          const row = document.createElement('user-query');
+          row.textContent = document.querySelector('[contenteditable]').innerText;
+          document.querySelector('infinite-scroller').append(row);
+          document.querySelector('[contenteditable]').innerText = '';
+        };
+      </script></body></html>` }));
+    for (const scenario of ["ready", "lost-result", "changed", "disabled", "readonly", "blocked", "duplicate", "stop-control", "focus-draft",
+      "focus-target", "focus-button", "focus-timeline", "click-throws", "expired", "capacity", "overlong-lease", "wrong-query", "oversized",
+      "fieldset-disabled", "inert", "transparent", "button-blocked"]) {
+      await page.goto(expectedUrl);
+      await page.locator("[contenteditable]").evaluate((editor, { scenario, text }) => {
+        editor.innerText = scenario === "changed" ? "User changed draft" : text;
+        const button = document.querySelector("button");
+        if (scenario === "disabled") button.disabled = true;
+        if (scenario === "fieldset-disabled") {
+          const fieldset = document.createElement("fieldset");
+          fieldset.disabled = true;
+          button.before(fieldset);
+          fieldset.append(button);
+        }
+        if (scenario === "inert") button.setAttribute("inert", "");
+        if (scenario === "transparent") button.style.opacity = "0";
+        if (scenario === "button-blocked") {
+          const rect = button.getBoundingClientRect();
+          const overlay = document.createElement("div");
+          overlay.style.cssText = `position:fixed;left:${rect.left}px;top:${rect.top}px;width:${rect.width}px;height:${rect.height}px;background:white;z-index:100`;
+          document.body.append(overlay);
+        }
+        if (scenario === "readonly") editor.setAttribute("aria-readonly", "true");
+        if (scenario === "blocked") {
+          const overlay = document.createElement("div");
+          overlay.style.cssText = "position:fixed;inset:0;background:white;z-index:100";
+          document.body.append(overlay);
+        }
+        if (scenario === "duplicate") button.parentElement.append(button.cloneNode(true));
+        if (scenario === "stop-control") button.setAttribute("aria-label", "Stop response");
+        if (scenario === "focus-draft") button.onfocus = () => { editor.innerText = "Focus changed draft"; };
+        if (scenario === "focus-target") button.onfocus = () => { history.replaceState({}, "", "?hl=fr"); };
+        if (scenario === "focus-button") button.onfocus = () => { button.replaceWith(button.cloneNode(true)); };
+        if (scenario === "focus-timeline") button.onfocus = () => {
+          const timeline = document.querySelector("infinite-scroller");
+          timeline.replaceWith(timeline.cloneNode(true));
+        };
+        if (scenario === "click-throws") {
+          const click = HTMLElement.prototype.click;
+          HTMLElement.prototype.click = function() { click.call(this); throw new Error("Synthetic lost activation result"); };
+        }
+        if (scenario === "capacity") window.geminiSubmitAttempts = new Set(Array.from({ length: 100 }, () => crypto.randomUUID()));
+      }, { scenario, text });
+      const input = { expectedUrl: scenario === "wrong-query" ? expectedUrl.replace("hl=en", "hl=fr") : expectedUrl,
+        text: scenario === "oversized" ? "x".repeat(2049) : text,
+        operationId: "df99320e-a54e-48e9-8c6d-09d8b1edbe9d", attemptId: "df99320e-a54e-48e9-8c6d-09d8b1edbe9d",
+        expiresAt: Date.now() + (scenario === "expired" ? -1 : scenario === "overlong-lease" ? 10000 : 4000) };
+      const outcome = await page.evaluate(submitGeminiDraft, input);
+      const expected = { ready: { ok: true, editor: "contenteditable", activated: true }, changed: { ok: false, code: "DRAFT_CHANGED" },
+        disabled: { ok: false, code: "SUBMIT_UNAVAILABLE" }, readonly: { ok: false, code: "COMPOSER_UNAVAILABLE" },
+        blocked: { ok: false, code: "COMPOSER_UNAVAILABLE" }, duplicate: { ok: false, code: "SUBMIT_UNAVAILABLE" },
+        "stop-control": { ok: false, code: "SUBMIT_UNAVAILABLE" }, "focus-draft": { ok: false, code: "DRAFT_CHANGED" },
+        "focus-target": { ok: false, code: "TARGET_CHANGED" }, "focus-button": { ok: false, code: "DISPATCH_UNAVAILABLE" },
+        "focus-timeline": { ok: false, code: "DISPATCH_UNAVAILABLE" }, "click-throws": { ok: false, code: "DISPATCH_UNCERTAIN" },
+        expired: { ok: false, code: "DISPATCH_UNAVAILABLE" }, capacity: { ok: false, code: "DISPATCH_UNAVAILABLE" },
+        "overlong-lease": { ok: false, code: "DISPATCH_UNAVAILABLE" }, "wrong-query": { ok: false, code: "TARGET_CHANGED" },
+        oversized: { ok: false, code: "DISPATCH_UNAVAILABLE" }, "fieldset-disabled": { ok: false, code: "SUBMIT_UNAVAILABLE" },
+        inert: { ok: false, code: "SUBMIT_UNAVAILABLE" }, transparent: { ok: false, code: "SUBMIT_UNAVAILABLE" },
+        "button-blocked": { ok: false, code: "SUBMIT_UNAVAILABLE" } };
+      if (scenario !== "lost-result") assert.deepEqual(outcome, expected[scenario], scenario);
+      const activated = ["ready", "lost-result", "click-throws"].includes(scenario);
+      assert.equal(await page.evaluate(() => window.activations), activated ? 1 : 0, scenario);
+      assert.equal(await page.locator("user-query").count(), activated ? 2 : 1, scenario);
+      if (activated) assert.equal(await page.locator("user-query").last().innerText(), text, scenario);
+      assert.equal(await page.locator("[contenteditable]").innerText(), activated ? "" : scenario === "changed" ? "User changed draft"
+        : scenario === "focus-draft" ? "Focus changed draft" : text, scenario);
+      assert.deepEqual(await page.evaluate(submitGeminiDraft, { ...input, expiresAt: Date.now() + 4000 }), { ok: false, code: "DISPATCH_UNAVAILABLE" }, scenario);
+      assert.equal(await page.evaluate(() => window.activations), activated ? 1 : 0, scenario);
+      assert.equal(await page.locator("user-query").count(), activated ? 2 : 1, scenario);
     }
   } finally {
     await browser.close();
