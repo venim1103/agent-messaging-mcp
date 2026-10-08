@@ -25,6 +25,10 @@ type FixtureReviewApprovalResult = { ok: true; operationId: string; expiresAt: n
 type FixturePreflightChallenge = { challengeId: string; operationId: string; expiresAt: number;
   tabId: number; documentId: string; text: string };
 type FixtureFillChallenge = Omit<FixturePreflightChallenge, "challengeId"> & { attemptId: string };
+type FixtureDispatchChallenge = Omit<FixturePreflightChallenge, "challengeId"> & { checkId: string };
+type FixtureDispatchObservation = { ok: true; editor: "textarea" | "rich"; draftText: string;
+  selected: true; writable: true; submitReady: true } | { ok: false;
+  code: "TARGET_CHANGED" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE" };
 
 let inputInProgress = false;
 const fixtureResetKey = "fixture-reset-done";
@@ -466,7 +470,7 @@ async function releaseDisconnectedFixtures(activeTabIds: number[]): Promise<void
   }
 }
 
-async function checkTrackedFixturePreflight(check: FixturePreflightChallenge): Promise<void> {
+async function checkTrackedFixturePreflight(check: FixturePreflightChallenge | FixtureDispatchChallenge): Promise<void> {
   if (check.expiresAt <= Date.now()) return;
   let observation: ReturnType<typeof inspectFixturePreflight> = { ok: false, code: "TARGET_CHANGED" };
   try {
@@ -479,7 +483,8 @@ async function checkTrackedFixturePreflight(check: FixturePreflightChallenge): P
       && (tab.url === "http://127.0.0.1:8787/" || tab.url === richFixtureUrl)) {
       const expectedUrl = tab.url;
       const [checked] = await browser.scripting.executeScript({ target: { tabId: check.tabId, documentIds: [check.documentId] },
-        func: inspectFixturePreflight, args: [{ expectedUrl, text: check.text }] });
+        func: inspectFixturePreflight, args: [{ expectedUrl, text: check.text,
+          draftState: "checkId" in check ? "prepared" : "empty" }] });
       if (checked?.frameId === 0 && checked.documentId === check.documentId && checked.result) {
         const [identity] = await browser.scripting.executeScript({ target: { tabId: check.tabId, documentIds: [check.documentId] },
           func: readFixtureIdentity });
@@ -493,7 +498,14 @@ async function checkTrackedFixturePreflight(check: FixturePreflightChallenge): P
       }
     }
   } catch {}
-  await completeFixtureBrowserCheck(check, observation);
+  if ("checkId" in check) {
+    const proof: FixtureDispatchObservation = observation.ok
+      ? { ...observation, draftText: check.text, selected: true, writable: true, submitReady: true }
+      : { ok: false, code: observation.code === "DRAFT_PRESENT" ? "DRAFT_CHANGED"
+        : observation.code === "TARGET_CHANGED" || observation.code === "SUBMIT_UNAVAILABLE"
+          ? observation.code : "COMPOSER_UNAVAILABLE" };
+    await completeFixtureBrowserCheck(check, proof);
+  } else await completeFixtureBrowserCheck(check, observation);
 }
 
 async function fillTrackedFixtureDraft(check: FixtureFillChallenge): Promise<void> {
@@ -549,13 +561,14 @@ async function fillTrackedFixtureDraft(check: FixtureFillChallenge): Promise<voi
   await completeFixtureBrowserCheck(check, observation);
 }
 
-async function completeFixtureBrowserCheck(check: FixturePreflightChallenge | FixtureFillChallenge,
-  observation: ReturnType<typeof fillFixtureDraft>): Promise<void> {
+async function completeFixtureBrowserCheck(check: FixturePreflightChallenge | FixtureFillChallenge | FixtureDispatchChallenge,
+  observation: ReturnType<typeof fillFixtureDraft> | FixtureDispatchObservation): Promise<void> {
   if (check.expiresAt <= Date.now()) return;
   const fill = "attemptId" in check;
+  const dispatch = "checkId" in check;
   await new Promise<boolean>((resolve) => {
     const requestId = crypto.randomUUID();
-    const deadlineMs = Date.now() + 5_000;
+    const deadlineMs = dispatch ? Math.min(Date.now() + 5_000, check.expiresAt) : Date.now() + 5_000;
     let port: ReturnType<typeof browser.runtime.connectNative>;
     try { port = browser.runtime.connectNative(nativeHostName); }
     catch { resolve(false); return; }
@@ -572,19 +585,55 @@ async function completeFixtureBrowserCheck(check: FixturePreflightChallenge | Fi
       if (typeof value !== "object" || value === null || Array.isArray(value)) return finish(false);
       const reply = value as Record<string, unknown>;
       const payload = reply.payload;
-      finish(Object.keys(reply).length === 6 && reply.kind === (fill ? "fixture_fill_recorded" : "fixture_preflight_recorded")
+      finish(Object.keys(reply).length === 6 && reply.kind === (dispatch ? "fixture_dispatch_check_recorded"
+        : fill ? "fixture_fill_recorded" : "fixture_preflight_recorded")
         && reply.protocolVersion === protocolVersion && reply.requestId === requestId
         && reply.connectionGeneration === 0 && reply.deadlineMs === deadlineMs
         && typeof payload === "object" && payload !== null && !Array.isArray(payload)
         && Object.keys(payload).length === 1 && (payload as { accepted?: unknown }).accepted === true);
     });
     port.onDisconnect.addListener(() => { void browser.runtime.lastError; finish(false); });
-    port.postMessage({ kind: fill ? "complete_fixture_fill" : "complete_fixture_preflight",
+    port.postMessage({ kind: dispatch ? "complete_fixture_dispatch_check" : fill ? "complete_fixture_fill" : "complete_fixture_preflight",
       protocolVersion, requestId, connectionGeneration: 0,
       deadlineMs, payload: { target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
         tabId: check.tabId, documentId: check.documentId },
-        ...(fill ? { attemptId: check.attemptId } : { challengeId: check.challengeId }), observation } });
+        ...(dispatch ? { operationId: check.operationId, checkId: check.checkId }
+          : fill ? { attemptId: check.attemptId } : { challengeId: check.challengeId }), observation } });
   }).catch(() => false);
+}
+
+function parseFixtureWriteCheck(entry: unknown, identifier: "challengeId" | "attemptId" | "checkId") {
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error();
+  const check = entry as Record<string, unknown>;
+  const validId = (value: unknown) => typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+  if (Object.keys(check).length !== 5 || !validId(check[identifier]) || !validId(check.operationId)
+    || typeof check.expiresAt !== "number" || !Number.isSafeInteger(check.expiresAt)
+    || typeof check.text !== "string" || !check.text || check.text.length > (identifier === "checkId" ? 2048 : 4000)
+    || new TextEncoder().encode(check.text).length > 4000
+    || typeof check.target !== "object" || check.target === null || Array.isArray(check.target)) throw new Error();
+  const target = check.target as Record<string, unknown>;
+  if (Object.keys(target).length !== 4 || target.origin !== "http://127.0.0.1:8787"
+    || target.conversationId !== "fixture-alpha" || typeof target.tabId !== "number"
+    || !Number.isSafeInteger(target.tabId) || target.tabId < 1
+    || typeof target.documentId !== "string" || !/^[!-~]{1,128}$/.test(target.documentId)) throw new Error();
+  return { id: check[identifier] as string, operationId: check.operationId as string,
+    expiresAt: check.expiresAt, text: check.text, tabId: target.tabId, documentId: target.documentId };
+}
+
+function parseFixtureDispatchChecks(value: unknown, requestId: string, deadlineMs: number) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+  const reply = value as Record<string, unknown>;
+  if (Object.keys(reply).length !== 6 || reply.kind !== "fixture_dispatch_checks"
+    || reply.protocolVersion !== protocolVersion || reply.requestId !== requestId
+    || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
+    || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) throw new Error();
+  const payload = reply.payload as Record<string, unknown>;
+  if (Object.keys(payload).length !== 1 || !Array.isArray(payload.checks) || payload.checks.length > 16) throw new Error();
+  return payload.checks.map((entry: unknown): FixtureDispatchChallenge => {
+    const { id, ...check } = parseFixtureWriteCheck(entry, "checkId");
+    return { ...check, checkId: id };
+  });
 }
 
 function parseFixtureReadChallenges(value: unknown, requestId: string, deadlineMs: number) {
@@ -618,30 +667,12 @@ function parseFixtureReadChallenges(value: unknown, requestId: string, deadlineM
     return { challengeId: challenge.challengeId, expiresAt: challenge.expiresAt,
       tabId: target.tabId, documentId: target.documentId };
   });
-  const parseWriteCheck = (entry: unknown, identifier: "challengeId" | "attemptId") => {
-    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error();
-    const check = entry as Record<string, unknown>;
-    const validId = (value: unknown) => typeof value === "string"
-      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
-    if (Object.keys(check).length !== 5 || !validId(check[identifier]) || !validId(check.operationId)
-      || typeof check.expiresAt !== "number" || !Number.isSafeInteger(check.expiresAt)
-      || typeof check.text !== "string" || !check.text || check.text.length > 4000
-      || new TextEncoder().encode(check.text).length > 4000
-      || typeof check.target !== "object" || check.target === null || Array.isArray(check.target)) throw new Error();
-    const target = check.target as Record<string, unknown>;
-    if (Object.keys(target).length !== 4 || target.origin !== "http://127.0.0.1:8787"
-      || target.conversationId !== "fixture-alpha" || typeof target.tabId !== "number"
-      || !Number.isSafeInteger(target.tabId) || target.tabId < 1
-      || typeof target.documentId !== "string" || !/^[!-~]{1,128}$/.test(target.documentId)) throw new Error();
-    return { id: check[identifier] as string, operationId: check.operationId as string,
-      expiresAt: check.expiresAt, text: check.text, tabId: target.tabId, documentId: target.documentId };
-  };
   const preflightChecks = payload.preflightChecks.map((entry: unknown): FixturePreflightChallenge => {
-    const { id, ...check } = parseWriteCheck(entry, "challengeId");
+    const { id, ...check } = parseFixtureWriteCheck(entry, "challengeId");
     return { ...check, challengeId: id };
   });
   const draftFills = payload.draftFills.map((entry: unknown): FixtureFillChallenge => {
-    const { id, ...check } = parseWriteCheck(entry, "attemptId");
+    const { id, ...check } = parseFixtureWriteCheck(entry, "attemptId");
     return { ...check, attemptId: id };
   });
   return { challenges, activeTabIds: payload.activeTabIds as number[], preflightChecks, draftFills };
@@ -694,6 +725,7 @@ function startFixtureReadWatch(): boolean {
   let deadlineMs = 0;
   let responseTimer: ReturnType<typeof setTimeout> | undefined;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let dispatchPhase = false;
 
   function stop() {
     if (fixtureReadWatch !== port) return;
@@ -708,6 +740,7 @@ function startFixtureReadWatch(): boolean {
       if (!await hasTrackedFixtureGrant()) return stop();
       if (fixtureReadWatch !== port) return;
       requestId = crypto.randomUUID();
+      dispatchPhase = false;
       deadlineMs = Date.now() + 5_000;
       responseTimer = setTimeout(stop, 5_000);
       port.postMessage({ kind: "list_fixture_read_challenges", protocolVersion,
@@ -721,12 +754,19 @@ function startFixtureReadWatch(): boolean {
     if (!requestId) return stop();
     clearTimeout(responseTimer);
     const listing = (() => {
-      try { return parseFixtureReadChallenges(value, requestId, deadlineMs); }
+      try { return dispatchPhase
+        ? { kind: "dispatch" as const, checks: parseFixtureDispatchChecks(value, requestId, deadlineMs) }
+        : { kind: "read" as const, ...parseFixtureReadChallenges(value, requestId, deadlineMs) }; }
       catch { stop(); return null; }
     })();
     requestId = null;
     if (!listing) return;
     void (async () => {
+      if (listing.kind === "dispatch") {
+        for (const check of listing.checks) await checkTrackedFixturePreflight(check);
+        if (fixtureReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
+        return;
+      }
       await releaseDisconnectedFixtures(listing.activeTabIds);
       for (const check of listing.draftFills) await fillTrackedFixtureDraft(check);
       for (const check of listing.preflightChecks) await checkTrackedFixturePreflight(check);
@@ -740,7 +780,14 @@ function startFixtureReadWatch(): boolean {
           await revokeTrackedFixture(challenge.tabId);
         }
       }
-      if (fixtureReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
+      if (fixtureReadWatch === port) {
+        dispatchPhase = true;
+        requestId = crypto.randomUUID();
+        deadlineMs = Date.now() + 5_000;
+        responseTimer = setTimeout(stop, 5_000);
+        port.postMessage({ kind: "list_fixture_dispatch_checks", protocolVersion,
+          requestId, connectionGeneration: 0, deadlineMs, payload: {} });
+      }
     })().catch(stop);
   });
   port.onDisconnect.addListener(() => { void browser.runtime.lastError; stop(); });

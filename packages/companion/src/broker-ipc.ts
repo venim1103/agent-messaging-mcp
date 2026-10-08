@@ -67,6 +67,29 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                 } });
                 return;
               }
+              if (reply.kind === "fixture_dispatch_check_authorized") {
+                try {
+                  const pending = operations?.requestFixtureDispatchInspection(owner, reply.payload.operationId,
+                    Date.now(), reply.deadlineMs);
+                  if (!pending || pending === "busy") {
+                    await writeBrokerResponse(socket, { ...reply, kind: "error",
+                      payload: { code: "DISPATCH_CHECK_UNAVAILABLE" } });
+                    return;
+                  }
+                  const ready = await pending.result;
+                  if (socket.destroyed) return;
+                  await writeBrokerResponse(socket, { ...reply, kind: "fixture_dispatch_check", payload: {
+                    operationId: reply.payload.operationId, checkId: pending.checkId, ready
+                  } });
+                } catch (error) {
+                  if (!(error instanceof Error) || !["APPROVAL_REQUIRED", "SEND_APPROVAL_REQUIRED",
+                    "OBSERVATION_UNAVAILABLE", "UNSUPPORTED_MESSAGE_TEXT", "DISPATCH_CHECK_BUSY",
+                    "DISPATCH_CHECK_UNAVAILABLE"].includes(error.message)) throw error;
+                  if (!socket.destroyed) await writeBrokerResponse(socket, { ...reply, kind: "error",
+                    payload: { code: "DISPATCH_CHECK_UNAVAILABLE" } });
+                }
+                return;
+              }
               if (reply.kind === "fixture_preflight_authorized") {
                 const pending = operations?.requestFixturePreflight(owner, reply.payload.operationId);
                 if (!pending || pending === "busy") {

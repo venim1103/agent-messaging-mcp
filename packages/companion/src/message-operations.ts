@@ -19,14 +19,15 @@ export const MAX_PENDING_FIXTURE_PREFLIGHTS = 16;
 export const FIXTURE_FILL_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_FILLS = 1;
 export const FIXTURE_DISPATCH_CHECK_TIMEOUT_MS = 4_000;
-const fixtureDispatchCheckResultSchema = z.discriminatedUnion("ok", [
+export const MAX_PENDING_FIXTURE_DISPATCH_CHECKS = 16;
+export const fixtureDispatchCheckResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]),
     draftText: z.string().max(2048), selected: z.literal(true), writable: z.literal(true),
     submitReady: z.literal(true) }),
   z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "COMPOSER_UNAVAILABLE",
     "DRAFT_CHANGED", "SUBMIT_UNAVAILABLE"]) })
 ]);
-type FixtureDispatchCheckResult = z.infer<typeof fixtureDispatchCheckResultSchema>;
+export type FixtureDispatchCheckResult = z.infer<typeof fixtureDispatchCheckResultSchema>;
 export const fixturePreflightResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]) }),
   z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
@@ -138,6 +139,9 @@ export class PreparedMessageOperations {
   private readonly recoveryReceipts = new Map<string, string>();
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
   private readonly dispatchChecks = new Map<string, FixtureDispatchCheck>();
+  private readonly dispatchInspections = new Map<string, {
+    timer: ReturnType<typeof setTimeout>; resolve: (ready: boolean) => void
+  }>();
   private readonly dispatchAuthorizations = new Map<string, FixtureDispatchAuthorization>();
   private readonly ambiguousEvidence = new Set<string>();
   private readonly preflightChecks = new Map<string, PendingFixturePreflight>();
@@ -210,7 +214,7 @@ export class PreparedMessageOperations {
     this.sendApprovals.delete(operationId);
     this.recoveryReceipts.delete(operationId);
     this.dispatchBaselines.delete(operationId);
-    this.dispatchChecks.delete(operationId);
+    this.discardFixtureDispatchCheck(operationId);
     this.dispatchAuthorizations.delete(operationId);
     this.ambiguousEvidence.delete(operationId);
   }
@@ -229,7 +233,7 @@ export class PreparedMessageOperations {
       if (approval.expiresAt <= now) this.sendApprovals.delete(operationId);
     }
     for (const [operationId, check] of this.dispatchChecks) {
-      if (check.expiresAt <= now) this.dispatchChecks.delete(operationId);
+      if (check.expiresAt <= now) this.discardFixtureDispatchCheck(operationId);
     }
     for (const [operationId, authorization] of this.dispatchAuthorizations) {
       if (authorization.expiresAt <= now) this.dispatchAuthorizations.delete(operationId);
@@ -614,7 +618,7 @@ export class PreparedMessageOperations {
     const baseline = Object.freeze({ capturedAt: snapshot.capturedAt, cursor: snapshot.cursor,
       messageIds: Object.freeze(snapshot.messages.map((message) => message.id)) });
     this.dispatchBaselines.set(operationId, baseline);
-    this.dispatchChecks.delete(operationId);
+    this.discardFixtureDispatchCheck(operationId);
     return Object.freeze({ operationId, capturedAt: baseline.capturedAt, cursor: baseline.cursor });
   }
 
@@ -633,19 +637,70 @@ export class PreparedMessageOperations {
     return baseline;
   }
 
-  requestFixtureDispatchCheck(owner: symbol, operationId: string, now = Date.now()) {
+  private finishFixtureDispatchInspection(operationId: string, ready: boolean): void {
+    const pending = this.dispatchInspections.get(operationId);
+    if (!pending) return;
+    this.dispatchInspections.delete(operationId);
+    clearTimeout(pending.timer);
+    pending.resolve(ready);
+  }
+
+  private discardFixtureDispatchCheck(operationId: string): void {
+    this.dispatchChecks.delete(operationId);
+    this.finishFixtureDispatchInspection(operationId, false);
+  }
+
+  requestFixtureDispatchInspection(owner: symbol, operationId: string, now = Date.now(),
+    deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
+    if (!this.getFixtureSendAuthorization(owner, operationId, now)) throw new Error("SEND_APPROVAL_REQUIRED");
+    if (this.dispatchInspections.has(operationId)) return "busy" as const;
+    this.recordFixtureDispatchBaseline(owner, operationId, now);
+    const check = this.requestFixtureDispatchCheck(owner, operationId, now, deadlineMs);
+    let resolve!: (ready: boolean) => void;
+    const result = new Promise<boolean>((done) => { resolve = done; });
+    const timer = setTimeout(() => this.discardFixtureDispatchCheck(operationId), check.expiresAt - now);
+    this.dispatchInspections.set(operationId, { timer, resolve });
+    return { checkId: check.checkId, result };
+  }
+
+  requestFixtureDispatchCheck(owner: symbol, operationId: string, now = Date.now(),
+    deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) throw new Error("DISPATCH_CHECK_UNAVAILABLE");
     const authorization = this.getFixtureSendAuthorization(owner, operationId, now);
     if (!authorization) throw new Error("SEND_APPROVAL_REQUIRED");
     if (authorization.text.length > 2048 || authorization.text.trim() !== authorization.text
       || authorization.text.includes("\r")) throw new Error("UNSUPPORTED_MESSAGE_TEXT");
     const baseline = this.freshDispatchBaseline(owner, operationId, now);
+    this.listFixtureDispatchChecks(now);
+    if (!this.dispatchChecks.has(operationId) && this.dispatchChecks.size >= MAX_PENDING_FIXTURE_DISPATCH_CHECKS) {
+      throw new Error("DISPATCH_CHECK_BUSY");
+    }
     const check = Object.freeze({ checkId: randomUUID(), owner, target: authorization.target,
       text: authorization.text, createdAt: now,
-      expiresAt: Math.min(authorization.expiresAt, now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS,
+      expiresAt: Math.min(deadlineMs, authorization.expiresAt, now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS,
         baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS), baseline, checkedAt: null });
+    this.discardFixtureDispatchCheck(operationId);
     this.dispatchChecks.set(operationId, check);
     return Object.freeze({ operationId, checkId: check.checkId, target: check.target,
       text: check.text, expiresAt: check.expiresAt });
+  }
+
+  listFixtureDispatchChecks(now = Date.now()) {
+    this.discardExpired(now);
+    for (const [operationId, check] of this.dispatchChecks) {
+      try {
+        if (check.createdAt > now || check.expiresAt <= now
+          || !this.getFixtureSendAuthorization(check.owner, operationId, now)
+          || this.freshDispatchBaseline(check.owner, operationId, now) !== check.baseline) {
+          this.discardFixtureDispatchCheck(operationId);
+        }
+      } catch {
+        this.discardFixtureDispatchCheck(operationId);
+      }
+    }
+    return [...this.dispatchChecks].filter(([, check]) => check.checkedAt === null)
+      .map(([operationId, check]) => Object.freeze({ operationId, checkId: check.checkId,
+        target: check.target, text: check.text, expiresAt: check.expiresAt }));
   }
 
   completeFixtureDispatchCheck(target: FixtureTarget, operationId: string, checkId: string,
@@ -657,15 +712,22 @@ export class PreparedMessageOperations {
       || check.expiresAt <= now || !parsed.success
       || check.target.origin !== target.origin || check.target.conversationId !== target.conversationId
       || check.target.tabId !== target.tabId || check.target.documentId !== target.documentId) return false;
-    this.dispatchChecks.delete(operationId);
     if (!parsed.data.ok || parsed.data.draftText !== check.text
-      || !this.getFixtureSendAuthorization(check.owner, operationId, now)) return false;
+      || !this.getFixtureSendAuthorization(check.owner, operationId, now)) {
+      this.discardFixtureDispatchCheck(operationId);
+      return false;
+    }
     try {
-      if (this.freshDispatchBaseline(check.owner, operationId, now) !== check.baseline) return false;
+      if (this.freshDispatchBaseline(check.owner, operationId, now) !== check.baseline) {
+        this.discardFixtureDispatchCheck(operationId);
+        return false;
+      }
     } catch {
+      this.discardFixtureDispatchCheck(operationId);
       return false;
     }
     this.dispatchChecks.set(operationId, Object.freeze({ ...check, checkedAt: now }));
+    this.finishFixtureDispatchInspection(operationId, true);
     return true;
   }
 

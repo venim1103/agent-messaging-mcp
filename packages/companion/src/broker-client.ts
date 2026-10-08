@@ -6,8 +6,9 @@ import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
 import { fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
-  MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS,
-  MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureFillResult, type FixturePreflightResult } from "./message-operations.js";
+  MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
+  MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureDispatchCheckResult,
+  type FixtureFillResult, type FixturePreflightResult } from "./message-operations.js";
 import type { FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
@@ -172,6 +173,23 @@ const replySchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({
     kind: z.literal("fixture_preflight_recorded"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ accepted: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_dispatch_checks"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ checks: z.array(z.strictObject({ operationId: z.uuid(), checkId: z.uuid(),
+      target: fixtureTarget, text: z.string().min(1).max(2048), expiresAt: z.number().int().safe()
+    })).max(MAX_PENDING_FIXTURE_DISPATCH_CHECKS) })
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_dispatch_check"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), checkId: z.uuid(), ready: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_dispatch_check_recorded"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ accepted: z.boolean() })
   }),
@@ -364,6 +382,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "read_gemini_snapshot" | "read_approved_snapshot"
       | "disconnect_fixture" | "prepare_fixture_message" | "get_prepared_operation"
       | "check_fixture_preflight" | "complete_fixture_preflight"
+      | "check_fixture_dispatch" | "list_fixture_dispatch_checks" | "complete_fixture_dispatch_check"
       | "fill_fixture_draft" | "complete_fixture_fill"
       | "list_pending" | "list_fixture_read_challenges" | "list_fixture_prepared_reviews"
       | "approve_fixture_review"
@@ -379,6 +398,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         || kind === "list_fixture_fill_reviews" || kind === "approve_fixture_fill_review"
         || kind === "list_fixture_send_reviews" || kind === "approve_fixture_send_review"
         || kind === "complete_fixture_preflight"
+        || kind === "list_fixture_dispatch_checks" || kind === "complete_fixture_dispatch_check"
         || kind === "complete_fixture_fill"
         || kind === "list_gemini_read_challenges"
         || kind === "approve_fixture" || kind === "approve_gemini" || kind === "revoke_fixture"
@@ -474,6 +494,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       checkFixturePreflight: (operationId: string) => request("check_fixture_preflight", { operationId }),
       completeFixturePreflight: (target: FixtureTarget, challengeId: string, observation: FixturePreflightResult) =>
         request("complete_fixture_preflight", { target, challengeId, observation }),
+      checkFixtureDispatch: (operationId: string) => request("check_fixture_dispatch", { operationId }),
+      listFixtureDispatchChecks: () => request("list_fixture_dispatch_checks", {}),
+      completeFixtureDispatchCheck: (target: FixtureTarget, operationId: string, checkId: string,
+        observation: FixtureDispatchCheckResult) =>
+        request("complete_fixture_dispatch_check", { target, operationId, checkId, observation }),
       fillFixtureDraft: (operationId: string) => request("fill_fixture_draft", { operationId }),
       completeFixtureFill: (target: FixtureTarget, attemptId: string, observation: FixtureFillResult) =>
         request("complete_fixture_fill", { target, attemptId, observation }),

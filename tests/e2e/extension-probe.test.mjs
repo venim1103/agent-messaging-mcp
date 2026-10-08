@@ -675,6 +675,42 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       kind: "approve_fixture_send_review", ...args
     }), { ...reviewArgs, operationId: prepared.payload.operationId, reviewId: sendReviewId });
     assert.equal(staleSendReview.ok, false);
+    const postConsentSnapshot = await facade.readFixtureSnapshot(connection.payload.connectionId);
+    assert.equal(postConsentSnapshot.kind, "fixture_snapshot");
+    const exactInspection = await facade.checkFixtureDispatch(prepared.payload.operationId);
+    assert.equal(exactInspection.kind, "fixture_dispatch_check", JSON.stringify(exactInspection.payload));
+    assert.equal(exactInspection.payload.ready, true);
+    assert.equal(await fixture.locator("#message").inputValue(), text);
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    await fixture.locator("#message").fill("Preserve this changed fixture draft");
+    assert.equal((await facade.readFixtureSnapshot(connection.payload.connectionId)).kind, "fixture_snapshot");
+    const changedInspection = await facade.checkFixtureDispatch(prepared.payload.operationId);
+    assert.equal(changedInspection.kind, "fixture_dispatch_check", JSON.stringify(changedInspection.payload));
+    assert.equal(changedInspection.payload.ready, false);
+    assert.equal(await fixture.locator("#message").inputValue(), "Preserve this changed fixture draft");
+    await fixture.locator("#message").fill(text);
+    await fixture.locator("button[type=submit]").evaluate(button => { button.disabled = true; });
+    assert.equal((await facade.readFixtureSnapshot(connection.payload.connectionId)).kind, "fixture_snapshot");
+    const blockedInspection = await facade.checkFixtureDispatch(prepared.payload.operationId);
+    assert.equal(blockedInspection.kind, "fixture_dispatch_check", JSON.stringify(blockedInspection.payload));
+    assert.equal(blockedInspection.payload.ready, false);
+    assert.equal(await fixture.locator("#message").inputValue(), text);
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    await fixture.locator("button[type=submit]").evaluate(button => { button.disabled = false; });
+    assert.equal((await facade.readFixtureSnapshot(connection.payload.connectionId)).kind, "fixture_snapshot");
+    const unapprovedTab = await context.newPage();
+    try {
+      await unapprovedTab.bringToFront();
+      const inactiveInspection = await facade.checkFixtureDispatch(prepared.payload.operationId);
+      assert.equal(inactiveInspection.kind, "fixture_dispatch_check", JSON.stringify(inactiveInspection.payload));
+      assert.equal(inactiveInspection.payload.ready, false);
+      assert.equal(await fixture.locator("#message").inputValue(), text);
+      assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    } finally {
+      await unapprovedTab.close();
+      await fixture.bringToFront();
+    }
+    assert.equal((await facade.getPreparedOperation(prepared.payload.operationId)).payload.state, "approved");
     const { DatabaseSync } = await import("node:sqlite");
     const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
     try {
@@ -750,6 +786,17 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     assert.equal(richFilled.kind, "fixture_fill");
     assert.equal(richFilled.payload.ok, true, JSON.stringify(richFilled.payload));
     assert.equal(richFilled.payload.editor, "rich");
+    assert.equal(await fixture.locator("#rich-message").innerText(), richPrepared.payload.preview.text);
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    await popup.evaluate(() => document.querySelector("#view-fixture-send-reviews").click());
+    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
+    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), richPrepared.payload.preview.text);
+    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+    await waitForPopupResult(popup.getByText(`Approved fixture send ${richPrepared.payload.operationId}. No message was sent.`));
+    assert.equal((await facade.readFixtureSnapshot(richConnection.payload.connectionId)).kind, "fixture_snapshot");
+    const richInspection = await facade.checkFixtureDispatch(richPrepared.payload.operationId);
+    assert.equal(richInspection.kind, "fixture_dispatch_check", JSON.stringify(richInspection.payload));
+    assert.equal(richInspection.payload.ready, true);
     assert.equal(await fixture.locator("#rich-message").innerText(), richPrepared.payload.preview.text);
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
     await fixture.locator("#rich-message").fill("");

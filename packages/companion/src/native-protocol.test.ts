@@ -18,6 +18,7 @@ import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parse
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
   parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
+  parseNativeFixtureDispatchCheck, parseNativeFixtureDispatchChecks,
   parseNativeFixtureReset, parseNativeFixtureRevocation,
   parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeGeminiSnapshot, parseNativePendingList,
@@ -34,6 +35,37 @@ const request = {
   deadlineMs: now + 10_000,
   payload: {}
 };
+
+test("native dispatch inspection accepts only bounded exact proof, never approval or submission", () => {
+  const listing = { ...request, kind: "list_fixture_dispatch_checks" };
+  assert.deepEqual(parseNativeFixtureDispatchChecks(listing, now), listing);
+  for (const invalid of [{ ...listing, payload: { operationId: request.requestId } },
+    { ...listing, payload: { selector: "button" } }, { ...listing, deadlineMs: now },
+    { ...listing, deadlineMs: now + 30_001 }, { ...listing, kind: "dispatch_fixture_message" }]) {
+    assert.throws(() => parseNativeFixtureDispatchChecks(invalid, now), /Invalid native fixture dispatch check list/);
+  }
+  const completion = { ...request, kind: "complete_fixture_dispatch_check", payload: {
+    target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "CHROME-doc_opaque-42" }, operationId: request.requestId, checkId: randomUUID(),
+    observation: { ok: true, editor: "textarea", draftText: "Synthetic exact draft",
+      selected: true, writable: true, submitReady: true }
+  } };
+  assert.deepEqual(parseNativeFixtureDispatchCheck(completion, now), completion);
+  const denied = { ...completion, payload: { ...completion.payload, observation: { ok: false, code: "DRAFT_CHANGED" } } };
+  assert.deepEqual(parseNativeFixtureDispatchCheck(denied, now), denied);
+  for (const invalid of [
+    { ...completion, payload: { ...completion.payload, approved: true } },
+    { ...completion, payload: { ...completion.payload, checkId: "not-a-challenge" } },
+    { ...completion, payload: { ...completion.payload, target: { ...completion.payload.target, origin: "https://gemini.google.com" } } },
+    { ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, draftText: "x".repeat(2049) } } },
+    { ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, selected: false } } },
+    { ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, writable: false } } },
+    { ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, submitReady: false } } },
+    { ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, approved: true } } },
+    { ...denied, payload: { ...denied.payload, observation: { ok: false, code: "DRAFT_CHANGED", detail: "private" } } },
+    { ...completion, kind: "dispatch_fixture_message" }, { ...completion, deadlineMs: now }
+  ]) assert.throws(() => parseNativeFixtureDispatchCheck(invalid, now), /Invalid native fixture dispatch check/);
+});
 
 test("native broker diagnostics disclose only exact fixed reasons, never private error contents", () => {
   const sensitive = "draft=private-message; credential=private-token; document=private-identity";
@@ -1009,6 +1041,56 @@ test("native relay lists only live broker pending IDs over real framing", { time
     }];
     assert.equal(sendReplay.kind, "error");
     assert.deepEqual(sendReplay.payload, { code: "SEND_REVIEW_UNAVAILABLE" });
+    assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, beforeSendReview.payload);
+    assert.throws(() => owningFacade.listFixtureDispatchChecks(), /Broker role cannot perform/);
+    const [publishedBaseline] = await exchangeFillReview({ ...request, kind: "publish_fixture_snapshot",
+      deadlineMs: Date.now() + 10_000, payload: { target: sendTarget, messages: [] } }) as [{
+      kind: string; payload: { count: number }
+    }];
+    assert.equal(publishedBaseline.kind, "fixture_snapshot_published");
+    assert.equal(publishedBaseline.payload.count, 1);
+    const inspecting = owningFacade.checkFixtureDispatch(prepared.payload.operationId);
+    let dispatchCheckId: string | undefined;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const [listedChecks] = await exchangeFillReview({ ...request, kind: "list_fixture_dispatch_checks",
+        deadlineMs: Date.now() + 10_000, payload: {} }) as [{ kind: string; payload: { checks: {
+          operationId: string; checkId: string; text: string; expiresAt: number
+        }[] } }];
+      assert.equal(listedChecks.kind, "fixture_dispatch_checks");
+      const check = listedChecks.payload.checks.find(candidate => candidate.operationId === prepared.payload.operationId);
+      if (check) {
+        dispatchCheckId = check.checkId;
+        assert.equal(check.text, prepared.payload.preview.text);
+        assert.equal(check.expiresAt > Date.now(), true);
+        assert.equal(JSON.stringify(listedChecks).includes(prepared.payload.recoveryToken), false);
+        break;
+      }
+      await setTimeout(10);
+    }
+    assert.ok(dispatchCheckId, "Broker did not queue a native exact-draft inspection");
+    const dispatchObservation = { ok: true as const, editor: "textarea" as const, draftText: prepared.payload.preview.text,
+      selected: true as const, writable: true as const, submitReady: true as const };
+    assert.throws(() => owningFacade.completeFixtureDispatchCheck(sendTarget, prepared.payload.operationId,
+      dispatchCheckId!, dispatchObservation), /Broker role cannot perform/);
+    const dispatchCompletionRequest = { ...request, kind: "complete_fixture_dispatch_check", payload: {
+      target: sendTarget, operationId: prepared.payload.operationId, checkId: dispatchCheckId, observation: dispatchObservation
+    } };
+    const [wrongDocumentCheck] = await exchangeFillReview({ ...dispatchCompletionRequest, deadlineMs: Date.now() + 10_000,
+      payload: { ...dispatchCompletionRequest.payload, target: { ...sendTarget, documentId: "changed" } } }) as [{
+      kind: string; payload: { accepted: boolean }
+    }];
+    assert.equal(wrongDocumentCheck.kind, "fixture_dispatch_check_recorded");
+    assert.equal(wrongDocumentCheck.payload.accepted, false);
+    const [dispatchChecked] = await exchangeFillReview({ ...dispatchCompletionRequest,
+      deadlineMs: Date.now() + 10_000 }) as [{ kind: string; payload: { accepted: boolean } }];
+    assert.equal(dispatchChecked.kind, "fixture_dispatch_check_recorded");
+    assert.equal(dispatchChecked.payload.accepted, true);
+    const inspected = await inspecting;
+    assert.equal(inspected.kind, "fixture_dispatch_check");
+    assert.deepEqual(inspected.payload, { operationId: prepared.payload.operationId, checkId: dispatchCheckId, ready: true });
+    const [dispatchCheckReplay] = await exchangeFillReview({ ...dispatchCompletionRequest,
+      deadlineMs: Date.now() + 10_000 }) as [{ kind: string; payload: { accepted: boolean } }];
+    assert.equal(dispatchCheckReplay.payload.accepted, false);
     assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, beforeSendReview.payload);
     fillHost.stdin.end();
     const [fillExit] = await reviewPortClose;

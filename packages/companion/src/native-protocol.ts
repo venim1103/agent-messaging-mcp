@@ -1,5 +1,5 @@
 import * as z from "zod/v4";
-import { fixtureFillResultSchema, fixturePreflightResultSchema } from "./message-operations.js";
+import { fixtureDispatchCheckResultSchema, fixtureFillResultSchema, fixturePreflightResultSchema } from "./message-operations.js";
 import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
   MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES } from "./pending-connections.js";
 
@@ -96,6 +96,32 @@ export function parseNativeFixtureFill(message: unknown, now = Date.now()) {
   const result = fixtureFillSchema.safeParse(message);
   if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
     throw new Error("Invalid native fixture fill");
+  }
+  return result.data;
+}
+
+const fixtureDispatchChecksSchema = fixtureReadChallengesSchema.extend({
+  kind: z.literal("list_fixture_dispatch_checks")
+});
+
+export function parseNativeFixtureDispatchChecks(message: unknown, now = Date.now()) {
+  const result = fixtureDispatchChecksSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture dispatch check list");
+  }
+  return result.data;
+}
+
+const fixtureDispatchCheckSchema = fixturePreflightSchema.extend({
+  kind: z.literal("complete_fixture_dispatch_check"),
+  payload: z.strictObject({ target: fixtureTargetSchema, operationId: z.uuid(), checkId: z.uuid(),
+    observation: fixtureDispatchCheckResultSchema })
+});
+
+export function parseNativeFixtureDispatchCheck(message: unknown, now = Date.now()) {
+  const result = fixtureDispatchCheckSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native fixture dispatch check");
   }
   return result.data;
 }
