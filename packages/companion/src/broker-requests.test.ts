@@ -7,6 +7,33 @@ import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS }
   from "./pending-connections.js";
 
+test("facade keepalive is a strict no-op and cannot renew browser grants", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("fixture owner");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+    documentId: "CHROME-doc_opaque-42" } as const;
+  const grant = requests.approve(pending.requestId, target, 2000)!;
+  const before = requests.get(owner, pending.requestId, 2001);
+  const envelope = { protocolVersion: PROTOCOL_VERSION,
+    requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+  const heartbeat = { ...envelope, kind: "keep_alive", payload: {} };
+  assert.deepEqual(handleBrokerRequest(heartbeat, "facade", owner, requests, 2001), {
+    ...envelope, kind: "kept_alive", payload: {}
+  });
+  assert.deepEqual(requests.get(owner, pending.requestId, 2001), before);
+  assert.deepEqual(handleBrokerRequest(heartbeat, "relay", Symbol("relay"), requests, 2001).payload,
+    { code: "PERMISSION_DENIED" });
+  for (const payload of [{ connectionId: grant.connectionId }, { approved: true }, { text: "private" }]) {
+    assert.throws(() => handleBrokerRequest({ ...heartbeat, payload }, "facade", owner, requests, 2001));
+  }
+  assert.throws(() => handleBrokerRequest({ ...heartbeat, deadlineMs: 2001 }, "facade", owner, requests, 2001));
+  const expiredAt = grant.expiresAt;
+  assert.equal(handleBrokerRequest({ ...heartbeat, deadlineMs: expiredAt + 5000 },
+    "facade", owner, requests, expiredAt).kind, "kept_alive");
+  assert.notEqual(requests.get(owner, pending.requestId, expiredAt)?.state, "ready_readonly");
+});
+
 test("only a relay marks a gap for the exact approved Gemini URL and document", () => {
   const requests = new PendingConnectionRequests();
   const owner = Symbol("Gemini owner");

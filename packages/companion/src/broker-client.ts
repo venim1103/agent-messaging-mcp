@@ -45,6 +45,11 @@ const fixtureCursor = z.strictObject({ epoch: z.uuid(), sequence: z.number().int
 
 const replySchema = z.discriminatedUnion("kind", [
   z.strictObject({
+    kind: z.literal("kept_alive"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({})
+  }),
+  z.strictObject({
     kind: z.literal("connection_requested"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ requestId: z.uuid(), state: z.literal("pending"), expiresAt: z.number().int().safe() })
@@ -354,7 +359,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
     }
     let nextRequest: Promise<void> = Promise.resolve();
     let pendingRequests = 0;
-    const request = (kind: "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
+    const request = (kind: "keep_alive" | "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
       | "disconnect_fixture" | "prepare_fixture_message" | "get_prepared_operation"
@@ -429,6 +434,22 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       nextRequest = completed.then(() => {}, () => {});
       return completed;
     };
+    let keepAlive: ReturnType<typeof setInterval> | undefined;
+    const stopKeepAlive = () => {
+      if (keepAlive === undefined) return;
+      clearInterval(keepAlive);
+      keepAlive = undefined;
+    };
+    socket.once("close", stopKeepAlive);
+    if (role === "facade" && upstreamDeadlineMs === undefined) {
+      keepAlive = setInterval(() => {
+        if (socket.destroyed || pendingRequests !== 0) return;
+        void request("keep_alive", {}).then((reply) => {
+          if (reply.kind !== "kept_alive") socket.destroy();
+        }, () => socket.destroy());
+      }, 60_000);
+      keepAlive.unref();
+    }
     return {
       role,
       get closed() { return socket.destroyed; },
@@ -483,7 +504,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       revokeFixture: (tabId: number, observed: { documentId: string; conversationId: string } | null) =>
         request("revoke_fixture", { tabId, observed }),
       revokeAllFixtures: () => request("revoke_all_fixture", {}),
-      close: () => socket.destroy()
+      close: () => { stopKeepAlive(); socket.destroy(); }
     };
   } catch (error) {
     socket.destroy();

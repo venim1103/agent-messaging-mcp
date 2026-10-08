@@ -32,6 +32,7 @@ const geminiMessage = z.strictObject({
 });
 
 const requestSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ ...envelope, kind: z.literal("keep_alive"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("request_connection"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("get_connection"), payload: z.strictObject({ requestId: z.uuid() }) }),
   z.strictObject({ ...envelope, kind: z.literal("read_fixture_snapshot"), payload: z.strictObject({
@@ -136,6 +137,11 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     connectionGeneration: 0,
     deadlineMs: request.deadlineMs
   };
+  if (request.kind === "keep_alive") {
+    return role === "facade"
+      ? { ...response, kind: "kept_alive" as const, payload: {} }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
   if (request.kind === "list_pending") {
     return role === "relay"
       ? { ...response, kind: "pending_list" as const, payload: { requests: requests.listPending(now) } }

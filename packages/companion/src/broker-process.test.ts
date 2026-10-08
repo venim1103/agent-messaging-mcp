@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { appendFileSync, chmodSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { Socket } from "node:net";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
@@ -11,6 +11,38 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { connectBroker } from "./broker-client.js";
 import { recoverStaleBrokerRuntime } from "./broker-recovery.js";
+
+async function brokerSocketReady(socketPath: string): Promise<boolean> {
+  try {
+    const info = await stat(socketPath);
+    return info.isSocket() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0;
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    return false;
+  }
+}
+
+test("broker process readiness refuses a socket before private permissions", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-process-readiness-"));
+  const socketPath = join(home, "broker.sock");
+  const server = createServer();
+  try {
+    assert.equal(await brokerSocketReady(socketPath), false);
+    assert.equal(await brokerSocketReady(home), false);
+    const listening = once(server, "listening");
+    server.listen(socketPath);
+    await listening;
+    await chmod(socketPath, 0o666);
+    assert.equal(await brokerSocketReady(socketPath), false);
+    await chmod(socketPath, 0o600);
+    assert.equal(await brokerSocketReady(socketPath), true);
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("spawned broker keeps role credentials private and exits cleanly", { timeout: 10000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-home-"));
@@ -22,13 +54,8 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
   try {
     let ready = false;
     for (let attempt = 0; attempt < 40; attempt++) {
-      try {
-        const info = await stat(join(directory, "broker.sock"));
-        ready = info.isSocket();
-        if (ready) break;
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      }
+      ready = await brokerSocketReady(join(directory, "broker.sock"));
+      if (ready) break;
       await setTimeout(25);
     }
     assert.equal(ready, true, "Broker did not start");
@@ -335,12 +362,8 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
   try {
     let ready = false;
     for (let attempt = 0; attempt < 40; attempt++) {
-      try {
-        ready = (await stat(join(directory, "broker.sock"))).isSocket();
-        if (ready) break;
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      }
+      ready = await brokerSocketReady(join(directory, "broker.sock"));
+      if (ready) break;
       await setTimeout(25);
     }
     assert.equal(ready, true, "First broker did not start");
@@ -358,8 +381,7 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
     for (let attempt = 0; attempt < 40; attempt++) {
       try {
         const rotated = (await readFile(join(directory, "facade.key"), "utf8")) !== oldKey;
-        const socket = await stat(join(directory, "broker.sock"));
-        refreshed = rotated && socket.isSocket() && (socket.mode & 0o077) === 0;
+        refreshed = rotated && await brokerSocketReady(join(directory, "broker.sock"));
         if (refreshed) break;
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;

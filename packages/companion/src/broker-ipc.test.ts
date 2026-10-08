@@ -124,6 +124,102 @@ test("broker client spends encoding time inside its original deadline", { timeou
   }
 });
 
+test("facade keepalive preserves its owner without renewing a grant", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-owner-keepalive-"));
+  const directory = join(home, "broker");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials());
+  const intervals = context.mock.method(globalThis, "setInterval");
+  const idle = context.mock.method(Socket.prototype, "setTimeout");
+  const cleared = context.mock.method(globalThis, "clearInterval");
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  try {
+    facade = await connectBroker("facade", directory);
+    relay = await connectBroker("relay", directory);
+    const created = await facade.requestConnection();
+    if (created.kind !== "connection_requested") throw new Error("Expected pending fixture request");
+    const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "CHROME-doc_opaque-42" } as const;
+    assert.equal((await relay.approveFixture(created.payload.requestId, target)).kind, "fixture_approved");
+    const before = await facade.getConnection(created.payload.requestId);
+    assert.equal(before.kind, "connection_state");
+    assert.equal(before.payload.state, "ready_readonly");
+    assert.equal(intervals.mock.callCount(), 1);
+    const interval = intervals.mock.calls[0];
+    assert.equal(interval?.arguments[1], 60_000);
+    const callback = interval?.arguments[0];
+    assert.equal(typeof callback, "function");
+    const accepted = idle.mock.calls.find((call) => call.arguments[0] === BROKER_IDLE_TIMEOUT_MS)?.this;
+    assert.ok(accepted instanceof Socket);
+    const heartbeat = once(accepted, "data");
+    Reflect.apply(callback as (...args: unknown[]) => unknown, globalThis, []);
+    const [chunk] = await heartbeat;
+    const [message] = new NativeFrameDecoder().push(chunk as Buffer);
+    assert.equal((message as { kind: string }).kind, "keep_alive");
+    assert.deepEqual((message as { payload: object }).payload, {});
+    assert.equal(accepted.timeout, BROKER_IDLE_TIMEOUT_MS);
+    assert.deepEqual((await facade.getConnection(created.payload.requestId)).payload, before.payload);
+    const encoded = context.mock.method(JSON, "stringify");
+    const busy = Promise.all(Array.from({ length: MAX_BROKER_PENDING_REQUESTS }, () =>
+      facade!.getConnection(created.payload.requestId)));
+    Reflect.apply(callback as (...args: unknown[]) => unknown, globalThis, []);
+    await busy;
+    assert.ok(encoded.mock.calls.every((call) => (call.arguments[0] as { kind: string }).kind !== "keep_alive"));
+    encoded.mock.restore();
+    const closed = once(accepted, "close");
+    facade.close();
+    await closed;
+    assert.equal(cleared.mock.callCount(), 1);
+  } finally {
+    facade?.close();
+    relay?.close();
+    await broker.close();
+    context.mock.restoreAll();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("failed facade keepalive closes its socket without retrying", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-keepalive-failure-"));
+  const broker = await startBrokerSocket(join(home, "broker"), createBrokerCredentials());
+  const intervals = context.mock.method(globalThis, "setInterval");
+  const idle = context.mock.method(Socket.prototype, "setTimeout");
+  const cleared = context.mock.method(globalThis, "clearInterval");
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  try {
+    facade = await connectBroker("facade", join(home, "broker"));
+    const accepted = idle.mock.calls.find((call) => call.arguments[0] === BROKER_IDLE_TIMEOUT_MS)?.this;
+    assert.ok(accepted instanceof Socket);
+    const write = Socket.prototype.write;
+    let attempts = 0;
+    context.mock.method(Socket.prototype, "write", function (this: Socket, chunk: unknown, ...options: unknown[]) {
+      if (this === accepted && Buffer.isBuffer(chunk)) {
+        const [reply] = new NativeFrameDecoder().push(chunk) as Array<{ kind: string }>;
+        if (reply?.kind === "kept_alive") {
+          attempts++;
+          return Reflect.apply(write, this, [encodeNativeFrame({ ...reply, kind: "error",
+            payload: { code: "PERMISSION_DENIED" } }), ...options]);
+        }
+      }
+      return Reflect.apply(write, this, [chunk, ...options]);
+    });
+    const callback = intervals.mock.calls[0]?.arguments[0];
+    assert.equal(typeof callback, "function");
+    const closed = once(accepted, "close");
+    Reflect.apply(callback as (...args: unknown[]) => unknown, globalThis, []);
+    await closed;
+    assert.equal(facade.closed, true);
+    assert.equal(cleared.mock.callCount(), 1);
+    Reflect.apply(callback as (...args: unknown[]) => unknown, globalThis, []);
+    assert.equal(attempts, 1);
+  } finally {
+    facade?.close();
+    await broker.close();
+    context.mock.restoreAll();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("broker client bounds pending requests and releases capacity after completion", { timeout: 5000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-client-queue-"));
   const directory = join(home, "broker");
