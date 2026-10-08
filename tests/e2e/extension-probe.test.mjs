@@ -13,6 +13,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { chromium } from "playwright-core";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
+import { reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 
 const extensionDirectory = fileURLToPath(new URL("../../packages/extension/.output/chrome-mv3/", import.meta.url));
 const nativeRelayPath = fileURLToPath(new URL("../../packages/companion/dist/native-relay.js", import.meta.url));
@@ -51,17 +52,13 @@ test("extension broker readiness rejects a socket until its permissions are priv
 
 test("isolated Chromium loads the extension, popup, and native host", { timeout: 15000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-extension-test-"));
+  const launch = () => chromium.launchPersistentContext(profile, {
+    chromiumSandbox: true, executablePath: "/usr/bin/chromium", headless: true,
+    args: [`--disable-extensions-except=${extensionDirectory}`, `--load-extension=${extensionDirectory}`]
+  });
   let context;
   try {
-    context = await chromium.launchPersistentContext(profile, {
-      chromiumSandbox: true,
-      executablePath: "/usr/bin/chromium",
-      headless: true,
-      args: [
-        `--disable-extensions-except=${extensionDirectory}`,
-        `--load-extension=${extensionDirectory}`
-      ]
-    });
+    context = await launch();
     let worker = context.serviceWorkers()[0];
     if (!worker) worker = await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
@@ -103,6 +100,93 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
     assert.equal(sandboxStatus["Seccomp-BPF sandbox"], "Yes", JSON.stringify(sandboxStatus));
     assert.ok(["Namespace", "SUID"].includes(sandboxStatus["Layer 1 Sandbox"]),
       JSON.stringify(sandboxStatus));
+    const operationId = crypto.randomUUID();
+    const reservation = () => ({ operationId, expiresAt: Date.now() + 4000 });
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, reservation()), true);
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, reservation()), false);
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, { ...reservation(), operationId: "invalid" }), false);
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, { ...reservation(), expiresAt: Date.now() - 1 }), false);
+    await worker.evaluate(() => {
+      const get = chrome.storage.local.get.bind(chrome.storage.local);
+      globalThis.fixtureOriginalReservationGet = get;
+      chrome.storage.local.get = async keys => {
+        if (keys === null) await new Promise(resolve => { globalThis.fixtureReleaseReservationGet = resolve; });
+        return get(keys);
+      };
+    });
+    const pendingReservation = worker.evaluate(reserveFixtureSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 });
+    try {
+      assert.equal(await worker.evaluate(() => globalThis.fixtureSubmitReservationPending), true);
+      assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
+        { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
+    } finally {
+      await worker.evaluate(() => {
+        chrome.storage.local.get = globalThis.fixtureOriginalReservationGet;
+        globalThis.fixtureReleaseReservationGet();
+        delete globalThis.fixtureOriginalReservationGet;
+        delete globalThis.fixtureReleaseReservationGet;
+      });
+    }
+    assert.equal(await pendingReservation, true);
+    const expiredReservationId = crypto.randomUUID();
+    await worker.evaluate(() => {
+      globalThis.fixtureOriginalReservationGet = chrome.storage.local.get.bind(chrome.storage.local);
+      chrome.storage.local.get = keys => keys === null
+        ? new Promise(resolve => { globalThis.fixtureReleaseReservationGet = resolve; })
+        : globalThis.fixtureOriginalReservationGet(keys);
+    });
+    try {
+      assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
+        { operationId: expiredReservationId, expiresAt: Date.now() + 100 }), false);
+      assert.equal(await worker.evaluate(() => globalThis.fixtureSubmitReservationPending), true);
+      assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
+        { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
+    } finally {
+      await worker.evaluate(async () => {
+        chrome.storage.local.get = globalThis.fixtureOriginalReservationGet;
+        globalThis.fixtureReleaseReservationGet({});
+        await Promise.resolve();
+        delete globalThis.fixtureOriginalReservationGet;
+        delete globalThis.fixtureReleaseReservationGet;
+      });
+    }
+    assert.equal(await worker.evaluate(() => globalThis.fixtureSubmitReservationPending), false);
+    assert.deepEqual(await worker.evaluate(key => chrome.storage.local.get(key),
+      `fixture-submit-attempt-${expiredReservationId}`), {});
+    await worker.evaluate(() => {
+      globalThis.fixtureOriginalReservationGet = chrome.storage.local.get.bind(chrome.storage.local);
+      chrome.storage.local.get = async () => { throw new Error("Private synthetic storage failure"); };
+    });
+    try {
+      assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
+        { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
+    } finally {
+      await worker.evaluate(() => {
+        chrome.storage.local.get = globalThis.fixtureOriginalReservationGet;
+        delete globalThis.fixtureOriginalReservationGet;
+      });
+    }
+    await context.close();
+    context = await launch();
+    worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+    assert.equal(new URL(worker.url()).hostname, extensionId);
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, reservation()), false);
+    const persisted = await worker.evaluate(async () => chrome.storage.local.get(null));
+    assert.equal(persisted[`fixture-submit-attempt-${operationId}`], true);
+    assert.equal(Object.values(persisted).every(value => value === true), true);
+    await worker.evaluate(async () => {
+      await chrome.storage.local.set({ "fixture-submit-attempt-invalid": true });
+    });
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
+    await worker.evaluate(async () => {
+      await chrome.storage.local.clear();
+      await chrome.storage.local.set(Object.fromEntries(Array.from({ length: 10_000 }, () =>
+        [`fixture-submit-attempt-${crypto.randomUUID()}`, true])));
+    });
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
   } finally {
     await context?.close();
     await rm(profile, { recursive: true, force: true });

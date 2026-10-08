@@ -200,6 +200,49 @@ export function fillFixtureDraft(input: {
   }
 }
 
+export async function reserveFixtureSubmitAttempt(input: { operationId: string; expiresAt: number }): Promise<boolean> {
+  const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
+    || !Number.isSafeInteger(input.expiresAt) || input.expiresAt <= Date.now()
+    || input.expiresAt > Date.now() + 4_000) return false;
+  const scope = globalThis as typeof globalThis & {
+    fixtureSubmitReservationPending?: boolean;
+    chrome?: { storage?: { local?: {
+      get: (keys: string | null) => Promise<Record<string, unknown>>;
+      set: (items: Record<string, unknown>) => Promise<void>
+    } } }
+  };
+  const storage = scope.chrome?.storage?.local;
+  if (!storage || scope.fixtureSubmitReservationPending) return false;
+  scope.fixtureSubmitReservationPending = true;
+  const prefix = "fixture-submit-attempt-";
+  const key = `${prefix}${input.operationId}`;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const persist = async () => {
+    try {
+      const entries = await storage.get(null);
+      const keys = Object.keys(entries).filter(entry => entry.startsWith(prefix));
+      if (keys.length >= 10_000 || keys.some(entry => !identifier.test(entry.slice(prefix.length)) || entries[entry] !== true)
+        || Object.hasOwn(entries, key) || input.expiresAt <= Date.now()) return false;
+      await storage.set({ [key]: true });
+      if (input.expiresAt <= Date.now()) return false;
+      const written = await storage.get(key);
+      return input.expiresAt > Date.now() && written[key] === true;
+    } catch {
+      return false;
+    } finally {
+      scope.fixtureSubmitReservationPending = false;
+    }
+  };
+  try {
+    return await Promise.race([persist(), new Promise<boolean>(resolve => {
+      timer = setTimeout(() => resolve(false), Math.max(0, input.expiresAt - Date.now()));
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function submitFixtureDraft(input: {
   expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number
 }): FixtureSubmit {
