@@ -56,6 +56,16 @@ export const fixtureFillResultSchema = z.discriminatedUnion("ok", [
     "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "SUBMIT_UNAVAILABLE", "FILL_UNAVAILABLE", "FILL_UNCERTAIN"]) })
 ]);
 export type FixtureFillResult = z.infer<typeof fixtureFillResultSchema>;
+export const geminiFillResultSchema = z.discriminatedUnion("ok", [
+  z.strictObject({ ok: z.literal(true), editor: z.literal("contenteditable") }),
+  z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
+    "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "FILL_UNAVAILABLE", "FILL_UNCERTAIN"]) })
+]);
+export type GeminiFillResult = z.infer<typeof geminiFillResultSchema>;
+export const geminiFillStatusSchema = z.discriminatedUnion("ok", [
+  geminiFillResultSchema.options[0].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() }),
+  geminiFillResultSchema.options[1].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() })
+]);
 export const fixtureFillStatusSchema = z.discriminatedUnion("ok", [
   fixtureFillResultSchema.options[0].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() }),
   fixtureFillResultSchema.options[1].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() })
@@ -63,7 +73,7 @@ export const fixtureFillStatusSchema = z.discriminatedUnion("ok", [
 export const fixtureDraftFillStateSchema = z.discriminatedUnion("state", [
   z.strictObject({ state: z.literal("fill_approved"), expiresAt: z.number().int().safe() }),
   z.strictObject({ state: z.literal("filling"), startedAt: z.number().int().safe(), expiresAt: z.number().int().safe() }),
-  z.strictObject({ state: z.literal("filled"), completedAt: z.number().int().safe(), editor: z.enum(["textarea", "rich"]) }),
+  z.strictObject({ state: z.literal("filled"), completedAt: z.number().int().safe(), editor: z.enum(["textarea", "rich", "contenteditable"]) }),
   z.strictObject({ state: z.literal("failed"), completedAt: z.number().int().safe(), code: z.enum(["TARGET_CHANGED",
     "UNSUPPORTED_MESSAGE_TEXT", "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "SUBMIT_UNAVAILABLE", "FILL_UNAVAILABLE"]) }),
   z.strictObject({ state: z.literal("uncertain"), completedAt: z.number().int().safe() })

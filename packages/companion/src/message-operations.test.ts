@@ -8,7 +8,8 @@ import { test } from "node:test";
 import { MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
   MAX_PREPARED_REVIEWS, MAX_RECORDED_PREPARED_MESSAGES, openPrivateOperationDatabase, PreparedMessageOperations,
   PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS, FIXTURE_REVIEW_APPROVAL_TTL_MS,
-  FIXTURE_PREFLIGHT_TIMEOUT_MS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS }
+  FIXTURE_PREFLIGHT_TIMEOUT_MS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
+  fixtureFillResultSchema, fixtureDraftFillStateSchema, geminiFillResultSchema, geminiFillStatusSchema }
   from "./message-operations.js";
 import { PendingConnectionRequests, type FixtureTarget } from "./pending-connections.js";
 
@@ -330,6 +331,27 @@ test("isolated Gemini review and fill approval honor caps, expiry and authority 
       ledger.disconnect(owner);
       database.close();
     }
+  }
+});
+
+test("isolated Gemini fill result schemas accept only fixed no-send outcomes", () => {
+  assert.equal(geminiFillResultSchema.safeParse({ ok: true, editor: "contenteditable" }).success, true);
+  for (const editor of ["textarea", "rich", "other"]) {
+    assert.equal(geminiFillResultSchema.safeParse({ ok: true, editor }).success, false);
+  }
+  assert.equal(fixtureFillResultSchema.safeParse({ ok: true, editor: "contenteditable" }).success, false);
+  for (const code of ["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT", "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT",
+    "FILL_UNAVAILABLE", "FILL_UNCERTAIN"]) assert.equal(geminiFillResultSchema.safeParse({ ok: false, code }).success, true);
+  for (const extra of [{ activated: true }, { sent: true }, { delivered: true }, { retryAllowed: true }, { text: "Private draft" }]) {
+    assert.equal(geminiFillResultSchema.safeParse({ ok: true, editor: "contenteditable", ...extra }).success, false);
+  }
+  assert.equal(geminiFillResultSchema.safeParse({ ok: false, code: "unknown" }).success, false);
+  const status = { ok: true, editor: "contenteditable", operationId: "a66b3997-9d43-4554-8399-267d1fe9f75c", completedAt: 2001 };
+  assert.equal(geminiFillStatusSchema.safeParse(status).success, true);
+  assert.equal(geminiFillStatusSchema.safeParse({ ...status, completedAt: Infinity }).success, false);
+  assert.equal(geminiFillStatusSchema.safeParse({ ...status, operationId: "invalid" }).success, false);
+  for (const editor of ["textarea", "rich", "contenteditable"]) {
+    assert.equal(fixtureDraftFillStateSchema.safeParse({ state: "filled", completedAt: 2001, editor }).success, true);
   }
 });
 
