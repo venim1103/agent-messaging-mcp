@@ -122,6 +122,42 @@ test("read-only Gemini draft inspection refuses unsafe composers without editing
     assert.deepEqual(await inspect(), { ok: false, code: "DRAFT_CHANGED" });
     assert.deepEqual(await inspect({ expectedUrl, text, draftMode: "prepared" }), { ok: true, editor: "contenteditable" });
     assert.deepEqual(await inspect({ expectedUrl, text: `${text} `, draftMode: "prepared" }), { ok: false, code: "DRAFT_CHANGED" });
+    for (const scenario of ["ready", "disabled", "fieldset-disabled", "inert", "hidden", "transparent", "wrong-type", "duplicate", "outside-main", "timeline", "blocked", "aria-disabled", "stop-control"]) {
+      await page.reload();
+      await page.locator("[contenteditable]").evaluate((editor, text) => { editor.innerText = text; }, text);
+      await page.locator("button").evaluate((button, scenario) => {
+        button.disabled = false;
+        button.type = "submit";
+        button.removeAttribute("class");
+        const form = button.parentElement;
+        form.before(...form.children);
+        form.remove();
+        if (scenario === "disabled") button.disabled = true;
+        if (scenario === "fieldset-disabled") {
+          const fieldset = document.createElement("fieldset");
+          fieldset.disabled = true;
+          button.before(fieldset);
+          fieldset.append(button);
+        }
+        if (scenario === "inert") button.setAttribute("inert", "");
+        if (scenario === "hidden") button.hidden = true;
+        if (scenario === "transparent") button.style.opacity = "0";
+        if (scenario === "wrong-type") button.type = "button";
+        if (scenario === "duplicate") button.parentElement.append(button.cloneNode(true));
+        if (scenario === "outside-main") document.body.append(button);
+        if (scenario === "timeline") document.querySelector("infinite-scroller").append(button);
+        if (scenario === "aria-disabled") button.setAttribute("aria-disabled", "true");
+        if (scenario === "stop-control") button.setAttribute("aria-label", "Stop response");
+        if (scenario === "blocked") {
+          const rect = button.getBoundingClientRect();
+          const overlay = document.createElement("div");
+          overlay.style.cssText = `position:fixed;left:${rect.left}px;top:${rect.top}px;width:${rect.width}px;height:${rect.height}px;background:white;z-index:100`;
+          document.body.append(overlay);
+        }
+      }, scenario);
+      assert.deepEqual(await inspect({ expectedUrl, text, draftMode: "prepared", checkSubmit: true }),
+        scenario === "ready" ? { ok: true, editor: "contenteditable" } : { ok: false, code: "SUBMIT_UNAVAILABLE" }, scenario);
+    }
     for (const attribute of ["inert", "aria-hidden", "aria-disabled", "aria-readonly"]) {
       await page.reload();
       await page.locator("form").evaluate((form, attribute) => form.setAttribute(attribute, "true"), attribute);

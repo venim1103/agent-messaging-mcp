@@ -1,9 +1,9 @@
 export type GeminiRenderedMessage = { direction: "incoming" | "outgoing"; text: string };
 
-export function inspectGeminiDraft(input: { expectedUrl: string; text: string; draftMode?: "empty" | "prepared" }):
+export function inspectGeminiDraft(input: { expectedUrl: string; text: string; draftMode?: "empty" | "prepared"; checkSubmit?: boolean }):
   { ok: true; editor: "contenteditable" } | { ok: false;
-    code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" } {
-  const failed = (code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED") =>
+    code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE" } {
+  const failed = (code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE") =>
     ({ ok: false as const, code });
   if (!input || window.top !== window || document.visibilityState !== "visible"
     || location.href !== input.expectedUrl || location.origin !== "https://gemini.google.com") return failed("TARGET_CHANGED");
@@ -13,7 +13,8 @@ export function inspectGeminiDraft(input: { expectedUrl: string; text: string; d
     || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return failed("TARGET_CHANGED");
   if (typeof input.text !== "string" || input.text.length > 2048
     || new TextEncoder().encode(input.text).length > 4000 || !input.text.trim()
-    || (input.draftMode !== undefined && input.draftMode !== "empty" && input.draftMode !== "prepared")) {
+    || (input.draftMode !== undefined && input.draftMode !== "empty" && input.draftMode !== "prepared")
+    || (input.checkSubmit !== undefined && typeof input.checkSubmit !== "boolean")) {
     return failed("UNSUPPORTED_MESSAGE_TEXT");
   }
   const visible = (element: HTMLElement) => element.getClientRects().length > 0
@@ -32,19 +33,29 @@ export function inspectGeminiDraft(input: { expectedUrl: string; text: string; d
     || editor.closest("[inert], [aria-hidden=true], [aria-disabled=true], [aria-readonly=true]")
     || editor.parentElement?.closest("[contenteditable]")
     || editor.querySelector("[contenteditable], input, textarea, [role=textbox]")) return failed("COMPOSER_UNAVAILABLE");
-  for (let ancestor: HTMLElement | null = editor; ancestor; ancestor = ancestor.parentElement) {
-    const style = getComputedStyle(ancestor);
-    if (style.visibility !== "visible" || Number(style.opacity) === 0) return failed("COMPOSER_UNAVAILABLE");
-  }
-  const rect = editor.getBoundingClientRect();
-  const centerX = rect.left + rect.width / 2;
-  const centerY = rect.top + rect.height / 2;
-  if (rect.width <= 0 || rect.height <= 0 || centerX < 0 || centerY < 0
-    || centerX >= innerWidth || centerY >= innerHeight) return failed("COMPOSER_UNAVAILABLE");
-  const hit = document.elementFromPoint(centerX, centerY);
-  if (!hit || (hit !== editor && !editor.contains(hit))) return failed("COMPOSER_UNAVAILABLE");
+  const unobstructed = (element: HTMLElement) => {
+    for (let ancestor: HTMLElement | null = element; ancestor; ancestor = ancestor.parentElement) {
+      const style = getComputedStyle(ancestor);
+      if (style.visibility !== "visible" || Number(style.opacity) === 0) return false;
+    }
+    const rect = element.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    if (rect.width <= 0 || rect.height <= 0 || centerX < 0 || centerY < 0
+      || centerX >= innerWidth || centerY >= innerHeight) return false;
+    const hit = document.elementFromPoint(centerX, centerY);
+    return Boolean(hit && (hit === element || element.contains(hit)));
+  };
+  if (!unobstructed(editor)) return failed("COMPOSER_UNAVAILABLE");
   if (input.draftMode === "prepared" ? editor.innerText !== input.text
     : Boolean(editor.textContent?.length || editor.innerText.trim())) return failed("DRAFT_CHANGED");
+  if (input.checkSubmit) {
+    const controls = [...document.querySelectorAll<HTMLButtonElement>('button[aria-label="Send message"]')].filter(visible);
+    const control = controls.length === 1 ? controls[0] : undefined;
+    if (!control || !region.contains(control) || timelines[0]!.contains(control) || control.type !== "submit"
+      || control.matches(":disabled") || control.closest("[inert], [aria-hidden=true], [aria-disabled=true]")
+      || !unobstructed(control)) return failed("SUBMIT_UNAVAILABLE");
+  }
   return { ok: true, editor: "contenteditable" };
 }
 
