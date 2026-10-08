@@ -103,7 +103,7 @@ type PreparedMessage<TargetLabel extends "fixture-alpha" | "gemini" = "fixture-a
   expiresAt: number;
   preview: Readonly<{ target: TargetLabel; text: string }>;
 }>;
-type PreparedReview = Readonly<Pick<PreparedMessage, "operationId" | "expiresAt" | "preview"> & {
+type PreparedReview<TargetLabel extends "fixture-alpha" | "gemini" = "fixture-alpha"> = Readonly<Pick<PreparedMessage<TargetLabel>, "operationId" | "expiresAt" | "preview"> & {
   reviewId: string
 }>;
 type FixtureDispatchBaseline = Readonly<{
@@ -337,6 +337,115 @@ export class PreparedMessageOperations {
     }
     return Object.freeze({ operationId, connectionId, state: "awaiting_approval", expiresAt,
       preview: Object.freeze({ target: label, text }) });
+  }
+
+  private sameGeminiTarget(left: GeminiTarget, right: GeminiTarget): boolean {
+    return left.origin === right.origin && left.conversationId === right.conversationId && left.url === right.url
+      && left.tabId === right.tabId && left.documentId === right.documentId;
+  }
+
+  listGeminiReviews(target: GeminiTarget, now = Date.now()): Readonly<{
+    reviews: ReadonlyArray<PreparedReview<"gemini">>; hasMore: boolean
+  }> {
+    this.discardExpired(now);
+    const reviews: Omit<PreparedReview<"gemini">, "reviewId">[] = [];
+    for (const [operationId, operation] of this.geminiContents) {
+      if (this.approvals.has(operationId) || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?")
+        .get(operationId) || !this.sameGeminiTarget(operation.target, target)) continue;
+      this.reviewTokens.delete(operationId);
+      const live = this.requests.getGeminiTarget(operation.owner, operation.connectionId, now);
+      if (!live || !this.sameGeminiTarget(live, target)) {
+        this.release(operationId);
+        continue;
+      }
+      reviews.push(Object.freeze({ operationId, expiresAt: operation.expiresAt,
+        preview: Object.freeze({ target: "gemini", text: operation.text }) }));
+    }
+    return Object.freeze({ reviews: Object.freeze(reviews.slice(-MAX_PREPARED_REVIEWS).reverse().map(review => {
+      const reviewId = randomUUID();
+      this.reviewTokens.set(review.operationId, reviewId);
+      return Object.freeze({ ...review, reviewId });
+    })), hasMore: reviews.length > MAX_PREPARED_REVIEWS });
+  }
+
+  approveGeminiReview(target: GeminiTarget, operationId: string, reviewId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.geminiContents.get(operationId);
+    const live = operation && this.requests.getGeminiTarget(operation.owner, operation.connectionId, now);
+    if (!operation || !live || this.approvals.has(operationId)
+      || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?").get(operationId)
+      || typeof reviewId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(reviewId)
+      || this.reviewTokens.get(operationId) !== reviewId || !this.sameGeminiTarget(operation.target, target)
+      || !this.sameGeminiTarget(live, target)) throw new Error("REVIEW_UNAVAILABLE");
+    this.reviewTokens.delete(operationId);
+    const approval = Object.freeze({ operationId, state: "approved" as const, approvedAt: now,
+      expiresAt: Math.min(operation.expiresAt, now + FIXTURE_REVIEW_APPROVAL_TTL_MS) });
+    this.approvals.set(operationId, approval);
+    return approval;
+  }
+
+  listGeminiFillReviews(target: GeminiTarget, now = Date.now()) {
+    this.discardExpired(now);
+    const reviews: PreparedReview<"gemini">[] = [];
+    for (const [operationId, operation] of this.geminiContents) {
+      if (!this.sameGeminiTarget(operation.target, target)) continue;
+      this.fillReviewTokens.delete(operationId);
+      const live = this.requests.getGeminiTarget(operation.owner, operation.connectionId, now);
+      if (!live || !this.sameGeminiTarget(live, target)) {
+        this.release(operationId);
+        continue;
+      }
+      if (this.getOperation(operation.owner, operationId, now).state !== "approved"
+        || this.fillApprovals.has(operationId) || this.consumedFillApprovals.has(operationId)) continue;
+      const reviewId = randomUUID();
+      reviews.push(Object.freeze({ operationId, reviewId, expiresAt: this.approvals.get(operationId)!.expiresAt,
+        preview: Object.freeze({ target: "gemini", text: operation.text }) }));
+    }
+    const selected = reviews.slice(-MAX_PREPARED_REVIEWS).reverse();
+    for (const review of selected) this.fillReviewTokens.set(review.operationId,
+      Object.freeze({ reviewId: review.reviewId, expiresAt: review.expiresAt }));
+    return Object.freeze({ reviews: Object.freeze(selected), hasMore: reviews.length > MAX_PREPARED_REVIEWS });
+  }
+
+  approveGeminiFillReview(target: GeminiTarget, operationId: string, reviewId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.geminiContents.get(operationId);
+    const live = operation && this.requests.getGeminiTarget(operation.owner, operation.connectionId, now);
+    const approval = this.approvals.get(operationId);
+    const fillReview = this.fillReviewTokens.get(operationId);
+    if (!operation || !live || !approval || this.getOperation(operation.owner, operationId, now).state !== "approved"
+      || typeof reviewId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(reviewId)
+      || fillReview?.reviewId !== reviewId || fillReview.expiresAt <= now || this.fillApprovals.has(operationId)
+      || this.consumedFillApprovals.has(operationId) || !this.sameGeminiTarget(operation.target, target)
+      || !this.sameGeminiTarget(live, target)) throw new Error("FILL_REVIEW_UNAVAILABLE");
+    const consent = Object.freeze({ operationId, state: "fill_approved" as const, approvedAt: now,
+      expiresAt: Math.min(operation.expiresAt, approval.expiresAt, now + FIXTURE_REVIEW_APPROVAL_TTL_MS) });
+    this.fillReviewTokens.delete(operationId);
+    this.fillApprovals.set(operationId, consent);
+    return consent;
+  }
+
+  getGeminiFillAuthorization(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.geminiContents.get(operationId);
+    const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
+    const consent = this.fillApprovals.get(operationId);
+    if (!operation || operation.owner !== owner || !live || !this.sameGeminiTarget(operation.target, live)
+      || !consent || consent.expiresAt <= now || this.consumedFillApprovals.has(operationId)
+      || this.getOperation(owner, operationId, now).state !== "approved") return null;
+    return Object.freeze({ operationId, target: operation.target, text: operation.text, expiresAt: consent.expiresAt });
+  }
+
+  consumeGeminiFillApproval(owner: symbol, operationId: string, now = Date.now()) {
+    const authorization = this.getGeminiFillAuthorization(owner, operationId, now);
+    if (!authorization || this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
+      LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+      WHERE evidence.operation_id IS NULL LIMIT 1`).get()) return null;
+    this.fillApprovals.delete(operationId);
+    this.fillReviewTokens.delete(operationId);
+    this.consumedFillApprovals.add(operationId);
+    this.fillStates.set(operationId, Object.freeze({ state: "uncertain", completedAt: now }));
+    return authorization;
   }
 
   listFixtureReviews(target: FixtureTarget, now = Date.now()): Readonly<{

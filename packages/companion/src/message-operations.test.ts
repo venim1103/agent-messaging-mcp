@@ -150,6 +150,189 @@ test("isolated Gemini preparations share caps and lose authority on grant expiry
   }
 });
 
+test("isolated Gemini review and fill approval stay distinct, exact-target and provider-bound", () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const ledger = new PreparedMessageOperations(requests, database);
+  const owner = Symbol("isolated Gemini consent");
+  try {
+    const target = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
+      url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 3, documentId: "synthetic-gemini-document" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic no-send consent",
+      "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    const fixtureTarget = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: target.tabId, documentId: target.documentId };
+    const fixturePending = requests.create(owner, 2001);
+    const fixtureGrant = requests.approve(fixturePending.requestId, fixtureTarget, 2001)!;
+    const fixture = ledger.prepare(owner, fixtureGrant.connectionId, 1, "Synthetic fixture consent",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    const fixtureReview = ledger.listFixtureReviews(fixtureTarget, 2002).reviews[0]!;
+    const [review] = ledger.listGeminiReviews(target, 2002).reviews;
+    assert.ok(review);
+    assert.deepEqual(review.preview, prepared.preview);
+    assert.equal(ledger.getGeminiFillAuthorization(owner, prepared.operationId, 2002), null);
+    assert.deepEqual(ledger.listGeminiFillReviews(target, 2002), { reviews: [], hasMore: false });
+    for (const changed of [{ ...target, url: target.url.replace("hl=en", "hl=fr") }, { ...target, tabId: 4 },
+      { ...target, documentId: "other" }, { ...target, conversationId: "other" }]) {
+      assert.deepEqual(ledger.listGeminiReviews(changed, 2002), { reviews: [], hasMore: false });
+      assert.throws(() => ledger.approveGeminiReview(changed, prepared.operationId, review.reviewId, 2002), /REVIEW_UNAVAILABLE/);
+    }
+    const rotated = ledger.listGeminiReviews(target, 2003).reviews[0]!;
+    assert.notEqual(rotated.reviewId, review.reviewId);
+    assert.throws(() => ledger.approveGeminiReview(target, prepared.operationId, review.reviewId, 2003), /REVIEW_UNAVAILABLE/);
+    assert.throws(() => ledger.approveGeminiReview(target, fixture.operationId, fixtureReview.reviewId, 2003), /REVIEW_UNAVAILABLE/);
+    assert.throws(() => ledger.approveFixtureReview(fixtureTarget, prepared.operationId, rotated.reviewId, 2003), /REVIEW_UNAVAILABLE/);
+    const approval = ledger.approveGeminiReview(target, prepared.operationId, rotated.reviewId, 2003);
+    assert.equal(approval.expiresAt, 2003 + FIXTURE_REVIEW_APPROVAL_TTL_MS);
+    assert.equal(ledger.getOperation(owner, prepared.operationId, 2003).state, "approved");
+    assert.throws(() => ledger.approveGeminiReview(target, prepared.operationId, rotated.reviewId, 2003), /REVIEW_UNAVAILABLE/);
+    assert.deepEqual(ledger.listGeminiReviews(target, 2003), { reviews: [], hasMore: false });
+    ledger.approveFixtureReview(fixtureTarget, fixture.operationId, fixtureReview.reviewId, 2003);
+    const fixtureFill = ledger.listFixtureFillReviews(fixtureTarget, 2003).reviews[0]!;
+    const firstFill = ledger.listGeminiFillReviews(target, 2004).reviews[0]!;
+    const fill = ledger.listGeminiFillReviews(target, 2005).reviews[0]!;
+    assert.notEqual(firstFill.reviewId, fill.reviewId);
+    assert.throws(() => ledger.approveGeminiFillReview(target, prepared.operationId, firstFill.reviewId, 2005), /FILL_REVIEW_UNAVAILABLE/);
+    assert.throws(() => ledger.approveGeminiFillReview({ ...target, url: target.url.replace("hl=en", "hl=fr") },
+      prepared.operationId, fill.reviewId, 2005), /FILL_REVIEW_UNAVAILABLE/);
+    assert.throws(() => ledger.approveGeminiFillReview(target, fixture.operationId, fixtureFill.reviewId, 2005), /FILL_REVIEW_UNAVAILABLE/);
+    assert.throws(() => ledger.approveFixtureFillReview(fixtureTarget, prepared.operationId, fill.reviewId, 2005), /FILL_REVIEW_UNAVAILABLE/);
+    const consent = ledger.approveGeminiFillReview(target, prepared.operationId, fill.reviewId, 2005);
+    assert.equal(consent.expiresAt, approval.expiresAt);
+    assert.equal(ledger.getGeminiFillAuthorization(Symbol("foreign"), prepared.operationId, 2005), null);
+    assert.equal(ledger.getGeminiFillAuthorization(owner, fixture.operationId, 2005), null);
+    assert.equal(ledger.getFixtureFillAuthorization(owner, prepared.operationId, 2005), null);
+    assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2005), null);
+    assert.equal(ledger.consumeFixtureFillApproval(owner, prepared.operationId, 2005), null);
+    const authorization = ledger.consumeGeminiFillApproval(owner, prepared.operationId, 2006);
+    assert.deepEqual(authorization, { operationId: prepared.operationId, target, text: prepared.preview.text, expiresAt: consent.expiresAt });
+    assert.equal(ledger.consumeGeminiFillApproval(owner, prepared.operationId, 2006), null);
+    assert.deepEqual(ledger.listGeminiFillReviews(target, 2006), { reviews: [], hasMore: false });
+    const status = ledger.getOperation(owner, prepared.operationId, 2006);
+    assert.ok("draftFill" in status);
+    assert.equal(status.draftFill?.state, "uncertain");
+    ledger.approveFixtureFillReview(fixtureTarget, fixture.operationId, fixtureFill.reviewId, 2006);
+    assert.ok(ledger.getFixtureFillAuthorization(owner, fixture.operationId, 2006));
+    assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2006), null);
+    assert.deepEqual(ledger.listFixtureDispatchAttempts(2006), []);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("isolated Gemini review and fill approval honor caps, expiry and authority loss", () => {
+  for (const outcome of ["bounds", "invalid-token", "preparation-expired", "approval-expired", "grant-expired",
+    "live-target-changed", "disconnect", "restart", "unresolved-dispatch"]) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol(outcome);
+    try {
+      const target = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
+        url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 3, documentId: "synthetic-gemini-document" };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+      const now = outcome === "grant-expired" ? grant.expiresAt - 10 : 2001;
+      const key = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+      const text = "Synthetic bounded no-send review";
+      const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, text, key, now);
+      if (outcome === "bounds") {
+        for (let index = 1; index < MAX_PREPARED_REVIEWS + 2; index++) ledger.prepareGemini(owner, grant.connectionId,
+          1, text, `b66b3997-9d43-4554-8399-${index.toString(16).padStart(12, "0")}`, now + index);
+        const first = ledger.listGeminiReviews(target, now + 20);
+        assert.equal(first.reviews.length, MAX_PREPARED_REVIEWS);
+        assert.equal(first.hasMore, true);
+        assert.equal(JSON.stringify(first).includes(target.url), false);
+        const rotated = ledger.listGeminiReviews(target, now + 21);
+        assert.throws(() => ledger.approveGeminiReview(target, first.reviews[0]!.operationId,
+          first.reviews[0]!.reviewId, now + 21), /REVIEW_UNAVAILABLE/);
+        for (const review of rotated.reviews) ledger.approveGeminiReview(target, review.operationId, review.reviewId, now + 21);
+        for (const review of ledger.listGeminiReviews(target, now + 22).reviews)
+          ledger.approveGeminiReview(target, review.operationId, review.reviewId, now + 22);
+        const fills = ledger.listGeminiFillReviews(target, now + 23);
+        assert.equal(fills.reviews.length, MAX_PREPARED_REVIEWS);
+        assert.equal(fills.hasMore, true);
+        for (const review of fills.reviews) ledger.approveGeminiFillReview(target, review.operationId, review.reviewId, now + 23);
+        const remaining = ledger.listGeminiFillReviews(target, now + 24);
+        assert.equal(remaining.reviews.length, 2);
+        assert.equal(remaining.hasMore, false);
+        assert.equal(ledger.getGeminiFillAuthorization(owner, prepared.operationId, now + 24), null);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+        continue;
+      }
+      const review = ledger.listGeminiReviews(target, now + 1).reviews[0]!;
+      if (outcome === "preparation-expired") {
+        assert.throws(() => ledger.approveGeminiReview(target, prepared.operationId, review.reviewId, prepared.expiresAt), /REVIEW_UNAVAILABLE/);
+        assert.deepEqual(ledger.listGeminiFillReviews(target, prepared.expiresAt), { reviews: [], hasMore: false });
+        assert.equal(ledger.getGeminiFillAuthorization(owner, prepared.operationId, prepared.expiresAt), null);
+        continue;
+      }
+      if (outcome === "invalid-token") assert.throws(() => ledger.approveGeminiReview(target, prepared.operationId, key,
+        now + 2), /REVIEW_UNAVAILABLE/);
+      const approval = ledger.approveGeminiReview(target, prepared.operationId, review.reviewId, now + 2);
+      const fill = ledger.listGeminiFillReviews(target, now + 3).reviews[0]!;
+      if (outcome === "invalid-token") assert.throws(() => ledger.approveGeminiFillReview(target, prepared.operationId,
+        review.reviewId, now + 4), /FILL_REVIEW_UNAVAILABLE/);
+      ledger.approveGeminiFillReview(target, prepared.operationId, fill.reviewId, now + 4);
+      if (outcome === "approval-expired" || outcome === "grant-expired") {
+        const expiredAt = outcome === "grant-expired" ? grant.expiresAt : approval.expiresAt;
+        assert.equal(ledger.getGeminiFillAuthorization(owner, prepared.operationId, expiredAt), null);
+        assert.equal(ledger.consumeGeminiFillApproval(owner, prepared.operationId, expiredAt), null);
+        assert.throws(() => ledger.approveGeminiFillReview(target, prepared.operationId, fill.reviewId, expiredAt), /FILL_REVIEW_UNAVAILABLE/);
+        assert.equal(ledger.getOperation(owner, prepared.operationId, expiredAt).state,
+          outcome === "grant-expired" ? "stale" : "awaiting_approval");
+      } else if (outcome === "live-target-changed") {
+        const original = requests.getGeminiTarget.bind(requests);
+        requests.getGeminiTarget = (identity, connectionId, time) => {
+          const selected = original(identity, connectionId, time);
+          return selected ? { ...selected, url: selected.url.replace("hl=en", "hl=fr") } : null;
+        };
+        try {
+          assert.equal(ledger.getGeminiFillAuthorization(owner, prepared.operationId, now + 5), null);
+          assert.equal(ledger.consumeGeminiFillApproval(owner, prepared.operationId, now + 5), null);
+          assert.deepEqual(ledger.listGeminiFillReviews(target, now + 5), { reviews: [], hasMore: false });
+        } finally {
+          requests.getGeminiTarget = original;
+        }
+        assert.throws(() => ledger.prepareGemini(owner, grant.connectionId, 1, text, key, now + 6), /OPERATION_UNAVAILABLE/);
+      } else if (outcome === "disconnect") {
+        ledger.disconnect(owner);
+        assert.equal(ledger.getGeminiFillAuthorization(owner, prepared.operationId, now + 5), null);
+        assert.throws(() => ledger.prepareGemini(owner, grant.connectionId, 1, text, key, now + 5), /OPERATION_UNAVAILABLE/);
+      } else if (outcome === "restart") {
+        const restarted = new PreparedMessageOperations(requests, database);
+        assert.equal(restarted.getGeminiFillAuthorization(owner, prepared.operationId, now + 5), null);
+        assert.deepEqual(restarted.listGeminiReviews(target, now + 5), { reviews: [], hasMore: false });
+        assert.throws(() => restarted.prepareGemini(owner, grant.connectionId, 1, text, key, now + 5), /OPERATION_UNAVAILABLE/);
+        restarted.disconnect(owner);
+      } else if (outcome === "unresolved-dispatch") {
+        const fixturePending = requests.create(owner, now + 5);
+        const fixtureGrant = requests.approve(fixturePending.requestId, { origin: "http://127.0.0.1:8787",
+          conversationId: "fixture-alpha", tabId: 4, documentId: "synthetic-fixture-document" }, now + 5)!;
+        const fixture = ledger.prepare(owner, fixtureGrant.connectionId, 1, text,
+          "b66b3997-9d43-4554-8399-267d1fe9f75c", now + 5);
+        database.prepare("INSERT INTO message_dispatch_attempts (operation_id, started_at, state) VALUES (?, ?, 'unknown')")
+          .run(fixture.operationId, now + 5);
+        assert.ok(ledger.getGeminiFillAuthorization(owner, prepared.operationId, now + 5));
+        assert.equal(ledger.consumeGeminiFillApproval(owner, prepared.operationId, now + 5), null);
+      } else {
+        assert.ok(ledger.consumeGeminiFillApproval(owner, prepared.operationId, now + 5));
+        assert.equal(ledger.consumeGeminiFillApproval(owner, prepared.operationId, now + 5), null);
+      }
+      assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, now + 6), null);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count,
+        outcome === "unresolved-dispatch" ? 1 : 0);
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
 test("durable dispatch jobs offer once and never regain authority after uncertain outcomes", async () => {
   for (const outcome of ["observed", "no_evidence", "failure", "wrong_target", "expired", "disconnected", "restarted",
     "changed_before_issue", "gap_before_issue", "actual_timeout", "request_deadline"]) {
