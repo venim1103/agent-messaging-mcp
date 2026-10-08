@@ -518,6 +518,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     };
     await popup.getByRole("button", { name: "Review fixture drafts" }).waitFor({ state: "visible" });
     const reviewArgs = { tabId: selected.tabId, expectedUrl: url };
+    assert.equal(await popup.locator("#view-fixture-send-reviews").count(), 1);
     const before = await popup.evaluate((args) => chrome.runtime.sendMessage({
       kind: "list_fixture_prepared_reviews", ...args
     }), reviewArgs);
@@ -527,11 +528,14 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       { selector: "#view-fixture-reviews", outcome: "empty" },
       { selector: "#view-fixture-fill-reviews", outcome: "empty" },
       { selector: "#view-fixture-reviews", outcome: "refused" },
-      { selector: "#view-fixture-fill-reviews", outcome: "rejected" }
+      { selector: "#view-fixture-fill-reviews", outcome: "rejected" },
+      { selector: "#view-fixture-send-reviews", outcome: "empty" },
+      { selector: "#view-fixture-send-reviews", outcome: "refused" },
+      { selector: "#view-fixture-send-reviews", outcome: "rejected" }
     ]) {
       await popup.evaluate(() => {
         globalThis.fixtureOriginalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
-        chrome.runtime.sendMessage = (...args) => ["list_fixture_prepared_reviews", "list_fixture_fill_reviews"]
+        chrome.runtime.sendMessage = (...args) => ["list_fixture_prepared_reviews", "list_fixture_fill_reviews", "list_fixture_send_reviews"]
           .includes(args[0]?.kind) ? new Promise((resolve, reject) => {
             globalThis.fixtureResolveReview = resolve;
             globalThis.fixtureRejectReview = reject;
@@ -586,6 +590,10 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       kind: "list_fixture_fill_reviews", ...args
     }), reviewArgs);
     assert.deepEqual(prematureFill, { ok: true, reviews: [], hasMore: false });
+    const prematureSend = await popup.evaluate((args) => chrome.runtime.sendMessage({
+      kind: "list_fixture_send_reviews", ...args
+    }), reviewArgs);
+    assert.deepEqual(prematureSend, { ok: true, reviews: [], hasMore: false });
     await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
     await waitForPopupResult(popup.locator("#fixture-reviews pre"));
     assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
@@ -646,6 +654,34 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     assert.equal(filled.payload.editor, "textarea");
     assert.equal(await fixture.locator("#message").inputValue(), text);
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    const sendReviews = await relay.listFixtureSendReviews(target);
+    assert.equal(sendReviews.kind, "fixture_send_reviews");
+    const sendReviewId = sendReviews.payload.reviews[0].reviewId;
+    assert.deepEqual((await relay.approveFixtureFillReview(target, prepared.payload.operationId,
+      sendReviewId)).payload, { code: "FILL_REVIEW_UNAVAILABLE" });
+    await popup.evaluate(() => document.querySelector("#view-fixture-send-reviews").click());
+    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
+    assert.equal(await popup.locator("#fixture-review-heading").textContent(), "Fixture send consent");
+    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
+    assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
+    assert.equal(await popup.getByRole("button", { name: "Approve fixture send", exact: true }).count(), 1);
+    assert.equal(await popup.getByRole("button", { name: "Allow draft fill (no send)", exact: true }).count(), 0);
+    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+    await waitForPopupResult(popup.getByText(`Approved fixture send ${prepared.payload.operationId}. No message was sent.`));
+    assert.equal(await fixture.locator("#message").inputValue(), text);
+    assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
+    assert.equal((await facade.getPreparedOperation(prepared.payload.operationId)).payload.state, "approved");
+    const staleSendReview = await popup.evaluate((args) => chrome.runtime.sendMessage({
+      kind: "approve_fixture_send_review", ...args
+    }), { ...reviewArgs, operationId: prepared.payload.operationId, reviewId: sendReviewId });
+    assert.equal(staleSendReview.ok, false);
+    const { DatabaseSync } = await import("node:sqlite");
+    const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
+    try {
+      assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, 0);
+    } finally {
+      journal.close();
+    }
     assert.deepEqual((await facade.fillFixtureDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
     await fixture.locator("#message").fill("");
     assert.deepEqual((await facade.fillFixtureDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });

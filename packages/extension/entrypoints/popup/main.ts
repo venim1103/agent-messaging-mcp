@@ -32,6 +32,7 @@ const inspectButton = document.querySelector<HTMLButtonElement>("#inspect");
 const pendingButton = document.querySelector<HTMLButtonElement>("#view-pending");
 const fixtureReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-reviews");
 const fixtureFillReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-fill-reviews");
+const fixtureSendReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-send-reviews");
 const fixtureInputButton = document.querySelector<HTMLButtonElement>("#test-fixture-input");
 const geminiDraftReview = document.querySelector<HTMLElement>("#gemini-draft-review");
 const geminiDraftPreview = document.querySelector<HTMLElement>("#gemini-draft-text");
@@ -100,7 +101,7 @@ function inspectGeminiStructure(): GeminiPreview | null {
   };
 }
 
-if (!inspectButton || !pendingButton || !fixtureReviewButton || !fixtureFillReviewButton || !fixtureInputButton || !geminiDraftReview
+if (!inspectButton || !pendingButton || !fixtureReviewButton || !fixtureFillReviewButton || !fixtureSendReviewButton || !fixtureInputButton || !geminiDraftReview
   || !geminiDraftPreview || !geminiDraftButton || !status || !result || !fixtureDocumentStatus || !pendingResult
   || !pendingTarget || !pendingRequests || !fixtureReviewResult || !fixtureReviewHeading || !fixtureReviews || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
@@ -145,6 +146,7 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   pendingButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
   fixtureReviewButton.hidden = url?.origin !== fixtureOrigin;
   fixtureFillReviewButton.hidden = url?.origin !== fixtureOrigin;
+  fixtureSendReviewButton.hidden = url?.origin !== fixtureOrigin;
   if (tab?.id != null && tab.url && url?.origin === fixtureOrigin) {
     selectedFixtureTab = { id: tab.id, url: tab.url };
   }
@@ -158,12 +160,23 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   }
 });
 
-const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
+const fixtureReviewCommands = {
+  review: { heading: "Prepared fixture drafts", list: "list_fixture_prepared_reviews",
+    approve: "approve_fixture_review", button: "Approve draft (no send)" },
+  fill: { heading: "Fixture draft-fill consent", list: "list_fixture_fill_reviews",
+    approve: "approve_fixture_fill_review", button: "Allow draft fill (no send)" },
+  send: { heading: "Fixture send consent", list: "list_fixture_send_reviews",
+    approve: "approve_fixture_send_review", button: "Approve fixture send" }
+} as const;
+
+const reviewFixtureDrafts = async (purpose: keyof typeof fixtureReviewCommands) => {
+  const commands = fixtureReviewCommands[purpose];
   fixtureReviewButton.disabled = true;
   fixtureFillReviewButton.disabled = true;
+  fixtureSendReviewButton.disabled = true;
   clearFixtureReviews();
   const reviewGeneration = fixtureReviewGeneration;
-  fixtureReviewHeading.textContent = purpose === "fill" ? "Fixture draft-fill consent" : "Prepared fixture drafts";
+  fixtureReviewHeading.textContent = commands.heading;
   status.textContent = "Checking the selected fixture draft...";
   try {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -173,7 +186,7 @@ const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
       return;
     }
     const response = await browser.runtime.sendMessage({
-      kind: purpose === "fill" ? "list_fixture_fill_reviews" : "list_fixture_prepared_reviews",
+      kind: commands.list,
       tabId: tab.id, expectedUrl: selectedFixtureTab.url }) as FixtureReviewsResult;
     if (reviewGeneration !== fixtureReviewGeneration) return;
     if (!response.ok) {
@@ -190,7 +203,7 @@ const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
       text.textContent = review.preview.text;
       const approve = document.createElement("button");
       approve.type = "button";
-      approve.textContent = purpose === "fill" ? "Allow draft fill (no send)" : "Approve draft (no send)";
+      approve.textContent = commands.button;
       approve.addEventListener("click", async () => {
         approve.disabled = true;
         try {
@@ -203,7 +216,7 @@ const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
             return;
           }
           const approved = await browser.runtime.sendMessage({
-            kind: purpose === "fill" ? "approve_fixture_fill_review" : "approve_fixture_review",
+            kind: commands.approve,
             tabId: tab.id, expectedUrl: selectedFixtureTab.url, operationId: review.operationId,
             reviewId: review.reviewId }) as FixtureReviewApprovalResult;
           if (!approved.ok) {
@@ -212,7 +225,9 @@ const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
             return;
           }
           row.remove();
-          status.textContent = purpose === "fill"
+          status.textContent = purpose === "send"
+            ? `Approved fixture send ${approved.operationId}. No message was sent.`
+            : purpose === "fill"
             ? `Allowed fixture draft fill ${approved.operationId}. Editor unchanged. No message was sent.`
             : `Approved fixture draft ${approved.operationId}. No message was sent.`;
         } catch {
@@ -240,10 +255,12 @@ const reviewFixtureDrafts = async (purpose: "review" | "fill") => {
   } finally {
     fixtureReviewButton.disabled = false;
     fixtureFillReviewButton.disabled = false;
+    fixtureSendReviewButton.disabled = false;
   }
 };
 fixtureReviewButton.addEventListener("click", () => { void reviewFixtureDrafts("review"); });
 fixtureFillReviewButton.addEventListener("click", () => { void reviewFixtureDrafts("fill"); });
+fixtureSendReviewButton.addEventListener("click", () => { void reviewFixtureDrafts("send"); });
 
 pendingButton.addEventListener("click", async () => {
   pendingButton.disabled = true;
