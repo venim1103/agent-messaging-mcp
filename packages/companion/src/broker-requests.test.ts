@@ -184,6 +184,30 @@ test("only the relay grants distinct fixture send consent after completed fill w
     assert.deepEqual(handleBrokerRequest(completion, "relay", relay, requests, 2009, operations).payload,
       { accepted: false });
     assert.deepEqual(handleBrokerRequest(checksRequest, "relay", relay, requests, 2009, operations).payload, { checks: [] });
+    const dispatchRequest = { ...envelope, kind: "dispatch_fixture_message", payload: { operationId, checkId: inspection.checkId } };
+    assert.equal(handleBrokerRequest(dispatchRequest, "facade", owner, requests, 2009, operations).kind,
+      "fixture_dispatch_authorized");
+    assert.deepEqual(handleBrokerRequest(dispatchRequest, "facade", stranger, requests, 2009, operations).payload,
+      { code: "DISPATCH_UNAVAILABLE" });
+    assert.deepEqual(handleBrokerRequest(dispatchRequest, "relay", relay, requests, 2009, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    for (const extra of [{ approved: true }, { text: "Changed" }, { target }, { recoveryToken: prepared.payload.recoveryToken }]) {
+      assert.throws(() => handleBrokerRequest({ ...dispatchRequest, payload: { ...dispatchRequest.payload, ...extra } },
+        "facade", owner, requests, 2009, operations));
+    }
+    const attemptsRequest = { ...envelope, kind: "list_fixture_dispatch_attempts", payload: {} };
+    assert.deepEqual(handleBrokerRequest(attemptsRequest, "facade", owner, requests, 2009, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(attemptsRequest, "relay", relay, requests, 2009, operations).payload, { attempts: [] });
+    const dispatchCompletion = { ...envelope, kind: "complete_fixture_dispatch", payload: {
+      target, operationId, attemptId: operationId, observation: { ok: true, editor: "textarea", activated: true }
+    } };
+    assert.deepEqual(handleBrokerRequest(dispatchCompletion, "facade", owner, requests, 2009, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(dispatchCompletion, "relay", relay, requests, 2009, operations).payload,
+      { accepted: false });
+    assert.throws(() => handleBrokerRequest({ ...dispatchCompletion, payload: { ...dispatchCompletion.payload,
+      observation: { ...dispatchCompletion.payload.observation, delivered: true } } }, "relay", relay, requests, 2009, operations));
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM message_dispatch_attempts").get() as { count: number }).count, 0);
     assert.throws(() => handleBrokerRequest({ ...envelope, kind: "record_fixture_dispatch_start", payload: { operationId } },
       "facade", owner, requests, 2009, operations));

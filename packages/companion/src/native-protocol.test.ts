@@ -19,6 +19,7 @@ import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parse
   parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeFixtureDispatchCheck, parseNativeFixtureDispatchChecks,
+  parseNativeFixtureDispatch, parseNativeFixtureDispatchAttempts,
   parseNativeFixtureReset, parseNativeFixtureRevocation,
   parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeGeminiSnapshot, parseNativePendingList,
@@ -65,6 +66,33 @@ test("native dispatch inspection accepts only bounded exact proof, never approva
     { ...denied, payload: { ...denied.payload, observation: { ok: false, code: "DRAFT_CHANGED", detail: "private" } } },
     { ...completion, kind: "dispatch_fixture_message" }, { ...completion, deadlineMs: now }
   ]) assert.throws(() => parseNativeFixtureDispatchCheck(invalid, now), /Invalid native fixture dispatch check/);
+});
+
+test("native dispatch completion carries only bounded activation metadata, never delivery or submit commands", () => {
+  const listing = { ...request, kind: "list_fixture_dispatch_attempts" };
+  assert.deepEqual(parseNativeFixtureDispatchAttempts(listing, now), listing);
+  for (const invalid of [{ ...listing, payload: { approved: true } }, { ...listing, payload: { selector: "button" } },
+    { ...listing, kind: "dispatch_fixture_message" }, { ...listing, deadlineMs: now },
+    { ...listing, deadlineMs: now + 30_001 }]) {
+    assert.throws(() => parseNativeFixtureDispatchAttempts(invalid, now), /Invalid native fixture dispatch attempt list/);
+  }
+  const completion = { ...request, kind: "complete_fixture_dispatch", payload: {
+    target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+      documentId: "CHROME-doc_opaque-42" }, operationId: request.requestId, attemptId: request.requestId,
+    observation: { ok: true, editor: "textarea", activated: true }
+  } };
+  assert.deepEqual(parseNativeFixtureDispatch(completion, now), completion);
+  const uncertain = { ...completion, payload: { ...completion.payload, observation: { ok: false, code: "DISPATCH_UNCERTAIN" } } };
+  assert.deepEqual(parseNativeFixtureDispatch(uncertain, now), uncertain);
+  for (const invalid of [
+    { ...completion, payload: { ...completion.payload, delivered: true } },
+    { ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, delivered: true } } },
+    { ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, activated: false } } },
+    { ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, text: "private" } } },
+    { ...uncertain, payload: { ...uncertain.payload, observation: { ok: false, code: "DISPATCH_UNCERTAIN", detail: "private" } } },
+    { ...completion, payload: { ...completion.payload, target: { ...completion.payload.target, origin: "https://gemini.google.com" } } },
+    { ...completion, kind: "dispatch_fixture_message" }, { ...completion, deadlineMs: now }
+  ]) assert.throws(() => parseNativeFixtureDispatch(invalid, now), /Invalid native fixture dispatch completion/);
 });
 
 test("native broker diagnostics disclose only exact fixed reasons, never private error contents", () => {
@@ -1091,6 +1119,24 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const [dispatchCheckReplay] = await exchangeFillReview({ ...dispatchCompletionRequest,
       deadlineMs: Date.now() + 10_000 }) as [{ kind: string; payload: { accepted: boolean } }];
     assert.equal(dispatchCheckReplay.payload.accepted, false);
+    assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, beforeSendReview.payload);
+    const attemptsEnvelope = { ...request, kind: "list_fixture_dispatch_attempts", payload: {},
+      deadlineMs: Date.now() + 10_000 };
+    const [unstartedAttempts] = await exchangeFillReview(attemptsEnvelope) as [{
+      kind: string; deadlineMs: number; payload: { attempts: unknown[] }
+    }];
+    assert.equal(unstartedAttempts.kind, "fixture_dispatch_attempts");
+    assert.equal(unstartedAttempts.deadlineMs, attemptsEnvelope.deadlineMs);
+    assert.deepEqual(unstartedAttempts.payload, { attempts: [] });
+    const completionEnvelope = { ...request, kind: "complete_fixture_dispatch", deadlineMs: Date.now() + 10_000,
+      payload: { target: sendTarget, operationId: prepared.payload.operationId, attemptId: prepared.payload.operationId,
+        observation: { ok: true, editor: "textarea", activated: true } } };
+    const [unstartedCompletion] = await exchangeFillReview(completionEnvelope) as [{
+      kind: string; deadlineMs: number; payload: { accepted: boolean }
+    }];
+    assert.equal(unstartedCompletion.kind, "fixture_dispatch_recorded");
+    assert.equal(unstartedCompletion.deadlineMs, completionEnvelope.deadlineMs);
+    assert.deepEqual(unstartedCompletion.payload, { accepted: false });
     assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, beforeSendReview.payload);
     fillHost.stdin.end();
     const [fillExit] = await reviewPortClose;

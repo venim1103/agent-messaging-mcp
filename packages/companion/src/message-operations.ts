@@ -27,6 +27,11 @@ export const fixtureDispatchResultSchema = z.discriminatedUnion("ok", [
     "DRAFT_CHANGED", "SUBMIT_UNAVAILABLE", "DISPATCH_UNAVAILABLE", "DISPATCH_UNCERTAIN"]) })
 ]);
 export type FixtureDispatchResult = z.infer<typeof fixtureDispatchResultSchema>;
+export const fixtureDispatchStatusSchema = z.discriminatedUnion("state", [
+  z.strictObject({ operationId: z.uuid(), state: z.literal("dispatch_uncertain"), startedAt: z.number().int().safe() }),
+  z.strictObject({ operationId: z.uuid(), state: z.literal("observed_in_ui"), startedAt: z.number().int().safe(),
+    observedAt: z.number().int().safe(), messageId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/) })
+]);
 export const fixtureDispatchCheckResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]),
     draftText: z.string().max(2048), selected: z.literal(true), writable: z.literal(true),
@@ -113,11 +118,7 @@ type FixtureDispatchCheck = Readonly<{
 type FixtureDispatchAuthorization = Readonly<{
   owner: symbol; operationId: string; target: FixtureTarget; text: string; startedAt: number; expiresAt: number
 }>;
-type FixtureDispatchStatus = Readonly<{
-  operationId: string; state: "dispatch_uncertain"; startedAt: number
-}> | Readonly<{
-  operationId: string; state: "observed_in_ui"; startedAt: number; observedAt: number; messageId: string
-}>;
+type FixtureDispatchStatus = Readonly<z.infer<typeof fixtureDispatchStatusSchema>>;
 type FixturePreflightStatus = z.infer<typeof fixturePreflightStatusSchema>;
 type PendingFixturePreflight = {
   owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number;
@@ -830,7 +831,9 @@ export class PreparedMessageOperations {
     });
   }
 
-  requestFixtureDispatch(owner: symbol, operationId: string, checkId: string, now = Date.now()) {
+  requestFixtureDispatch(owner: symbol, operationId: string, checkId: string, now = Date.now(),
+    deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) throw new Error("DISPATCH_UNAVAILABLE");
     const status = this.getOperation(owner, operationId, now);
     if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") throw new Error("DISPATCH_UNCERTAIN");
     if (status.state !== "approved") throw new Error("APPROVAL_REQUIRED");
@@ -838,11 +841,12 @@ export class PreparedMessageOperations {
     const started = this.recordFixtureDispatchStart(owner, operationId, now, checkId);
     const authorization = this.consumeFixtureDispatchAuthorization(owner, operationId, now);
     if (!authorization) throw new Error("DISPATCH_UNCERTAIN");
+    const expiresAt = Math.min(deadlineMs, authorization.expiresAt);
     let resolve!: PendingFixtureDispatch["resolve"];
     const result = new Promise<FixtureDispatchStatus>(done => { resolve = done; });
-    const timer = setTimeout(() => this.finishFixtureDispatch(operationId), authorization.expiresAt - now);
+    const timer = setTimeout(() => this.finishFixtureDispatch(operationId), expiresAt - now);
     this.dispatchJobs.set(operationId, { owner, operationId, target: authorization.target, text: authorization.text,
-      expiresAt: authorization.expiresAt, startedAt: started.startedAt, issued: false, timer, resolve });
+      expiresAt, startedAt: started.startedAt, issued: false, timer, resolve });
     return { operationId, result };
   }
 

@@ -392,9 +392,16 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     context = await launch();
     worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     assert.equal(new URL(worker.url()).hostname, extensionId);
+    const restartedPopup = await context.newPage();
+    await restartedPopup.goto(`chrome-extension://${extensionId}/popup.html`);
+    const restartedResponse = await restartedPopup.evaluate(() =>
+      chrome.runtime.sendMessage({ kind: "list_fixture_pending", tabId: 1 }));
+    assert.equal(restartedResponse?.ok, false, JSON.stringify(restartedResponse));
+    assert.notEqual(restartedResponse?.error, "Fixture grant reset unavailable; try again");
     await waitForStale(beforeBrowserRestart);
     assert.equal(await worker.evaluate(async () =>
       (await chrome.storage.session.get("fixture-reset-done"))["fixture-reset-done"]), true);
+    await restartedPopup.close();
 
     const trackedTab = await createSettledTab();
     const beforeTabClose = await grant(trackedTab.id);

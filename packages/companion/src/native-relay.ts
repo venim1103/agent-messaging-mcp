@@ -11,6 +11,7 @@ import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parse
   parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeFixtureDispatchCheck, parseNativeFixtureDispatchChecks,
+  parseNativeFixtureDispatch, parseNativeFixtureDispatchAttempts,
   parseNativeGeminiSnapshot,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
   PROTOCOL_VERSION }
@@ -91,6 +92,10 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "complete_fixture_dispatch_check" ? parseNativeFixtureDispatchCheck(message)
                   : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "list_fixture_dispatch_attempts" ? parseNativeFixtureDispatchAttempts(message)
+                  : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "complete_fixture_dispatch" ? parseNativeFixtureDispatch(message)
+                  : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "list_fixture_prepared_reviews" ? parseNativeFixturePreparedReviews(message)
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "approve_fixture_review" ? parseNativeFixtureReviewApproval(message)
@@ -121,9 +126,13 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | "fixture_send_reviews" | "fixture_send_review_approved"
             | "fixture_fill_recorded" | "fixture_preflight_recorded"
             | "fixture_dispatch_checks" | "fixture_dispatch_check_recorded"
+            | "fixture_dispatch_attempts" | "fixture_dispatch_recorded"
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
+            | { attempts: ReadonlyArray<{ operationId: string; attemptId: string; target: {
+              origin: string; conversationId: string; tabId: number; documentId: string
+            }; text: string; expiresAt: number }> }
             | { checks: ReadonlyArray<{ operationId: string; checkId: string; target: {
               origin: string; conversationId: string; tabId: number; documentId: string
             }; text: string; expiresAt: number }> }
@@ -201,6 +210,17 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 kind = "error";
                 payload = { code: "SEND_REVIEW_UNAVAILABLE" };
               } else throw new Error("Broker refused fixture send review approval");
+            } else if (request.kind === "list_fixture_dispatch_attempts") {
+              const result = await client.listFixtureDispatchAttempts();
+              if (result.kind !== "fixture_dispatch_attempts") throw new Error("Broker refused fixture dispatch attempts");
+              kind = "fixture_dispatch_attempts";
+              payload = result.payload;
+            } else if (request.kind === "complete_fixture_dispatch") {
+              const result = await client.completeFixtureDispatch(request.payload.target, request.payload.operationId,
+                request.payload.attemptId, request.payload.observation);
+              if (result.kind !== "fixture_dispatch_recorded") throw new Error("Broker refused fixture dispatch completion");
+              kind = "fixture_dispatch_recorded";
+              payload = result.payload;
             } else if (request.kind === "list_fixture_dispatch_checks") {
               const result = await client.listFixtureDispatchChecks();
               if (result.kind !== "fixture_dispatch_checks") throw new Error("Broker refused fixture dispatch checks");

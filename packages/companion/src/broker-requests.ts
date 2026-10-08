@@ -1,6 +1,7 @@
 import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
-import { fixtureDispatchCheckResultSchema, fixtureFillResultSchema, fixturePreflightResultSchema, MAX_PREPARED_MESSAGE_BYTES,
+import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureFillResultSchema,
+  fixturePreflightResultSchema, MAX_PREPARED_MESSAGE_BYTES,
   PreparedMessageOperations } from "./message-operations.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
@@ -73,6 +74,13 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("list_fixture_dispatch_checks"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("complete_fixture_dispatch_check"), payload: z.strictObject({
     target: fixtureTarget, operationId: z.uuid(), checkId: z.uuid(), observation: fixtureDispatchCheckResultSchema
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("dispatch_fixture_message"), payload: z.strictObject({
+    operationId: z.uuid(), checkId: z.uuid()
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_fixture_dispatch_attempts"), payload: z.strictObject({}) }),
+  z.strictObject({ ...envelope, kind: z.literal("complete_fixture_dispatch"), payload: z.strictObject({
+    target: fixtureTarget, operationId: z.uuid(), attemptId: z.uuid(), observation: fixtureDispatchResultSchema
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("fill_fixture_draft"), payload: z.strictObject({
     operationId: z.uuid()
@@ -232,6 +240,20 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
           request.payload.checkId, request.payload.observation, now) } }
       : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
   }
+  if (request.kind === "list_fixture_dispatch_attempts") {
+    return role === "relay"
+      ? { ...response, kind: "fixture_dispatch_attempts" as const,
+        payload: { attempts: operations?.listFixtureDispatchAttempts(now) ?? [] } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "complete_fixture_dispatch") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    return operations
+      ? { ...response, kind: "fixture_dispatch_recorded" as const, payload: {
+        accepted: operations.completeFixtureDispatch(request.payload.target, request.payload.operationId,
+          request.payload.attemptId, request.payload.observation, now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+  }
   if (request.kind === "list_fixture_send_reviews") {
     if (role !== "relay") return { ...response, kind: "error" as const,
       payload: { code: "PERMISSION_DENIED" } };
@@ -351,6 +373,16 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       ? { ...response, kind: "fixture_dispatch_check_authorized" as const,
         payload: { operationId: request.payload.operationId } }
       : { ...response, kind: "error" as const, payload: { code: "DISPATCH_CHECK_UNAVAILABLE" } };
+  }
+  if (request.kind === "dispatch_fixture_message") {
+    if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+    const status = operations.getOperation(owner, request.payload.operationId, now);
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") {
+      return { ...response, kind: "fixture_dispatch" as const, payload: status };
+    }
+    return operations.getFixtureSendAuthorization(owner, request.payload.operationId, now)
+      ? { ...response, kind: "fixture_dispatch_authorized" as const, payload: request.payload }
+      : { ...response, kind: "error" as const, payload: { code: "DISPATCH_UNAVAILABLE" } };
   }
   if (request.kind === "prepare_fixture_message") {
     if (!operations) return { ...response, kind: "error" as const,

@@ -38,7 +38,7 @@ function checkSyntheticDispatch(ledger: PreparedMessageOperations, owner: symbol
 
 test("durable dispatch jobs offer once and never regain authority after uncertain outcomes", async () => {
   for (const outcome of ["observed", "no_evidence", "failure", "wrong_target", "expired", "disconnected", "restarted",
-    "changed_before_issue", "gap_before_issue", "actual_timeout"]) {
+    "changed_before_issue", "gap_before_issue", "actual_timeout", "request_deadline"]) {
     const database = new DatabaseSync(":memory:");
     const requests = new PendingConnectionRequests();
     const owner = Symbol("durable fixture job");
@@ -65,7 +65,8 @@ test("durable dispatch jobs offer once and never regain authority after uncertai
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
       assert.throws(() => ledger.requestFixtureDispatch(Symbol("foreign"), prepared.operationId, check.checkId, 2005),
         /APPROVAL_REQUIRED/);
-      const dispatch = ledger.requestFixtureDispatch(owner, prepared.operationId, check.checkId, 2005);
+      const dispatch = ledger.requestFixtureDispatch(owner, prepared.operationId, check.checkId, 2005,
+        outcome === "request_deadline" ? 2006 : 9000);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
       assert.equal(ledger.consumeFixtureDispatchAuthorization(owner, prepared.operationId, 2005), null);
       const completion = { ok: true as const, editor: "textarea" as const, activated: true as const };
@@ -78,7 +79,7 @@ test("durable dispatch jobs offer once and never regain authority after uncertai
       if (outcome === "changed_before_issue" || outcome === "gap_before_issue") assert.deepEqual(offered, []);
       else {
         assert.deepEqual(offered, [{ operationId: prepared.operationId, attemptId: prepared.operationId, target,
-          text: prepared.preview.text, expiresAt: check.expiresAt }]);
+          text: prepared.preview.text, expiresAt: outcome === "request_deadline" ? 2006 : check.expiresAt }]);
         assert.equal(JSON.stringify(offered).includes(receipt.recoveryToken), false);
       }
       assert.deepEqual(ledger.listFixtureDispatchAttempts(2005), []);

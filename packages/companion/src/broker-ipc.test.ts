@@ -596,6 +596,131 @@ test("authenticated fixture preparation remains owner-bound and cannot dispatch"
   }
 });
 
+test("authenticated dispatch jobs offer once and never resend after unanswered completion or owner close", async () => {
+  for (const outcome of ["observed", "lost_completion", "owner_closed"]) {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-dispatch-ipc-"));
+    const directory = join(home, "broker");
+    const database = new DatabaseSync(":memory:");
+    const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+    const clients: Awaited<ReturnType<typeof connectBroker>>[] = [];
+    try {
+      const facade = await connectBroker("facade", directory);
+      const stranger = await connectBroker("facade", directory);
+      const relay = await connectBroker("relay", directory);
+      clients.push(facade, stranger, relay);
+      const pending = await facade.requestConnection();
+      if (pending.kind !== "connection_requested") throw new Error("Expected pending fixture connection");
+      const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 3, documentId: "CHROME-doc_opaque-42" };
+      assert.equal((await relay.approveFixture(pending.payload.requestId, target)).kind, "fixture_approved");
+      const connection = await facade.getConnection(pending.payload.requestId);
+      if (connection.kind !== "connection_state" || connection.payload.state !== "ready_readonly") {
+        throw new Error("Expected owned fixture grant");
+      }
+      const text = "Synthetic authenticated dispatch";
+      const prepared = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text,
+        "a66b3997-9d43-4554-8399-267d1fe9f75c");
+      if (prepared.kind !== "message_prepared") throw new Error("Expected owned preparation");
+      const operationId = prepared.payload.operationId;
+      assert.deepEqual((await facade.dispatchFixtureMessage(operationId, operationId)).payload, { code: "DISPATCH_UNAVAILABLE" });
+      const reviews = await relay.listFixturePreparedReviews(target);
+      if (reviews.kind !== "fixture_prepared_reviews") throw new Error("Expected ordinary review");
+      assert.equal((await relay.approveFixtureReview(target, operationId, reviews.payload.reviews[0]!.reviewId)).kind,
+        "fixture_review_approved");
+      const fillReviews = await relay.listFixtureFillReviews(target);
+      if (fillReviews.kind !== "fixture_fill_reviews") throw new Error("Expected fill review");
+      assert.equal((await relay.approveFixtureFillReview(target, operationId, fillReviews.payload.reviews[0]!.reviewId)).kind,
+        "fixture_fill_review_approved");
+      const filling = facade.fillFixtureDraft(operationId);
+      let fillAttempt: string | undefined;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const listed = await relay.listFixtureReadChallenges();
+        if (listed.kind !== "fixture_read_challenges") throw new Error("Expected fill challenge");
+        fillAttempt = listed.payload.draftFills[0]?.attemptId;
+        if (fillAttempt) break;
+        await new Promise<void>(resolve => setTimeout(resolve, 10));
+      }
+      assert.ok(fillAttempt);
+      assert.deepEqual((await relay.completeFixtureFill(target, fillAttempt, { ok: true, editor: "textarea" })).payload,
+        { accepted: true });
+      assert.equal((await filling).kind, "fixture_fill");
+      const sendReviews = await relay.listFixtureSendReviews(target);
+      if (sendReviews.kind !== "fixture_send_reviews") throw new Error("Expected distinct send review");
+      assert.equal((await relay.approveFixtureSendReview(target, operationId, sendReviews.payload.reviews[0]!.reviewId)).kind,
+        "fixture_send_review_approved");
+      assert.equal((await relay.publishFixtureSnapshot(target, [])).kind, "fixture_snapshot_published");
+      const inspecting = facade.checkFixtureDispatch(operationId);
+      let checkId: string | undefined;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const listed = await relay.listFixtureDispatchChecks();
+        if (listed.kind !== "fixture_dispatch_checks") throw new Error("Expected dispatch proof");
+        checkId = listed.payload.checks[0]?.checkId;
+        if (checkId) break;
+        await new Promise<void>(resolve => setTimeout(resolve, 10));
+      }
+      assert.ok(checkId);
+      assert.deepEqual((await relay.completeFixtureDispatchCheck(target, operationId, checkId,
+        { ok: true, editor: "textarea", draftText: text, selected: true, writable: true, submitReady: true })).payload,
+      { accepted: true });
+      const inspected = await inspecting;
+      if (inspected.kind !== "fixture_dispatch_check") throw new Error("Expected proof readiness");
+      assert.equal(inspected.payload.ready, true);
+      assert.deepEqual((await stranger.dispatchFixtureMessage(operationId, checkId)).payload, { code: "DISPATCH_UNAVAILABLE" });
+      assert.throws(() => relay.dispatchFixtureMessage(operationId, checkId!), /role cannot perform/);
+      assert.throws(() => facade.listFixtureDispatchAttempts(), /role cannot perform/);
+      const dispatching = facade.dispatchFixtureMessage(operationId, checkId);
+      let offered: { operationId: string; attemptId: string; expiresAt: number; text: string } | undefined;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const listed = await relay.listFixtureDispatchAttempts();
+        if (listed.kind !== "fixture_dispatch_attempts") throw new Error("Expected one offered browser attempt");
+        offered = listed.payload.attempts[0];
+        if (offered) break;
+        await new Promise<void>(resolve => setTimeout(resolve, 10));
+      }
+      assert.ok(offered);
+      assert.equal(offered.operationId, operationId);
+      assert.equal(offered.attemptId, operationId);
+      assert.equal(offered.text, text);
+      assert.equal(offered.expiresAt > Date.now(), true);
+      assert.equal(JSON.stringify(offered).includes(prepared.payload.recoveryToken), false);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      assert.deepEqual((await relay.listFixtureDispatchAttempts()).payload, { attempts: [] });
+      const activated = { ok: true as const, editor: "textarea" as const, activated: true as const };
+      assert.throws(() => facade.completeFixtureDispatch(target, operationId, operationId, activated), /role cannot perform/);
+      assert.deepEqual((await relay.completeFixtureDispatch({ ...target, documentId: "wrong" }, operationId,
+        operationId, activated)).payload, { accepted: false });
+      if (outcome === "observed") {
+        assert.equal((await relay.publishFixtureSnapshot(target,
+          [{ id: "new-outgoing", direction: "outgoing", text }])).kind, "fixture_snapshot_published");
+        assert.deepEqual((await relay.completeFixtureDispatch(target, operationId, operationId, activated)).payload,
+          { accepted: true });
+      }
+      if (outcome === "owner_closed") {
+        const closed = assert.rejects(dispatching, /closed|disconnected/i);
+        facade.close();
+        await closed;
+      } else {
+        const dispatched = await dispatching;
+        assert.equal(dispatched.kind, "fixture_dispatch");
+        assert.equal(dispatched.payload.state, outcome === "observed" ? "observed_in_ui" : "dispatch_uncertain");
+        assert.deepEqual((await facade.dispatchFixtureMessage(operationId, checkId)).payload, dispatched.payload);
+      }
+      assert.deepEqual((await relay.listFixtureDispatchAttempts()).payload, { attempts: [] });
+      assert.deepEqual((await relay.completeFixtureDispatch(target, operationId, operationId, activated)).payload,
+        { accepted: false });
+      const recovered = await stranger.getPreparedOperation(operationId, prepared.payload.recoveryToken);
+      assert.equal(recovered.kind, "prepared_operation_state");
+      assert.equal(recovered.payload.state, outcome === "observed" ? "observed_in_ui" : "dispatch_uncertain");
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+    } finally {
+      for (const client of clients) client.close();
+      await broker.close();
+      database.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+
 test("a new facade recovers uncertain status without inheriting a browser grant", async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-recovery-ipc-"));
   const directory = join(home, "broker");

@@ -5,10 +5,11 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
-import { fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
+import { fixtureDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
+  MAX_PENDING_FIXTURE_DISPATCHES,
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureDispatchCheckResult,
-  type FixtureFillResult, type FixturePreflightResult } from "./message-operations.js";
+  type FixtureDispatchResult, type FixtureFillResult, type FixturePreflightResult } from "./message-operations.js";
 import type { FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
@@ -194,6 +195,23 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ accepted: z.boolean() })
   }),
   z.strictObject({
+    kind: z.literal("fixture_dispatch_attempts"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ attempts: z.array(z.strictObject({ operationId: z.uuid(), attemptId: z.uuid(),
+      target: fixtureTarget, text: z.string().min(1).max(2048), expiresAt: z.number().int().safe()
+    })).max(MAX_PENDING_FIXTURE_DISPATCHES) })
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_dispatch"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: fixtureDispatchStatusSchema
+  }),
+  z.strictObject({
+    kind: z.literal("fixture_dispatch_recorded"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ accepted: z.boolean() })
+  }),
+  z.strictObject({
     kind: z.literal("fixture_fill"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: fixtureFillStatusSchema
@@ -304,6 +322,7 @@ const replySchema = z.discriminatedUnion("kind", [
       "INVALID_MESSAGE_TEXT", "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED",
       "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED", "REVIEW_UNAVAILABLE", "FILL_REVIEW_UNAVAILABLE",
       "SEND_REVIEW_UNAVAILABLE",
+      "DISPATCH_CHECK_UNAVAILABLE", "DISPATCH_UNAVAILABLE",
       "DISPATCH_UNCERTAIN", "PREFLIGHT_UNAVAILABLE", "FILL_UNAVAILABLE"]) })
   })
 ]);
@@ -383,6 +402,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "disconnect_fixture" | "prepare_fixture_message" | "get_prepared_operation"
       | "check_fixture_preflight" | "complete_fixture_preflight"
       | "check_fixture_dispatch" | "list_fixture_dispatch_checks" | "complete_fixture_dispatch_check"
+      | "dispatch_fixture_message" | "list_fixture_dispatch_attempts" | "complete_fixture_dispatch"
       | "fill_fixture_draft" | "complete_fixture_fill"
       | "list_pending" | "list_fixture_read_challenges" | "list_fixture_prepared_reviews"
       | "approve_fixture_review"
@@ -399,6 +419,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         || kind === "list_fixture_send_reviews" || kind === "approve_fixture_send_review"
         || kind === "complete_fixture_preflight"
         || kind === "list_fixture_dispatch_checks" || kind === "complete_fixture_dispatch_check"
+        || kind === "list_fixture_dispatch_attempts" || kind === "complete_fixture_dispatch"
         || kind === "complete_fixture_fill"
         || kind === "list_gemini_read_challenges"
         || kind === "approve_fixture" || kind === "approve_gemini" || kind === "revoke_fixture"
@@ -499,6 +520,10 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       completeFixtureDispatchCheck: (target: FixtureTarget, operationId: string, checkId: string,
         observation: FixtureDispatchCheckResult) =>
         request("complete_fixture_dispatch_check", { target, operationId, checkId, observation }),
+      dispatchFixtureMessage: (operationId: string, checkId: string) => request("dispatch_fixture_message", { operationId, checkId }),
+      listFixtureDispatchAttempts: () => request("list_fixture_dispatch_attempts", {}),
+      completeFixtureDispatch: (target: FixtureTarget, operationId: string, attemptId: string,
+        observation: FixtureDispatchResult) => request("complete_fixture_dispatch", { target, operationId, attemptId, observation }),
       fillFixtureDraft: (operationId: string) => request("fill_fixture_draft", { operationId }),
       completeFixtureFill: (target: FixtureTarget, attemptId: string, observation: FixtureFillResult) =>
         request("complete_fixture_fill", { target, attemptId, observation }),
