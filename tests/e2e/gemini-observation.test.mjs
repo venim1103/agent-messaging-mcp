@@ -1,9 +1,69 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
-import { captureGeminiSnapshot, identifyGeminiConversation, isEligibleGeminiUrl,
+import { captureGeminiSnapshot, identifyGeminiConversation, inspectGeminiDraft, isEligibleGeminiUrl,
   observeGeminiIdentity, observeGeminiMessages }
   from "../../packages/extension/lib/gemini-observation.ts";
+
+test("read-only Gemini draft inspection refuses unsafe composers without editing or submitting", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    const expectedUrl = "https://gemini.google.com/app/disposable-chat?hl=en";
+    const text = "Synthetic exact draft\nSecond line";
+    await page.route("https://gemini.google.com/**", route => route.fulfill({ contentType: "text/html; charset=utf-8",
+      body: `<!doctype html><html><head><style>
+        main, infinite-scroller, user-query, user-query-content { display: block; }
+        [contenteditable] { display: block; min-height: 80px; width: 400px; border: 1px solid black; }
+      </style></head><body><main>
+        <infinite-scroller><user-query><user-query-content>Initial row</user-query-content></user-query></infinite-scroller>
+        <form><div contenteditable="true" aria-label="Enter a prompt for Gemini"></div><button>Send</button></form>
+      </main><script>window.submits = 0; document.querySelector('form').onsubmit = event => {
+        event.preventDefault(); window.submits += 1;
+      };</script></body></html>` }));
+    await page.goto(expectedUrl);
+    const inspect = async (input = { expectedUrl, text }) => {
+      const before = await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML }));
+      const result = await page.evaluate(inspectGeminiDraft, input);
+      assert.deepEqual(await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML })), before);
+      assert.equal(await page.evaluate(() => window.submits), 0);
+      return result;
+    };
+    assert.deepEqual(await inspect(), { ok: true, editor: "contenteditable" });
+    assert.deepEqual(await inspect({ expectedUrl: expectedUrl.replace("hl=en", "hl=fr"), text }), { ok: false, code: "TARGET_CHANGED" });
+    assert.deepEqual(await inspect({ expectedUrl, text: "x".repeat(2049) }), { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
+    assert.deepEqual(await inspect({ expectedUrl, text: " " }), { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
+    await page.locator("[contenteditable]").evaluate((editor, text) => { editor.innerText = text; }, text);
+    assert.deepEqual(await inspect(), { ok: false, code: "DRAFT_CHANGED" });
+    assert.deepEqual(await inspect({ expectedUrl, text, draftMode: "prepared" }), { ok: true, editor: "contenteditable" });
+    assert.deepEqual(await inspect({ expectedUrl, text: `${text} `, draftMode: "prepared" }), { ok: false, code: "DRAFT_CHANGED" });
+    for (const attribute of ["inert", "aria-hidden", "aria-disabled", "aria-readonly"]) {
+      await page.reload();
+      await page.locator("form").evaluate((form, attribute) => form.setAttribute(attribute, "true"), attribute);
+      assert.deepEqual(await inspect(), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+    }
+    for (const scenario of ["duplicate", "nested", "transparent", "offscreen", "overlay", "timeline"]) {
+      await page.reload();
+      await page.locator("[contenteditable]").evaluate((editor, scenario) => {
+        if (scenario === "duplicate") editor.parentElement.append(editor.cloneNode(true));
+        if (scenario === "nested") editor.innerHTML = '<span contenteditable="true"></span>';
+        if (scenario === "transparent") editor.parentElement.style.opacity = "0";
+        if (scenario === "offscreen") editor.style.marginTop = "2000px";
+        if (scenario === "overlay") {
+          const overlay = document.createElement("div");
+          overlay.style.cssText = "position:fixed;inset:0;background:white;z-index:100";
+          document.body.append(overlay);
+        }
+        if (scenario === "timeline") document.querySelector("infinite-scroller").append(editor);
+      }, scenario);
+      assert.deepEqual(await inspect(), { ok: false, code: "COMPOSER_UNAVAILABLE" }, scenario);
+    }
+    await page.goto(`${expectedUrl}#reply`);
+    assert.deepEqual(await inspect({ expectedUrl: page.url(), text }), { ok: false, code: "TARGET_CHANGED" });
+  } finally {
+    await browser.close();
+  }
+});
 
 test("Gemini URL eligibility accepts bounded saved chats and rejects unsupported shapes", () => {
   const saved = "https://gemini.google.com/app/disposable-chat";

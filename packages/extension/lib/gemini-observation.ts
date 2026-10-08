@@ -1,5 +1,53 @@
 export type GeminiRenderedMessage = { direction: "incoming" | "outgoing"; text: string };
 
+export function inspectGeminiDraft(input: { expectedUrl: string; text: string; draftMode?: "empty" | "prepared" }):
+  { ok: true; editor: "contenteditable" } | { ok: false;
+    code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" } {
+  const failed = (code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED") =>
+    ({ ok: false as const, code });
+  if (!input || window.top !== window || document.visibilityState !== "visible"
+    || location.href !== input.expectedUrl || location.origin !== "https://gemini.google.com") return failed("TARGET_CHANGED");
+  const url = new URL(location.href);
+  const route = url.pathname.split("/").filter(Boolean);
+  if (url.href.length > 512 || url.username || url.password || url.hash || route.length !== 2
+    || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return failed("TARGET_CHANGED");
+  if (typeof input.text !== "string" || input.text.length > 2048
+    || new TextEncoder().encode(input.text).length > 4000 || !input.text.trim()
+    || (input.draftMode !== undefined && input.draftMode !== "empty" && input.draftMode !== "prepared")) {
+    return failed("UNSUPPORTED_MESSAGE_TEXT");
+  }
+  const visible = (element: HTMLElement) => element.getClientRects().length > 0
+    && getComputedStyle(element).visibility === "visible";
+  const regions = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);
+  if (regions.length !== 1) return failed("TARGET_CHANGED");
+  const region = regions[0]!;
+  const timelines = [...region.querySelectorAll<HTMLElement>("infinite-scroller")]
+    .filter((timeline) => visible(timeline) && [...timeline.querySelectorAll<HTMLElement>("user-query, model-response")].some(visible));
+  if (timelines.length !== 1) return failed("TARGET_CHANGED");
+  const editors = [...document.querySelectorAll<HTMLElement>("[contenteditable=true]")]
+    .filter((element) => visible(element) && (element.getAttribute("aria-label") === "Enter a prompt for Gemini"
+      || element.getAttribute("placeholder") === "Enter a prompt for Gemini"));
+  const editor = editors.length === 1 ? editors[0] : undefined;
+  if (!editor || !region.contains(editor) || timelines[0]!.contains(editor) || !editor.isContentEditable
+    || editor.closest("[inert], [aria-hidden=true], [aria-disabled=true], [aria-readonly=true]")
+    || editor.parentElement?.closest("[contenteditable]")
+    || editor.querySelector("[contenteditable], input, textarea, [role=textbox]")) return failed("COMPOSER_UNAVAILABLE");
+  for (let ancestor: HTMLElement | null = editor; ancestor; ancestor = ancestor.parentElement) {
+    const style = getComputedStyle(ancestor);
+    if (style.visibility !== "visible" || Number(style.opacity) === 0) return failed("COMPOSER_UNAVAILABLE");
+  }
+  const rect = editor.getBoundingClientRect();
+  const centerX = rect.left + rect.width / 2;
+  const centerY = rect.top + rect.height / 2;
+  if (rect.width <= 0 || rect.height <= 0 || centerX < 0 || centerY < 0
+    || centerX >= innerWidth || centerY >= innerHeight) return failed("COMPOSER_UNAVAILABLE");
+  const hit = document.elementFromPoint(centerX, centerY);
+  if (!hit || (hit !== editor && !editor.contains(hit))) return failed("COMPOSER_UNAVAILABLE");
+  if (input.draftMode === "prepared" ? editor.innerText !== input.text
+    : Boolean(editor.textContent?.length || editor.innerText.trim())) return failed("DRAFT_CHANGED");
+  return { ok: true, editor: "contenteditable" };
+}
+
 export function isEligibleGeminiUrl(href: string): boolean {
   try {
     const url = new URL(href);
