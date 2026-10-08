@@ -59,6 +59,88 @@ export function inspectGeminiDraft(input: { expectedUrl: string; text: string; d
   return { ok: true, editor: "contenteditable" };
 }
 
+export function fillGeminiDraft(input: { expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number }):
+  { ok: true; editor: "contenteditable" } | { ok: false;
+    code: "FILL_UNAVAILABLE" | "FILL_UNCERTAIN" | "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_PRESENT" } {
+  const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
+    || typeof input.attemptId !== "string" || !identifier.test(input.attemptId)
+    || !Number.isSafeInteger(input.expiresAt)) return { ok: false, code: "FILL_UNAVAILABLE" };
+  const scope = globalThis as typeof globalThis & { geminiDraftFillAttempts?: Set<string> };
+  const attempts = scope.geminiDraftFillAttempts ??= new Set<string>();
+  if (attempts.has(input.attemptId) || attempts.size >= 100) return { ok: false, code: "FILL_UNAVAILABLE" };
+  attempts.add(input.attemptId);
+  const now = Date.now();
+  if (input.expiresAt <= now || input.expiresAt > now + 4_000) return { ok: false, code: "FILL_UNAVAILABLE" };
+  if (typeof input.text !== "string" || input.text.length > 2048 || new TextEncoder().encode(input.text).length > 4000
+    || !input.text || input.text !== input.text.trim() || input.text.includes("\r")) return { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" };
+  if (window.top !== window || location.href !== input.expectedUrl || location.origin !== "https://gemini.google.com") {
+    return { ok: false, code: "TARGET_CHANGED" };
+  }
+  const url = new URL(location.href);
+  const route = url.pathname.split("/").filter(Boolean);
+  if (url.href.length > 512 || url.username || url.password || url.hash || route.length !== 2
+    || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return { ok: false, code: "TARGET_CHANGED" };
+  const inspect = (filled = false) => {
+    if (location.href !== input.expectedUrl || document.visibilityState !== "visible") return { ok: false as const, code: "TARGET_CHANGED" as const };
+    const visible = (element: HTMLElement) => element.getClientRects().length > 0 && getComputedStyle(element).visibility === "visible";
+    const regions = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);
+    if (regions.length !== 1) return { ok: false as const, code: "TARGET_CHANGED" as const };
+    const root = regions[0]!;
+    const timelines = [...root.querySelectorAll<HTMLElement>("infinite-scroller")]
+      .filter((timeline) => visible(timeline) && [...timeline.querySelectorAll<HTMLElement>("user-query, model-response")].some(visible));
+    if (timelines.length !== 1) return { ok: false as const, code: "TARGET_CHANGED" as const };
+    const editors = [...document.querySelectorAll<HTMLElement>("[contenteditable=true]")].filter((element) => visible(element)
+      && (element.getAttribute("aria-label") === "Enter a prompt for Gemini" || element.getAttribute("placeholder") === "Enter a prompt for Gemini"));
+    const editor = editors.length === 1 ? editors[0] : undefined;
+    if (!editor || !root.contains(editor) || timelines[0]!.contains(editor) || !editor.isContentEditable
+      || editor.closest("[inert], [aria-hidden=true], [aria-disabled=true], [aria-readonly=true]")
+      || editor.parentElement?.closest("[contenteditable]")
+      || editor.querySelector("[contenteditable], input, textarea, [role=textbox]")) return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
+    if (filled ? editor.innerText !== input.text : Boolean(editor.textContent?.length || editor.innerText.trim())) {
+      return { ok: false as const, code: "DRAFT_PRESENT" as const };
+    }
+    for (let ancestor: HTMLElement | null = editor; ancestor; ancestor = ancestor.parentElement) {
+      const style = getComputedStyle(ancestor);
+      if (style.visibility !== "visible" || Number(style.opacity) === 0) return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
+    }
+    const rect = editor.getBoundingClientRect();
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    if (rect.width <= 0 || rect.height <= 0 || rect.left < 0 || rect.top < 0 || rect.right > innerWidth || rect.bottom > innerHeight
+      || !hit || (hit !== editor && !editor.contains(hit))) return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
+    return { ok: true as const, root, timeline: timelines[0]!, editor };
+  };
+  let inputStarted = false;
+  try {
+    const before = inspect();
+    if (!before.ok) return before;
+    HTMLElement.prototype.focus.call(before.editor, { preventScroll: true });
+    const focused = inspect();
+    if (!focused.ok) return focused;
+    if (focused.root !== before.root || focused.timeline !== before.timeline || focused.editor !== before.editor
+      || document.activeElement !== focused.editor || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNAVAILABLE" };
+    const selection = window.getSelection();
+    if (!selection) return { ok: false, code: "FILL_UNAVAILABLE" };
+    const range = document.createRange();
+    range.selectNodeContents(focused.editor);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const ready = inspect();
+    if (!ready.ok) return ready;
+    if (ready.root !== focused.root || ready.timeline !== focused.timeline || ready.editor !== focused.editor
+      || document.activeElement !== ready.editor || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNAVAILABLE" };
+    inputStarted = true;
+    if (!Document.prototype.execCommand.call(document, "insertText", false, input.text)) return { ok: false, code: "FILL_UNCERTAIN" };
+    const completed = inspect(true);
+    if (!completed.ok || completed.root !== ready.root || completed.timeline !== ready.timeline || completed.editor !== ready.editor
+      || document.activeElement !== ready.editor || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNCERTAIN" };
+    return { ok: true, editor: "contenteditable" };
+  } catch {
+    return { ok: false, code: inputStarted ? "FILL_UNCERTAIN" : "FILL_UNAVAILABLE" };
+  }
+}
+
 export function inspectGeminiSubmitControls(expectedUrl: string): { controls: {
   label: "send-message" | "send" | "unrecognized"; classMatch: boolean; type: "button" | "submit" | "other";
   visible: boolean; disabled: boolean; ariaDisabled: boolean; inTimeline: boolean; inMain: boolean; sharesEditorForm: boolean;

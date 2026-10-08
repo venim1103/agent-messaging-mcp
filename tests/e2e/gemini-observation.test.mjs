@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
-import { captureGeminiSnapshot, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl,
+import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl,
   observeGeminiIdentity, observeGeminiMessages }
   from "../../packages/extension/lib/gemini-observation.ts";
 
@@ -183,6 +183,84 @@ test("read-only Gemini draft inspection refuses unsafe composers without editing
     assert.deepEqual(await inspect({ expectedUrl: page.url(), text }), { ok: false, code: "TARGET_CHANGED" });
     assert.equal(await inspectControls(page.url()), null);
     assert.equal(await inspectNearby(page.url()), null);
+  } finally {
+    await browser.close();
+  }
+});
+
+test("isolated one-shot Gemini draft fill uses native input and never activates Send", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    const expectedUrl = "https://gemini.google.com/app/disposable-chat?hl=en";
+    const text = "Synthetic exact draft\nSecond line \u00e9";
+    await page.route("https://gemini.google.com/**", route => route.fulfill({ contentType: "text/html; charset=utf-8",
+      body: `<!doctype html><html><head><style>
+        main, infinite-scroller, user-query { display: block; }
+        [contenteditable] { min-height: 80px; width: 400px; border: 1px solid black; }
+      </style></head><body><main><infinite-scroller><user-query>Initial row</user-query></infinite-scroller>
+        <div contenteditable="true" aria-label="Enter a prompt for Gemini"></div>
+        <button type="submit" aria-label="Send message">Send</button></main><script>
+        window.activations = 0; window.trustedInputs = 0; window.nativeInsertCalls = 0;
+        const nativeInsert = Document.prototype.execCommand;
+        Document.prototype.execCommand = function(command, showUi, value) {
+          if (command === 'insertText') window.nativeInsertCalls += 1;
+          return nativeInsert.call(this, command, showUi, value);
+        };
+        document.querySelector('button').onclick = () => { window.activations += 1; };
+        document.querySelector('[contenteditable]').oninput = event => { if (event.isTrusted) window.trustedInputs += 1; };
+      </script></body></html>` }));
+    for (const scenario of ["ready", "existing", "readonly", "blocked", "focus-draft", "focus-target", "focus-timeline", "input-replaced", "input-ambiguous-root", "expired",
+      "overlong-lease", "wrong-query", "oversized", "byte-oversized", "whitespace", "capacity"]) {
+      await page.goto(expectedUrl);
+      await page.locator("[contenteditable]").evaluate((editor, scenario) => {
+        if (scenario === "existing") editor.innerText = "Existing user draft";
+        if (scenario === "readonly") editor.setAttribute("aria-readonly", "true");
+        if (scenario === "blocked") {
+          const overlay = document.createElement("div");
+          overlay.style.cssText = "position:fixed;inset:0;background:white;z-index:100";
+          document.body.append(overlay);
+        }
+        if (scenario === "focus-draft") editor.onfocus = () => { editor.innerText = "Focus-created draft"; };
+        if (scenario === "focus-target") editor.onfocus = () => { history.replaceState({}, "", "?hl=fr"); };
+        if (scenario === "focus-timeline") editor.onfocus = () => {
+          const timeline = document.querySelector("infinite-scroller");
+          timeline.replaceWith(timeline.cloneNode(true));
+        };
+        if (scenario === "input-replaced") editor.addEventListener("input", () => { editor.replaceWith(editor.cloneNode(true)); });
+        if (scenario === "input-ambiguous-root") editor.addEventListener("input", () => {
+          const other = document.createElement("main");
+          other.textContent = "Another visible region";
+          document.body.append(other);
+        });
+        if (scenario === "capacity") window.geminiDraftFillAttempts = new Set(Array.from({ length: 100 }, () => crypto.randomUUID()));
+      }, scenario);
+      const input = { expectedUrl: scenario === "wrong-query" ? expectedUrl.replace("hl=en", "hl=fr") : expectedUrl,
+        text: scenario === "oversized" ? "x".repeat(2049) : scenario === "byte-oversized" ? "\u00e9".repeat(2040) : scenario === "whitespace" ? " " : text,
+        operationId: "0cc50313-0ce9-43ad-9e32-a0e3bfd15871", attemptId: "d4ad1de0-25d8-4609-aad9-0d307972c1fa",
+        expiresAt: Date.now() + (scenario === "expired" ? -1 : scenario === "overlong-lease" ? 10000 : 4000) };
+      const outcome = await page.evaluate(fillGeminiDraft, input);
+      const expected = { ready: { ok: true, editor: "contenteditable" }, existing: { ok: false, code: "DRAFT_PRESENT" },
+        readonly: { ok: false, code: "COMPOSER_UNAVAILABLE" }, blocked: { ok: false, code: "COMPOSER_UNAVAILABLE" },
+        "focus-draft": { ok: false, code: "DRAFT_PRESENT" }, "focus-target": { ok: false, code: "TARGET_CHANGED" },
+        "focus-timeline": { ok: false, code: "FILL_UNAVAILABLE" }, "input-replaced": { ok: false, code: "FILL_UNCERTAIN" },
+        "input-ambiguous-root": { ok: false, code: "FILL_UNCERTAIN" },
+        expired: { ok: false, code: "FILL_UNAVAILABLE" }, "overlong-lease": { ok: false, code: "FILL_UNAVAILABLE" },
+        "wrong-query": { ok: false, code: "TARGET_CHANGED" }, oversized: { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" },
+        "byte-oversized": { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" }, whitespace: { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" },
+        capacity: { ok: false, code: "FILL_UNAVAILABLE" } };
+      assert.deepEqual(outcome, expected[scenario], scenario);
+      assert.equal(await page.evaluate(() => window.activations), 0, scenario);
+      assert.equal(await page.evaluate(() => window.nativeInsertCalls), ["ready", "input-replaced", "input-ambiguous-root"].includes(scenario) ? 1 : 0, scenario);
+      assert.equal(await page.evaluate(() => window.trustedInputs > 0), ["ready", "input-replaced", "input-ambiguous-root"].includes(scenario), scenario);
+      const actualText = await page.locator("[contenteditable]").innerText();
+      assert.equal(actualText, scenario === "existing" ? "Existing user draft" : scenario === "focus-draft" ? "Focus-created draft"
+        : ["ready", "input-replaced", "input-ambiguous-root"].includes(scenario) ? text : "", scenario);
+      assert.deepEqual(await page.evaluate(fillGeminiDraft, { ...input, expiresAt: Date.now() + 4000 }), { ok: false, code: "FILL_UNAVAILABLE" }, scenario);
+      assert.equal(await page.evaluate(() => window.nativeInsertCalls), ["ready", "input-replaced", "input-ambiguous-root"].includes(scenario) ? 1 : 0, scenario);
+      assert.equal(await page.evaluate(() => window.activations), 0, scenario);
+      assert.equal(await page.locator("[contenteditable]").innerText(), actualText, scenario);
+    }
   } finally {
     await browser.close();
   }
