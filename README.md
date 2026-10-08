@@ -4,6 +4,8 @@ Connect an MCP agent to a browser chat that a person opens and approves through 
 
 > **Status: early local prototype.** The fixture toolbar-to-MCP read path is manually verified. One explicitly selected disposable Gemini chat also passed read-only toolbar approval, a visible-row snapshot, and later event observations after a prompt sent manually by the user; each grant was disconnected. This is not complete chat history or general Gemini support. There is no message-send tool. Do not use this build to grant access to personal conversations.
 
+An assisted post-restart test on October 8 again read the selected disposable Gemini chat through MCP. The initial two-row snapshot passed, but the later event wait lost access and its request became `unknown`; the cause is not established. After a new explicit toolbar approval, a fresh four-row snapshot included the person's already-sent prompt and the expected one-word reply, then disconnect returned true and the grant became `stale`. This verifies reads after reapproval, not uninterrupted events or automatic two-way communication. The person sent the prompt manually; the connector did not fill or submit anything. Rebuild and typecheck passed; the last full implementation gate remains **124/124 units and 13/13 e2e checks** on October 6.
+
 ## How It Works
 
 An agent requests a connection through MCP. The user selects the local fixture tab and approves the pending request in the extension popup. A browser-spawned Native Messaging host relays bounded observations to a private local broker; only the MCP client that owns the approved connection can read them.
