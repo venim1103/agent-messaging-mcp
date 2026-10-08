@@ -191,6 +191,17 @@ test("only the relay grants distinct fixture send consent after completed fill w
       { code: "DISPATCH_UNAVAILABLE" });
     assert.deepEqual(handleBrokerRequest(dispatchRequest, "relay", relay, requests, 2009, operations).payload,
       { code: "PERMISSION_DENIED" });
+    const commitRequest = { ...envelope, kind: "commit_fixture_message", payload: { operationId } };
+    assert.equal(handleBrokerRequest(commitRequest, "facade", owner, requests, 2009, operations).kind, "fixture_commit_authorized");
+    assert.deepEqual(handleBrokerRequest(commitRequest, "facade", stranger, requests, 2009, operations).payload,
+      { code: "DISPATCH_UNAVAILABLE" });
+    assert.deepEqual(handleBrokerRequest(commitRequest, "relay", relay, requests, 2009, operations).payload,
+      { code: "PERMISSION_DENIED" });
+    for (const extra of [{ checkId: inspection.checkId }, { approved: true }, { target }, { text: "Changed" },
+      { recoveryToken: prepared.payload.recoveryToken }]) {
+      assert.throws(() => handleBrokerRequest({ ...commitRequest, payload: { ...commitRequest.payload, ...extra } },
+        "facade", owner, requests, 2009, operations));
+    }
     for (const extra of [{ approved: true }, { text: "Changed" }, { target }, { recoveryToken: prepared.payload.recoveryToken }]) {
       assert.throws(() => handleBrokerRequest({ ...dispatchRequest, payload: { ...dispatchRequest.payload, ...extra } },
         "facade", owner, requests, 2009, operations));

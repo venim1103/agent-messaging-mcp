@@ -60,12 +60,17 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
       "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_read_messages",
-      "chat_wait_for_events", "chat_prepare_message", "chat_fill_draft", "chat_get_operation", "chat_disconnect"
+      "chat_wait_for_events", "chat_prepare_message", "chat_fill_draft", "chat_commit_message", "chat_get_operation", "chat_disconnect"
     ]);
     assert.ok(tools.every((tool) => /^[a-z0-9_-]+$/.test(tool.name)));
     const fillTool = tools.find((tool) => tool.name === "chat_fill_draft");
     assert.equal(fillTool?.annotations?.readOnlyHint, false);
     assert.equal(fillTool?.annotations?.idempotentHint, false);
+    const commitTool = tools.find((tool) => tool.name === "chat_commit_message");
+    assert.equal(commitTool?.annotations?.readOnlyHint, false);
+    assert.equal(commitTool?.annotations?.destructiveHint, true);
+    assert.equal(commitTool?.annotations?.idempotentHint, false);
+    assert.equal(commitTool?.inputSchema.additionalProperties, false);
 
     const result = await client.callTool({ name: "browser_chat_feasibility", arguments: {} });
     assert.equal(result.isError, undefined);
@@ -141,6 +146,10 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal(unavailableFill.isError, true);
     assert.deepEqual(unavailableFill.structuredContent, { operationId: unavailableFillId, ok: false,
       code: "FILL_UNCERTAIN", retryAllowed: false });
+    const unavailableCommit = await clientOne.callTool({ name: "chat_commit_message", arguments: { operationId: unavailableFillId } });
+    assert.equal(unavailableCommit.isError, true);
+    assert.deepEqual(unavailableCommit.structuredContent, { operationId: unavailableFillId, ok: false,
+      code: "DISPATCH_UNCERTAIN", retryAllowed: false, state: "dispatch_uncertain" });
 
     broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
     brokerExit = once(broker, "exit");
@@ -277,6 +286,20 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
     assert.equal(JSON.stringify(filledState).includes(preview.recoveryToken), false);
     assert.deepEqual((await clientTwo.callTool({ name: "chat_get_operation", arguments: { operationId: preview.operationId } }))
       .structuredContent, { state: "unknown" });
+    for (const caller of [clientOne, clientTwo]) {
+      const deniedCommit = await caller.callTool({ name: "chat_commit_message", arguments: { operationId: preview.operationId } });
+      assert.equal(deniedCommit.isError, true);
+      assert.deepEqual(deniedCommit.structuredContent, { operationId: preview.operationId, ok: false,
+        code: "DISPATCH_UNAVAILABLE", retryAllowed: false });
+    }
+    for (const extra of [{ approved: true }, { text: "Changed" }, { target }, { connectionId },
+      { checkId: preview.operationId }, { recoveryToken: preview.recoveryToken }, { send: true }]) {
+      const invalidCommit = await clientOne.callTool({ name: "chat_commit_message",
+        arguments: { operationId: preview.operationId, ...extra } });
+      assert.equal(invalidCommit.isError, true);
+    }
+    assert.deepEqual((await clientOne.callTool({ name: "chat_get_operation",
+      arguments: { operationId: preview.operationId } })).structuredContent, filledState.structuredContent);
     const fillReplay = await clientOne.callTool({ name: "chat_fill_draft", arguments: { operationId: preview.operationId } });
     assert.equal(fillReplay.isError, true);
     assert.deepEqual(fillReplay.structuredContent, { operationId: preview.operationId, ok: false,

@@ -78,6 +78,7 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("dispatch_fixture_message"), payload: z.strictObject({
     operationId: z.uuid(), checkId: z.uuid()
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("commit_fixture_message"), payload: z.strictObject({ operationId: z.uuid() }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_fixture_dispatch_attempts"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("complete_fixture_dispatch"), payload: z.strictObject({
     target: fixtureTarget, operationId: z.uuid(), attemptId: z.uuid(), observation: fixtureDispatchResultSchema
@@ -374,15 +375,18 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
         payload: { operationId: request.payload.operationId } }
       : { ...response, kind: "error" as const, payload: { code: "DISPATCH_CHECK_UNAVAILABLE" } };
   }
-  if (request.kind === "dispatch_fixture_message") {
+  if (request.kind === "dispatch_fixture_message" || request.kind === "commit_fixture_message") {
     if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
     const status = operations.getOperation(owner, request.payload.operationId, now);
     if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") {
       return { ...response, kind: "fixture_dispatch" as const, payload: status };
     }
-    return operations.getFixtureSendAuthorization(owner, request.payload.operationId, now)
-      ? { ...response, kind: "fixture_dispatch_authorized" as const, payload: request.payload }
-      : { ...response, kind: "error" as const, payload: { code: "DISPATCH_UNAVAILABLE" } };
+    if (!operations.getFixtureSendAuthorization(owner, request.payload.operationId, now)) {
+      return { ...response, kind: "error" as const, payload: { code: "DISPATCH_UNAVAILABLE" } };
+    }
+    return request.kind === "commit_fixture_message"
+      ? { ...response, kind: "fixture_commit_authorized" as const, payload: request.payload }
+      : { ...response, kind: "fixture_dispatch_authorized" as const, payload: request.payload };
   }
   if (request.kind === "prepare_fixture_message") {
     if (!operations) return { ...response, kind: "error" as const,

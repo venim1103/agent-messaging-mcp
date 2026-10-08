@@ -294,15 +294,15 @@ export class PendingConnectionRequests {
     return grant.observations?.read(cursor, limit) ?? "not_ready";
   }
 
-  requestFreshFixtureRead(owner: symbol, connectionId: string, now = Date.now()) {
+  requestFreshFixtureRead(owner: symbol, connectionId: string, now = Date.now(), deadlineMs = now + FIXTURE_READ_TIMEOUT_MS) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (grant?.target.origin !== "http://127.0.0.1:8787") return null;
+    if (grant?.target.origin !== "http://127.0.0.1:8787" || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     if (this.fixtureReads.size >= MAX_PENDING_FIXTURE_READS) return "busy" as const;
     const challengeId = randomUUID();
-    const expiresAt = now + FIXTURE_READ_TIMEOUT_MS;
+    const expiresAt = Math.min(now + FIXTURE_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt);
     let resolve!: PendingFixtureRead["resolve"];
     const result = new Promise<FixtureSnapshot | "not_ready" | null>((done) => { resolve = done; });
-    const timer = setTimeout(() => this.finishFixtureRead(challengeId, "not_ready"), FIXTURE_READ_TIMEOUT_MS);
+    const timer = setTimeout(() => this.finishFixtureRead(challengeId, "not_ready"), expiresAt - now);
     this.fixtureReads.set(challengeId, { owner, connectionId, target: grant.target, expiresAt, timer, resolve });
     return { challengeId, result };
   }

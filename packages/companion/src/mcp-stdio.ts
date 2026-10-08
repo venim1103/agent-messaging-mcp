@@ -37,6 +37,12 @@ function fillFailure(operationId: string, code: string) {
   return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(payload) }], structuredContent: payload };
 }
 
+function commitFailure(operationId: string, code: "DISPATCH_UNAVAILABLE" | "DISPATCH_UNCERTAIN") {
+  const payload = { operationId, ok: false, code, retryAllowed: false,
+    ...(code === "DISPATCH_UNCERTAIN" ? { state: "dispatch_uncertain" } : {}) };
+  return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(payload) }], structuredContent: payload };
+}
+
 function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); };
@@ -166,8 +172,37 @@ server.registerTool("chat_fill_draft", {
   }
 });
 
+server.registerTool("chat_commit_message", {
+  description: "Submit an owned local fixture operation once after completed fill and distinct trusted popup Approve fixture send consent. Obtains a fresh exact-document baseline and current-draft proof before durable intent and one guarded activation. Gemini is unavailable. Never automatically retry; uncertainty may mean submitted. observed_in_ui is unique outgoing UI evidence, not acceptance or delivery. Recovery tokens grant status only.",
+  inputSchema: z.object({ operationId: z.uuid() }).strict(),
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
+}, async ({ operationId }, extra) => {
+  let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  const cancel = () => client?.close();
+  try {
+    if (extra.mcpReq.signal.aborted) return commitFailure(operationId, "DISPATCH_UNAVAILABLE");
+    client = await pendingBroker();
+    extra.mcpReq.signal.addEventListener("abort", cancel, { once: true });
+    if (extra.mcpReq.signal.aborted) { cancel(); return commitFailure(operationId, "DISPATCH_UNCERTAIN"); }
+    const result = await client.commitFixtureMessage(operationId);
+    if (result.kind === "error") return commitFailure(operationId,
+      result.payload.code === "DISPATCH_UNCERTAIN" ? "DISPATCH_UNCERTAIN" : "DISPATCH_UNAVAILABLE");
+    if (result.kind !== "fixture_dispatch") throw new Error("Unexpected fixture commit reply");
+    const ok = result.payload.state === "observed_in_ui";
+    const payload = { ...result.payload, ok, retryAllowed: false,
+      ...(!ok ? { code: "DISPATCH_UNCERTAIN" } : {}) };
+    return { isError: !ok, content: [{ type: "text", text: JSON.stringify(payload) }], structuredContent: payload };
+  } catch {
+    client?.close();
+    if (broker === client) broker = undefined;
+    return commitFailure(operationId, "DISPATCH_UNCERTAIN");
+  } finally {
+    extra.mcpReq.signal.removeEventListener("abort", cancel);
+  }
+});
+
 server.registerTool("chat_get_operation", {
-  description: "Read fixture operation status with separate owned draftFill consent/in-flight/readback/uncertainty metadata. Filled describes past exact readback, not current draft state or send permission. A recoveryToken recovers only dispatch_uncertain or observed_in_ui metadata after restart, not fill state, browser access, approval, or resend permission. UI evidence is not service acceptance or delivery. No commit tool exists.",
+  description: "Read fixture operation status with separate owned draftFill consent/in-flight/readback/uncertainty metadata. Filled describes past exact readback, not current draft state or send permission. A recoveryToken recovers only dispatch_uncertain or observed_in_ui metadata after restart, not fill state, browser access, approval, or resend permission. UI evidence is not service acceptance or delivery; no status query performs a submit.",
   inputSchema: z.object({ operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   annotations: { readOnlyHint: true }
 }, async ({ operationId, recoveryToken }) => {

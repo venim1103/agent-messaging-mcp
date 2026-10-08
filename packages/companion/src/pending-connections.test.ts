@@ -236,6 +236,32 @@ test("fresh fixture read challenges belong to a live owner and expire or cancel 
   assert.deepEqual(requests.listFixtureReadChallenges(2002), []);
 });
 
+test("fixture reads preserve the original request and grant deadlines without creating authority", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("reader");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    tabId: 3, documentId: "CHROME-doc_opaque-42" };
+  const grant = requests.approve(pending.requestId, target, 2000)!;
+  for (const deadlineMs of [2000, 2001, 2001.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(requests.requestFreshFixtureRead(owner, grant.connectionId, 2001, deadlineMs), null);
+    assert.deepEqual(requests.listFixtureReadChallenges(2001), []);
+  }
+  const clipped = requests.requestFreshFixtureRead(owner, grant.connectionId, 2001, 2002);
+  if (!clipped || clipped === "busy") throw new Error("Expected request-clipped read");
+  assert.deepEqual(requests.listFixtureReadChallenges(2001), [{ challengeId: clipped.challengeId, target, expiresAt: 2002 }]);
+  assert.equal(await clipped.result, "not_ready");
+  assert.deepEqual(requests.listFixtureReadChallenges(2002), []);
+  const beforeExpiry = grant.expiresAt - 2;
+  const grantClipped = requests.requestFreshFixtureRead(owner, grant.connectionId, beforeExpiry, grant.expiresAt + 1000);
+  if (!grantClipped || grantClipped === "busy") throw new Error("Expected original-grant-clipped read");
+  assert.deepEqual(requests.listFixtureReadChallenges(beforeExpiry), [{ challengeId: grantClipped.challengeId,
+    target, expiresAt: grant.expiresAt }]);
+  assert.deepEqual(requests.listFixtureReadChallenges(grant.expiresAt), []);
+  assert.equal(await grantClipped.result, "not_ready");
+  assert.equal(requests.requestFreshFixtureRead(owner, grant.connectionId, grant.expiresAt, grant.expiresAt + 1), null);
+});
+
 test("only a new exact-target publication completes its read challenge once", async () => {
   const requests = new PendingConnectionRequests();
   const owner = Symbol("reader");

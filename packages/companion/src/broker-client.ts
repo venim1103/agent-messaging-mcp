@@ -402,7 +402,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "disconnect_fixture" | "prepare_fixture_message" | "get_prepared_operation"
       | "check_fixture_preflight" | "complete_fixture_preflight"
       | "check_fixture_dispatch" | "list_fixture_dispatch_checks" | "complete_fixture_dispatch_check"
-      | "dispatch_fixture_message" | "list_fixture_dispatch_attempts" | "complete_fixture_dispatch"
+      | "dispatch_fixture_message" | "commit_fixture_message" | "list_fixture_dispatch_attempts" | "complete_fixture_dispatch"
       | "fill_fixture_draft" | "complete_fixture_fill"
       | "list_pending" | "list_fixture_read_challenges" | "list_fixture_prepared_reviews"
       | "approve_fixture_review"
@@ -521,6 +521,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         observation: FixtureDispatchCheckResult) =>
         request("complete_fixture_dispatch_check", { target, operationId, checkId, observation }),
       dispatchFixtureMessage: (operationId: string, checkId: string) => request("dispatch_fixture_message", { operationId, checkId }),
+      commitFixtureMessage: (operationId: string) => request("commit_fixture_message", { operationId }),
       listFixtureDispatchAttempts: () => request("list_fixture_dispatch_attempts", {}),
       completeFixtureDispatch: (target: FixtureTarget, operationId: string, attemptId: string,
         observation: FixtureDispatchResult) => request("complete_fixture_dispatch", { target, operationId, attemptId, observation }),

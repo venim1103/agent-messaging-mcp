@@ -831,6 +831,24 @@ export class PreparedMessageOperations {
     });
   }
 
+  async commitFixtureMessage(owner: symbol, operationId: string, deadlineMs: number) {
+    const now = Date.now();
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) throw new Error("DISPATCH_UNAVAILABLE");
+    const status = this.getOperation(owner, operationId, now);
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") return status;
+    const authorization = this.getFixtureSendAuthorization(owner, operationId, now);
+    const operation = this.contents.get(operationId);
+    if (!authorization || !operation || operation.owner !== owner) throw new Error("DISPATCH_UNAVAILABLE");
+    const expiresAt = Math.min(deadlineMs, authorization.expiresAt);
+    const reading = this.requests.requestFreshFixtureRead(owner, operation.connectionId, now, expiresAt);
+    if (!reading || reading === "busy") throw new Error("DISPATCH_UNAVAILABLE");
+    const snapshot = await reading.result;
+    if (!snapshot || snapshot === "not_ready" || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
+    const inspecting = this.requestFixtureDispatchInspection(owner, operationId, Date.now(), expiresAt);
+    if (inspecting === "busy" || !await inspecting.result || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
+    return this.requestFixtureDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt).result;
+  }
+
   requestFixtureDispatch(owner: symbol, operationId: string, checkId: string, now = Date.now(),
     deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) throw new Error("DISPATCH_UNAVAILABLE");

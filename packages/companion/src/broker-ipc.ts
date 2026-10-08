@@ -67,19 +67,21 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                 } });
                 return;
               }
-              if (reply.kind === "fixture_dispatch_authorized") {
+              if (reply.kind === "fixture_dispatch_authorized" || reply.kind === "fixture_commit_authorized") {
                 try {
-                  const pending = operations?.requestFixtureDispatch(owner, reply.payload.operationId, reply.payload.checkId,
-                    Date.now(), reply.deadlineMs);
-                  if (!pending) {
+                  if (!operations) {
                     await writeBrokerResponse(socket, { ...reply, kind: "error", payload: { code: "DISPATCH_UNAVAILABLE" } });
                     return;
                   }
-                  const status = await pending.result;
+                  const status = reply.kind === "fixture_commit_authorized"
+                    ? await operations.commitFixtureMessage(owner, reply.payload.operationId, reply.deadlineMs)
+                    : await operations.requestFixtureDispatch(owner, reply.payload.operationId, reply.payload.checkId,
+                      Date.now(), reply.deadlineMs).result;
                   if (!socket.destroyed) await writeBrokerResponse(socket, { ...reply, kind: "fixture_dispatch", payload: status });
                 } catch (error) {
                   if (!(error instanceof Error) || !["APPROVAL_REQUIRED", "SEND_APPROVAL_REQUIRED", "RECOVERY_REQUIRED",
                     "OBSERVATION_UNAVAILABLE", "DISPATCH_CHECK_REQUIRED", "DISPATCH_CHECK_BUSY",
+                    "UNSUPPORTED_MESSAGE_TEXT", "DISPATCH_CHECK_UNAVAILABLE",
                     "DISPATCH_UNAVAILABLE", "DISPATCH_UNCERTAIN"].includes(error.message)) throw error;
                   if (!socket.destroyed) await writeBrokerResponse(socket, { ...reply, kind: "error",
                     payload: { code: error.message === "DISPATCH_UNCERTAIN" ? "DISPATCH_UNCERTAIN" : "DISPATCH_UNAVAILABLE" } });
