@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
-import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests, type FixtureTarget } from "./pending-connections.js";
+import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
 export const FIXTURE_REVIEW_APPROVAL_TTL_MS = 2 * 60_000;
@@ -96,12 +96,12 @@ export function openPrivateOperationDatabase(directory: string): DatabaseSync {
   return new DatabaseSync(filePath);
 }
 
-type PreparedMessage = Readonly<{
+type PreparedMessage<TargetLabel extends "fixture-alpha" | "gemini" = "fixture-alpha"> = Readonly<{
   operationId: string;
   connectionId: string;
   state: "awaiting_approval";
   expiresAt: number;
-  preview: Readonly<{ target: "fixture-alpha"; text: string }>;
+  preview: Readonly<{ target: TargetLabel; text: string }>;
 }>;
 type PreparedReview = Readonly<Pick<PreparedMessage, "operationId" | "expiresAt" | "preview"> & {
   reviewId: string
@@ -139,6 +139,9 @@ export class PreparedMessageOperations {
   private readonly owners = new Map<symbol, string>();
   private readonly contents = new Map<string, Readonly<{
     owner: symbol; connectionId: string; target: FixtureTarget; text: string; expiresAt: number
+  }>>();
+  private readonly geminiContents = new Map<string, Readonly<{
+    owner: symbol; connectionId: string; target: GeminiTarget; text: string; expiresAt: number
   }>>();
   private readonly reviewTokens = new Map<string, string>();
   private readonly approvals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
@@ -218,6 +221,7 @@ export class PreparedMessageOperations {
       if (pending.operationId === operationId) this.finishFillCheck(attemptId, null);
     }
     this.contents.delete(operationId);
+    this.geminiContents.delete(operationId);
     this.reviewTokens.delete(operationId);
     this.approvals.delete(operationId);
     this.fillReviewTokens.delete(operationId);
@@ -238,6 +242,9 @@ export class PreparedMessageOperations {
       if (pending.expiresAt <= now) this.finishFixtureDispatch(operationId);
     }
     for (const [operationId, operation] of this.contents) {
+      if (operation.expiresAt <= now) this.release(operationId);
+    }
+    for (const [operationId, operation] of this.geminiContents) {
       if (operation.expiresAt <= now) this.release(operationId);
     }
     for (const [operationId, approval] of this.approvals) {
@@ -262,10 +269,26 @@ export class PreparedMessageOperations {
     this.discardExpired(now);
     const target = this.requests.getApprovedTarget(owner, connectionId, now);
     if (!target) throw new Error("CONNECTION_NOT_FOUND");
+    return this.prepareBound(owner, connectionId, expectedGeneration, target, "fixture-alpha", text, idempotencyKey, now);
+  }
+
+  prepareGemini(owner: symbol, connectionId: string, expectedGeneration: number,
+    text: string, idempotencyKey: string, now = Date.now()): PreparedMessage<"gemini"> {
+    this.discardExpired(now);
+    const target = this.requests.getGeminiTarget(owner, connectionId, now);
+    if (!target) throw new Error("CONNECTION_NOT_FOUND");
+    return this.prepareBound(owner, connectionId, expectedGeneration, target, "gemini", text, idempotencyKey, now);
+  }
+
+  private prepareBound<TargetLabel extends "fixture-alpha" | "gemini">(owner: symbol, connectionId: string,
+    expectedGeneration: number, target: ApprovedTarget, label: TargetLabel, text: string,
+    idempotencyKey: string, now: number): PreparedMessage<TargetLabel> {
     if (expectedGeneration !== 1) throw new Error("GENERATION_MISMATCH");
     if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > MAX_PREPARED_MESSAGE_BYTES || !text.trim()) {
       throw new Error("INVALID_MESSAGE_TEXT");
     }
+    if (target.origin === "https://gemini.google.com"
+      && (text.length > 2048 || text !== text.trim() || text.includes("\r"))) throw new Error("INVALID_MESSAGE_TEXT");
     if (typeof idempotencyKey !== "string"
       || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) {
       throw new Error("INVALID_IDEMPOTENCY_KEY");
@@ -291,13 +314,13 @@ export class PreparedMessageOperations {
       if (this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?")
         .get(existing.operation_id)) throw new Error("DISPATCH_UNCERTAIN");
       if (existing.expires_at <= now) throw new Error("OPERATION_EXPIRED");
-      const retained = this.contents.get(existing.operation_id);
+      const retained = this.contents.get(existing.operation_id) ?? this.geminiContents.get(existing.operation_id);
       if (!retained || retained.owner !== owner) throw new Error("OPERATION_UNAVAILABLE");
       return Object.freeze({ operationId: existing.operation_id, connectionId, state: "awaiting_approval",
-        expiresAt: existing.expires_at, preview: Object.freeze({ target: "fixture-alpha", text: retained.text }) });
+        expiresAt: existing.expires_at, preview: Object.freeze({ target: label, text: retained.text }) });
     }
 
-    if (this.contents.size >= MAX_ACTIVE_PREPARED_MESSAGES) throw new Error("TOO_MANY_PREPARED");
+    if (this.contents.size + this.geminiContents.size >= MAX_ACTIVE_PREPARED_MESSAGES) throw new Error("TOO_MANY_PREPARED");
     const recorded = this.database.prepare("SELECT count(*) AS count FROM prepared_message_operations")
       .get() as { count: number };
     if (recorded.count >= MAX_RECORDED_PREPARED_MESSAGES) throw new Error("TOO_MANY_PREPARED");
@@ -307,9 +330,13 @@ export class PreparedMessageOperations {
       (operation_id, owner_id, connection_id, idempotency_key, content_digest, target_digest, expires_at, state)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_approval')`)
       .run(operationId, ownerId, connectionId, idempotencyKey, contentDigest, targetDigest, expiresAt);
-    this.contents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt }));
+    if (target.origin === "https://gemini.google.com") {
+      this.geminiContents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt }));
+    } else {
+      this.contents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt }));
+    }
     return Object.freeze({ operationId, connectionId, state: "awaiting_approval", expiresAt,
-      preview: Object.freeze({ target: "fixture-alpha", text }) });
+      preview: Object.freeze({ target: label, text }) });
   }
 
   listFixtureReviews(target: FixtureTarget, now = Date.now()): Readonly<{
@@ -972,10 +999,11 @@ export class PreparedMessageOperations {
     const dispatch = this.dispatchStatus(operationId);
     if (dispatch) return dispatch;
     if (record.expires_at <= now) return { operationId, state: "expired" as const };
-    if (!this.requests.getApprovedTarget(owner, record.connection_id, now)) {
+    if (!this.requests.getApprovedTarget(owner, record.connection_id, now)
+      && !this.requests.getGeminiTarget(owner, record.connection_id, now)) {
       return { operationId, state: "stale" as const };
     }
-    const retained = this.contents.get(operationId);
+    const retained = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
     if (!retained || retained.owner !== owner) return { state: "unknown" as const };
     for (const [attemptId, pending] of this.fillChecks) {
       if (pending.operationId === operationId && pending.expiresAt <= now) this.finishFillCheck(attemptId, null, now);
@@ -994,6 +1022,9 @@ export class PreparedMessageOperations {
   disconnect(owner: symbol): void {
     this.owners.delete(owner);
     for (const [operationId, operation] of this.contents) {
+      if (operation.owner === owner) this.release(operationId);
+    }
+    for (const [operationId, operation] of this.geminiContents) {
       if (operation.owner === owner) this.release(operationId);
     }
   }
