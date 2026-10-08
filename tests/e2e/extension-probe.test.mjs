@@ -13,7 +13,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { chromium } from "playwright-core";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
-import { reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
+import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 
 const extensionDirectory = fileURLToPath(new URL("../../packages/extension/.output/chrome-mv3/", import.meta.url));
 const nativeRelayPath = fileURLToPath(new URL("../../packages/companion/dist/native-relay.js", import.meta.url));
@@ -103,6 +103,15 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
     const operationId = crypto.randomUUID();
     const reservation = () => ({ operationId, expiresAt: Date.now() + 4000 });
     assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, reservation()), true);
+    const geminiOperationId = crypto.randomUUID();
+    const geminiReservation = () => ({ operationId: geminiOperationId, expiresAt: Date.now() + 4000, provider: "gemini" });
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt, geminiReservation()), true);
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt, geminiReservation()), false);
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt, { ...geminiReservation(), provider: "unsupported" }), false);
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() - 1, provider: "gemini" }), false);
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 10_000, provider: "gemini" }), false);
     assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, reservation()), false);
     assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, { ...reservation(), operationId: "invalid" }), false);
     assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, { ...reservation(), expiresAt: Date.now() - 1 }), false);
@@ -120,6 +129,8 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
       assert.equal(await worker.evaluate(() => globalThis.fixtureSubmitReservationPending), true);
       assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
         { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
+      assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
+        { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000, provider: "gemini" }), false);
     } finally {
       await worker.evaluate(() => {
         chrome.storage.local.get = globalThis.fixtureOriginalReservationGet;
@@ -172,9 +183,38 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
     worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     assert.equal(new URL(worker.url()).hostname, extensionId);
     assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt, reservation()), false);
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt, geminiReservation()), false);
     const persisted = await worker.evaluate(async () => chrome.storage.local.get(null));
     assert.equal(persisted[`fixture-submit-attempt-${operationId}`], true);
+    assert.equal(persisted[`gemini-submit-attempt-${geminiOperationId}`], true);
     assert.equal(Object.values(persisted).every(value => value === true), true);
+    const missingWriteId = crypto.randomUUID();
+    await worker.evaluate(() => {
+      globalThis.originalReservationSet = chrome.storage.local.set.bind(chrome.storage.local);
+      chrome.storage.local.set = async () => {};
+    });
+    try {
+      assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
+        { operationId: missingWriteId, expiresAt: Date.now() + 4000, provider: "gemini" }), false);
+      assert.deepEqual(await worker.evaluate(key => chrome.storage.local.get(key), `gemini-submit-attempt-${missingWriteId}`), {});
+    } finally {
+      await worker.evaluate(() => {
+        chrome.storage.local.set = globalThis.originalReservationSet;
+        delete globalThis.originalReservationSet;
+      });
+    }
+    await worker.evaluate(async () => chrome.storage.local.set({ "gemini-submit-attempt-invalid": true }));
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000, provider: "gemini" }), false);
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
+    await worker.evaluate(async () => chrome.storage.local.remove("gemini-submit-attempt-invalid"));
+    await worker.evaluate(async key => chrome.storage.local.set({ [key]: false }), `gemini-submit-attempt-${geminiOperationId}`);
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000, provider: "gemini" }), false);
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
+    await worker.evaluate(async key => chrome.storage.local.set({ [key]: true }), `gemini-submit-attempt-${geminiOperationId}`);
     await worker.evaluate(async () => {
       await chrome.storage.local.set({ "fixture-submit-attempt-invalid": true });
     });
@@ -187,6 +227,22 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
     });
     assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
       { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
+    await worker.evaluate(async () => {
+      await chrome.storage.local.clear();
+      await chrome.storage.local.set(Object.fromEntries(Array.from({ length: 10_000 }, (_, index) =>
+        [`${index % 2 ? "gemini" : "fixture"}-submit-attempt-${crypto.randomUUID()}`, true])));
+    });
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000, provider: "gemini" }), false);
+    assert.equal(await worker.evaluate(reserveFixtureSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
+    await worker.evaluate(async () => {
+      await chrome.storage.local.clear();
+      await chrome.storage.local.set(Object.fromEntries(Array.from({ length: 10_000 }, () =>
+        [`gemini-submit-attempt-${crypto.randomUUID()}`, true])));
+    });
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
+      { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000, provider: "gemini" }), false);
   } finally {
     await context?.close();
     await rm(profile, { recursive: true, force: true });

@@ -200,9 +200,10 @@ export function fillFixtureDraft(input: {
   }
 }
 
-export async function reserveFixtureSubmitAttempt(input: { operationId: string; expiresAt: number }): Promise<boolean> {
+export async function reserveFixtureSubmitAttempt(input: { operationId: string; expiresAt: number; provider?: "fixture" | "gemini" }): Promise<boolean> {
   const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
+    || (input.provider !== undefined && input.provider !== "fixture" && input.provider !== "gemini")
     || !Number.isSafeInteger(input.expiresAt) || input.expiresAt <= Date.now()
     || input.expiresAt > Date.now() + 4_000) return false;
   const scope = globalThis as typeof globalThis & {
@@ -215,14 +216,18 @@ export async function reserveFixtureSubmitAttempt(input: { operationId: string; 
   const storage = scope.chrome?.storage?.local;
   if (!storage || scope.fixtureSubmitReservationPending) return false;
   scope.fixtureSubmitReservationPending = true;
-  const prefix = "fixture-submit-attempt-";
+  const prefixes = { fixture: "fixture-submit-attempt-", gemini: "gemini-submit-attempt-" };
+  const prefix = prefixes[input.provider ?? "fixture"];
   const key = `${prefix}${input.operationId}`;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const persist = async () => {
     try {
       const entries = await storage.get(null);
-      const keys = Object.keys(entries).filter(entry => entry.startsWith(prefix));
-      if (keys.length >= 10_000 || keys.some(entry => !identifier.test(entry.slice(prefix.length)) || entries[entry] !== true)
+      const keys = Object.keys(entries).filter(entry => entry.startsWith(prefixes.fixture) || entry.startsWith(prefixes.gemini));
+      if (keys.length >= 10_000 || keys.some(entry => {
+        const entryPrefix = entry.startsWith(prefixes.fixture) ? prefixes.fixture : prefixes.gemini;
+        return !identifier.test(entry.slice(entryPrefix.length)) || entries[entry] !== true;
+      })
         || Object.hasOwn(entries, key) || input.expiresAt <= Date.now()) return false;
       await storage.set({ [key]: true });
       if (input.expiresAt <= Date.now()) return false;
@@ -242,6 +247,8 @@ export async function reserveFixtureSubmitAttempt(input: { operationId: string; 
     clearTimeout(timer);
   }
 }
+
+export const reserveBrowserSubmitAttempt = reserveFixtureSubmitAttempt;
 
 export function submitFixtureDraft(input: {
   expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number
