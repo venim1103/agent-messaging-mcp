@@ -83,6 +83,46 @@ export function inspectGeminiSubmitControls(expectedUrl: string): { controls: {
   })), hasMore: controls.length > 4 };
 }
 
+export function inspectGeminiPromptControls(expectedUrl: string): { promptCount: number; empty: boolean | null;
+  ancestorDepth: number | null; controls: { tag: "button" | "div" | "other"; roleButton: boolean;
+    label: "send-message" | "send" | "submit" | "other"; type: "button" | "submit" | "other";
+    visible: boolean; disabled: boolean; ariaDisabled: boolean; sendIcon: boolean }[]; hasMore: boolean } | null {
+  if (window.top !== window || document.visibilityState !== "visible" || location.href !== expectedUrl
+    || location.origin !== "https://gemini.google.com") return null;
+  const url = new URL(location.href);
+  const route = url.pathname.split("/").filter(Boolean);
+  if (url.href.length > 512 || url.username || url.password || url.hash || route.length !== 2
+    || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return null;
+  const visible = (element: HTMLElement) => element.getClientRects().length > 0
+    && getComputedStyle(element).visibility === "visible";
+  const prompts = [...document.querySelectorAll<HTMLElement>("[contenteditable=true]")]
+    .filter((prompt) => visible(prompt) && (prompt.getAttribute("aria-label") === "Enter a prompt for Gemini"
+      || prompt.getAttribute("placeholder") === "Enter a prompt for Gemini"));
+  if (prompts.length !== 1) return { promptCount: prompts.length, empty: null, ancestorDepth: null, controls: [], hasMore: false };
+  const prompt = prompts[0]!;
+  const empty = !Boolean(prompt.textContent?.length || prompt.innerText.trim());
+  let ancestor = prompt.parentElement;
+  for (let depth = 1; ancestor && depth <= 4; depth++, ancestor = ancestor.parentElement) {
+    if (["html", "body", "main"].includes(ancestor.localName) || ancestor.getAttribute("role") === "main") break;
+    const controls = [...ancestor.querySelectorAll<HTMLElement>("button, [role=button]")]
+      .filter((control) => !prompt.contains(control));
+    if (!controls.length) continue;
+    return { promptCount: 1, empty, ancestorDepth: depth, controls: controls.slice(0, 8).map((control) => {
+      const label = control.getAttribute("aria-label");
+      const type = control instanceof HTMLButtonElement ? control.type : control.getAttribute("type");
+      return { tag: control.localName === "button" || control.localName === "div" ? control.localName : "other",
+        roleButton: control.getAttribute("role") === "button",
+        label: label === "Send message" ? "send-message" : label === "Send" ? "send" : label === "Submit" ? "submit" : "other",
+        type: type === "button" || type === "submit" ? type : "other", visible: visible(control),
+        disabled: control instanceof HTMLButtonElement && control.disabled,
+        ariaDisabled: control.getAttribute("aria-disabled") === "true",
+        sendIcon: [...control.querySelectorAll<HTMLElement>("mat-icon, [data-mat-icon-name], .google-symbols, .material-symbols-outlined, .material-icons")]
+          .some((icon) => icon.getAttribute("data-mat-icon-name") === "send" || icon.textContent?.trim() === "send") };
+    }), hasMore: controls.length > 8 };
+  }
+  return { promptCount: 1, empty, ancestorDepth: null, controls: [], hasMore: false };
+}
+
 export function isEligibleGeminiUrl(href: string): boolean {
   try {
     const url = new URL(href);

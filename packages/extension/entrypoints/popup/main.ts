@@ -1,6 +1,6 @@
 import { browser } from "wxt/browser";
 import { geminiDraftText } from "../../lib/approved-probe";
-import { captureGeminiSnapshot, inspectGeminiSubmitControls, isEligibleGeminiUrl } from "../../lib/gemini-observation";
+import { captureGeminiSnapshot, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl } from "../../lib/gemini-observation";
 
 type FixturePreview = {
   conversationId: string;
@@ -404,6 +404,7 @@ inspectButton.addEventListener("click", async () => {
 
       let readShape: { direction: string; characters: number }[] | null = null;
       let submitShape: ReturnType<typeof inspectGeminiSubmitControls> = null;
+      let promptShape: ReturnType<typeof inspectGeminiPromptControls> = null;
       const documentId = injection.documentId;
       if (typeof documentId === "string" && /^[!-~]{1,128}$/.test(documentId)
         && preview.mainRegions === 1 && preview.timelineCount === 1) {
@@ -414,6 +415,12 @@ inspectButton.addEventListener("click", async () => {
           const [selected] = await browser.tabs.query({ active: true, currentWindow: true });
           if (controls?.frameId === 0 && controls.documentId === documentId && selected?.id === tab.id
             && (await browser.tabs.get(tab.id)).url === tab.url) submitShape = controls.result ?? null;
+          const [nearby] = await browser.scripting.executeScript({
+            target: { tabId: tab.id, documentIds: [documentId] }, func: inspectGeminiPromptControls, args: [tab.url]
+          });
+          const [current] = await browser.tabs.query({ active: true, currentWindow: true });
+          if (nearby?.frameId === 0 && nearby.documentId === documentId && current?.id === tab.id
+            && (await browser.tabs.get(tab.id)).url === tab.url) promptShape = nearby.result ?? null;
           const [captured] = await browser.scripting.executeScript({
             target: { tabId: tab.id, documentIds: [documentId] }, func: captureGeminiSnapshot
           });
@@ -448,6 +455,15 @@ inspectButton.addEventListener("click", async () => {
           + `${control.inTimeline ? "inside timeline" : "outside timeline"}; ${control.inMain ? "inside main" : "outside main"}; `
           + `${control.sharesEditorForm ? "shared editor form" : "no shared editor form"}`)
           .concat(submitShape.hasMore ? ["Additional matches omitted"] : []).join("\n") || "None matching"
+          : "Unsupported or changed"],
+        ["Prompt state", promptShape ? `${promptShape.promptCount} prompt matches; `
+          + `${promptShape.empty === null ? "ambiguous" : promptShape.empty ? "empty" : "nonempty"}` : "Unsupported or changed"],
+        ["Nearby prompt controls", promptShape ? promptShape.controls.map((control) =>
+          `depth ${promptShape.ancestorDepth}; ${control.tag}; ${control.roleButton ? "role button" : "native control"}; `
+          + `${control.label}; ${control.type}; ${control.visible ? "visible" : "hidden"}; `
+          + `${control.disabled ? "disabled" : "enabled"}; ${control.ariaDisabled ? "aria-disabled" : "no aria-disabled"}; `
+          + `${control.sendIcon ? "send icon" : "no send icon"}`)
+          .concat(promptShape.hasMore ? ["Additional matches omitted"] : []).join("\n") || "None within bounded ancestors"
           : "Unsupported or changed"],
         ["Rendered rows", preview.timelineCount === 1
           ? preview.rows.map((row) => `${row.tag} (${row.characters} chars)`).join("\n") || "No visible rows"

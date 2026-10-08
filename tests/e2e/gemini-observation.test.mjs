@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
-import { captureGeminiSnapshot, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiSubmitControls, isEligibleGeminiUrl,
+import { captureGeminiSnapshot, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl,
   observeGeminiIdentity, observeGeminiMessages }
   from "../../packages/extension/lib/gemini-observation.ts";
 
@@ -42,6 +42,57 @@ test("read-only Gemini draft inspection refuses unsafe composers without editing
     const control = { label: "send-message", classMatch: true, type: "button", visible: true,
       disabled: true, ariaDisabled: false, inTimeline: false, inMain: true, sharesEditorForm: true };
     assert.deepEqual(await inspectControls(), { controls: [control], hasMore: false });
+    const inspectNearby = async (url = expectedUrl) => {
+      const before = await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML }));
+      const result = await page.evaluate(inspectGeminiPromptControls, url);
+      assert.deepEqual(await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML })), before);
+      assert.equal(await page.evaluate(() => window.submits), 0);
+      assert.equal(JSON.stringify(result).includes("Private"), false);
+      return result;
+    };
+    const nearbyControl = { tag: "button", roleButton: false, label: "send-message", type: "button", visible: true,
+      disabled: true, ariaDisabled: false, sendIcon: false };
+    assert.deepEqual(await inspectNearby(), { promptCount: 1, empty: true, ancestorDepth: 1, controls: [nearbyControl], hasMore: false });
+    assert.equal(await inspectNearby(expectedUrl.replace("hl=en", "hl=fr")), null);
+    await page.locator("button").evaluate((button) => {
+      button.removeAttribute("class");
+      button.setAttribute("aria-label", "Private unreviewed label");
+      button.disabled = false;
+      const icon = document.createElement("mat-icon");
+      icon.textContent = "send";
+      button.append(icon);
+    });
+    assert.deepEqual(await inspectControls(), { controls: [], hasMore: false });
+    assert.deepEqual(await inspectNearby(), { promptCount: 1, empty: true, ancestorDepth: 1,
+      controls: [{ ...nearbyControl, label: "other", disabled: false, sendIcon: true }], hasMore: false });
+    await page.locator("[contenteditable]").evaluate((editor) => { editor.innerText = "Private unsent draft"; });
+    assert.equal((await inspectNearby()).empty, false);
+    await page.locator("form").evaluate((form) => {
+      for (let count = 0; count < 8; count++) {
+        const control = document.createElement("div");
+        control.setAttribute("role", "button");
+        control.setAttribute("aria-label", "Private role label");
+        control.textContent = "Private control text";
+        form.append(control);
+      }
+    });
+    const nearbyBounded = await inspectNearby();
+    assert.equal(nearbyBounded.controls.length, 8);
+    assert.equal(nearbyBounded.hasMore, true);
+    assert.equal(nearbyBounded.controls[1].tag, "div");
+    assert.equal(nearbyBounded.controls[1].roleButton, true);
+    await page.locator("[contenteditable]").evaluate((editor) => editor.parentElement.append(editor.cloneNode(true)));
+    assert.deepEqual(await inspectNearby(), { promptCount: 2, empty: null, ancestorDepth: null, controls: [], hasMore: false });
+    await page.reload();
+    await page.locator("[contenteditable]").evaluate((editor) => {
+      for (let depth = 0; depth < 4; depth++) {
+        const wrapper = document.createElement("div");
+        editor.parentElement.insertBefore(wrapper, editor);
+        wrapper.append(editor);
+      }
+    });
+    assert.deepEqual(await inspectNearby(), { promptCount: 1, empty: true, ancestorDepth: null, controls: [], hasMore: false });
+    await page.reload();
     await page.locator("button").evaluate((button) => { button.disabled = false; });
     assert.deepEqual(await inspectControls(), { controls: [{ ...control, disabled: false }], hasMore: false });
     await page.locator("button").evaluate((button) => { button.disabled = true; });
@@ -95,6 +146,7 @@ test("read-only Gemini draft inspection refuses unsafe composers without editing
     await page.goto(`${expectedUrl}#reply`);
     assert.deepEqual(await inspect({ expectedUrl: page.url(), text }), { ok: false, code: "TARGET_CHANGED" });
     assert.equal(await inspectControls(page.url()), null);
+    assert.equal(await inspectNearby(page.url()), null);
   } finally {
     await browser.close();
   }

@@ -1300,6 +1300,10 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     const controlDiagnostic = await popup.locator("#messages").textContent();
     assert.ok(controlDiagnostic.includes("Send controls"));
     assert.ok(controlDiagnostic.includes("send-message; send-button; button; visible; enabled; no aria-disabled; outside timeline; outside main; no shared editor form"));
+    assert.ok(controlDiagnostic.includes("Prompt state"));
+    assert.ok(controlDiagnostic.includes("1 prompt matches; nonempty"));
+    assert.ok(controlDiagnostic.includes("Nearby prompt controls"));
+    assert.ok(controlDiagnostic.includes("None within bounded ancestors"));
     assert.equal(controlDiagnostic.includes("Private control text"), false);
     assert.equal(controlDiagnostic.includes("Private draft"), false);
     assert.equal(await page.locator("body").innerHTML(), beforeInspection);
