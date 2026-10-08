@@ -4,7 +4,8 @@ import { readFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
-import { captureFixtureSnapshot, fillFixtureDraft, inspectFixturePreflight, observeFixtureMessages } from "../../packages/extension/lib/fixture-observation.ts";
+import { captureFixtureSnapshot, fillFixtureDraft, inspectFixturePreflight, observeFixtureMessages,
+  submitFixtureDraft } from "../../packages/extension/lib/fixture-observation.ts";
 import { PreparedMessageOperations } from "../../packages/companion/dist/message-operations.js";
 import { PendingConnectionRequests } from "../../packages/companion/dist/pending-connections.js";
 import { createFixtureServer } from "../fixtures/server.mjs";
@@ -262,6 +263,76 @@ test("one-shot fixture draft fill preserves user input and never activates Send"
     await page.goto("about:blank");
     assert.deepEqual(await page.evaluate(fillFixtureDraft, fillInput("http://127.0.0.1:8787/")),
       { ok: false, code: "TARGET_CHANGED" });
+  } finally {
+    await browser.close();
+  }
+});
+
+test("fixture submit activates once only for the exact draft and rechecks after focus", async () => {
+  const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("http://127.0.0.1:8787/**", route => route.fulfill({
+      status: 200, contentType: "text/html; charset=utf-8", body: html
+    }));
+    const text = "Synthetic exact submit\nSecond line \u00e9";
+    for (const editor of ["textarea", "rich"]) {
+      const expectedUrl = `http://127.0.0.1:8787/${editor === "rich" ? "?editor=rich" : ""}`;
+      for (const outcome of ["exact", "lost_result", "changed", "disabled", "readonly", "blocked", "expired",
+        "changed_on_focus", "target_on_focus", "replaced_on_focus", "throws_after_activation"]) {
+        await page.goto(expectedUrl);
+        const operationId = crypto.randomUUID();
+        const input = { expectedUrl, text, operationId, attemptId: operationId, expiresAt: Date.now() + 4000 };
+        assert.deepEqual(await page.evaluate(fillFixtureDraft, { ...input, attemptId: crypto.randomUUID() }),
+          { ok: true, editor });
+        await page.locator("#composer").evaluate(form => {
+          window.fixtureSubmitCount = 0;
+          form.addEventListener("submit", () => { window.fixtureSubmitCount++; });
+        });
+        if (outcome === "changed") await page.getByRole("textbox", { name: "Message" }).fill("Preserve changed draft");
+        if (outcome === "disabled") await page.locator("button[type=submit]").evaluate(button => { button.disabled = true; });
+        if (outcome === "readonly") await page.getByRole("textbox", { name: "Message" }).evaluate(element => {
+          if (element instanceof HTMLTextAreaElement) element.readOnly = true;
+          else element.setAttribute("aria-readonly", "true");
+        });
+        if (outcome === "blocked") await page.locator("button[type=submit]").evaluate(button => {
+          const overlay = document.createElement("div");
+          overlay.style.cssText = "position:fixed;inset:0;z-index:999999;background:white";
+          document.body.append(overlay);
+        });
+        if (outcome.endsWith("_on_focus")) await page.locator("button[type=submit]").evaluate((button, action) => {
+          button.addEventListener("focus", () => {
+            if (action === "changed_on_focus") {
+              const composer = document.querySelector("#composer [role=textbox], #composer textarea:not([hidden])");
+              if (composer instanceof HTMLTextAreaElement) composer.value = "Changed during focus";
+              else composer.textContent = "Changed during focus";
+            }
+            if (action === "target_on_focus") document.querySelector("main").dataset.conversationId = "fixture-beta";
+            if (action === "replaced_on_focus") button.replaceWith(button.cloneNode(true));
+          }, { once: true });
+        }, outcome);
+        if (outcome === "throws_after_activation") await page.evaluate(() => {
+          const click = HTMLElement.prototype.click;
+          HTMLElement.prototype.click = function () { click.call(this); throw new Error("Private synthetic failure"); };
+        });
+        const result = await page.evaluate(submitFixtureDraft,
+          outcome === "expired" ? { ...input, expiresAt: Date.now() - 1 } : input);
+        const activated = ["exact", "lost_result", "throws_after_activation"].includes(outcome);
+        if (outcome !== "lost_result") assert.deepEqual(result, outcome === "throws_after_activation"
+          ? { ok: false, code: "DISPATCH_UNCERTAIN" } : outcome === "exact"
+            ? { ok: true, editor, activated: true } : { ok: false, code: outcome === "changed" || outcome === "changed_on_focus"
+              ? "DRAFT_CHANGED" : outcome === "disabled" || outcome === "blocked" ? "SUBMIT_UNAVAILABLE"
+                : outcome === "readonly" ? "COMPOSER_UNAVAILABLE" : outcome === "target_on_focus"
+                  ? "TARGET_CHANGED" : "DISPATCH_UNAVAILABLE" }, `${editor}: ${outcome}`);
+        assert.equal(await page.evaluate(() => window.fixtureSubmitCount), activated ? 1 : 0, `${editor}: ${outcome}`);
+        assert.equal(await page.locator("ol#messages > li").count(), activated ? 3 : 2, `${editor}: ${outcome}`);
+        assert.deepEqual(await page.evaluate(submitFixtureDraft, { ...input, expiresAt: Date.now() + 4000 }),
+          { ok: false, code: "DISPATCH_UNAVAILABLE" }, `${editor}: replay ${outcome}`);
+        assert.equal(await page.evaluate(() => window.fixtureSubmitCount), activated ? 1 : 0);
+        if (activated) assert.equal(await page.locator("ol#messages > li:last-child p").textContent(), text);
+      }
+    }
   } finally {
     await browser.close();
   }

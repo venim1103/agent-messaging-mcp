@@ -3,6 +3,9 @@ type FixturePreflight = { ok: true; editor: "textarea" | "rich" } | { ok: false;
   code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_PRESENT" | "SUBMIT_UNAVAILABLE"
 };
 type FixtureFill = FixturePreflight | { ok: false; code: "FILL_UNAVAILABLE" | "FILL_UNCERTAIN" };
+type FixtureSubmit = { ok: true; editor: "textarea" | "rich"; activated: true } | { ok: false;
+  code: "TARGET_CHANGED" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE"
+    | "DISPATCH_UNAVAILABLE" | "DISPATCH_UNCERTAIN" };
 
 export function captureFixtureSnapshot(): { messages: FixtureMessage[] } | null {
   if (location.origin !== "http://127.0.0.1:8787") return null;
@@ -194,6 +197,99 @@ export function fillFixtureDraft(input: {
     return { ok: true, editor: ready.kind };
   } catch {
     return { ok: false, code: "FILL_UNCERTAIN" };
+  }
+}
+
+export function submitFixtureDraft(input: {
+  expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number
+}): FixtureSubmit {
+  const fixtureUrl = "http://127.0.0.1:8787/";
+  const richUrl = `${fixtureUrl}?editor=rich`;
+  const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
+    || input.attemptId !== input.operationId || !Number.isSafeInteger(input.expiresAt)) {
+    return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+  }
+  const scope = globalThis as typeof globalThis & { fixtureSubmitAttempts?: Set<string> };
+  const attempts = scope.fixtureSubmitAttempts ??= new Set<string>();
+  if (attempts.has(input.operationId) || attempts.size >= 100) return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+  attempts.add(input.operationId);
+  if (input.expiresAt <= Date.now() || input.expiresAt > Date.now() + 4_000) {
+    return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+  }
+  if ((input.expectedUrl !== fixtureUrl && input.expectedUrl !== richUrl)
+    || location.href !== input.expectedUrl || window.top !== window || document.visibilityState !== "visible") {
+    return { ok: false, code: "TARGET_CHANGED" };
+  }
+  if (typeof input.text !== "string" || !input.text || input.text !== input.text.trim() || input.text.includes("\r")
+    || input.text.length > 2048 || new TextEncoder().encode(input.text).length > 4000) {
+    return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+  }
+  const inspect = () => {
+    if (location.href !== input.expectedUrl || document.visibilityState !== "visible" || input.expiresAt <= Date.now()) {
+      return { ok: false as const, code: "TARGET_CHANGED" as const };
+    }
+    const roots = document.querySelectorAll<HTMLElement>("main[data-conversation-id]");
+    const root = roots[0];
+    if (roots.length !== 1 || root?.dataset.conversationId !== "fixture-alpha") {
+      return { ok: false as const, code: "TARGET_CHANGED" as const };
+    }
+    const visible = (element: HTMLElement) => element.getClientRects().length > 0
+      && getComputedStyle(element).visibility === "visible" && Number(getComputedStyle(element).opacity) > 0;
+    const forms = root.querySelectorAll("form#composer");
+    const form = forms[0];
+    if (forms.length !== 1 || !(form instanceof HTMLFormElement) || !visible(root) || !visible(form)) {
+      return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
+    }
+    const editors = [...form.querySelectorAll<HTMLElement>("textarea, [contenteditable=true], [role=textbox]")].filter(visible);
+    const editor = editors[0];
+    const kind = input.expectedUrl === richUrl ? "rich" as const : "textarea" as const;
+    if (editors.length !== 1 || !editor || editor.closest("[inert], [aria-disabled=true], fieldset:disabled")) {
+      return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
+    }
+    if (kind === "textarea") {
+      if (!(editor instanceof HTMLTextAreaElement) || editor.id !== "message" || editor.matches(":disabled") || editor.readOnly) {
+        return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
+      }
+      if (editor.value !== input.text) return { ok: false as const, code: "DRAFT_CHANGED" as const };
+    } else {
+      if (editor.id !== "rich-message" || !editor.isContentEditable || editor.getAttribute("aria-readonly") === "true") {
+        return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
+      }
+      if (editor.innerText !== input.text) return { ok: false as const, code: "DRAFT_CHANGED" as const };
+    }
+    const buttons = form.querySelectorAll("button[type=submit]");
+    const button = buttons[0];
+    if (buttons.length !== 1 || !(button instanceof HTMLButtonElement) || button.form !== form || !visible(button)
+      || button.matches(":disabled") || button.closest("[inert], [aria-disabled=true]")) {
+      return { ok: false as const, code: "SUBMIT_UNAVAILABLE" as const };
+    }
+    for (const [element, code] of [[button, "SUBMIT_UNAVAILABLE"], [editor, "COMPOSER_UNAVAILABLE"]] as const) {
+      const rect = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      if (rect.width <= 0 || rect.height <= 0 || rect.left < 0 || rect.top < 0
+        || rect.right > innerWidth || rect.bottom > innerHeight || !hit || (hit !== element && !element.contains(hit))) {
+        return { ok: false as const, code };
+      }
+    }
+    return { ok: true as const, root, form, editor, button, kind };
+  };
+  let activated = false;
+  try {
+    const before = inspect();
+    if (!before.ok) return before;
+    HTMLElement.prototype.focus.call(before.button, { preventScroll: true });
+    const ready = inspect();
+    if (!ready.ok) return ready;
+    if (ready.root !== before.root || ready.form !== before.form || ready.editor !== before.editor
+      || ready.button !== before.button || document.activeElement !== ready.button || Date.now() >= input.expiresAt) {
+      return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+    }
+    activated = true;
+    HTMLElement.prototype.click.call(ready.button);
+    return { ok: true, editor: ready.kind, activated: true };
+  } catch {
+    return { ok: false, code: activated ? "DISPATCH_UNCERTAIN" : "DISPATCH_UNAVAILABLE" };
   }
 }
 
