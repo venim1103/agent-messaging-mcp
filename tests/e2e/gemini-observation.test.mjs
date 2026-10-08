@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
-import { captureGeminiSnapshot, identifyGeminiConversation, inspectGeminiDraft, isEligibleGeminiUrl,
+import { captureGeminiSnapshot, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiSubmitControls, isEligibleGeminiUrl,
   observeGeminiIdentity, observeGeminiMessages }
   from "../../packages/extension/lib/gemini-observation.ts";
 
@@ -17,10 +17,11 @@ test("read-only Gemini draft inspection refuses unsafe composers without editing
         [contenteditable] { display: block; min-height: 80px; width: 400px; border: 1px solid black; }
       </style></head><body><main>
         <infinite-scroller><user-query><user-query-content>Initial row</user-query-content></user-query></infinite-scroller>
-        <form><div contenteditable="true" aria-label="Enter a prompt for Gemini"></div><button>Send</button></form>
+        <form><div contenteditable="true" aria-label="Enter a prompt for Gemini"></div>
+          <button type="button" class="send-button" aria-label="Send message" disabled>Private button text</button></form>
       </main><script>window.submits = 0; document.querySelector('form').onsubmit = event => {
         event.preventDefault(); window.submits += 1;
-      };</script></body></html>` }));
+      }; document.querySelector('button').onclick = () => { window.submits += 1; };</script></body></html>` }));
     await page.goto(expectedUrl);
     const inspect = async (input = { expectedUrl, text }) => {
       const before = await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML }));
@@ -30,6 +31,36 @@ test("read-only Gemini draft inspection refuses unsafe composers without editing
       return result;
     };
     assert.deepEqual(await inspect(), { ok: true, editor: "contenteditable" });
+    const inspectControls = async (url = expectedUrl) => {
+      const before = await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML }));
+      const result = await page.evaluate(inspectGeminiSubmitControls, url);
+      assert.deepEqual(await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML })), before);
+      assert.equal(await page.evaluate(() => window.submits), 0);
+      assert.equal(JSON.stringify(result).includes("Private button text"), false);
+      return result;
+    };
+    const control = { label: "send-message", classMatch: true, type: "button", visible: true,
+      disabled: true, ariaDisabled: false, inTimeline: false, sharesEditorForm: true };
+    assert.deepEqual(await inspectControls(), { controls: [control], hasMore: false });
+    await page.locator("button").evaluate((button) => { button.disabled = false; });
+    assert.deepEqual(await inspectControls(), { controls: [{ ...control, disabled: false }], hasMore: false });
+    await page.locator("button").evaluate((button) => { button.disabled = true; });
+    assert.equal(await inspectControls(expectedUrl.replace("hl=en", "hl=fr")), null);
+    await page.locator("button").evaluate((button) => {
+      button.setAttribute("aria-label", "Private arbitrary label");
+      button.setAttribute("aria-disabled", "true");
+      document.querySelector("infinite-scroller").append(button);
+    });
+    assert.deepEqual(await inspectControls(), { controls: [{ ...control, label: "unrecognized", ariaDisabled: true,
+      inTimeline: true, sharesEditorForm: false }], hasMore: false });
+    await page.locator("button").evaluate((button) => {
+      for (let count = 0; count < 4; count++) button.parentElement.append(button.cloneNode(true));
+    });
+    const bounded = await inspectControls();
+    assert.equal(bounded.controls.length, 4);
+    assert.equal(bounded.hasMore, true);
+    assert.equal(JSON.stringify(bounded).includes("Private arbitrary label"), false);
+    await page.reload();
     assert.deepEqual(await inspect({ expectedUrl: expectedUrl.replace("hl=en", "hl=fr"), text }), { ok: false, code: "TARGET_CHANGED" });
     assert.deepEqual(await inspect({ expectedUrl, text: "x".repeat(2049) }), { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
     assert.deepEqual(await inspect({ expectedUrl, text: " " }), { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
@@ -60,6 +91,7 @@ test("read-only Gemini draft inspection refuses unsafe composers without editing
     }
     await page.goto(`${expectedUrl}#reply`);
     assert.deepEqual(await inspect({ expectedUrl: page.url(), text }), { ok: false, code: "TARGET_CHANGED" });
+    assert.equal(await inspectControls(page.url()), null);
   } finally {
     await browser.close();
   }

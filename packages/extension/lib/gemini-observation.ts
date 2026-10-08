@@ -48,6 +48,40 @@ export function inspectGeminiDraft(input: { expectedUrl: string; text: string; d
   return { ok: true, editor: "contenteditable" };
 }
 
+export function inspectGeminiSubmitControls(expectedUrl: string): { controls: {
+  label: "send-message" | "send" | "unrecognized"; classMatch: boolean; type: "button" | "submit" | "other";
+  visible: boolean; disabled: boolean; ariaDisabled: boolean; inTimeline: boolean; sharesEditorForm: boolean;
+}[]; hasMore: boolean } | null {
+  if (window.top !== window || document.visibilityState !== "visible" || location.href !== expectedUrl
+    || location.origin !== "https://gemini.google.com") return null;
+  const url = new URL(location.href);
+  const route = url.pathname.split("/").filter(Boolean);
+  if (url.href.length > 512 || url.username || url.password || url.hash || route.length !== 2
+    || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return null;
+  const visible = (element: HTMLElement) => element.getClientRects().length > 0
+    && getComputedStyle(element).visibility === "visible";
+  const regions = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);
+  if (regions.length !== 1) return null;
+  const region = regions[0]!;
+  const timelines = [...region.querySelectorAll<HTMLElement>("infinite-scroller")]
+    .filter((timeline) => visible(timeline) && [...timeline.querySelectorAll<HTMLElement>("user-query, model-response")].some(visible));
+  if (timelines.length !== 1) return null;
+  const editors = [...region.querySelectorAll<HTMLElement>("[contenteditable=true]")]
+    .filter((editor) => visible(editor) && (editor.getAttribute("aria-label") === "Enter a prompt for Gemini"
+      || editor.getAttribute("placeholder") === "Enter a prompt for Gemini"));
+  const editorForm = editors.length === 1 ? editors[0]!.closest("form") : null;
+  const controls = [...region.querySelectorAll<HTMLButtonElement>(
+    'button.send-button, button[aria-label="Send message"], button[aria-label="Send"]')];
+  return { controls: controls.slice(0, 4).map((control) => ({
+    label: control.getAttribute("aria-label") === "Send message" ? "send-message"
+      : control.getAttribute("aria-label") === "Send" ? "send" : "unrecognized",
+    classMatch: control.classList.contains("send-button"),
+    type: control.type === "button" || control.type === "submit" ? control.type : "other",
+    visible: visible(control), disabled: control.disabled, ariaDisabled: control.getAttribute("aria-disabled") === "true",
+    inTimeline: timelines[0]!.contains(control), sharesEditorForm: editorForm !== null && control.form === editorForm
+  })), hasMore: controls.length > 4 };
+}
+
 export function isEligibleGeminiUrl(href: string): boolean {
   try {
     const url = new URL(href);

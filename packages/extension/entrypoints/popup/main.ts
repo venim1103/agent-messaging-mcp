@@ -1,6 +1,6 @@
 import { browser } from "wxt/browser";
 import { geminiDraftText } from "../../lib/approved-probe";
-import { captureGeminiSnapshot, isEligibleGeminiUrl } from "../../lib/gemini-observation";
+import { captureGeminiSnapshot, inspectGeminiSubmitControls, isEligibleGeminiUrl } from "../../lib/gemini-observation";
 
 type FixturePreview = {
   conversationId: string;
@@ -403,10 +403,17 @@ inspectButton.addEventListener("click", async () => {
       }
 
       let readShape: { direction: string; characters: number }[] | null = null;
+      let submitShape: ReturnType<typeof inspectGeminiSubmitControls> = null;
       const documentId = injection.documentId;
       if (typeof documentId === "string" && /^[!-~]{1,128}$/.test(documentId)
         && preview.mainRegions === 1 && preview.timelineCount === 1) {
         try {
+          const [controls] = await browser.scripting.executeScript({
+            target: { tabId: tab.id, documentIds: [documentId] }, func: inspectGeminiSubmitControls, args: [tab.url]
+          });
+          const [selected] = await browser.tabs.query({ active: true, currentWindow: true });
+          if (controls?.frameId === 0 && controls.documentId === documentId && selected?.id === tab.id
+            && (await browser.tabs.get(tab.id)).url === tab.url) submitShape = controls.result ?? null;
           const [captured] = await browser.scripting.executeScript({
             target: { tabId: tab.id, documentIds: [documentId] }, func: captureGeminiSnapshot
           });
@@ -435,6 +442,12 @@ inspectButton.addEventListener("click", async () => {
           : selectedUrl.search ? "Eligible saved-chat URL (query bound exactly)" : "Eligible saved-chat URL"],
         ["Regions", `${preview.mainRegions} main, ${preview.timelineCount} candidate chat timelines`],
         ["Editors", preview.editors.map((editor) => `${editor.tag}: ${editor.isPrompt ? "Gemini prompt" : "other editor"}`).join("\n") || "None visible"],
+        ["Send controls", submitShape ? submitShape.controls.map((control) =>
+          `${control.label}; ${control.classMatch ? "send-button" : "no class match"}; ${control.type}; ${control.visible ? "visible" : "hidden"}; `
+          + `${control.disabled ? "disabled" : "enabled"}; ${control.ariaDisabled ? "aria-disabled" : "no aria-disabled"}; `
+          + `${control.inTimeline ? "inside timeline" : "outside timeline"}; ${control.sharesEditorForm ? "shared editor form" : "no shared editor form"}`)
+          .concat(submitShape.hasMore ? ["Additional matches omitted"] : []).join("\n") || "None matching"
+          : "Unsupported or changed"],
         ["Rendered rows", preview.timelineCount === 1
           ? preview.rows.map((row) => `${row.tag} (${row.characters} chars)`).join("\n") || "No visible rows"
           : "Missing or ambiguous chat region; no text inspected"],
