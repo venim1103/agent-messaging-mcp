@@ -20,6 +20,13 @@ export const FIXTURE_FILL_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_FILLS = 1;
 export const FIXTURE_DISPATCH_CHECK_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_DISPATCH_CHECKS = 16;
+export const MAX_PENDING_FIXTURE_DISPATCHES = 1;
+export const fixtureDispatchResultSchema = z.discriminatedUnion("ok", [
+  z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]), activated: z.literal(true) }),
+  z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "COMPOSER_UNAVAILABLE",
+    "DRAFT_CHANGED", "SUBMIT_UNAVAILABLE", "DISPATCH_UNAVAILABLE", "DISPATCH_UNCERTAIN"]) })
+]);
+export type FixtureDispatchResult = z.infer<typeof fixtureDispatchResultSchema>;
 export const fixtureDispatchCheckResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]),
     draftText: z.string().max(2048), selected: z.literal(true), writable: z.literal(true),
@@ -122,6 +129,10 @@ type PendingFixtureFill = {
   owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number;
   timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureFillStatus | null) => void
 };
+type PendingFixtureDispatch = {
+  owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number; startedAt: number;
+  issued: boolean; timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureDispatchStatus) => void
+};
 
 export class PreparedMessageOperations {
   private readonly owners = new Map<symbol, string>();
@@ -143,6 +154,7 @@ export class PreparedMessageOperations {
     timer: ReturnType<typeof setTimeout>; resolve: (ready: boolean) => void
   }>();
   private readonly dispatchAuthorizations = new Map<string, FixtureDispatchAuthorization>();
+  private readonly dispatchJobs = new Map<string, PendingFixtureDispatch>();
   private readonly ambiguousEvidence = new Set<string>();
   private readonly preflightChecks = new Map<string, PendingFixturePreflight>();
   private readonly fillChecks = new Map<string, PendingFixtureFill>();
@@ -197,6 +209,7 @@ export class PreparedMessageOperations {
   }
 
   private release(operationId: string): void {
+    this.finishFixtureDispatch(operationId);
     for (const [challengeId, pending] of this.preflightChecks) {
       if (pending.operationId === operationId) this.finishPreflightCheck(challengeId, null);
     }
@@ -220,6 +233,9 @@ export class PreparedMessageOperations {
   }
 
   private discardExpired(now: number): void {
+    for (const [operationId, pending] of this.dispatchJobs) {
+      if (pending.expiresAt <= now) this.finishFixtureDispatch(operationId);
+    }
     for (const [operationId, operation] of this.contents) {
       if (operation.expiresAt <= now) this.release(operationId);
     }
@@ -802,6 +818,84 @@ export class PreparedMessageOperations {
       || this.database.prepare("SELECT 1 FROM message_dispatch_evidence WHERE operation_id = ?").get(operationId)) return null;
     return Object.freeze({ operationId, attemptId: operationId, target: authorization.target,
       text: authorization.text, expiresAt: authorization.expiresAt });
+  }
+
+  private finishFixtureDispatch(operationId: string): void {
+    const pending = this.dispatchJobs.get(operationId);
+    if (!pending) return;
+    this.dispatchJobs.delete(operationId);
+    clearTimeout(pending.timer);
+    pending.resolve(this.dispatchStatus(operationId) ?? {
+      operationId, state: "dispatch_uncertain", startedAt: pending.startedAt
+    });
+  }
+
+  requestFixtureDispatch(owner: symbol, operationId: string, checkId: string, now = Date.now()) {
+    const status = this.getOperation(owner, operationId, now);
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") throw new Error("DISPATCH_UNCERTAIN");
+    if (status.state !== "approved") throw new Error("APPROVAL_REQUIRED");
+    if (this.dispatchJobs.size >= MAX_PENDING_FIXTURE_DISPATCHES) throw new Error("DISPATCH_CHECK_BUSY");
+    const started = this.recordFixtureDispatchStart(owner, operationId, now, checkId);
+    const authorization = this.consumeFixtureDispatchAuthorization(owner, operationId, now);
+    if (!authorization) throw new Error("DISPATCH_UNCERTAIN");
+    let resolve!: PendingFixtureDispatch["resolve"];
+    const result = new Promise<FixtureDispatchStatus>(done => { resolve = done; });
+    const timer = setTimeout(() => this.finishFixtureDispatch(operationId), authorization.expiresAt - now);
+    this.dispatchJobs.set(operationId, { owner, operationId, target: authorization.target, text: authorization.text,
+      expiresAt: authorization.expiresAt, startedAt: started.startedAt, issued: false, timer, resolve });
+    return { operationId, result };
+  }
+
+  listFixtureDispatchAttempts(now = Date.now()) {
+    this.discardExpired(now);
+    const attempts: Array<Readonly<{ operationId: string; attemptId: string; target: FixtureTarget;
+      text: string; expiresAt: number }>> = [];
+    for (const [operationId, pending] of this.dispatchJobs) {
+      const operation = this.contents.get(operationId);
+      const live = operation && this.requests.getApprovedTarget(pending.owner, operation.connectionId, now);
+      const intent = this.database.prepare("SELECT state, started_at FROM message_dispatch_attempts WHERE operation_id = ?")
+        .get(operationId) as { state: string; started_at: number } | undefined;
+      if (!operation || operation.owner !== pending.owner || !live || intent?.state !== "dispatching"
+        || intent.started_at !== pending.startedAt || pending.startedAt > now
+        || live.origin !== pending.target.origin || live.conversationId !== pending.target.conversationId
+        || live.tabId !== pending.target.tabId || live.documentId !== pending.target.documentId) {
+        this.finishFixtureDispatch(operationId);
+        continue;
+      }
+      if (pending.issued) continue;
+      const baseline = this.dispatchBaselines.get(operationId);
+      const current = this.requests.getFixtureSnapshot(pending.owner, operation.connectionId, now);
+      if (!baseline || baseline.capturedAt > now || baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS <= now
+        || !current || current === "not_ready" || current.capturedAt > now || current.capturedAt < baseline.capturedAt
+        || current.cursor.epoch !== baseline.cursor.epoch || current.cursor.sequence !== baseline.cursor.sequence) {
+        this.finishFixtureDispatch(operationId);
+        continue;
+      }
+      pending.issued = true;
+      attempts.push(Object.freeze({ operationId, attemptId: operationId, target: pending.target,
+        text: pending.text, expiresAt: pending.expiresAt }));
+    }
+    return attempts;
+  }
+
+  completeFixtureDispatch(target: FixtureTarget, operationId: string, attemptId: string,
+    observation: FixtureDispatchResult, now = Date.now()): boolean {
+    this.discardExpired(now);
+    const pending = this.dispatchJobs.get(operationId);
+    const parsed = fixtureDispatchResultSchema.safeParse(observation);
+    const operation = this.contents.get(operationId);
+    const live = operation && pending && this.requests.getApprovedTarget(pending.owner, operation.connectionId, now);
+    const intent = this.database.prepare("SELECT state, started_at FROM message_dispatch_attempts WHERE operation_id = ?")
+      .get(operationId) as { state: string; started_at: number } | undefined;
+    if (!pending || !pending.issued || attemptId !== operationId || !parsed.success || !live || pending.startedAt > now
+      || intent?.state !== "dispatching" || intent.started_at !== pending.startedAt
+      || pending.target.origin !== target.origin || pending.target.conversationId !== target.conversationId
+      || pending.target.tabId !== target.tabId || pending.target.documentId !== target.documentId
+      || live.origin !== target.origin || live.conversationId !== target.conversationId
+      || live.tabId !== target.tabId || live.documentId !== target.documentId) return false;
+    if (parsed.data.ok) this.reconcileFixtureObservation(pending.owner, operationId, now);
+    this.finishFixtureDispatch(operationId);
+    return true;
   }
 
   reconcileFixtureObservation(owner: symbol, operationId: string, now = Date.now()) {
