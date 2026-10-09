@@ -526,7 +526,7 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D10 Unconfirmed sends: decided.** Resolve from page evidence and pause only the affected chat when still unclear, with a one-click popup resolution; the barrier becomes per connection (section 10). Sub-question D10a (clearing the agent's own leftover draft) is open.
 - **D11 Hidden tab: decided, phased.** First the chat tab must stay visible; its own window is fine, so "active tab of the current window" relaxes to "visible tab". Later a hidden tab must work too, so that only closing the tab or the browser disconnects.
 - **D12 Target platform: decided.** Keep the devcontainer: container Chromium, native host, broker and MCP server in one container (section 12).
-- **D13 Connection start: decided.** The person clicks **Connect this chat** first and the agent picks the chat up (section 4). Sub-question D13a is open: which agent receives the chat when several MCP servers are connected. The proposed first rule is the single connected agent, refusing when there are none or several.
+- **D13 Connection start: decided.** The person clicks **Connect this chat** first and the agent picks the chat up (section 4). Sub-question D13a is open: which agent receives the chat. Proposed rule, to confirm before T2: exactly one connected agent receives it; with none, the offer waits until an agent picks it up or the tab closes; with several, the popup refuses.
 
 The system's value should be **controlled, inspectable chat operations with explicit limitations**, rather than a claim that every website can be automated identically.
 

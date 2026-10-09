@@ -1,8 +1,8 @@
 # Implementation Handoff
 
-Updated: 2026-10-09 (product decisions).
+Updated: 2026-10-09 (handover).
 
-Start with the dashboard below. Everything after it is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
+Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
 ## Current State Dashboard
 
@@ -53,7 +53,7 @@ This supervised chain stays for tests. The autonomous path (T3) reuses its fill,
 
 ### Critical path to the target
 
-Done: G1, the dispatch-job slice (`11dec64`). Steps T1-T6 replace the earlier G2-G6 plan.
+Done: G1, the dispatch-job slice (`11dec64`). Steps T1-T6 replace the earlier G2-G6 plan. The exact changes, tests, completion criteria and ask-points for each step are in **Implementation Plan T1-T6** below the dashboard.
 
 1. **T1 Read robustness.** Restart a stopped native watch without retrying writes (R2). Apply D8: a newest-rows window with `omittedBefore`, explicit per-message truncation within the frame limit, and skipping instead of revoking when a capture fails but URL, document and conversation are unchanged (R1).
 2. **T2 Connection model.** Popup-first **Connect this chat**, picked up by the connected MCP agent through a new tool (D13). One approval grants reading and autonomous sending (D1). No fixed expiry: the connection ends on tab close, chat switch, browser or MCP server restart, or disconnect, and a reload of the same chat re-attaches using a one-time optional `gemini.google.com` host permission (D2). The MCP server starts the broker and connects at startup (D4).
@@ -87,11 +87,79 @@ Done: G1, the dispatch-job slice (`11dec64`). Steps T1-T6 replace the earlier G2
 
 ### Decisions
 
-Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Still open: D6, the debugger permission, decided after the first live test; D10a, whether the system may clear a leftover draft that exactly equals the agent's own not-sent text; D13a, which agent receives a chat when several MCP servers are connected; and which second chat site to support.
+Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Still open: D6, the debugger permission, decided after the first live test (T5); D10a, whether the system may clear a leftover draft that exactly equals the agent's own not-sent text (ask before T3); D13a, the rule for which agent receives a popup connection (proposal in DESIGN.md D13, confirm before T2); and which second chat site to support.
 
 ### Next step
 
-T1 as one checkpoint (D7): the native watch restart (R2) and the D8 observation policy (R1). Then T2. Update README.md when the autonomous mode ships, because it still says outgoing messages need separate approval.
+T1 from the Implementation Plan below, in one or two gated checkpoints. It needs no user decision. Ask the user to confirm D13a before starting T2.
+
+## Implementation Plan T1-T6 (2026-10-09)
+
+Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks first, then the exact gate, a short dated entry, the dashboard updated in place, and DEVELOPMENT.md updated whenever tools, limits or setup change. Keep the fixture and Gemini behaving alike unless a step says otherwise. Stop and ask the user only at the marked points or when a human step is needed.
+
+### T1 Read robustness (no user decision needed)
+
+**T1a Restart a stopped native watch (R2).**
+
+- Code: `startGeminiReadWatch` and `startFixtureReadWatch` in `packages/extension/entrypoints/background.ts`. Their `stop()` ends the watch for good today.
+- Change: when a watch stops while `hasTrackedGeminiGrant()` (or `hasTrackedFixtureGrant()`) still returns true, schedule one restart with bounded backoff, for example 1 s doubling to 10 s and reset after a successful reply. Keep at most one pending restart timer, and do not restart when no tracked grant remains.
+- Why it is safe: a restart only resumes polling. The broker never re-offers an issued fill, proof or submit job, and lost results already settle uncertain.
+- Test: in a disposable browser, end the watch's native port (for example kill its long-lived `native-relay` process, or force a reply timeout), then show that a later `chat_read_messages` succeeds without reapproval and that no issued job is offered twice.
+
+**T1b Observation window and failure policy (D8, R1).**
+
+- Capture: in `captureGeminiSnapshot` (`packages/extension/lib/gemini-observation.ts`) and `captureFixtureSnapshot` (`packages/extension/lib/fixture-observation.ts`), keep the newest 32 visible rows instead of failing. Cut any message longer than 16,000 UTF-16 units and mark it `truncated: true`. Then drop the oldest rows until the JSON is at most 96 KiB, cutting the newest row further only if it alone is too big. Report `omittedBefore: true` whenever rows were dropped. Rows with ambiguous structure still make the capture fail.
+- Failure policy: the Gemini `gemini_messages_changed` handler and the watch's challenge loop in `background.ts` revoke the grant on any failed publication. Revoke only when `classifyGeminiPublicationFailure` returns `target_changed`; on `observation_unavailable`, skip the publication and keep the grant, so a challenged read times out as `OBSERVATION_UNAVAILABLE`. Give the fixture handlers the same identity classification.
+- Broker and schemas: change the caps and add the optional per-message `truncated: true` and the capture-level `omittedBefore` in `pending-connections.ts` (`MAX_*_SNAPSHOT_BYTES`, the 2,048 text checks in both publishers, per-grant buffers from 32 events/256 KiB to 128 events/4 MiB), `broker-requests.ts` (publish and message schemas), `native-protocol.ts` (publish parsers) and `broker-client.ts` (reply schemas, including event payloads). In `broker-ipc.ts`, `omittedBefore` must also be true when the capture omitted rows. Two 96 KiB events must still fit one 256 KiB frame.
+- Tests: unit checks for the new bounds, strict refusal of other extra fields and deduplication that includes the new flags. Synthetic-page checks for more than 32 rows, a 16,001-unit message, a transient model row without `model-response-content` (no revocation, and a later publication works) and a URL change (still revokes).
+- Done when: the exact gate passes, the dashboard marks R1 and R2 fixed, and the DEVELOPMENT.md limits and troubleshooting entries are updated.
+
+### T2 Connection model (ask the user to confirm D13a first)
+
+- **Broker start (D4):** `packages/companion/src/mcp-stdio.ts` connects at startup. If the socket is missing or refuses, it spawns `broker-process.js` detached with `stdio: "ignore"` (never the MCP stdout), waits within a bounded loop for the owner-only private socket and connects. Racing facades are safe because the broker refuses a second instance. `mcp-stdio.test.ts` currently expects `BROKER_UNAVAILABLE` without a broker (around line 161); keep a way to disable auto-start in tests.
+- **Connect this chat (D13, D1):** add the popup action for an eligible fixture or Gemini tab. Its text states that the agent may read and send in this chat on its own until the tab closes, and that chat content can influence what it sends. The click requests optional host permission for that origin (`optional_host_permissions` in `packages/extension/wxt.config.ts`; `permissions.request` must run inside the click handler), then a new relay-only command creates an autonomous grant.
+- **Proposed D13a rule:** exactly one connected facade receives the chat; with none, the offer waits until an agent picks it up or the tab closes; with several, the popup refuses.
+- **Pickup tool:** `chat_wait_for_connection { timeoutMs }` (at most 20 s) returns connections offered to this agent. `chat_request_connection` stays for tests.
+- **Grant model:** autonomous grants report state `ready` with read and send capability and no expiry (`expiresAt: null`). Keep clipping correct wherever expiry feeds deadlines: `liveGrant`, read challenges, `getConnectionExpiresAt` and the extension's stored grants. Legacy read-only grants keep the five-minute TTL.
+- **Lifetime (D2):** tab close, chat switch, extension reload, browser restart (`ensureFixtureReset`) and owner disconnect already revoke. Change the `tabs.onUpdated` handler near the end of `background.ts` so a reload of the same exact URL re-attaches: after load, confirm identity in the new document, rebind the broker target through a new relay-only command, mark an observation gap and reinstall observers. Any other URL change still revokes.
+- **Tests:** units for offer binding with zero, one and several facades, no-expiry clipping, rebind and gap; SDK tests for the pickup tool; disposable-browser tests for Connect, reload re-attach, chat switch and tab close.
+- **Done when:** the gate passes, DEVELOPMENT.md documents the new flow and tools, and the capability matrix is updated.
+
+### T3 Autonomous send (ask the user about D10a first)
+
+- **Tool:** `chat_send_message { connectionId, text, idempotencyKey }` on an autonomous connection. Results: `sent` (D9 evidence); `not_sent` with a code, after which the agent may send again with a new key; or `unresolved`, which pauses sending in that chat. Every result says `retryAllowed: false` for that operation, and the same key and text return the existing status.
+- **Pipeline:** in the broker, inside one absolute deadline: prepare (journal digest and receipt), fill job, fresh challenged read, proof job, durable intent, submit job with browser reservation and one guarded activation, then evidence. Add a dedicated budget for this request only (for example 30 s); every inner lease stays at most 4 s and is clipped to it. Owner disconnect before durable intent sends nothing; after it, the outcome is still recorded.
+- **Provider-neutral (D5):** implement the pipeline once, with provider adapters for text limits, editor kind and evidence. Reuse `fillGeminiDraft`, `inspectGeminiDraft` and `submitGeminiDraft`, the worker executors and `reserveBrowserSubmitAttempt` (Gemini namespace). Use generic phase commands for new browser jobs instead of more `*_gemini_*` families. Relax the staged job's post-offer cursor check (see the Staged Gemini One-Offer Dispatch Job entry).
+- **Evidence and unconfirmed sends (D9, D10):** after activation, watch for a settle window of about 5 s. Baseline rows followed by exactly one new outgoing row with the exact text means sent. The exact text still in the composer with Send enabled and no new row, checked with `inspectGeminiDraft` in prepared mode, means not sent. Anything else is unresolved.
+- **Barrier (R8):** scope `recordDispatchIntent` to one conversation. Store on each attempt a conversation key: an HMAC of origin and conversation ID under a persistent 32-byte key kept in a new single-row table of the same private database, because `digestKey` is random per process. Record resolutions (`sent` or `not_sent`, by page or person) in a new table. An attempt without evidence or resolution blocks only its own conversation; older attempts without a key keep the current global behavior.
+- **Popup:** for a connected chat, list unresolved sends with **Sent** and **Not sent** buttons through new relay-only commands, plus **Disconnect**.
+- **Runaway guard:** one send in flight (the shared pending-submit cap already allows only one globally) and an hourly cap per conversation, counted from journal attempts and set by an environment variable such as `BROWSER_CHAT_MAX_SENDS_PER_HOUR` (default 60).
+- **Visible tab (D11):** the Gemini write executors (`fillTrackedGeminiDraft`, `checkTrackedGeminiDraft` and the new submit executor) require the active tab of the current window via `tabs.query({ active: true, currentWindow: true })`. Require instead that the target tab is active in its own window (`tabs.get(tabId).active`) and visible. Popup approvals keep the current-window check.
+- **Tests:** units for pipeline states, idempotency, guard, per-conversation barrier and resolution. Disposable-browser tests on synthetic Gemini pages for sent, not sent, unresolved with popup resolution, hidden-tab refusal, and the existing loss cases (script result loss, native completion loss, worker stop and wake, broker kill), always with at most one activation.
+- **Done when:** the gate passes, and DEVELOPMENT.md, the dashboard and README.md (outgoing messages no longer need separate approval) are updated.
+
+### T4 Reply completion (needs a live read-only review)
+
+- Build `settled_heuristic` first: the newest incoming row unchanged for a quiet period of about 2 s under continuous observation.
+- Ask the user to authorize a fresh read-only review of one disposable Gemini chat while it streams, to find a reviewed completion indicator such as the Send/Stop control state. Record only fixed metadata. Then report `streaming`, `complete` or `settled_heuristic` on the newest incoming row.
+- Add `chat_wait_for_reply { connectionId, timeoutMs }` (at most 20 s; the agent calls again), returning the newest incoming reply once it is complete or settled.
+- Done when: the gate passes and the tools are documented.
+
+### T5 Live acceptance (human steps and authorization)
+
+- Ask the user to authorize one bounded session (AGENTS.md): a disposable chat, the planned neutral messages and a message limit.
+- Coordinated restart (DEVELOPMENT.md) and extension reload; the person opens the chat in container Chromium and clicks **Connect this chat**.
+- The agent picks up the connection, sends the planned messages and reads the complete replies with no further clicks. The person then closes the tab, and the connection must end.
+- Record outcomes and timings only, never chat text, URLs or IDs. Then decide D6 with the user.
+
+### T6 Later
+
+Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## Handover Preparation (2026-10-09)
+
+- At the user's request the plan was made precise for handover to a new chat: the Implementation Plan T1-T6 above gives code pointers, tests, completion criteria and ask-points, and D13a in DESIGN.md section 17 now states the proposed rule. Code facts were checked for the plan: cap and schema locations, the worker's current-window checks, the `tabs.onUpdated` revocation, the per-process `digestKey`, and the test that expects `BROKER_UNAVAILABLE`.
+- Repository state at handover: clean worktree on `main`. No services were running. Documentation only; no source, service, browser or grant was touched.
 
 ## User Product Decisions (2026-10-09)
 
