@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -83,7 +83,7 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
   }
 });
 
-test("concurrent first MCP calls retain one broker owner without sharing it with another facade", { timeout: 5000 }, async () => {
+test("concurrent first MCP calls retain one broker owner without sharing it with another facade", { timeout: 5000 }, async (context) => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-concurrent-"));
   const parent = join(home, ".config/agent-messaging-mcp");
   await mkdir(parent, { recursive: true, mode: 0o700 });
@@ -92,8 +92,20 @@ test("concurrent first MCP calls retain one broker owner without sharing it with
   const other = new Client({ name: "other-owner", version: "0.0.1" });
   const options = { command: process.execPath,
     args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))], env: { ...process.env, HOME: home } };
+  const clientTransport = new StdioClientTransport(options);
+  const otherTransport = new StdioClientTransport(options);
+  const facadePids = new Set<number>();
+  const forcedShutdowns: number[] = [];
+  const originalKill = ChildProcess.prototype.kill;
+  context.mock.method(ChildProcess.prototype, "kill", function (this: ChildProcess, signal?: NodeJS.Signals | number) {
+    if (this.pid !== undefined && facadePids.has(this.pid)) forcedShutdowns.push(this.pid);
+    return originalKill.call(this, signal);
+  });
   try {
-    await client.connect(new StdioClientTransport(options));
+    await client.connect(clientTransport);
+    const clientPid = clientTransport.pid;
+    assert.notEqual(clientPid, null);
+    if (clientPid !== null) facadePids.add(clientPid);
     const created = await Promise.all(Array.from({ length: 8 }, () => client.callTool({
       name: "chat_request_connection", arguments: {}
     })));
@@ -111,12 +123,18 @@ test("concurrent first MCP calls retain one broker owner without sharing it with
       assert.equal(owned[index]?.isError, undefined);
       assert.deepEqual(owned[index]?.structuredContent, handles[index]);
     }
-    await other.connect(new StdioClientTransport(options));
+    await other.connect(otherTransport);
+    const otherPid = otherTransport.pid;
+    assert.notEqual(otherPid, null);
+    if (otherPid !== null) facadePids.add(otherPid);
     for (const handle of handles) {
       const foreign = await other.callTool({ name: "chat_get_connection", arguments: { requestId: handle.requestId } });
       assert.equal(foreign.isError, undefined);
       assert.deepEqual(foreign.structuredContent, { state: "unknown" });
     }
+    await client.close();
+    await other.close();
+    assert.deepEqual(forcedShutdowns, []);
   } finally {
     await client.close();
     await other.close();

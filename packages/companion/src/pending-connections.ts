@@ -212,15 +212,15 @@ export class PendingConnectionRequests {
     return grant.geminiObservations?.read(cursor, limit) ?? "not_ready";
   }
 
-  requestFreshGeminiRead(owner: symbol, connectionId: string, now = Date.now()) {
+  requestFreshGeminiRead(owner: symbol, connectionId: string, now = Date.now(), deadlineMs = now + GEMINI_READ_TIMEOUT_MS) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (grant?.target.origin !== "https://gemini.google.com") return null;
+    if (grant?.target.origin !== "https://gemini.google.com" || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     if (this.geminiReads.size >= MAX_PENDING_GEMINI_READS) return "busy" as const;
     const challengeId = randomUUID();
-    const expiresAt = now + GEMINI_READ_TIMEOUT_MS;
+    const expiresAt = Math.min(now + GEMINI_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt);
     let resolve!: PendingGeminiRead["resolve"];
     const result = new Promise<GeminiSnapshot | "not_ready" | null>((done) => { resolve = done; });
-    const timer = setTimeout(() => this.finishGeminiRead(challengeId, "not_ready"), GEMINI_READ_TIMEOUT_MS);
+    const timer = setTimeout(() => this.finishGeminiRead(challengeId, "not_ready"), expiresAt - now);
     this.geminiReads.set(challengeId, { owner, connectionId, target: grant.target, expiresAt, timer, resolve });
     return { challengeId, result };
   }

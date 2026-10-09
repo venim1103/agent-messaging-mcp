@@ -999,6 +999,18 @@ export class PreparedMessageOperations {
     }
   }
 
+  requestGeminiDispatchRead(owner: symbol, operationId: string, now = Date.now(),
+    deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
+    const authorization = this.getGeminiSendAuthorization(owner, operationId, now);
+    const operation = this.geminiContents.get(operationId);
+    if (!authorization || !operation) return null;
+    this.discardInvalidGeminiDispatchChecks(now);
+    if (this.geminiDispatchChecks.has(operationId)) return "busy" as const;
+    return this.requests.requestFreshGeminiRead(owner, operation.connectionId, now,
+      Math.min(deadlineMs, authorization.expiresAt));
+  }
+
   requestGeminiDispatchInspection(owner: symbol, operationId: string, now = Date.now(),
     deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) throw new Error("DISPATCH_CHECK_UNAVAILABLE");

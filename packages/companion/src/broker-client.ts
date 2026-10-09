@@ -10,7 +10,8 @@ import { fixtureDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillSt
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureDispatchCheckResult,
-  type FixtureDispatchResult, type FixtureFillResult, type FixturePreflightResult, type GeminiFillResult } from "./message-operations.js";
+  type FixtureDispatchResult, type FixtureFillResult, type FixturePreflightResult, type GeminiFillResult,
+  type GeminiDispatchCheckResult } from "./message-operations.js";
 import type { FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
@@ -231,6 +232,23 @@ const replySchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({
     kind: z.literal("fixture_dispatch_check_recorded"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ accepted: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_dispatch_checks"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ checks: z.array(z.strictObject({ operationId: z.uuid(), checkId: z.uuid(),
+      target: geminiTarget, text: geminiReview.shape.preview.shape.text, expiresAt: z.number().int().safe()
+    })).max(MAX_PENDING_FIXTURE_DISPATCH_CHECKS) })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_dispatch_check"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), checkId: z.uuid(), ready: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_dispatch_check_recorded"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ accepted: z.boolean() })
   }),
@@ -466,6 +484,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "prepare_gemini_message"
       | "check_fixture_preflight" | "complete_fixture_preflight"
       | "check_fixture_dispatch" | "list_fixture_dispatch_checks" | "complete_fixture_dispatch_check"
+      | "check_gemini_dispatch" | "list_gemini_dispatch_checks" | "complete_gemini_dispatch_check"
       | "dispatch_fixture_message" | "commit_fixture_message" | "list_fixture_dispatch_attempts" | "complete_fixture_dispatch"
       | "fill_fixture_draft" | "complete_fixture_fill"
       | "fill_gemini_draft" | "list_gemini_fill_challenges" | "complete_gemini_fill"
@@ -487,6 +506,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         || kind === "list_fixture_send_reviews" || kind === "approve_fixture_send_review"
         || kind === "complete_fixture_preflight"
         || kind === "list_fixture_dispatch_checks" || kind === "complete_fixture_dispatch_check"
+        || kind === "list_gemini_dispatch_checks" || kind === "complete_gemini_dispatch_check"
         || kind === "list_fixture_dispatch_attempts" || kind === "complete_fixture_dispatch"
         || kind === "complete_fixture_fill"
         || kind === "list_gemini_fill_challenges" || kind === "complete_gemini_fill"
@@ -594,6 +614,10 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       completeFixtureDispatchCheck: (target: FixtureTarget, operationId: string, checkId: string,
         observation: FixtureDispatchCheckResult) =>
         request("complete_fixture_dispatch_check", { target, operationId, checkId, observation }),
+      checkGeminiDispatch: (operationId: string) => request("check_gemini_dispatch", { operationId }),
+      listGeminiDispatchChecks: () => request("list_gemini_dispatch_checks", {}),
+      completeGeminiDispatchCheck: (target: GeminiTarget, operationId: string, checkId: string,
+        observation: GeminiDispatchCheckResult) => request("complete_gemini_dispatch_check", { target, operationId, checkId, observation }),
       dispatchFixtureMessage: (operationId: string, checkId: string) => request("dispatch_fixture_message", { operationId, checkId }),
       commitFixtureMessage: (operationId: string) => request("commit_fixture_message", { operationId }),
       listFixtureDispatchAttempts: () => request("list_fixture_dispatch_attempts", {}),

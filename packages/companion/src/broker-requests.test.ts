@@ -133,7 +133,7 @@ test("only the relay grants separate Gemini review and fill consent without brow
   }
 });
 
-test("only the relay grants distinct Gemini Send consent after completed fill without proof or dispatch", async () => {
+test("only the relay grants distinct Gemini Send consent and completes owned read-only proof without dispatch", async () => {
   const requests = new PendingConnectionRequests();
   const database = new DatabaseSync(":memory:");
   const operations = new PreparedMessageOperations(requests, database);
@@ -195,6 +195,39 @@ test("only the relay grants distinct Gemini Send consent after completed fill wi
     assert.equal(operations.getGeminiSendAuthorization(Symbol("foreign"), prepared.operationId, 2008), null);
     assert.equal(operations.getFixtureSendAuthorization(owner, prepared.operationId, 2008), null);
     assert.deepEqual(operations.listGeminiDispatchChecks(2008), []);
+    const inspecting = { ...envelope, kind: "check_gemini_dispatch", payload: { operationId: prepared.operationId } };
+    assert.equal(handleBrokerRequest(inspecting, "facade", owner, requests, 2008, operations).kind, "gemini_dispatch_check_authorized");
+    assert.deepEqual(handleBrokerRequest(inspecting, "facade", Symbol("foreign"), requests, 2008, operations).payload,
+      { code: "DISPATCH_CHECK_UNAVAILABLE" });
+    assert.deepEqual(handleBrokerRequest(inspecting, "relay", relay, requests, 2008, operations).payload, { code: "PERMISSION_DENIED" });
+    for (const extra of [{ target }, { text: "Changed" }, { approved: true }, { checkId: prepared.operationId }]) {
+      assert.throws(() => handleBrokerRequest({ ...inspecting, payload: { ...inspecting.payload, ...extra } }, "facade", owner, requests, 2008, operations));
+    }
+    assert.equal(operations.requestGeminiDispatchRead(Symbol("foreign"), prepared.operationId, 2008, 2100), null);
+    const reading = operations.requestGeminiDispatchRead(owner, prepared.operationId, 2008, 2100);
+    assert.ok(reading && reading !== "busy");
+    assert.deepEqual(requests.listGeminiReadChallenges(2008), [{ challengeId: reading.challengeId, target, expiresAt: 2100 }]);
+    assert.equal(requests.publishGeminiSnapshot(target, [{ direction: "outgoing", text: "Synthetic existing row" }], 2009, reading.challengeId), 1);
+    assert.ok(await reading.result);
+    const checking = operations.requestGeminiDispatchInspection(owner, prepared.operationId, 2010, 2100);
+    assert.ok(checking !== "busy");
+    assert.equal(operations.requestGeminiDispatchRead(owner, prepared.operationId, 2011, 2200), "busy");
+    const checksMessage = { ...envelope, kind: "list_gemini_dispatch_checks", payload: {} };
+    assert.deepEqual(handleBrokerRequest(checksMessage, "facade", owner, requests, 2011, operations).payload, { code: "PERMISSION_DENIED" });
+    const checks = handleBrokerRequest(checksMessage, "relay", relay, requests, 2011, operations);
+    if (checks.kind !== "gemini_dispatch_checks") throw new Error("Expected one Gemini proof offer");
+    assert.deepEqual(checks.payload, { checks: [{ operationId: prepared.operationId, checkId: checking.checkId,
+      target, text: prepared.preview.text, expiresAt: 2100 }] });
+    assert.deepEqual(handleBrokerRequest(checksMessage, "relay", relay, requests, 2012, operations).payload, { checks: [] });
+    const completion = { ...envelope, kind: "complete_gemini_dispatch_check", payload: { target,
+      operationId: prepared.operationId, checkId: checking.checkId, observation: { ok: true, editor: "contenteditable",
+        draftText: prepared.preview.text, selected: true, writable: true, submitReady: true } } };
+    assert.deepEqual(handleBrokerRequest(completion, "facade", owner, requests, 2012, operations).payload, { code: "PERMISSION_DENIED" });
+    assert.throws(() => handleBrokerRequest({ ...completion, payload: { ...completion.payload,
+      observation: { ...completion.payload.observation, activated: true } } }, "relay", relay, requests, 2012, operations));
+    assert.deepEqual(handleBrokerRequest(completion, "relay", relay, requests, 2012, operations).payload, { accepted: true });
+    assert.equal(await checking.result, true);
+    assert.deepEqual(handleBrokerRequest(completion, "relay", relay, requests, 2013, operations).payload, { accepted: false });
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
   } finally {

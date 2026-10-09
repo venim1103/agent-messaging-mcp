@@ -23,6 +23,7 @@ import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parse
   parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeFixtureDispatchCheck, parseNativeFixtureDispatchChecks,
+  parseNativeGeminiDispatchCheck, parseNativeGeminiDispatchChecks,
   parseNativeFixtureDispatch, parseNativeFixtureDispatchAttempts,
   parseNativeFixtureReset, parseNativeFixtureRevocation,
   parseNativeFixtureSnapshot, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
@@ -128,6 +129,39 @@ test("native Gemini Send consent is strict, exact-target and distinct from fill 
         parse({ ...message, payload: { ...message.payload, [field]: "invalid" } }, now), /Invalid native Gemini send/);
     }
   }
+});
+
+test("native Gemini fresh-proof transport rejects authority, fixture results and unsafe exact targets", () => {
+  const listing = { ...request, kind: "list_gemini_dispatch_checks" };
+  assert.deepEqual(parseNativeGeminiDispatchChecks(listing, now), listing);
+  for (const invalid of [{ ...listing, kind: "check_gemini_dispatch" }, { ...listing, deadlineMs: now },
+    { ...listing, deadlineMs: now + 30_001 }, { ...listing, payload: { operationId: request.requestId } }]) {
+    assert.throws(() => parseNativeGeminiDispatchChecks(invalid, now), /Invalid native Gemini dispatch check list/);
+  }
+  const completion = { ...request, kind: "complete_gemini_dispatch_check", payload: {
+    target: { origin: "https://gemini.google.com", conversationId: "synthetic-chat",
+      url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 3, documentId: "synthetic-document" },
+    operationId: request.requestId, checkId: randomUUID(), observation: { ok: true, editor: "contenteditable",
+      draftText: "Synthetic exact draft", selected: true, writable: true, submitReady: true }
+  } };
+  assert.deepEqual(parseNativeGeminiDispatchCheck(completion, now), completion);
+  assert.deepEqual(parseNativeGeminiDispatchCheck({ ...completion, payload: { ...completion.payload,
+    observation: { ok: false, code: "DRAFT_CHANGED" } } }, now).payload.observation, { ok: false, code: "DRAFT_CHANGED" });
+  for (const invalid of [
+    { ...completion, kind: "dispatch_gemini_message" }, { ...completion, kind: "check_gemini_dispatch" },
+    { ...completion, deadlineMs: now }, { ...completion, deadlineMs: now + 30_001 }, { ...completion, deadlineMs: now + 0.5 },
+    { ...completion, connectionGeneration: 1 }, { ...completion, payload: { ...completion.payload, checkId: "invalid" } },
+    { ...completion, payload: { ...completion.payload, operationId: "invalid" } },
+    ...[{ approved: true }, { selector: "button" }, { recoveryToken: "a".repeat(64) }].map(extra =>
+      ({ ...completion, payload: { ...completion.payload, ...extra } })),
+    ...[{ origin: "http://127.0.0.1:8787" }, { conversationId: "other" }, { url: `${completion.payload.target.url}#fragment` },
+      { tabId: 0 }, { documentId: "line\nbreak" }].map(changed =>
+      ({ ...completion, payload: { ...completion.payload, target: { ...completion.payload.target, ...changed } } })),
+    ...[{ editor: "textarea" }, { editor: "rich" }, { selected: false }, { writable: false }, { submitReady: false },
+      { activated: true }, { retryAllowed: true }, { sent: true }, { delivered: true }, { draftText: " text" },
+      { draftText: "x".repeat(2049) }, { draftText: "\u00e9".repeat(2048) }, { draftText: "line\rbreak" }].map(changed =>
+      ({ ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, ...changed } } }))
+  ]) assert.throws(() => parseNativeGeminiDispatchCheck(invalid, now), /Invalid native Gemini dispatch check completion/);
 });
 
 test("native dispatch inspection accepts only bounded exact proof, never approval or submission", () => {
@@ -1341,6 +1375,53 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const [geminiSendReplay] = await exchangeFillReview({ ...geminiSendApproval, deadlineMs: Date.now() + 10_000 }) as [{ kind: string; payload: unknown }];
     assert.equal(geminiSendReplay.kind, "error");
     assert.deepEqual(geminiSendReplay.payload, { code: "SEND_REVIEW_UNAVAILABLE" });
+    assert.deepEqual((await owningFacade.getPreparedOperation(geminiPrepared.payload.operationId)).payload, beforeGeminiSend.payload);
+    const geminiChecking = owningFacade.checkGeminiDispatch(geminiPrepared.payload.operationId);
+    let geminiReadChallenge: string | undefined;
+    for (let index = 0; index < 40; index++) {
+      const [reads] = await exchangeFillReview({ ...request, kind: "list_gemini_read_challenges", deadlineMs: Date.now() + 10_000,
+        payload: {} }) as [{ kind: string; payload: { challenges: { challengeId: string }[] } }];
+      assert.equal(reads.kind, "gemini_read_challenges");
+      if (reads.payload.challenges[0]) { geminiReadChallenge = reads.payload.challenges[0].challengeId; break; }
+      await setTimeout(10);
+    }
+    assert.ok(geminiReadChallenge);
+    await exchangeFillReview({ ...request, kind: "publish_gemini_snapshot", deadlineMs: Date.now() + 10_000,
+      payload: { target: nativeFillTarget, challengeId: geminiReadChallenge,
+        messages: [{ direction: "outgoing", text: "Synthetic native baseline row" }] } });
+    let geminiCheckId: string | undefined;
+    for (let index = 0; index < 40; index++) {
+      const checksEnvelope = { ...request, kind: "list_gemini_dispatch_checks", deadlineMs: Date.now() + 10_000, payload: {} };
+      const [checks] = await exchangeFillReview(checksEnvelope) as [{ kind: string; deadlineMs: number;
+        payload: { checks: { operationId: string; checkId: string; text: string }[] } }];
+      assert.equal(checks.kind, "gemini_dispatch_checks");
+      assert.equal(checks.deadlineMs, checksEnvelope.deadlineMs);
+      if (checks.payload.checks[0]) {
+        const offer = checks.payload.checks[0];
+        geminiCheckId = offer.checkId;
+        assert.equal(offer.operationId, geminiPrepared.payload.operationId);
+        assert.equal(offer.text, geminiPrepared.payload.preview.text);
+        break;
+      }
+      await setTimeout(10);
+    }
+    assert.ok(geminiCheckId);
+    const [geminiProofNoReoffer] = await exchangeFillReview({ ...request, kind: "list_gemini_dispatch_checks",
+      deadlineMs: Date.now() + 10_000, payload: {} }) as [{ payload: unknown }];
+    assert.deepEqual(geminiProofNoReoffer.payload, { checks: [] });
+    const geminiProofCompletion = { ...request, kind: "complete_gemini_dispatch_check", deadlineMs: Date.now() + 10_000,
+      payload: { target: nativeFillTarget, operationId: geminiPrepared.payload.operationId, checkId: geminiCheckId,
+        observation: { ok: true, editor: "contenteditable", draftText: geminiPrepared.payload.preview.text,
+          selected: true, writable: true, submitReady: true } } };
+    const [geminiProofRecorded] = await exchangeFillReview(geminiProofCompletion) as [{ kind: string; deadlineMs: number; payload: unknown }];
+    assert.equal(geminiProofRecorded.kind, "gemini_dispatch_check_recorded");
+    assert.equal(geminiProofRecorded.deadlineMs, geminiProofCompletion.deadlineMs);
+    assert.deepEqual(geminiProofRecorded.payload, { accepted: true });
+    const geminiProofReady = await geminiChecking;
+    assert.equal(geminiProofReady.kind, "gemini_dispatch_check");
+    assert.deepEqual(geminiProofReady.payload, { operationId: geminiPrepared.payload.operationId, checkId: geminiCheckId, ready: true });
+    const [geminiProofReplay] = await exchangeFillReview({ ...geminiProofCompletion, deadlineMs: Date.now() + 10_000 }) as [{ payload: unknown }];
+    assert.deepEqual(geminiProofReplay.payload, { accepted: false });
     assert.deepEqual((await owningFacade.getPreparedOperation(geminiPrepared.payload.operationId)).payload, beforeGeminiSend.payload);
     const [nativeFillRevoked] = await exchangeFillReview({ ...request, kind: "revoke_fixture", deadlineMs: Date.now() + 10_000,
       payload: { tabId: nativeFillTarget.tabId, observed: null } }) as [{ kind: string; payload: { count: number } }];

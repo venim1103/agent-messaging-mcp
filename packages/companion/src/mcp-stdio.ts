@@ -10,13 +10,30 @@ const server = new McpServer({ name: "browser-chat-feasibility", version: "0.0.1
 const runtimeDirectory = join(homedir(), ".config/agent-messaging-mcp/broker");
 let broker: Awaited<ReturnType<typeof connectBroker>> | undefined;
 let connectingBroker: ReturnType<typeof connectBroker> | undefined;
+let facadeClosed = false;
+
+function closeFacadeBroker() {
+  facadeClosed = true;
+  broker?.close();
+  broker = undefined;
+  void connectingBroker?.then((client) => client.close(), () => {});
+}
+
+process.stdin.once("end", closeFacadeBroker);
+process.stdin.once("close", closeFacadeBroker);
 
 async function pendingBroker() {
+  if (facadeClosed) throw new Error("MCP stdio is closed");
   if (broker?.closed) broker = undefined;
   if (broker) return broker;
   const connection = connectingBroker ??= connectBroker("facade", runtimeDirectory);
   try {
-    return broker ??= await connection;
+    const connected = await connection;
+    if (facadeClosed) {
+      connected.close();
+      throw new Error("MCP stdio is closed");
+    }
+    return broker ??= connected;
   } finally {
     if (connectingBroker === connection) connectingBroker = undefined;
   }

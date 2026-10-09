@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { brokerRequestDeadline, connectBroker } from "./broker-client.js";
 import { BROKER_IDLE_TIMEOUT_MS, startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials, MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
-import { MAX_PREPARED_REVIEWS, PreparedMessageOperations } from "./message-operations.js";
+import { MAX_PREPARED_REVIEWS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS, PreparedMessageOperations } from "./message-operations.js";
 import { encodeNativeFrame, MAX_NATIVE_FRAME_BYTES, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
@@ -120,6 +120,52 @@ test("broker client validates bounded purpose-specific Gemini consent replies", 
       await assert.rejects(trustedRelay.approveGeminiSendReview(target, operationId, reviewId),
         error => error instanceof Error && error.name === "ZodError");
     }
+  } finally {
+    facade?.close();
+    relay?.close();
+    await broker.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("broker client refuses over-cap or authority-bearing Gemini proof replies", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-proof-replies-"));
+  const directory = join(home, "broker");
+  const database = new DatabaseSync(":memory:");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-chat",
+    url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 4, documentId: "synthetic-document" };
+  const operationId = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+  const checkId = "b66b3997-9d43-4554-8399-267d1fe9f75c";
+  const check = { operationId, checkId, target, text: "Synthetic exact proof reply", expiresAt: Date.now() + 4000 };
+  let checks: unknown = [check];
+  let accepted: unknown = true;
+  context.mock.method(PreparedMessageOperations.prototype, "listGeminiDispatchChecks", () => checks as never);
+  context.mock.method(PreparedMessageOperations.prototype, "completeGeminiDispatchCheck", () => accepted as never);
+  try {
+    facade = await connectBroker("facade", directory);
+    relay = await connectBroker("relay", directory);
+    assert.throws(() => facade!.listGeminiDispatchChecks(), /Broker role cannot perform/);
+    assert.throws(() => relay!.checkGeminiDispatch(operationId), /Broker role cannot perform/);
+    assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks });
+    checks = Array.from({ length: MAX_PENDING_FIXTURE_DISPATCH_CHECKS }, () => check);
+    assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks });
+    for (const invalid of [Array.from({ length: MAX_PENDING_FIXTURE_DISPATCH_CHECKS + 1 }, () => check),
+      [{ ...check, approved: true }], [{ ...check, retryAllowed: true }], [{ ...check, activated: true }],
+      [{ ...check, target: { ...target, origin: "http://127.0.0.1:8787" } }], [{ ...check, checkId: "invalid" }],
+      [{ ...check, expiresAt: 1.5 }], ...[" text", "x".repeat(2049), "\u00e9".repeat(2048), "line\rbreak"].map(text => [{ ...check, text }])]) {
+      checks = invalid;
+      await assert.rejects(relay.listGeminiDispatchChecks(), error => error instanceof Error && error.name === "ZodError");
+    }
+    const observation = { ok: true as const, editor: "contenteditable" as const, draftText: check.text,
+      selected: true as const, writable: true as const, submitReady: true as const };
+    assert.deepEqual((await relay.completeGeminiDispatchCheck(target, operationId, checkId, observation)).payload, { accepted: true });
+    accepted = "send_approved";
+    await assert.rejects(relay.completeGeminiDispatchCheck(target, operationId, checkId, observation),
+      error => error instanceof Error && error.name === "ZodError");
   } finally {
     facade?.close();
     relay?.close();
@@ -576,6 +622,62 @@ test("authenticated private Gemini preparation remains owner-bound without fixtu
     assert.deepEqual((await relay.completeGeminiFill(target, attemptId, { ok: true, editor: "contenteditable" })).payload,
       { accepted: false });
     assert.deepEqual((await facade.fillGeminiDraft(operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    assert.deepEqual((await facade.checkGeminiDispatch(operationId)).payload, { code: "DISPATCH_CHECK_UNAVAILABLE" });
+    const sends = await relay.listGeminiSendReviews(target);
+    if (sends.kind !== "gemini_send_reviews") throw new Error("Expected separate private Gemini Send preview");
+    assert.deepEqual((await relay.approveGeminiSendReview(target, operationId, fills.payload.reviews[0]!.reviewId)).payload,
+      { code: "SEND_REVIEW_UNAVAILABLE" });
+    assert.equal((await relay.approveGeminiSendReview(target, operationId, sends.payload.reviews[0]!.reviewId)).kind,
+      "gemini_send_review_approved");
+    assert.deepEqual((await stranger.checkGeminiDispatch(operationId)).payload, { code: "DISPATCH_CHECK_UNAVAILABLE" });
+    assert.deepEqual((await facade.checkFixtureDispatch(operationId)).payload, { code: "DISPATCH_CHECK_UNAVAILABLE" });
+    assert.throws(() => relay.checkGeminiDispatch(operationId), /Broker role cannot perform/);
+    assert.throws(() => facade.listGeminiDispatchChecks(), /Broker role cannot perform/);
+    await relay.publishGeminiSnapshot(target, [{ direction: "outgoing", text: "Synthetic cached row" }]);
+    const checking = facade.checkGeminiDispatch(operationId);
+    let challengeId: string | undefined;
+    for (let index = 0; index < 40; index++) {
+      const reads = await relay.listGeminiReadChallenges();
+      if (reads.kind !== "gemini_read_challenges") throw new Error("Expected challenged Gemini proof snapshot");
+      const challenge = reads.payload.challenges[0];
+      if (challenge) {
+        challengeId = challenge.challengeId;
+        assert.deepEqual(challenge.target, target);
+        break;
+      }
+      await new Promise<void>(done => setTimeout(done, 10));
+    }
+    assert.ok(challengeId);
+    assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks: [] });
+    await relay.publishGeminiSnapshot(target, [{ direction: "outgoing", text: "Synthetic fresh row" }], challengeId);
+    let checkId: string | undefined;
+    for (let index = 0; index < 40; index++) {
+      const checks = await relay.listGeminiDispatchChecks();
+      if (checks.kind !== "gemini_dispatch_checks") throw new Error("Expected one private Gemini proof offer");
+      const offer = checks.payload.checks[0];
+      if (offer) {
+        checkId = offer.checkId;
+        assert.equal(offer.operationId, operationId);
+        assert.equal(offer.text, text);
+        assert.deepEqual(offer.target, target);
+        break;
+      }
+      await new Promise<void>(done => setTimeout(done, 10));
+    }
+    assert.ok(checkId);
+    assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks: [] });
+    const observation = { ok: true as const, editor: "contenteditable" as const, draftText: text,
+      selected: true as const, writable: true as const, submitReady: true as const };
+    assert.throws(() => facade.completeGeminiDispatchCheck(target, operationId, checkId, observation), /Broker role cannot perform/);
+    assert.deepEqual((await relay.completeGeminiDispatchCheck({ ...target, documentId: "other-document" },
+      operationId, checkId, observation)).payload, { accepted: false });
+    assert.deepEqual((await relay.completeGeminiDispatchCheck(target, operationId, checkId, observation)).payload, { accepted: true });
+    const checked = await checking;
+    assert.equal(checked.kind, "gemini_dispatch_check");
+    assert.deepEqual(checked.payload, { operationId, checkId, ready: true });
+    assert.deepEqual((await relay.completeGeminiDispatchCheck(target, operationId, checkId, observation)).payload, { accepted: false });
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
   } finally {
     for (const client of clients) client.close();
     await broker.close();
@@ -679,6 +781,139 @@ test("private Gemini fill IPC loses no authority after dropped replies, owner cl
       assert.deepEqual((await observer.completeGeminiFill(target, attemptId, { ok: true, editor: "contenteditable" })).payload,
         { accepted: false });
       assert.equal(offered, 1, outcome);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+    } finally {
+      context.mock.restoreAll();
+      for (const client of clients) client.close();
+      await broker.close();
+      database.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test("private Gemini proof IPC never reoffers after actual reply loss, owner close or original deadline", { timeout: 10_000 }, async (context) => {
+  for (const outcome of ["offer-reply-loss", "readiness-reply-loss", "owner-close", "original-deadline"]) {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-proof-loss-"));
+    const directory = join(home, "broker");
+    const database = new DatabaseSync(":memory:");
+    const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+    const clients: Awaited<ReturnType<typeof connectBroker>>[] = [];
+    let dropKind: string | undefined;
+    let dropped = 0;
+    let offered = 0;
+    let checkId: string | undefined;
+    let expiresAt: number | undefined;
+    const originalWrite = Socket.prototype.write;
+    context.mock.method(Socket.prototype, "write", function(this: Socket, ...args: Parameters<Socket["write"]>) {
+      const chunk = args[0];
+      if (Buffer.isBuffer(chunk)) {
+        let message: { kind: string; payload?: { checks?: { checkId: string; expiresAt: number }[] } } | undefined;
+        try { [message] = new NativeFrameDecoder().push(chunk) as [typeof message]; } catch {}
+        if (message?.kind === "gemini_dispatch_checks" && message.payload?.checks?.length) {
+          offered++;
+          checkId = message.payload.checks[0]!.checkId;
+          expiresAt = message.payload.checks[0]!.expiresAt;
+        }
+        if (dropKind && message?.kind === dropKind && (dropKind !== "gemini_dispatch_checks" || message.payload?.checks?.length)) {
+          dropKind = undefined;
+          dropped++;
+          return true;
+        }
+      }
+      return Reflect.apply(originalWrite, this, args) as boolean;
+    });
+    try {
+      const deadline = outcome === "readiness-reply-loss" || outcome === "original-deadline" ? Date.now() + 1000 : undefined;
+      const facade = await connectBroker("facade", directory, deadline);
+      const relay = await connectBroker("relay", directory);
+      const observer = await connectBroker("relay", directory);
+      clients.push(facade, relay, observer);
+      const pending = await facade.requestConnection();
+      if (pending.kind !== "connection_requested") throw new Error("Expected Gemini pending connection");
+      const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-chat",
+        url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 4, documentId: "synthetic-document" };
+      await relay.approveGemini(pending.payload.requestId, target);
+      const grant = await facade.getConnection(pending.payload.requestId);
+      if (grant.kind !== "connection_state" || grant.payload.state !== "ready_readonly") throw new Error("Expected Gemini grant");
+      const prepared = await facade.prepareGeminiMessage(grant.payload.connectionId, 1, "Synthetic proof IPC loss only",
+        "a66b3997-9d43-4554-8399-267d1fe9f75c");
+      if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected Gemini preparation");
+      const operationId = prepared.payload.operationId;
+      const ordinary = await relay.listGeminiPreparedReviews(target);
+      if (ordinary.kind !== "gemini_prepared_reviews") throw new Error("Expected ordinary consent");
+      await relay.approveGeminiReview(target, operationId, ordinary.payload.reviews[0]!.reviewId);
+      const fills = await relay.listGeminiFillReviews(target);
+      if (fills.kind !== "gemini_fill_reviews") throw new Error("Expected fill consent");
+      await relay.approveGeminiFillReview(target, operationId, fills.payload.reviews[0]!.reviewId);
+      const filling = facade.fillGeminiDraft(operationId);
+      let fillAttempt: string | undefined;
+      for (let index = 0; index < 40; index++) {
+        const listing = await relay.listGeminiFillChallenges();
+        if (listing.kind !== "gemini_fill_challenges") throw new Error("Expected fill offer");
+        if (listing.payload.fills[0]) { fillAttempt = listing.payload.fills[0].attemptId; break; }
+        await new Promise<void>(done => setTimeout(done, 10));
+      }
+      assert.ok(fillAttempt);
+      await relay.completeGeminiFill(target, fillAttempt, { ok: true, editor: "contenteditable" });
+      await filling;
+      const sends = await relay.listGeminiSendReviews(target);
+      if (sends.kind !== "gemini_send_reviews") throw new Error("Expected Send consent");
+      await relay.approveGeminiSendReview(target, operationId, sends.payload.reviews[0]!.reviewId);
+      const checking = facade.checkGeminiDispatch(operationId);
+      const expectedLoss = outcome !== "offer-reply-loss" ? assert.rejects(checking, /closed|disconnected|timed out|reply expired/i) : undefined;
+      let challengeId: string | undefined;
+      for (let index = 0; index < 40; index++) {
+        const reads = await relay.listGeminiReadChallenges();
+        if (reads.kind !== "gemini_read_challenges") throw new Error("Expected proof snapshot challenge");
+        if (reads.payload.challenges[0]) { challengeId = reads.payload.challenges[0].challengeId; break; }
+        await new Promise<void>(done => setTimeout(done, 10));
+      }
+      assert.ok(challengeId);
+      await relay.publishGeminiSnapshot(target, [{ direction: "outgoing", text: "Synthetic existing row" }], challengeId);
+      if (outcome === "offer-reply-loss") {
+        dropKind = "gemini_dispatch_checks";
+        const losingRelay = await connectBroker("relay", directory, Date.now() + 500);
+        clients.push(losingRelay);
+        await assert.rejects((async () => {
+          for (let index = 0; index < 40; index++) {
+            const listing = await losingRelay.listGeminiDispatchChecks();
+            assert.equal(listing.kind, "gemini_dispatch_checks");
+            assert.deepEqual(listing.payload, { checks: [] });
+            await new Promise<void>(done => setTimeout(done, 10));
+          }
+          throw new Error("Proof offer was not dropped within bounded polling");
+        })(), /timed out|reply expired/i);
+        assert.equal(dropped, 1);
+      } else {
+        for (let index = 0; index < 40; index++) {
+          const listing = await relay.listGeminiDispatchChecks();
+          if (listing.kind !== "gemini_dispatch_checks") throw new Error("Expected proof offer");
+          if (listing.payload.checks.length) break;
+          await new Promise<void>(done => setTimeout(done, 10));
+        }
+      }
+      assert.ok(checkId, outcome);
+      assert.equal(offered, 1, outcome);
+      assert.deepEqual((await observer.listGeminiDispatchChecks()).payload, { checks: [] });
+      const observation = { ok: true as const, editor: "contenteditable" as const, draftText: prepared.payload.preview.text,
+        selected: true as const, writable: true as const, submitReady: true as const };
+      if (outcome === "readiness-reply-loss") {
+        dropKind = "gemini_dispatch_check";
+        assert.deepEqual((await relay.completeGeminiDispatchCheck(target, operationId, checkId, observation)).payload, { accepted: true });
+      } else if (outcome === "owner-close") facade.close();
+      else if (outcome === "original-deadline") assert.equal(expiresAt, deadline);
+      if (expectedLoss) await expectedLoss;
+      else {
+        const checked = await checking;
+        assert.equal(checked.kind, "gemini_dispatch_check");
+        assert.deepEqual(checked.payload, { operationId, checkId, ready: false });
+      }
+      if (outcome === "readiness-reply-loss") assert.equal(dropped, 1);
+      assert.deepEqual((await observer.listGeminiDispatchChecks()).payload, { checks: [] });
+      assert.deepEqual((await observer.completeGeminiDispatchCheck(target, operationId, checkId, observation)).payload, { accepted: false });
+      assert.equal(offered, 1);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
     } finally {

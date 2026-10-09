@@ -1,6 +1,6 @@
 import * as z from "zod/v4";
 import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureFillResultSchema,
-  fixturePreflightResultSchema, geminiFillResultSchema } from "./message-operations.js";
+  fixturePreflightResultSchema, geminiFillResultSchema, geminiDispatchCheckResultSchema } from "./message-operations.js";
 import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
   MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES } from "./pending-connections.js";
 
@@ -265,6 +265,27 @@ export function parseNativeGeminiFill(message: unknown, now = Date.now()) {
   const result = geminiFillSchema.safeParse(message);
   if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
     || !isValidGeminiTarget(result.data.payload.target)) throw new Error("Invalid native Gemini fill completion");
+  return result.data;
+}
+
+const geminiDispatchChecksSchema = fixtureDispatchChecksSchema.extend({ kind: z.literal("list_gemini_dispatch_checks") });
+
+export function parseNativeGeminiDispatchChecks(message: unknown, now = Date.now()) {
+  const result = geminiDispatchChecksSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native Gemini dispatch check list");
+  }
+  return result.data;
+}
+
+const geminiDispatchCheckSchema = fixtureDispatchCheckSchema.extend({ kind: z.literal("complete_gemini_dispatch_check"),
+  payload: z.strictObject({ target: geminiTargetSchema, operationId: z.uuid(), checkId: z.uuid(), observation: geminiDispatchCheckResultSchema })
+});
+
+export function parseNativeGeminiDispatchCheck(message: unknown, now = Date.now()) {
+  const result = geminiDispatchCheckSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) throw new Error("Invalid native Gemini dispatch check completion");
   return result.data;
 }
 

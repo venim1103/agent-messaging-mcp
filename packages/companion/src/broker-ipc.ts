@@ -101,6 +101,29 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                 }
                 return;
               }
+              if (reply.kind === "gemini_dispatch_check_authorized") {
+                try {
+                  const reading = operations?.requestGeminiDispatchRead(owner, reply.payload.operationId, Date.now(), reply.deadlineMs);
+                  if (!reading || reading === "busy") throw new Error("DISPATCH_CHECK_UNAVAILABLE");
+                  const snapshot = await reading.result;
+                  if (socket.destroyed) return;
+                  if (!snapshot || snapshot === "not_ready") throw new Error("OBSERVATION_UNAVAILABLE");
+                  const pending = operations?.requestGeminiDispatchInspection(owner, reply.payload.operationId, Date.now(), reply.deadlineMs);
+                  if (!pending || pending === "busy") throw new Error("DISPATCH_CHECK_UNAVAILABLE");
+                  const observed = await pending.result;
+                  if (socket.destroyed) return;
+                  const ready = observed && !!operations?.getGeminiDispatchProof(owner, reply.payload.operationId, pending.checkId);
+                  await writeBrokerResponse(socket, { ...reply, kind: "gemini_dispatch_check", payload: {
+                    operationId: reply.payload.operationId, checkId: pending.checkId, ready
+                  } });
+                } catch (error) {
+                  if (!(error instanceof Error) || !["SEND_APPROVAL_REQUIRED", "OBSERVATION_UNAVAILABLE",
+                    "DISPATCH_CHECK_UNAVAILABLE", "DISPATCH_CHECK_BUSY"].includes(error.message)) throw error;
+                  if (!socket.destroyed) await writeBrokerResponse(socket, { ...reply, kind: "error",
+                    payload: { code: "DISPATCH_CHECK_UNAVAILABLE" } });
+                }
+                return;
+              }
               if (reply.kind === "fixture_dispatch_check_authorized") {
                 try {
                   const pending = operations?.requestFixtureDispatchInspection(owner, reply.payload.operationId,

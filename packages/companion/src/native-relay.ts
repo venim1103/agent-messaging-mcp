@@ -15,6 +15,7 @@ import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parse
   parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeFixtureDispatchCheck, parseNativeFixtureDispatchChecks,
+  parseNativeGeminiDispatchCheck, parseNativeGeminiDispatchChecks,
   parseNativeFixtureDispatch, parseNativeFixtureDispatchAttempts,
   parseNativeGeminiSnapshot,
   parseNativeFixtureReset, parseNativeFixtureRevocation, parseNativeFixtureSnapshot, parseNativePendingList,
@@ -96,6 +97,10 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "complete_fixture_dispatch_check" ? parseNativeFixtureDispatchCheck(message)
                   : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "list_gemini_dispatch_checks" ? parseNativeGeminiDispatchChecks(message)
+                  : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "complete_gemini_dispatch_check" ? parseNativeGeminiDispatchCheck(message)
+                  : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "list_fixture_dispatch_attempts" ? parseNativeFixtureDispatchAttempts(message)
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "complete_fixture_dispatch" ? parseNativeFixtureDispatch(message)
@@ -149,6 +154,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | "fixture_fill_recorded" | "fixture_preflight_recorded"
             | "gemini_fill_challenges" | "gemini_fill_recorded"
             | "fixture_dispatch_checks" | "fixture_dispatch_check_recorded"
+            | "gemini_dispatch_checks" | "gemini_dispatch_check_recorded"
             | "fixture_dispatch_attempts" | "fixture_dispatch_recorded"
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "error";
@@ -262,6 +268,17 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 kind = "error";
                 payload = { code: "FILL_REVIEW_UNAVAILABLE" };
               } else throw new Error("Broker refused Gemini fill review approval");
+            } else if (request.kind === "list_gemini_dispatch_checks") {
+              const result = await client.listGeminiDispatchChecks();
+              if (result.kind !== "gemini_dispatch_checks") throw new Error("Broker refused Gemini dispatch checks");
+              kind = "gemini_dispatch_checks";
+              payload = result.payload;
+            } else if (request.kind === "complete_gemini_dispatch_check") {
+              const result = await client.completeGeminiDispatchCheck(request.payload.target, request.payload.operationId,
+                request.payload.checkId, request.payload.observation);
+              if (result.kind !== "gemini_dispatch_check_recorded") throw new Error("Broker refused Gemini dispatch check completion");
+              kind = "gemini_dispatch_check_recorded";
+              payload = result.payload;
             } else if (request.kind === "list_gemini_send_reviews") {
               const result = await client.listGeminiSendReviews(request.payload.target);
               if (result.kind !== "gemini_send_reviews") throw new Error("Broker refused Gemini send reviews");

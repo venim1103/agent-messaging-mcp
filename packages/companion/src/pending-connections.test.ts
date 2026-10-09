@@ -420,6 +420,44 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   assert.equal(requests.getGeminiTarget(owner, queryGrant!.connectionId, 2001), null);
 });
 
+test("Gemini fresh reads preserve the original request and grant deadline without renewing authority", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("bounded Gemini read");
+  const pending = requests.create(owner, 1000);
+  const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-chat",
+    url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 4, documentId: "synthetic-document" };
+  const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+  try {
+    for (const deadline of [NaN, Infinity, 2001, 2000, 2001.5]) {
+      assert.equal(requests.requestFreshGeminiRead(owner, grant.connectionId, 2001, deadline), null);
+      assert.deepEqual(requests.listGeminiReadChallenges(2001), []);
+    }
+    assert.equal(requests.requestFreshGeminiRead(Symbol("foreign"), grant.connectionId, 2001, 2002), null);
+    const clipped = requests.requestFreshGeminiRead(owner, grant.connectionId, 2001, 2002);
+    assert.ok(clipped && clipped !== "busy");
+    assert.equal(requests.listGeminiReadChallenges(2001)[0]?.expiresAt, 2002);
+    assert.deepEqual(requests.listGeminiReadChallenges(2002), []);
+    assert.equal(await clipped.result, "not_ready");
+    assert.equal(requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic late row" }],
+      2002, clipped.challengeId), 0);
+    const ordinary = requests.requestFreshGeminiRead(owner, grant.connectionId, 2003, 20_000);
+    assert.ok(ordinary && ordinary !== "busy");
+    assert.equal(requests.listGeminiReadChallenges(2003)[0]?.expiresAt, 2003 + GEMINI_READ_TIMEOUT_MS);
+    requests.listGeminiReadChallenges(2003 + GEMINI_READ_TIMEOUT_MS);
+    assert.equal(await ordinary.result, "not_ready");
+    const beforeExpiry = grant.expiresAt - 1;
+    const grantClipped = requests.requestFreshGeminiRead(owner, grant.connectionId, beforeExpiry, grant.expiresAt + 1000);
+    assert.ok(grantClipped && grantClipped !== "busy");
+    assert.equal(requests.listGeminiReadChallenges(beforeExpiry)[0]?.expiresAt, grant.expiresAt);
+    assert.deepEqual(requests.listGeminiReadChallenges(grant.expiresAt), []);
+    assert.equal(await grantClipped.result, "not_ready");
+    assert.equal(requests.requestFreshGeminiRead(owner, grant.connectionId, grant.expiresAt, grant.expiresAt + 1), null);
+    assert.equal(requests.getConnectionExpiresAt(owner, grant.connectionId, 2001), grant.expiresAt);
+  } finally {
+    requests.disconnect(owner);
+  }
+});
+
 test("fresh Gemini challenges require the exact owner, URL and document and cannot be replayed", async () => {
   const requests = new PendingConnectionRequests();
   const owner = Symbol("Gemini reader");
