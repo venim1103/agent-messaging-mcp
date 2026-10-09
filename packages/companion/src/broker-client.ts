@@ -152,6 +152,17 @@ const replySchema = z.discriminatedUnion("kind", [
       approvedAt: z.number().int().safe(), expiresAt: z.number().int().safe() })
   }),
   z.strictObject({
+    kind: z.literal("gemini_send_reviews"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ reviews: z.array(geminiReview).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_send_review_approved"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), state: z.literal("send_approved"),
+      approvedAt: z.number().int().safe(), expiresAt: z.number().int().safe() })
+  }),
+  z.strictObject({
     kind: z.literal("fixture_prepared_reviews"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ reviews: z.array(z.strictObject({
@@ -465,6 +476,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "list_gemini_read_challenges"
       | "list_gemini_prepared_reviews" | "approve_gemini_review"
       | "list_gemini_fill_reviews" | "approve_gemini_fill_review"
+      | "list_gemini_send_reviews" | "approve_gemini_send_review"
       | "approve_fixture" | "approve_gemini"
       | "publish_fixture_snapshot" | "publish_gemini_snapshot"
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap"
@@ -481,6 +493,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         || kind === "list_gemini_read_challenges"
         || kind === "list_gemini_prepared_reviews" || kind === "approve_gemini_review"
         || kind === "list_gemini_fill_reviews" || kind === "approve_gemini_fill_review"
+        || kind === "list_gemini_send_reviews" || kind === "approve_gemini_send_review"
         || kind === "approve_fixture" || kind === "approve_gemini" || kind === "revoke_fixture"
         || kind === "revoke_all_fixture" || kind === "publish_fixture_snapshot"
         || kind === "publish_gemini_snapshot"
@@ -611,6 +624,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       listGeminiFillReviews: (target: GeminiTarget) => request("list_gemini_fill_reviews", { target }),
       approveGeminiFillReview: (target: GeminiTarget, operationId: string, reviewId: string) =>
         request("approve_gemini_fill_review", { target, operationId, reviewId }),
+      listGeminiSendReviews: (target: GeminiTarget) => request("list_gemini_send_reviews", { target }),
+      approveGeminiSendReview: (target: GeminiTarget, operationId: string, reviewId: string) =>
+        request("approve_gemini_send_review", { target, operationId, reviewId }),
       approveFixture: (pendingRequestId: string, target: FixtureTarget) =>
         request("approve_fixture", { pendingRequestId, target }),
       approveGemini: (pendingRequestId: string, target: GeminiTarget) =>

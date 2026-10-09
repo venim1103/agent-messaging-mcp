@@ -60,10 +60,13 @@ test("broker client validates bounded purpose-specific Gemini consent replies", 
   const approval = { operationId, state: "approved", approvedAt: Date.now(), expiresAt: review.expiresAt };
   let ordinary: unknown = approval;
   let fill: unknown = { ...approval, state: "fill_approved" };
+  let send: unknown = { ...approval, state: "send_approved" };
   context.mock.method(PreparedMessageOperations.prototype, "listGeminiReviews", () => reviews as never);
   context.mock.method(PreparedMessageOperations.prototype, "listGeminiFillReviews", () => reviews as never);
   context.mock.method(PreparedMessageOperations.prototype, "approveGeminiReview", () => ordinary as never);
   context.mock.method(PreparedMessageOperations.prototype, "approveGeminiFillReview", () => fill as never);
+  context.mock.method(PreparedMessageOperations.prototype, "listGeminiSendReviews", () => reviews as never);
+  context.mock.method(PreparedMessageOperations.prototype, "approveGeminiSendReview", () => send as never);
   try {
     facade = await connectBroker("facade", directory);
     relay = await connectBroker("relay", directory);
@@ -71,7 +74,10 @@ test("broker client validates bounded purpose-specific Gemini consent replies", 
     const trustedRelay = relay;
     assert.throws(() => ownedFacade.listGeminiPreparedReviews(target), /Broker role cannot perform/);
     assert.throws(() => ownedFacade.approveGeminiFillReview(target, operationId, reviewId), /Broker role cannot perform/);
-    for (const list of [() => trustedRelay.listGeminiPreparedReviews(target), () => trustedRelay.listGeminiFillReviews(target)]) {
+    assert.throws(() => ownedFacade.listGeminiSendReviews(target), /Broker role cannot perform/);
+    assert.throws(() => ownedFacade.approveGeminiSendReview(target, operationId, reviewId), /Broker role cannot perform/);
+    for (const list of [() => trustedRelay.listGeminiPreparedReviews(target), () => trustedRelay.listGeminiFillReviews(target),
+      () => trustedRelay.listGeminiSendReviews(target)]) {
       assert.deepEqual((await list()).payload, reviews);
       reviews = { reviews: Array.from({ length: MAX_PREPARED_REVIEWS }, () => review), hasMore: true };
       assert.deepEqual((await list()).payload, reviews);
@@ -90,6 +96,7 @@ test("broker client validates bounded purpose-specific Gemini consent replies", 
     }
     assert.deepEqual((await trustedRelay.approveGeminiReview(target, operationId, reviewId)).payload, approval);
     assert.deepEqual((await trustedRelay.approveGeminiFillReview(target, operationId, reviewId)).payload, fill);
+    assert.deepEqual((await trustedRelay.approveGeminiSendReview(target, operationId, reviewId)).payload, send);
     for (const state of ["fill_approved", "send_approved"]) {
       ordinary = { ...approval, state };
       await assert.rejects(trustedRelay.approveGeminiReview(target, operationId, reviewId),
@@ -103,6 +110,16 @@ test("broker client validates bounded purpose-specific Gemini consent replies", 
     fill = { ...approval, state: "fill_approved", activated: true };
     await assert.rejects(trustedRelay.approveGeminiFillReview(target, operationId, reviewId),
       error => error instanceof Error && error.name === "ZodError");
+    for (const state of ["approved", "fill_approved"]) {
+      send = { ...approval, state };
+      await assert.rejects(trustedRelay.approveGeminiSendReview(target, operationId, reviewId),
+        error => error instanceof Error && error.name === "ZodError");
+    }
+    for (const extra of [{ activated: true }, { retryAllowed: true }, { delivered: true }, { recoveryToken: "synthetic" }]) {
+      send = { ...approval, state: "send_approved", ...extra };
+      await assert.rejects(trustedRelay.approveGeminiSendReview(target, operationId, reviewId),
+        error => error instanceof Error && error.name === "ZodError");
+    }
   } finally {
     facade?.close();
     relay?.close();

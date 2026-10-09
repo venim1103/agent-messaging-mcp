@@ -309,6 +309,24 @@ export function parseNativeGeminiFillReviewApproval(message: unknown, now = Date
   return result.data;
 }
 
+const geminiSendReviewsSchema = geminiPreparedReviewsSchema.extend({ kind: z.literal("list_gemini_send_reviews") });
+
+export function parseNativeGeminiSendReviews(message: unknown, now = Date.now()) {
+  const result = geminiSendReviewsSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) throw new Error("Invalid native Gemini send review list");
+  return result.data;
+}
+
+const geminiSendReviewApprovalSchema = geminiReviewApprovalSchema.extend({ kind: z.literal("approve_gemini_send_review") });
+
+export function parseNativeGeminiSendReviewApproval(message: unknown, now = Date.now()) {
+  const result = geminiSendReviewApprovalSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) throw new Error("Invalid native Gemini send review approval");
+  return result.data;
+}
+
 const geminiApprovalSchema = z.strictObject({
   kind: z.literal("approve_gemini"),
   protocolVersion: z.literal(PROTOCOL_VERSION),
