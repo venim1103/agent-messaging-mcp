@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
-import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget } from "./pending-connections.js";
+import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget,
+  type GeminiSnapshot } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
 export const FIXTURE_REVIEW_APPROVAL_TTL_MS = 2 * 60_000;
@@ -40,6 +41,19 @@ export const fixtureDispatchCheckResultSchema = z.discriminatedUnion("ok", [
     "DRAFT_CHANGED", "SUBMIT_UNAVAILABLE"]) })
 ]);
 export type FixtureDispatchCheckResult = z.infer<typeof fixtureDispatchCheckResultSchema>;
+export const geminiDispatchCheckResultSchema = z.discriminatedUnion("ok", [
+  fixtureDispatchCheckResultSchema.options[0].extend({ editor: z.literal("contenteditable"),
+    draftText: z.string().min(1).max(2048).refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES
+      && text.trim() === text && !text.includes("\r")) }),
+  z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
+    "COMPOSER_UNAVAILABLE", "DRAFT_CHANGED", "SUBMIT_UNAVAILABLE"]) })
+]);
+export type GeminiDispatchCheckResult = z.infer<typeof geminiDispatchCheckResultSchema>;
+export const geminiDispatchResultSchema = z.discriminatedUnion("ok", [
+  fixtureDispatchResultSchema.options[0].extend({ editor: z.literal("contenteditable") }),
+  fixtureDispatchResultSchema.options[1]
+]);
+export type GeminiDispatchResult = z.infer<typeof geminiDispatchResultSchema>;
 export const fixturePreflightResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]) }),
   z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
@@ -128,6 +142,10 @@ type FixtureDispatchCheck = Readonly<{
 type FixtureDispatchAuthorization = Readonly<{
   owner: symbol; operationId: string; target: FixtureTarget; text: string; startedAt: number; expiresAt: number
 }>;
+type GeminiDispatchCheck = Readonly<{
+  checkId: string; owner: symbol; target: GeminiTarget; text: string; createdAt: number; expiresAt: number;
+  baseline: GeminiSnapshot; checkedAt: number | null; issued: boolean
+}>;
 type FixtureDispatchStatus = Readonly<z.infer<typeof fixtureDispatchStatusSchema>>;
 type FixturePreflightStatus = z.infer<typeof fixturePreflightStatusSchema>;
 type PendingFixturePreflight = {
@@ -169,6 +187,7 @@ export class PreparedMessageOperations {
   private readonly recoveryReceipts = new Map<string, string>();
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
   private readonly dispatchChecks = new Map<string, FixtureDispatchCheck>();
+  private readonly geminiDispatchChecks = new Map<string, GeminiDispatchCheck>();
   private readonly dispatchInspections = new Map<string, {
     timer: ReturnType<typeof setTimeout>; resolve: (ready: boolean) => void
   }>();
@@ -252,6 +271,7 @@ export class PreparedMessageOperations {
     this.recoveryReceipts.delete(operationId);
     this.dispatchBaselines.delete(operationId);
     this.discardFixtureDispatchCheck(operationId);
+    this.discardGeminiDispatchCheck(operationId);
     this.dispatchAuthorizations.delete(operationId);
     this.ambiguousEvidence.delete(operationId);
   }
@@ -277,6 +297,9 @@ export class PreparedMessageOperations {
     }
     for (const [operationId, check] of this.dispatchChecks) {
       if (check.expiresAt <= now) this.discardFixtureDispatchCheck(operationId);
+    }
+    for (const [operationId, check] of this.geminiDispatchChecks) {
+      if (check.expiresAt <= now) this.discardGeminiDispatchCheck(operationId);
     }
     for (const [operationId, authorization] of this.dispatchAuthorizations) {
       if (authorization.expiresAt <= now) this.dispatchAuthorizations.delete(operationId);
@@ -953,6 +976,93 @@ export class PreparedMessageOperations {
     this.finishFixtureDispatchInspection(operationId, false);
   }
 
+  private discardGeminiDispatchCheck(operationId: string): void {
+    this.geminiDispatchChecks.delete(operationId);
+    this.finishFixtureDispatchInspection(operationId, false);
+  }
+
+  private freshGeminiDispatchCheck(operationId: string, check: GeminiDispatchCheck, now: number): boolean {
+    const authorization = this.getGeminiSendAuthorization(check.owner, operationId, now);
+    const operation = this.geminiContents.get(operationId);
+    const current = operation && this.requests.getGeminiSnapshot(check.owner, operation.connectionId, now);
+    return !!authorization && this.sameGeminiTarget(authorization.target, check.target)
+      && check.createdAt <= now && check.expiresAt > now && check.baseline.capturedAt <= now
+      && check.baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS > now
+      && !!current && current !== "not_ready" && current.capturedAt <= now
+      && current.capturedAt >= check.baseline.capturedAt && current.cursor.epoch === check.baseline.cursor.epoch
+      && current.cursor.sequence === check.baseline.cursor.sequence;
+  }
+
+  private discardInvalidGeminiDispatchChecks(now: number): void {
+    for (const [operationId, check] of this.geminiDispatchChecks) {
+      if (!this.freshGeminiDispatchCheck(operationId, check, now)) this.discardGeminiDispatchCheck(operationId);
+    }
+  }
+
+  requestGeminiDispatchInspection(owner: symbol, operationId: string, now = Date.now(),
+    deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) throw new Error("DISPATCH_CHECK_UNAVAILABLE");
+    const authorization = this.getGeminiSendAuthorization(owner, operationId, now);
+    if (!authorization) throw new Error("SEND_APPROVAL_REQUIRED");
+    this.discardInvalidGeminiDispatchChecks(now);
+    if (this.geminiDispatchChecks.has(operationId)
+      || this.dispatchChecks.size + this.geminiDispatchChecks.size >= MAX_PENDING_FIXTURE_DISPATCH_CHECKS) return "busy" as const;
+    const operation = this.geminiContents.get(operationId)!;
+    const consent = this.sendApprovals.get(operationId)!;
+    const baseline = this.requests.getGeminiSnapshot(owner, operation.connectionId, now);
+    if (!baseline || baseline === "not_ready" || baseline.capturedAt < consent.approvedAt || baseline.capturedAt > now
+      || baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS <= now) throw new Error("OBSERVATION_UNAVAILABLE");
+    const check = Object.freeze({ checkId: randomUUID(), owner, target: authorization.target, text: authorization.text,
+      createdAt: now, expiresAt: Math.min(deadlineMs, authorization.expiresAt, now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS,
+        baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS), baseline, checkedAt: null, issued: false });
+    this.geminiDispatchChecks.set(operationId, check);
+    let resolve!: (ready: boolean) => void;
+    const result = new Promise<boolean>(done => { resolve = done; });
+    const timer = setTimeout(() => this.discardGeminiDispatchCheck(operationId), check.expiresAt - now);
+    this.dispatchInspections.set(operationId, { timer, resolve });
+    return { checkId: check.checkId, result };
+  }
+
+  listGeminiDispatchChecks(now = Date.now()) {
+    this.discardExpired(now);
+    this.discardInvalidGeminiDispatchChecks(now);
+    const offered: Readonly<{ operationId: string; checkId: string; target: GeminiTarget; text: string; expiresAt: number }>[] = [];
+    for (const [operationId, check] of this.geminiDispatchChecks) {
+      if (check.checkedAt !== null || check.issued) continue;
+      this.geminiDispatchChecks.set(operationId, Object.freeze({ ...check, issued: true }));
+      offered.push(Object.freeze({ operationId, checkId: check.checkId, target: check.target, text: check.text, expiresAt: check.expiresAt }));
+    }
+    return Object.freeze(offered);
+  }
+
+  completeGeminiDispatchCheck(target: GeminiTarget, operationId: string, checkId: string,
+    observation: GeminiDispatchCheckResult, now = Date.now()): boolean {
+    this.discardExpired(now);
+    const check = this.geminiDispatchChecks.get(operationId);
+    const parsed = geminiDispatchCheckResultSchema.safeParse(observation);
+    if (!check || check.checkId !== checkId || !check.issued || check.checkedAt !== null || !parsed.success
+      || !this.sameGeminiTarget(check.target, target)) return false;
+    if (!parsed.data.ok || parsed.data.draftText !== check.text || !this.freshGeminiDispatchCheck(operationId, check, now)) {
+      this.discardGeminiDispatchCheck(operationId);
+      return false;
+    }
+    this.geminiDispatchChecks.set(operationId, Object.freeze({ ...check, checkedAt: now }));
+    this.finishFixtureDispatchInspection(operationId, true);
+    return true;
+  }
+
+  getGeminiDispatchProof(owner: symbol, operationId: string, checkId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const check = this.geminiDispatchChecks.get(operationId);
+    if (!check || check.owner !== owner || check.checkId !== checkId || !check.issued
+      || check.checkedAt === null || check.checkedAt > now) return null;
+    if (!this.freshGeminiDispatchCheck(operationId, check, now)) {
+      this.discardGeminiDispatchCheck(operationId);
+      return null;
+    }
+    return check;
+  }
+
   requestFixtureDispatchInspection(owner: symbol, operationId: string, now = Date.now(),
     deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
     if (!this.getFixtureSendAuthorization(owner, operationId, now)) throw new Error("SEND_APPROVAL_REQUIRED");
@@ -975,7 +1085,8 @@ export class PreparedMessageOperations {
       || authorization.text.includes("\r")) throw new Error("UNSUPPORTED_MESSAGE_TEXT");
     const baseline = this.freshDispatchBaseline(owner, operationId, now);
     this.listFixtureDispatchChecks(now);
-    if (!this.dispatchChecks.has(operationId) && this.dispatchChecks.size >= MAX_PENDING_FIXTURE_DISPATCH_CHECKS) {
+    if (!this.dispatchChecks.has(operationId)
+      && this.dispatchChecks.size + this.geminiDispatchChecks.size >= MAX_PENDING_FIXTURE_DISPATCH_CHECKS) {
       throw new Error("DISPATCH_CHECK_BUSY");
     }
     const check = Object.freeze({ checkId: randomUUID(), owner, target: authorization.target,
