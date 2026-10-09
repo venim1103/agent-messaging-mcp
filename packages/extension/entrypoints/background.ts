@@ -19,7 +19,7 @@ type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: n
 type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
 type FixtureReviewsResult = { ok: true; reviews: { operationId: string; expiresAt: number;
-  reviewId: string; preview: { target: "fixture-alpha"; text: string } }[]; hasMore: boolean }
+  reviewId: string; preview: { target: "fixture-alpha" | "gemini"; text: string } }[]; hasMore: boolean }
   | { ok: false; error: string };
 type FixtureReviewApprovalResult = { ok: true; operationId: string; expiresAt: number }
   | { ok: false; error: string };
@@ -1286,30 +1286,49 @@ const fixtureReviewProtocol = {
     refusal: "SEND_REVIEW_UNAVAILABLE" }
 } as const;
 
+const geminiReviewProtocol = {
+  review: { list: "list_gemini_prepared_reviews", reviews: "gemini_prepared_reviews",
+    approve: "approve_gemini_review", approved: "gemini_review_approved", state: "approved",
+    refusal: "REVIEW_UNAVAILABLE" },
+  fill: { list: "list_gemini_fill_reviews", reviews: "gemini_fill_reviews",
+    approve: "approve_gemini_fill_review", approved: "gemini_fill_review_approved", state: "fill_approved",
+    refusal: "FILL_REVIEW_UNAVAILABLE" }
+} as const;
+
 async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: string,
-  purpose: keyof typeof fixtureReviewProtocol = "review"): Promise<FixtureReviewsResult> {
-  const protocol = fixtureReviewProtocol[purpose];
+  purpose: keyof typeof fixtureReviewProtocol = "review", provider: "fixture" | "gemini" = "fixture"): Promise<FixtureReviewsResult> {
+  const gemini = provider === "gemini";
+  const label = gemini ? "Gemini" : "Fixture";
+  if (gemini && purpose === "send") return { ok: false, error: "Gemini Send consent unavailable" };
+  const protocol = gemini ? geminiReviewProtocol[purpose === "fill" ? "fill" : "review"] : fixtureReviewProtocol[purpose];
   try {
-    if (!await ensureFixtureReset()) return { ok: false, error: "Fixture grant reset unavailable" };
+    if (!await ensureFixtureReset()) return { ok: false, error: `${label} grant reset unavailable` };
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
     const tab = await browser.tabs.get(tabId);
     if (active?.id !== tabId || !tab.active || tab.url !== expectedUrl
-      || new URL(expectedUrl).origin !== "http://127.0.0.1:8787") {
-      return { ok: false, error: "Select the approved local fixture first" };
+      || (gemini ? !isEligibleGeminiUrl(expectedUrl) : new URL(expectedUrl).origin !== "http://127.0.0.1:8787")) {
+      return { ok: false, error: gemini ? "Select the approved Gemini chat first" : "Select the approved local fixture first" };
     }
-    const key = fixtureGrantKey(tabId);
-    const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
+    const key = (gemini ? geminiGrantKey : fixtureGrantKey)(tabId);
+    const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
     if (!stored || typeof stored.documentId !== "string" || !/^[!-~]{1,128}$/.test(stored.documentId)
-      || typeof stored.expiresAt !== "number" || stored.expiresAt <= Date.now()) {
-      return { ok: false, error: "Fixture approval expired or unavailable" };
+      || typeof stored.expiresAt !== "number" || stored.expiresAt <= Date.now()
+      || (gemini && (!("url" in stored) || stored.url !== expectedUrl))) {
+      return { ok: false, error: `${label} approval expired or unavailable` };
     }
     const documentId = stored.documentId;
-    const [identity] = await browser.scripting.executeScript({
+    const [identity] = gemini ? await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+    }) : await browser.scripting.executeScript({
       target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
     });
-    if (identity?.frameId !== 0 || identity.documentId !== documentId || identity.result !== "fixture-alpha"
+    const conversationId = gemini && typeof identity?.result === "object" && identity.result !== null
+      ? identity.result.conversationId : "fixture-alpha";
+    if (identity?.frameId !== 0 || identity.documentId !== documentId
+      || (gemini ? typeof identity.result !== "object" || identity.result?.url !== expectedUrl
+        : identity.result !== "fixture-alpha")
       || (await browser.tabs.get(tabId)).url !== expectedUrl) {
-      return { ok: false, error: "Approved fixture document changed" };
+      return { ok: false, error: `Approved ${gemini ? "Gemini" : "fixture"} document changed` };
     }
 
     return await new Promise<FixtureReviewsResult>((resolve) => {
@@ -1319,11 +1338,11 @@ async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: stri
       try {
         port = browser.runtime.connectNative(nativeHostName);
       } catch {
-        resolve({ ok: false, error: "Native fixture review unavailable" });
+        resolve({ ok: false, error: `Native ${gemini ? "Gemini" : "fixture"} review unavailable` });
         return;
       }
       let settled = false;
-      const timer = setTimeout(() => finish({ ok: false, error: "Fixture review timed out" }), 10_000);
+      const timer = setTimeout(() => finish({ ok: false, error: `${label} review timed out` }), 10_000);
 
       function finish(result: FixtureReviewsResult) {
         if (settled) return;
@@ -1345,7 +1364,7 @@ async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: stri
           const payload = reply.payload as Record<string, unknown>;
           if (reply.kind === "error" && Object.keys(payload).length === 1
             && payload.code === "BROKER_UNAVAILABLE") {
-            finish({ ok: false, error: "Broker unavailable; no fixture review" });
+            finish({ ok: false, error: `Broker unavailable; no ${gemini ? "Gemini" : "fixture"} review` });
             return;
           }
           const reviews = payload.reviews;
@@ -1364,62 +1383,84 @@ async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: stri
                 && entry.expiresAt > Date.now()
                 && typeof preview === "object" && preview !== null && !Array.isArray(preview)
                 && Object.keys(preview).length === 2
-                && (preview as Record<string, unknown>).target === "fixture-alpha"
+                && (preview as Record<string, unknown>).target === (gemini ? "gemini" : "fixture-alpha")
                 && typeof (preview as Record<string, unknown>).text === "string"
-                && new TextEncoder().encode((preview as { text: string }).text).length <= 4_000;
+                && new TextEncoder().encode((preview as { text: string }).text).length <= 4_000
+                && (!gemini || ((preview as { text: string }).text.length > 0
+                  && (preview as { text: string }).text.length <= 2048
+                  && (preview as { text: string }).text.trim() === (preview as { text: string }).text
+                  && !(preview as { text: string }).text.includes("\r")));
             })) throw new Error();
-          const [fresh] = await browser.scripting.executeScript({
+          const [fresh] = gemini ? await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+          }) : await browser.scripting.executeScript({
             target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
           });
           const current = await browser.tabs.get(tabId);
           const [selected] = await browser.tabs.query({ active: true, currentWindow: true });
-          const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
-          if (fresh?.frameId !== 0 || fresh.documentId !== documentId || fresh.result !== "fixture-alpha"
+          const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
+          if (fresh?.frameId !== 0 || fresh.documentId !== documentId
+            || (gemini ? typeof fresh.result !== "object" || fresh.result?.url !== expectedUrl
+              || fresh.result?.conversationId !== conversationId : fresh.result !== "fixture-alpha")
             || selected?.id !== tabId || !current.active || current.url !== expectedUrl
             || grant?.documentId !== documentId || typeof grant.expiresAt !== "number"
-            || grant.expiresAt <= Date.now()) throw new Error();
+            || grant.expiresAt <= Date.now()
+            || (gemini && (!("url" in grant) || grant.url !== expectedUrl))) throw new Error();
           finish({ ok: true, reviews: reviews as Extract<FixtureReviewsResult, { ok: true }>["reviews"],
             hasMore: payload.hasMore as boolean });
-        })().catch(() => finish({ ok: false, error: "Fixture review invalid or selected document changed" }));
+        })().catch(() => finish({ ok: false, error: `${label} review invalid or selected document changed` }));
       });
       port.onDisconnect.addListener(() => {
         void browser.runtime.lastError;
-        finish({ ok: false, error: "Native fixture review unavailable" });
+        finish({ ok: false, error: `Native ${gemini ? "Gemini" : "fixture"} review unavailable` });
       });
       port.postMessage({ kind: protocol.list,
         protocolVersion, requestId,
-        connectionGeneration: 0, deadlineMs, payload: { target: {
+        connectionGeneration: 0, deadlineMs, payload: { target: gemini ? {
+          origin: geminiOrigin, conversationId, url: expectedUrl, tabId, documentId
+        } : {
           origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId
         } } });
     });
   } catch {
-    return { ok: false, error: "Approved fixture document unavailable" };
+    return { ok: false, error: `Approved ${gemini ? "Gemini" : "fixture"} document unavailable` };
   }
 }
 
 async function approveFixtureReviewForSelectedTab(tabId: number, expectedUrl: string,
-  operationId: string, reviewId: string, purpose: keyof typeof fixtureReviewProtocol = "review"): Promise<FixtureReviewApprovalResult> {
-  const protocol = fixtureReviewProtocol[purpose];
+  operationId: string, reviewId: string, purpose: keyof typeof fixtureReviewProtocol = "review",
+  provider: "fixture" | "gemini" = "fixture"): Promise<FixtureReviewApprovalResult> {
+  const gemini = provider === "gemini";
+  const label = gemini ? "Gemini" : "Fixture";
+  if (gemini && purpose === "send") return { ok: false, error: "Gemini Send consent unavailable" };
+  const protocol = gemini ? geminiReviewProtocol[purpose === "fill" ? "fill" : "review"] : fixtureReviewProtocol[purpose];
   try {
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
     const tab = await browser.tabs.get(tabId);
     if (active?.id !== tabId || !tab.active || tab.url !== expectedUrl
-      || new URL(expectedUrl).origin !== "http://127.0.0.1:8787") {
-      return { ok: false, error: "Select the approved local fixture first" };
+      || (gemini ? !isEligibleGeminiUrl(expectedUrl) : new URL(expectedUrl).origin !== "http://127.0.0.1:8787")) {
+      return { ok: false, error: gemini ? "Select the approved Gemini chat first" : "Select the approved local fixture first" };
     }
-    const key = fixtureGrantKey(tabId);
-    const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
+    const key = (gemini ? geminiGrantKey : fixtureGrantKey)(tabId);
+    const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
     if (!stored || typeof stored.documentId !== "string" || !/^[!-~]{1,128}$/.test(stored.documentId)
-      || typeof stored.expiresAt !== "number" || stored.expiresAt <= Date.now()) {
-      return { ok: false, error: "Fixture approval expired or unavailable" };
+      || typeof stored.expiresAt !== "number" || stored.expiresAt <= Date.now()
+      || (gemini && (!("url" in stored) || stored.url !== expectedUrl))) {
+      return { ok: false, error: `${label} approval expired or unavailable` };
     }
     const documentId = stored.documentId;
-    const [identity] = await browser.scripting.executeScript({
+    const [identity] = gemini ? await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+    }) : await browser.scripting.executeScript({
       target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
     });
-    if (identity?.frameId !== 0 || identity.documentId !== documentId || identity.result !== "fixture-alpha"
+    const conversationId = gemini && typeof identity?.result === "object" && identity.result !== null
+      ? identity.result.conversationId : "fixture-alpha";
+    if (identity?.frameId !== 0 || identity.documentId !== documentId
+      || (gemini ? typeof identity.result !== "object" || identity.result?.url !== expectedUrl
+        : identity.result !== "fixture-alpha")
       || (await browser.tabs.get(tabId)).url !== expectedUrl) {
-      return { ok: false, error: "Approved fixture document changed" };
+      return { ok: false, error: `Approved ${gemini ? "Gemini" : "fixture"} document changed` };
     }
 
     return await new Promise<FixtureReviewApprovalResult>((resolve) => {
@@ -1429,11 +1470,11 @@ async function approveFixtureReviewForSelectedTab(tabId: number, expectedUrl: st
       try {
         port = browser.runtime.connectNative(nativeHostName);
       } catch {
-        resolve({ ok: false, error: "Native fixture approval unavailable" });
+        resolve({ ok: false, error: `Native ${gemini ? "Gemini" : "fixture"} approval unavailable` });
         return;
       }
       let settled = false;
-      const timer = setTimeout(() => finish({ ok: false, error: "Fixture approval timed out" }), 10_000);
+      const timer = setTimeout(() => finish({ ok: false, error: `${label} approval timed out` }), 10_000);
 
       function finish(result: FixtureReviewApprovalResult) {
         if (settled) return;
@@ -1471,36 +1512,43 @@ async function approveFixtureReviewForSelectedTab(tabId: number, expectedUrl: st
             || typeof payload.expiresAt !== "number" || !Number.isSafeInteger(payload.expiresAt)
             || payload.expiresAt <= Date.now()) throw new Error();
           brokerApproved = true;
-          const [fresh] = await browser.scripting.executeScript({
+          const [fresh] = gemini ? await browser.scripting.executeScript({
+            target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+          }) : await browser.scripting.executeScript({
             target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
           });
           const current = await browser.tabs.get(tabId);
           const [selected] = await browser.tabs.query({ active: true, currentWindow: true });
-          const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
-          if (fresh?.frameId !== 0 || fresh.documentId !== documentId || fresh.result !== "fixture-alpha"
+          const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
+          if (fresh?.frameId !== 0 || fresh.documentId !== documentId
+            || (gemini ? typeof fresh.result !== "object" || fresh.result?.url !== expectedUrl
+              || fresh.result?.conversationId !== conversationId : fresh.result !== "fixture-alpha")
             || selected?.id !== tabId || !current.active || current.url !== expectedUrl
             || grant?.documentId !== documentId || typeof grant.expiresAt !== "number"
-            || grant.expiresAt <= Date.now()) throw new Error();
+            || grant.expiresAt <= Date.now()
+            || (gemini && (!("url" in grant) || grant.url !== expectedUrl))) throw new Error();
           finish({ ok: true, operationId, expiresAt: payload.expiresAt });
         })().catch(async () => {
           if (brokerApproved && await revokeFixtureTab(tabId, null)) {
             await browser.storage.session.remove(key).catch(() => {});
           }
-          finish({ ok: false, error: "Fixture changed or review response invalid; reconnect" });
+          finish({ ok: false, error: `${label} changed or review response invalid; reconnect` });
         });
       });
       port.onDisconnect.addListener(() => {
         void browser.runtime.lastError;
-        finish({ ok: false, error: "Native fixture approval unavailable" });
+        finish({ ok: false, error: `Native ${gemini ? "Gemini" : "fixture"} approval unavailable` });
       });
       port.postMessage({ kind: protocol.approve,
         protocolVersion, requestId,
-        connectionGeneration: 0, deadlineMs, payload: { target: {
+        connectionGeneration: 0, deadlineMs, payload: { target: gemini ? {
+          origin: geminiOrigin, conversationId, url: expectedUrl, tabId, documentId
+        } : {
           origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId
         }, operationId, reviewId } });
     });
   } catch {
-    return { ok: false, error: "Approved fixture document unavailable" };
+    return { ok: false, error: `Approved ${gemini ? "Gemini" : "fixture"} document unavailable` };
   }
 }
 
@@ -1740,6 +1788,22 @@ export default defineBackground(() => {
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
       && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512) {
       return listPendingForSelectedTab(request.tabId, request.expectedUrl);
+    }
+    if ((request.kind === "list_gemini_prepared_reviews" || request.kind === "list_gemini_fill_reviews")
+      && Object.keys(request).length === 3
+      && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
+      && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512) {
+      return listFixtureReviewsForSelectedTab(request.tabId, request.expectedUrl,
+        request.kind === "list_gemini_fill_reviews" ? "fill" : "review", "gemini");
+    }
+    if ((request.kind === "approve_gemini_review" || request.kind === "approve_gemini_fill_review")
+      && Object.keys(request).length === 5
+      && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
+      && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512
+      && typeof request.operationId === "string" && /^[0-9a-f-]{36}$/.test(request.operationId)
+      && typeof request.reviewId === "string" && /^[0-9a-f-]{36}$/.test(request.reviewId)) {
+      return approveFixtureReviewForSelectedTab(request.tabId, request.expectedUrl,
+        request.operationId, request.reviewId, request.kind === "approve_gemini_fill_review" ? "fill" : "review", "gemini");
     }
     if (request.kind === "approve_fixture" && Object.keys(request).length === 4
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0

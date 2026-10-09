@@ -1348,8 +1348,8 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     const created = await facade.requestConnection();
     if (created.kind !== "connection_requested") throw new Error("Expected synthetic Gemini request");
     const popup = await context.newPage();
-    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
     await page.bringToFront();
+    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
     const beforeInspection = await page.locator("body").innerHTML();
     await popup.evaluate(() => document.getElementById("inspect").click());
     await popup.locator("#result").waitFor({ state: "visible", timeout: 4000 });
@@ -1374,6 +1374,88 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
       throw new Error("Expected a seeded Gemini owner handle");
     }
     assert.equal(state.payload.observation.state, "not_observed");
+    const prepared = await facade.prepareGeminiMessage(state.payload.connectionId, 1,
+      "Synthetic trusted Gemini consent only", "c66b3997-9d43-4554-8399-267d1fe9f75c");
+    if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected private Gemini candidate");
+    const reviewArgs = { tabId: selected.tabId, expectedUrl: url };
+    assert.equal(await popup.locator("#view-fixture-send-reviews").isVisible(), false);
+    await popup.evaluate(() => document.getElementById("view-fixture-fill-reviews").click());
+    await popup.locator("#fixture-review-result").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-reviews li").count(), 0);
+    assert.deepEqual((await facade.fillGeminiDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    await popup.evaluate(() => {
+      window.syntheticOriginalSendMessage = chrome.runtime.sendMessage;
+      chrome.runtime.sendMessage = async function(...args) {
+        const reply = await Reflect.apply(window.syntheticOriginalSendMessage, chrome.runtime, args);
+        if (args[0]?.kind === "list_gemini_prepared_reviews" && reply?.ok) window.syntheticOrdinaryReply = reply;
+        return reply;
+      };
+    });
+    await popup.evaluate(() => document.getElementById("view-fixture-reviews").click());
+    await popup.locator("#fixture-reviews li").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), prepared.payload.preview.text);
+    const ordinary = await popup.evaluate(() => {
+      chrome.runtime.sendMessage = window.syntheticOriginalSendMessage;
+      return window.syntheticOrdinaryReply;
+    });
+    assert.equal(ordinary.ok, true);
+    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+    await popup.waitForFunction(() => document.getElementById("status").textContent.startsWith("Approved Gemini draft"),
+      undefined, { timeout: 4000 });
+    const phaseConfusion = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+      kind: "approve_gemini_fill_review", ...reviewArgs, operationId: prepared.payload.operationId,
+      reviewId: ordinary.reviews[0].reviewId
+    });
+    assert.equal(phaseConfusion.ok, false);
+    assert.deepEqual((await facade.fillGeminiDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    await popup.evaluate(() => document.getElementById("view-fixture-fill-reviews").click());
+    await popup.locator("#fixture-reviews li").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), prepared.payload.preview.text);
+    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+    await popup.waitForFunction(() => document.getElementById("status").textContent.startsWith("Allowed Gemini draft fill"),
+      undefined, { timeout: 4000 });
+    assert.equal(await page.locator("[contenteditable]").textContent(), "Private draft");
+    assert.equal(await page.evaluate(() => window.controlActivations), 0);
+    assert.equal((await facade.getPreparedOperation(prepared.payload.operationId)).payload.draftFill.state, "fill_approved");
+    assert.deepEqual((await facade.commitFixtureMessage(prepared.payload.operationId)).payload, { code: "DISPATCH_UNAVAILABLE" });
+    const guarded = await facade.prepareGeminiMessage(state.payload.connectionId, 1,
+      "Synthetic sender and selection guard", "d66b3997-9d43-4554-8399-267d1fe9f75c");
+    if (guarded.kind !== "gemini_message_prepared") throw new Error("Expected guarded synthetic preparation");
+    const guardedReviews = await popup.evaluate(args => chrome.runtime.sendMessage({ kind: "list_gemini_prepared_reviews", ...args }), reviewArgs);
+    assert.equal(guardedReviews.ok, true);
+    const guardedApproval = { kind: "approve_gemini_review", ...reviewArgs,
+      operationId: guarded.payload.operationId, reviewId: guardedReviews.reviews[0].reviewId };
+    const untrusted = await worker.evaluate(async ({ tabId, documentId, message }) => {
+      const [reply] = await chrome.scripting.executeScript({ target: { tabId, documentIds: [documentId] },
+        func: async request => { try { return await chrome.runtime.sendMessage(request); } catch { return null; } },
+        args: [message] });
+      return reply.result;
+    }, { tabId: selected.tabId, documentId: selected.documentId, message: guardedApproval });
+    assert.notEqual(untrusted?.ok, true);
+    for (const message of [
+      { ...guardedApproval, expectedUrl: url.replace("hl=en", "hl=fr") },
+      { ...guardedApproval, kind: "approve_fixture_review" },
+      { ...guardedApproval, kind: "approve_gemini_send_review" },
+      { ...guardedApproval, text: "Forged synthetic text" },
+      { ...guardedApproval, approved: true }
+    ]) {
+      const refused = await popup.evaluate(async request => {
+        try { return await chrome.runtime.sendMessage(request); } catch { return null; }
+      }, message);
+      assert.notEqual(refused?.ok, true);
+      assert.equal((await facade.getPreparedOperation(guarded.payload.operationId)).payload.state, "awaiting_approval");
+    }
+    await popup.evaluate(() => document.getElementById("view-fixture-reviews").click());
+    await popup.locator("#fixture-reviews li").waitFor({ state: "visible", timeout: 4000 });
+    const otherTab = await context.newPage();
+    await otherTab.goto("about:blank");
+    await popup.locator("#fixture-review-result").waitFor({ state: "hidden", timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-reviews li").count(), 0);
+    assert.equal((await facade.getPreparedOperation(guarded.payload.operationId)).payload.state, "awaiting_approval");
+    await otherTab.close();
+    await page.bringToFront();
+    assert.equal(await page.locator("[contenteditable]").textContent(), "Private draft");
+    assert.equal(await page.evaluate(() => window.controlActivations), 0);
     const read = await facade.readApprovedSnapshot(state.payload.connectionId);
     if (read.kind !== "gemini_snapshot") throw new Error(`Expected a challenged Gemini snapshot, got ${read.kind}`);
     assert.deepEqual(read.payload.messages, [

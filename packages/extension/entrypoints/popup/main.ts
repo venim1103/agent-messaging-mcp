@@ -20,7 +20,7 @@ type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: n
 type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
 type FixtureReviewsResult = { ok: true; reviews: { operationId: string; expiresAt: number;
-  reviewId: string; preview: { target: "fixture-alpha"; text: string } }[]; hasMore: boolean }
+  reviewId: string; preview: { target: "fixture-alpha" | "gemini"; text: string } }[]; hasMore: boolean }
   | { ok: false; error: string };
 type FixtureReviewApprovalResult = { ok: true; operationId: string; expiresAt: number }
   | { ok: false; error: string };
@@ -121,22 +121,28 @@ function clearFixtureReviews() {
 }
 
 browser.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName === "session" && selectedFixtureTab
-    && Object.hasOwn(changes, `fixture-grant-${selectedFixtureTab.id}`)) {
+  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  if (areaName === "session" && selected
+    && Object.hasOwn(changes, `${selectedGeminiTab ? "gemini" : "fixture"}-grant-${selected.id}`)) {
     clearFixtureReviews();
-    status.textContent = "Fixture approval changed. Draft review cleared.";
+    status.textContent = selectedGeminiTab ? "Gemini approval changed. Draft review cleared."
+      : "Fixture approval changed. Draft review cleared.";
   }
 });
 browser.tabs.onActivated.addListener(({ tabId }) => {
-  if (selectedFixtureTab && tabId !== selectedFixtureTab.id) {
+  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  if (selected && tabId !== selected.id) {
     clearFixtureReviews();
-    status.textContent = "Selected fixture changed. Draft review cleared.";
+    status.textContent = selectedGeminiTab ? "Selected Gemini changed. Draft review cleared."
+      : "Selected fixture changed. Draft review cleared.";
   }
 });
 browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (selectedFixtureTab?.id === tabId && (changeInfo.status === "loading" || changeInfo.url)) {
+  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  if (selected?.id === tabId && (changeInfo.status === "loading" || changeInfo.url)) {
     clearFixtureReviews();
-    status.textContent = "Fixture document changed. Draft review cleared.";
+    status.textContent = selectedGeminiTab ? "Gemini document changed. Draft review cleared."
+      : "Fixture document changed. Draft review cleared.";
   }
 });
 
@@ -144,9 +150,13 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   const url = tab?.url ? new URL(tab.url) : null;
   const selectedSavedGemini = tab?.url ? isEligibleGeminiUrl(tab.url) : false;
   pendingButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
-  fixtureReviewButton.hidden = url?.origin !== fixtureOrigin;
-  fixtureFillReviewButton.hidden = url?.origin !== fixtureOrigin;
+  fixtureReviewButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
+  fixtureFillReviewButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
   fixtureSendReviewButton.hidden = url?.origin !== fixtureOrigin;
+  if (selectedSavedGemini) {
+    fixtureReviewButton.textContent = "Review Gemini drafts";
+    fixtureFillReviewButton.textContent = "Review Gemini fill consent";
+  }
   if (tab?.id != null && tab.url && url?.origin === fixtureOrigin) {
     selectedFixtureTab = { id: tab.id, url: tab.url };
   }
@@ -169,34 +179,47 @@ const fixtureReviewCommands = {
     approve: "approve_fixture_send_review", button: "Approve fixture send" }
 } as const;
 
+const geminiReviewCommands = {
+  review: { heading: "Prepared Gemini drafts", list: "list_gemini_prepared_reviews",
+    approve: "approve_gemini_review", button: "Approve draft (no send)" },
+  fill: { heading: "Gemini draft-fill consent", list: "list_gemini_fill_reviews",
+    approve: "approve_gemini_fill_review", button: "Allow draft fill (no send)" }
+} as const;
+
 const reviewFixtureDrafts = async (purpose: keyof typeof fixtureReviewCommands) => {
-  const commands = fixtureReviewCommands[purpose];
+  const gemini = selectedGeminiTab !== null;
+  if (gemini && purpose === "send") return;
+  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  const targetLabel = gemini ? "gemini" : "fixture-alpha";
+  const chatLabel = gemini ? "Gemini" : "fixture";
+  const commands = gemini ? geminiReviewCommands[purpose === "fill" ? "fill" : "review"] : fixtureReviewCommands[purpose];
   fixtureReviewButton.disabled = true;
   fixtureFillReviewButton.disabled = true;
   fixtureSendReviewButton.disabled = true;
   clearFixtureReviews();
   const reviewGeneration = fixtureReviewGeneration;
   fixtureReviewHeading.textContent = commands.heading;
-  status.textContent = "Checking the selected fixture draft...";
+  status.textContent = `Checking the selected ${chatLabel} draft...`;
   try {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
     if (reviewGeneration !== fixtureReviewGeneration) return;
-    if (!selectedFixtureTab || tab?.id !== selectedFixtureTab.id || tab.url !== selectedFixtureTab.url) {
-      status.textContent = "Selected fixture changed. No draft shown.";
+    if (!selected || tab?.id !== selected.id || tab.url !== selected.url) {
+      status.textContent = gemini ? "Selected Gemini changed. No draft shown." : "Selected fixture changed. No draft shown.";
       return;
     }
     const response = await browser.runtime.sendMessage({
       kind: commands.list,
-      tabId: tab.id, expectedUrl: selectedFixtureTab.url }) as FixtureReviewsResult;
+      tabId: tab.id, expectedUrl: selected.url }) as FixtureReviewsResult;
     if (reviewGeneration !== fixtureReviewGeneration) return;
     if (!response.ok) {
       status.textContent = response.error;
       return;
     }
+    if (response.reviews.some(review => review.preview.target !== targetLabel)) throw new Error();
     for (const review of response.reviews) {
       const row = document.createElement("li");
       const label = document.createElement("strong");
-      label.textContent = `fixture-alpha / ${review.operationId}`;
+      label.textContent = `${targetLabel} / ${review.operationId}`;
       const expiry = document.createElement("p");
       expiry.textContent = `${Math.max(0, Math.ceil((review.expiresAt - Date.now()) / 1000))} seconds remaining`;
       const text = document.createElement("pre");
@@ -208,16 +231,17 @@ const reviewFixtureDrafts = async (purpose: keyof typeof fixtureReviewCommands) 
         approve.disabled = true;
         try {
           const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-          if (!selectedFixtureTab || tab?.id !== selectedFixtureTab.id || tab.url !== selectedFixtureTab.url
+          if (tab?.id !== selected.id || tab.url !== selected.url
             || !row.isConnected || fixtureReviewResult.hidden || text.textContent !== review.preview.text
             || Date.now() >= review.expiresAt) {
             clearFixtureReviews();
-            status.textContent = "Fixture or draft changed. No approval recorded.";
+            status.textContent = gemini ? "Gemini or draft changed. No approval recorded."
+              : "Fixture or draft changed. No approval recorded.";
             return;
           }
           const approved = await browser.runtime.sendMessage({
             kind: commands.approve,
-            tabId: tab.id, expectedUrl: selectedFixtureTab.url, operationId: review.operationId,
+            tabId: tab.id, expectedUrl: selected.url, operationId: review.operationId,
             reviewId: review.reviewId }) as FixtureReviewApprovalResult;
           if (!approved.ok) {
             clearFixtureReviews();
@@ -228,11 +252,12 @@ const reviewFixtureDrafts = async (purpose: keyof typeof fixtureReviewCommands) 
           status.textContent = purpose === "send"
             ? `Approved fixture send ${approved.operationId}. No message was sent.`
             : purpose === "fill"
-            ? `Allowed fixture draft fill ${approved.operationId}. Editor unchanged. No message was sent.`
-            : `Approved fixture draft ${approved.operationId}. No message was sent.`;
+            ? `Allowed ${chatLabel} draft fill ${approved.operationId}. Editor unchanged. No message was sent.`
+            : `Approved ${chatLabel} draft ${approved.operationId}. No message was sent.`;
         } catch {
           clearFixtureReviews();
-          status.textContent = "Fixture draft approval unavailable. No message was sent.";
+          status.textContent = gemini ? "Gemini draft approval unavailable. No message was sent."
+            : "Fixture draft approval unavailable. No message was sent.";
         } finally {
           approve.disabled = false;
         }
@@ -244,14 +269,15 @@ const reviewFixtureDrafts = async (purpose: keyof typeof fixtureReviewCommands) 
     if (response.reviews.length) {
       fixtureReviewExpiry = setTimeout(() => {
         clearFixtureReviews();
-        status.textContent = "Prepared fixture draft expired.";
+        status.textContent = gemini ? "Prepared Gemini draft expired." : "Prepared fixture draft expired.";
       }, Math.max(0, Math.min(...response.reviews.map((review) => review.expiresAt)) - Date.now()));
     }
     status.textContent = response.reviews.length
-      ? `${response.reviews.length} prepared fixture draft(s)${response.hasMore ? "; more pending" : ""}. Awaiting approval.`
-      : "No prepared drafts for this fixture document.";
+      ? `${response.reviews.length} prepared ${chatLabel} draft(s)${response.hasMore ? "; more pending" : ""}. Awaiting approval.`
+      : gemini ? "No prepared drafts for this Gemini document." : "No prepared drafts for this fixture document.";
   } catch {
-    if (reviewGeneration === fixtureReviewGeneration) status.textContent = "Fixture draft review unavailable.";
+    if (reviewGeneration === fixtureReviewGeneration) status.textContent = gemini ? "Gemini draft review unavailable."
+      : "Fixture draft review unavailable.";
   } finally {
     fixtureReviewButton.disabled = false;
     fixtureFillReviewButton.disabled = false;
