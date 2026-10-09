@@ -2,7 +2,7 @@ import { browser } from "wxt/browser";
 import { geminiDraftText } from "../lib/approved-probe";
 import { captureFixtureSnapshot, fillFixtureDraft, inspectFixturePreflight, observeFixtureMessages,
   reserveFixtureSubmitAttempt, submitFixtureDraft } from "../lib/fixture-observation";
-import { captureGeminiSnapshot, identifyGeminiConversation, isEligibleGeminiUrl,
+import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, isEligibleGeminiUrl,
   observeGeminiIdentity, observeGeminiMessages }
   from "../lib/gemini-observation";
 
@@ -26,6 +26,8 @@ type FixtureReviewApprovalResult = { ok: true; operationId: string; expiresAt: n
 type FixturePreflightChallenge = { challengeId: string; operationId: string; expiresAt: number;
   tabId: number; documentId: string; text: string };
 type FixtureFillChallenge = Omit<FixturePreflightChallenge, "challengeId"> & { attemptId: string };
+type GeminiFillChallenge = { operationId: string; attemptId: string; text: string; expiresAt: number;
+  target: { origin: "https://gemini.google.com"; conversationId: string; url: string; tabId: number; documentId: string } };
 type FixtureDispatchChallenge = Omit<FixturePreflightChallenge, "challengeId"> & { checkId: string };
 type FixtureSubmitChallenge = FixtureFillChallenge & { dispatch: true };
 type FixtureDispatchObservation = { ok: true; editor: "textarea" | "rich"; draftText: string;
@@ -566,6 +568,59 @@ async function fillTrackedFixtureDraft(check: FixtureFillChallenge): Promise<voi
   await completeFixtureBrowserCheck(check, observation);
 }
 
+async function fillTrackedGeminiDraft(check: GeminiFillChallenge): Promise<void> {
+  if (check.expiresAt <= Date.now()) return;
+  if (inputInProgress) {
+    await completeFixtureBrowserCheck(check, { ok: false, code: "FILL_UNAVAILABLE" });
+    return;
+  }
+  inputInProgress = true;
+  let observation: ReturnType<typeof fillGeminiDraft> = { ok: false, code: "TARGET_CHANGED" };
+  try {
+    const target = check.target;
+    const key = geminiGrantKey(target.tabId);
+    const grant = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
+    const [selected] = await browser.tabs.query({ active: true, currentWindow: true });
+    const tab = await browser.tabs.get(target.tabId);
+    if (grant?.documentId === target.documentId && grant.url === target.url
+      && typeof grant.expiresAt === "number" && grant.expiresAt > Date.now()
+      && selected?.id === target.tabId && tab.active && tab.url === target.url) {
+      const [identity] = await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] },
+        func: identifyGeminiConversation });
+      const [active] = await browser.tabs.query({ active: true, currentWindow: true });
+      const current = await browser.tabs.get(target.tabId);
+      const stillGranted = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
+      if (identity?.frameId === 0 && identity.documentId === target.documentId
+        && identity.result?.conversationId === target.conversationId && identity.result.url === target.url
+        && active?.id === target.tabId && current.active && current.url === target.url
+        && stillGranted?.documentId === target.documentId && stillGranted.url === target.url
+        && typeof stillGranted.expiresAt === "number" && stillGranted.expiresAt > Date.now()
+        && check.expiresAt > Date.now()) {
+        observation = { ok: false, code: "FILL_UNCERTAIN" };
+        const [filled] = await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] },
+          func: fillGeminiDraft, args: [{ expectedUrl: target.url, text: check.text,
+            operationId: check.operationId, attemptId: check.attemptId,
+            expiresAt: Math.min(check.expiresAt, stillGranted.expiresAt) }] });
+        if (filled?.frameId === 0 && filled.documentId === target.documentId && filled.result) {
+          const [afterIdentity] = await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] },
+            func: identifyGeminiConversation });
+          const [afterSelection] = await browser.tabs.query({ active: true, currentWindow: true });
+          const afterTab = await browser.tabs.get(target.tabId);
+          const afterGrant = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
+          if (afterIdentity?.frameId === 0 && afterIdentity.documentId === target.documentId
+            && afterIdentity.result?.conversationId === target.conversationId && afterIdentity.result.url === target.url
+            && afterSelection?.id === target.tabId && afterTab.active && afterTab.url === target.url
+            && afterGrant?.documentId === target.documentId && afterGrant.url === target.url
+            && typeof afterGrant.expiresAt === "number" && afterGrant.expiresAt > Date.now()
+            && check.expiresAt > Date.now()) observation = filled.result;
+        }
+      }
+    }
+  } catch {}
+  finally { inputInProgress = false; }
+  await completeFixtureBrowserCheck(check, observation);
+}
+
 async function submitTrackedFixtureDraft(check: FixtureSubmitChallenge): Promise<void> {
   if (check.expiresAt <= Date.now()) return;
   if (inputInProgress) {
@@ -622,15 +677,17 @@ async function submitTrackedFixtureDraft(check: FixtureSubmitChallenge): Promise
 }
 
 async function completeFixtureBrowserCheck(
-  check: FixturePreflightChallenge | FixtureFillChallenge | FixtureDispatchChallenge | FixtureSubmitChallenge,
-  observation: ReturnType<typeof fillFixtureDraft> | FixtureDispatchObservation | ReturnType<typeof submitFixtureDraft>): Promise<void> {
+  check: FixturePreflightChallenge | FixtureFillChallenge | FixtureDispatchChallenge | FixtureSubmitChallenge | GeminiFillChallenge,
+  observation: ReturnType<typeof fillFixtureDraft> | FixtureDispatchObservation | ReturnType<typeof submitFixtureDraft>
+    | ReturnType<typeof fillGeminiDraft>): Promise<void> {
   if (check.expiresAt <= Date.now()) return;
+  const gemini = "target" in check;
   const submit = "dispatch" in check;
   const fill = "attemptId" in check;
   const dispatch = "checkId" in check;
   await new Promise<boolean>((resolve) => {
     const requestId = crypto.randomUUID();
-    const deadlineMs = dispatch || submit ? Math.min(Date.now() + 5_000, check.expiresAt) : Date.now() + 5_000;
+    const deadlineMs = dispatch || submit || gemini ? Math.min(Date.now() + 5_000, check.expiresAt) : Date.now() + 5_000;
     let port: ReturnType<typeof browser.runtime.connectNative>;
     try { port = browser.runtime.connectNative(nativeHostName); }
     catch { resolve(false); return; }
@@ -647,7 +704,7 @@ async function completeFixtureBrowserCheck(
       if (typeof value !== "object" || value === null || Array.isArray(value)) return finish(false);
       const reply = value as Record<string, unknown>;
       const payload = reply.payload;
-      finish(Object.keys(reply).length === 6 && reply.kind === (submit ? "fixture_dispatch_recorded"
+      finish(Object.keys(reply).length === 6 && reply.kind === (gemini ? "gemini_fill_recorded" : submit ? "fixture_dispatch_recorded"
         : dispatch ? "fixture_dispatch_check_recorded"
         : fill ? "fixture_fill_recorded" : "fixture_preflight_recorded")
         && reply.protocolVersion === protocolVersion && reply.requestId === requestId
@@ -656,10 +713,10 @@ async function completeFixtureBrowserCheck(
         && Object.keys(payload).length === 1 && (payload as { accepted?: unknown }).accepted === true);
     });
     port.onDisconnect.addListener(() => { void browser.runtime.lastError; finish(false); });
-    port.postMessage({ kind: submit ? "complete_fixture_dispatch"
+    port.postMessage({ kind: gemini ? "complete_gemini_fill" : submit ? "complete_fixture_dispatch"
       : dispatch ? "complete_fixture_dispatch_check" : fill ? "complete_fixture_fill" : "complete_fixture_preflight",
       protocolVersion, requestId, connectionGeneration: 0,
-      deadlineMs, payload: { target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+      deadlineMs, payload: { target: gemini ? check.target : { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
         tabId: check.tabId, documentId: check.documentId },
         ...(submit ? { operationId: check.operationId, attemptId: check.attemptId }
           : dispatch ? { operationId: check.operationId, checkId: check.checkId }
@@ -889,6 +946,36 @@ function startFixtureReadWatch(): boolean {
   return true;
 }
 
+function parseGeminiFillChallenges(value: unknown, requestId: string, deadlineMs: number): GeminiFillChallenge[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+  const reply = value as Record<string, unknown>;
+  if (Object.keys(reply).length !== 6 || reply.kind !== "gemini_fill_challenges"
+    || reply.protocolVersion !== protocolVersion || reply.requestId !== requestId
+    || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs || deadlineMs <= Date.now()
+    || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) throw new Error();
+  const payload = reply.payload as Record<string, unknown>;
+  if (Object.keys(payload).length !== 1 || !Array.isArray(payload.fills) || payload.fills.length > 1) throw new Error();
+  return payload.fills.map((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error();
+    const check = entry as Record<string, unknown>;
+    const validId = (value: unknown) => typeof value === "string"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+    if (Object.keys(check).length !== 5 || !validId(check.attemptId) || !validId(check.operationId)
+      || typeof check.expiresAt !== "number" || !Number.isSafeInteger(check.expiresAt) || check.expiresAt > Date.now() + 4_000
+      || typeof check.text !== "string" || !check.text || check.text.length > 2048
+      || check.text !== check.text.trim() || check.text.includes("\r") || new TextEncoder().encode(check.text).length > 4_000
+      || typeof check.target !== "object" || check.target === null || Array.isArray(check.target)) throw new Error();
+    const target = check.target as Record<string, unknown>;
+    if (Object.keys(target).length !== 5 || target.origin !== geminiOrigin
+      || typeof target.conversationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(target.conversationId)
+      || typeof target.url !== "string" || !isEligibleGeminiUrl(target.url)
+      || new URL(target.url).pathname.split("/").filter(Boolean)[1] !== target.conversationId
+      || typeof target.tabId !== "number" || !Number.isSafeInteger(target.tabId) || target.tabId < 1
+      || typeof target.documentId !== "string" || !/^[!-~]{1,128}$/.test(target.documentId)) throw new Error();
+    return entry as GeminiFillChallenge;
+  });
+}
+
 function startGeminiReadWatch(): boolean {
   if (geminiReadWatch) return true;
   let port: ReturnType<typeof browser.runtime.connectNative>;
@@ -898,6 +985,7 @@ function startGeminiReadWatch(): boolean {
     return false;
   }
   geminiReadWatch = port;
+  let fillPoll = false;
   let requestId: string | null = null;
   let deadlineMs = 0;
   let responseTimer: ReturnType<typeof setTimeout> | undefined;
@@ -918,7 +1006,7 @@ function startGeminiReadWatch(): boolean {
       requestId = crypto.randomUUID();
       deadlineMs = Date.now() + 5_000;
       responseTimer = setTimeout(stop, 5_000);
-      port.postMessage({ kind: "list_gemini_read_challenges", protocolVersion,
+      port.postMessage({ kind: fillPoll ? "list_gemini_fill_challenges" : "list_gemini_read_challenges", protocolVersion,
         requestId, connectionGeneration: 0, deadlineMs, payload: {} });
     } catch {
       stop();
@@ -928,6 +1016,20 @@ function startGeminiReadWatch(): boolean {
   port.onMessage.addListener((value: unknown) => {
     if (!requestId) return stop();
     clearTimeout(responseTimer);
+    if (fillPoll) {
+      const fills = (() => {
+        try { return parseGeminiFillChallenges(value, requestId, deadlineMs); }
+        catch { stop(); return null; }
+      })();
+      requestId = null;
+      if (!fills) return;
+      void (async () => {
+        for (const check of fills) await fillTrackedGeminiDraft(check);
+        fillPoll = false;
+        if (geminiReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
+      })().catch(stop);
+      return;
+    }
     const listing = (() => {
       try { return parseGeminiReadChallenges(value, requestId, deadlineMs); }
       catch { stop(); return null; }
@@ -948,7 +1050,8 @@ function startGeminiReadWatch(): boolean {
             await classifyGeminiPublicationFailure(challenge.tabId, challenge.url, challenge.documentId));
         }
       }
-      if (geminiReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 250);
+      fillPoll = true;
+      if (geminiReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, 0);
     })().catch(stop);
   });
   port.onDisconnect.addListener(() => { void browser.runtime.lastError; stop(); });

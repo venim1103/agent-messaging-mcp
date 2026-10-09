@@ -1285,6 +1285,225 @@ test("worker and broker crashes after fixture activation never restore submit au
   for (const outcome of ["worker_crash", "broker_crash"]) await exerciseFixtureDispatch(outcome);
 });
 
+test("connected Gemini worker fills once and never retries lost script or completion results", { timeout: 25000 }, async () => {
+  for (const outcome of ["observed", "script-result-loss", "completion-request-loss", "worker-stop", "broker-stop"]) {
+    const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-worker-fill-"));
+    const unpacked = join(profile, "unpacked-extension");
+    await cp(extensionDirectory, unpacked, { recursive: true });
+    const manifestPath = join(unpacked, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.host_permissions = ["https://gemini.google.com/*"];
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const brokerDirectory = join(profile, ".config/agent-messaging-mcp/broker");
+    const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
+    let context;
+    let broker;
+    let brokerExit;
+    let facade;
+    let relay;
+    try {
+      context = await chromium.launchPersistentContext(profile, {
+        chromiumSandbox: true, executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+        args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`]
+      });
+      let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+      const extensionId = new URL(worker.url()).hostname;
+      await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+      broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+      brokerExit = once(broker, "exit");
+      let ready = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        try { if (await brokerSocketReady(join(brokerDirectory, "broker.sock"))) { ready = true; break; } }
+        catch (error) {
+          if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+        }
+        await setTimeout(25);
+      }
+      assert.equal(ready, true, "Broker did not start");
+      facade = await connectBroker("facade", brokerDirectory);
+      relay = await connectBroker("relay", brokerDirectory);
+      const page = await context.newPage();
+      const url = "https://gemini.google.com/app/synthetic-worker-fill?hl=en";
+      await page.route("https://gemini.google.com/**", route => route.fulfill({ contentType: "text/html; charset=utf-8",
+        body: `<!doctype html><html><head><meta charset="utf-8"><style>
+          main, infinite-scroller, user-query, user-query-content { display:block }
+          [contenteditable] { min-height:40px; width:480px; border:1px solid black }
+        </style></head><body><main><div contenteditable="true" aria-label="Enter a prompt for Gemini"></div>
+          <infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic existing row</p>
+          </user-query-content></user-query></infinite-scroller></main>
+          <button type="button" aria-label="Send message" onclick="window.controlActivations++">Send</button>
+          <script>window.controlActivations=0;window.inputEvents=[];
+          document.querySelector('[contenteditable]').addEventListener('input',event=>window.inputEvents.push(event.isTrusted));</script>
+        </body></html>` }));
+      await page.goto(url);
+      const selected = await worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const [identity] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => location.href });
+        return { tabId: tab.id, documentId: identity.documentId };
+      });
+      const popup = await context.newPage();
+      await page.bringToFront();
+      await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+      const pending = await facade.requestConnection();
+      if (pending.kind !== "connection_requested") throw new Error("Expected synthetic worker-fill pending request");
+      const granted = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+        kind: "approve_gemini", tabId: selected.tabId, expectedUrl: url, pendingRequestId: pending.payload.requestId
+      });
+      assert.equal(granted?.ok, true);
+      const connection = await facade.getConnection(pending.payload.requestId);
+      if (connection.kind !== "connection_state" || connection.payload.state !== "ready_readonly") throw new Error("Expected synthetic grant");
+      const text = "Synthetic worker fill \u00e9\nSecond line";
+      const prepared = await facade.prepareGeminiMessage(connection.payload.connectionId, 1, text, crypto.randomUUID());
+      if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected private worker-fill preparation");
+      for (const [list, approve] of [["list_gemini_prepared_reviews", "approve_gemini_review"],
+        ["list_gemini_fill_reviews", "approve_gemini_fill_review"]]) {
+        const reviews = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+          kind: list, tabId: selected.tabId, expectedUrl: url
+        });
+        assert.equal(reviews.ok, true);
+        const approved = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+          kind: approve, tabId: selected.tabId, expectedUrl: url,
+          operationId: prepared.payload.operationId, reviewId: reviews.reviews[0].reviewId
+        });
+        assert.equal(approved.ok, true);
+      }
+      await worker.evaluate(async ({ scenario, tabId, documentId }) => {
+        await chrome.scripting.executeScript({ target: { tabId, documentIds: [documentId] }, func: () => {
+          globalThis.syntheticNativeInsertCalls = 0;
+          const nativeInsert = Document.prototype.execCommand;
+          Document.prototype.execCommand = function(command, ...args) {
+            if (command === "insertText") globalThis.syntheticNativeInsertCalls++;
+            return Reflect.apply(nativeInsert, this, [command, ...args]);
+          };
+        } });
+        const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+        globalThis.syntheticFillExecutions = 0;
+        globalThis.syntheticFillCompletionDrops = 0;
+        chrome.scripting.executeScript = async details => {
+          const results = await execute(details);
+          if (details.func.toString().includes("geminiDraftFillAttempts")) {
+            globalThis.syntheticFillExecutions++;
+            if (scenario === "script-result-loss") return [];
+            if (scenario === "worker-stop" || scenario === "broker-stop") {
+              return new Promise(resolve => { globalThis.syntheticReleaseFillResults = () => resolve(results); });
+            }
+          }
+          return results;
+        };
+        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+        chrome.runtime.connectNative = (...args) => {
+          const port = connect(...args);
+          const post = port.postMessage.bind(port);
+          port.postMessage = message => {
+            if (scenario === "completion-request-loss" && message.kind === "complete_gemini_fill") {
+              globalThis.syntheticFillCompletionDrops++;
+              return;
+            }
+            post(message);
+          };
+          return port;
+        };
+      }, { scenario: outcome, ...selected });
+      const nativeInsertCalls = () => worker.evaluate(async target => {
+        const [count] = await chrome.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] },
+          func: () => globalThis.syntheticNativeInsertCalls });
+        return count.result;
+      }, selected);
+      const filling = facade.fillGeminiDraft(prepared.payload.operationId);
+      const lostBroker = outcome === "broker-stop" ? assert.rejects(filling, /closed|disconnected/i) : undefined;
+      if (outcome === "worker-stop" || outcome === "broker-stop") {
+        let inputObserved = false;
+        for (let attempt = 0; attempt < 80; attempt++) {
+          if (await worker.evaluate(() => globalThis.syntheticFillExecutions === 1)) { inputObserved = true; break; }
+          await setTimeout(25);
+        }
+        assert.equal(inputObserved, true, "The real insertion did not reach the controlled result boundary");
+        assert.equal(await nativeInsertCalls(), 1);
+        assert.equal(await page.locator("[contenteditable]").innerText(), text);
+      }
+      if (outcome === "worker-stop") {
+        const manager = await context.newPage();
+        await manager.goto("chrome://extensions/");
+        const serviceWorkers = await context.newCDPSession(manager);
+        let confirmStopped;
+        const stopped = new Promise(resolve => { confirmStopped = resolve; });
+        const registered = new Promise(resolve => serviceWorkers.on("ServiceWorker.workerVersionUpdated", event => {
+          const version = event.versions.find(entry => entry.scriptURL === worker.url());
+          if (version) resolve(version.versionId);
+          if (version?.runningStatus === "stopped") confirmStopped();
+        }));
+        await serviceWorkers.send("ServiceWorker.enable");
+        const versionId = await Promise.race([registered, setTimeout(3000).then(() => { throw new Error("Worker version not found"); })]);
+        await serviceWorkers.send("ServiceWorker.stopWorker", { versionId });
+        await Promise.race([stopped, setTimeout(5000).then(() => { throw new Error("Gemini fill worker did not stop"); })]);
+        await page.bringToFront();
+        await popup.reload();
+        const awake = await popup.evaluate(() => chrome.runtime.sendMessage({ kind: "probe_native_handshake" }));
+        assert.equal(awake?.ok, true);
+        worker = context.serviceWorkers().find(candidate => candidate.url() === worker.url()) ?? worker;
+        await serviceWorkers.detach();
+        await manager.close();
+      } else if (outcome === "broker-stop") {
+        const previousKey = await readFile(join(brokerDirectory, "facade.key"), "utf8");
+        broker.kill("SIGKILL");
+        await brokerExit;
+        brokerExit = undefined;
+        await lostBroker;
+        facade.close();
+        relay.close();
+        broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+        brokerExit = once(broker, "exit");
+        ready = false;
+        for (let attempt = 0; attempt < 80; attempt++) {
+          try {
+            ready = await readFile(join(brokerDirectory, "facade.key"), "utf8") !== previousKey
+              && await brokerSocketReady(join(brokerDirectory, "broker.sock"));
+            if (ready) break;
+          }
+          catch (error) {
+            if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+          }
+          await setTimeout(25);
+        }
+        assert.equal(ready, true, "Replacement synthetic broker did not start");
+        facade = await connectBroker("facade", brokerDirectory);
+        relay = await connectBroker("relay", brokerDirectory);
+        await worker.evaluate(() => globalThis.syntheticReleaseFillResults());
+      }
+      if (!lostBroker) {
+        const filled = await filling;
+        if (filled.kind !== "gemini_fill") throw new Error("Expected fixed connected fill outcome");
+        assert.equal(filled.payload.ok, outcome === "observed", outcome);
+        if (!filled.payload.ok) assert.equal(filled.payload.code, "FILL_UNCERTAIN", outcome);
+      }
+      assert.equal(await page.locator("[contenteditable]").innerText(), text);
+      const inputEvents = await page.evaluate(() => window.inputEvents);
+      assert.ok(inputEvents.length > 0);
+      assert.equal(inputEvents.every(trusted => trusted === true), true);
+      assert.equal(await nativeInsertCalls(), 1);
+      assert.equal(await page.evaluate(() => window.controlActivations), 0);
+      assert.equal(await worker.evaluate(() => globalThis.syntheticFillExecutions ?? 0), outcome === "worker-stop" ? 0 : 1);
+      assert.equal(await worker.evaluate(() => globalThis.syntheticFillCompletionDrops ?? 0), outcome === "completion-request-loss" ? 1 : 0);
+      assert.deepEqual((await facade.fillGeminiDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
+      assert.deepEqual((await relay.listGeminiFillChallenges()).payload, { fills: [] });
+      const status = await facade.getPreparedOperation(prepared.payload.operationId);
+      if (outcome === "broker-stop") assert.deepEqual(status.payload, { state: "unknown" });
+      else assert.equal(status.payload.draftFill.state, outcome === "observed" ? "filled" : "uncertain");
+      assert.equal(await page.locator("[contenteditable]").innerText(), text);
+      assert.deepEqual(await page.evaluate(() => window.inputEvents), inputEvents);
+      assert.equal(await nativeInsertCalls(), 1);
+      assert.equal(await page.evaluate(() => window.controlActivations), 0);
+    } finally {
+      facade?.close();
+      relay?.close();
+      await context?.close();
+      broker?.kill();
+      if (brokerExit) await brokerExit;
+      await rm(profile, { recursive: true, force: true });
+    }
+  }
+});
+
 test("test-only Gemini host access carries exact synthetic rows and later observations", { timeout: 20000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-read-test-"));
   const unpacked = join(profile, "unpacked-extension");
@@ -1418,6 +1637,13 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     assert.equal(await page.evaluate(() => window.controlActivations), 0);
     assert.equal((await facade.getPreparedOperation(prepared.payload.operationId)).payload.draftFill.state, "fill_approved");
     assert.deepEqual((await facade.commitFixtureMessage(prepared.payload.operationId)).payload, { code: "DISPATCH_UNAVAILABLE" });
+    const refusedFill = await facade.fillGeminiDraft(prepared.payload.operationId);
+    assert.equal(refusedFill.kind, "gemini_fill");
+    assert.deepEqual(refusedFill.payload.ok ? refusedFill.payload : { ok: refusedFill.payload.ok, code: refusedFill.payload.code },
+      { ok: false, code: "DRAFT_PRESENT" });
+    assert.equal(await page.locator("[contenteditable]").textContent(), "Private draft");
+    assert.equal(await page.evaluate(() => window.controlActivations), 0);
+    assert.deepEqual((await facade.fillGeminiDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
     const guarded = await facade.prepareGeminiMessage(state.payload.connectionId, 1,
       "Synthetic sender and selection guard", "d66b3997-9d43-4554-8399-267d1fe9f75c");
     if (guarded.kind !== "gemini_message_prepared") throw new Error("Expected guarded synthetic preparation");
