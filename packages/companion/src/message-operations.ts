@@ -445,6 +445,68 @@ export class PreparedMessageOperations {
     return consent;
   }
 
+  listGeminiSendReviews(target: GeminiTarget, now = Date.now()) {
+    this.discardExpired(now);
+    const reviews: PreparedReview<"gemini">[] = [];
+    for (const [operationId, operation] of this.geminiContents) {
+      if (!this.sameGeminiTarget(operation.target, target)) continue;
+      this.sendReviewTokens.delete(operationId);
+      const live = this.requests.getGeminiTarget(operation.owner, operation.connectionId, now);
+      const grantExpiresAt = this.requests.getConnectionExpiresAt(operation.owner, operation.connectionId, now);
+      if (!live || grantExpiresAt === null || !this.sameGeminiTarget(live, target)) {
+        this.release(operationId);
+        continue;
+      }
+      const fill = this.fillStates.get(operationId);
+      if (this.getOperation(operation.owner, operationId, now).state !== "approved"
+        || fill?.state !== "filled" || fill.editor !== "contenteditable" || this.sendApprovals.has(operationId)) continue;
+      const approval = this.approvals.get(operationId)!;
+      const reviewId = randomUUID();
+      reviews.push(Object.freeze({ operationId, reviewId,
+        expiresAt: Math.min(operation.expiresAt, approval.expiresAt, grantExpiresAt, now + FIXTURE_SEND_APPROVAL_TTL_MS),
+        preview: Object.freeze({ target: "gemini", text: operation.text }) }));
+    }
+    const selected = reviews.slice(-MAX_PREPARED_REVIEWS).reverse();
+    for (const review of selected) this.sendReviewTokens.set(review.operationId,
+      Object.freeze({ reviewId: review.reviewId, expiresAt: review.expiresAt }));
+    return Object.freeze({ reviews: Object.freeze(selected), hasMore: reviews.length > MAX_PREPARED_REVIEWS });
+  }
+
+  approveGeminiSendReview(target: GeminiTarget, operationId: string, reviewId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.geminiContents.get(operationId);
+    const live = operation && this.requests.getGeminiTarget(operation.owner, operation.connectionId, now);
+    const grantExpiresAt = operation && this.requests.getConnectionExpiresAt(operation.owner, operation.connectionId, now);
+    const approval = this.approvals.get(operationId);
+    const review = this.sendReviewTokens.get(operationId);
+    const fill = this.fillStates.get(operationId);
+    if (!operation || !live || grantExpiresAt == null || !approval
+      || this.getOperation(operation.owner, operationId, now).state !== "approved"
+      || fill?.state !== "filled" || fill.editor !== "contenteditable" || this.sendApprovals.has(operationId)
+      || typeof reviewId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(reviewId)
+      || review?.reviewId !== reviewId || review.expiresAt <= now || !this.sameGeminiTarget(operation.target, target)
+      || !this.sameGeminiTarget(live, target)) throw new Error("SEND_REVIEW_UNAVAILABLE");
+    const consent = Object.freeze({ operationId, state: "send_approved" as const, approvedAt: now,
+      expiresAt: Math.min(operation.expiresAt, approval.expiresAt, review.expiresAt, grantExpiresAt) });
+    this.sendReviewTokens.delete(operationId);
+    this.sendApprovals.set(operationId, consent);
+    return consent;
+  }
+
+  getGeminiSendAuthorization(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.geminiContents.get(operationId);
+    const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
+    const grantExpiresAt = operation && this.requests.getConnectionExpiresAt(owner, operation.connectionId, now);
+    const consent = this.sendApprovals.get(operationId);
+    const fill = this.fillStates.get(operationId);
+    if (!operation || operation.owner !== owner || !live || grantExpiresAt == null || !consent || consent.expiresAt <= now
+      || !this.sameGeminiTarget(operation.target, live) || fill?.state !== "filled" || fill.editor !== "contenteditable"
+      || this.getOperation(owner, operationId, now).state !== "approved") return null;
+    return Object.freeze({ operationId, target: operation.target, text: operation.text,
+      expiresAt: Math.min(consent.expiresAt, grantExpiresAt) });
+  }
+
   getGeminiFillAuthorization(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const operation = this.geminiContents.get(operationId);

@@ -334,6 +334,140 @@ test("isolated Gemini review and fill approval honor caps, expiry and authority 
   }
 });
 
+test("staged Gemini Send consent requires completed fill and distinct exact-target owner-bound authority", async () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const ledger = new PreparedMessageOperations(requests, database);
+  const owner = Symbol("staged Gemini Send consent");
+  try {
+    const target = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
+      url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 3, documentId: "synthetic-gemini-document" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+    const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic staged Gemini Send consent",
+      "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    assert.deepEqual(ledger.listGeminiSendReviews(target, 2002), { reviews: [], hasMore: false });
+    const ordinary = ledger.listGeminiReviews(target, 2002).reviews[0]!;
+    ledger.approveGeminiReview(target, prepared.operationId, ordinary.reviewId, 2002);
+    assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, 2003), null);
+    const fill = ledger.listGeminiFillReviews(target, 2003).reviews[0]!;
+    ledger.approveGeminiFillReview(target, prepared.operationId, fill.reviewId, 2003);
+    assert.deepEqual(ledger.listGeminiSendReviews(target, 2003), { reviews: [], hasMore: false });
+    const filling = ledger.requestGeminiFill(owner, prepared.operationId, 2004, 2100);
+    assert.ok(filling && filling !== "busy");
+    assert.deepEqual(ledger.listGeminiSendReviews(target, 2004), { reviews: [], hasMore: false });
+    ledger.listGeminiFillChallenges(2005);
+    assert.equal(ledger.completeGeminiFill(target, filling.attemptId, { ok: true, editor: "contenteditable" }, 2006), true);
+    assert.ok((await filling.result)?.ok);
+    assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, 2006), null);
+    assert.deepEqual(ledger.listFixtureSendReviews({ origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+      tabId: 3, documentId: target.documentId }, 2006), { reviews: [], hasMore: false });
+    const oldSend = ledger.listGeminiSendReviews(target, 2007).reviews[0]!;
+    const send = ledger.listGeminiSendReviews(target, 2008).reviews[0]!;
+    assert.deepEqual(send.preview, prepared.preview);
+    for (const reviewId of [ordinary.reviewId, fill.reviewId, oldSend.reviewId, "invalid"]) {
+      assert.throws(() => ledger.approveGeminiSendReview(target, prepared.operationId, reviewId, 2009), /SEND_REVIEW_UNAVAILABLE/);
+    }
+    for (const wrong of [{ ...target, url: target.url.replace("hl=en", "hl=fr") }, { ...target, tabId: 4 },
+      { ...target, documentId: "other" }, { ...target, conversationId: "other" }]) {
+      assert.throws(() => ledger.approveGeminiSendReview(wrong, prepared.operationId, send.reviewId, 2009), /SEND_REVIEW_UNAVAILABLE/);
+    }
+    const consent = ledger.approveGeminiSendReview(target, prepared.operationId, send.reviewId, 2010);
+    assert.equal(consent.state, "send_approved");
+    assert.ok(consent.expiresAt <= prepared.expiresAt && consent.expiresAt <= send.expiresAt
+      && consent.expiresAt <= grant.expiresAt);
+    assert.deepEqual(ledger.getGeminiSendAuthorization(owner, prepared.operationId, 2011), {
+      operationId: prepared.operationId, target, text: prepared.preview.text, expiresAt: consent.expiresAt
+    });
+    assert.equal(ledger.getGeminiSendAuthorization(Symbol("foreign"), prepared.operationId, 2011), null);
+    assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, 2011), null);
+    assert.throws(() => ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2011), /APPROVAL_REQUIRED/);
+    assert.throws(() => ledger.approveGeminiSendReview(target, prepared.operationId, send.reviewId, 2011), /SEND_REVIEW_UNAVAILABLE/);
+    assert.deepEqual(ledger.listGeminiSendReviews(target, 2011), { reviews: [], hasMore: false });
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+    requests.revokeChangedTab(target.tabId, null);
+    assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, 2012), null);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("staged Gemini Send consent expires and cannot survive target, owner, result or ledger loss", async () => {
+  for (const boundary of ["approval-expiry", "preparation-expiry", "read-grant-expiry", "disconnect", "restart",
+    "live-url-change", "uncertain-fill", "failed-fill"]) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol(boundary);
+    try {
+      const target = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
+        url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 3, documentId: "synthetic-gemini-document" };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+      const preparedAt = boundary === "read-grant-expiry" ? grant.expiresAt - 100 : 2001;
+      const approvedAt = boundary === "preparation-expiry" ? preparedAt + 179_900 : preparedAt + 1;
+      const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic staged Send expiry",
+        "a66b3997-9d43-4554-8399-267d1fe9f75c", preparedAt);
+      const ordinary = ledger.listGeminiReviews(target, approvedAt).reviews[0]!;
+      const approval = ledger.approveGeminiReview(target, prepared.operationId, ordinary.reviewId, approvedAt);
+      const fill = ledger.listGeminiFillReviews(target, approvedAt + 1).reviews[0]!;
+      ledger.approveGeminiFillReview(target, prepared.operationId, fill.reviewId, approvedAt + 1);
+      const filling = ledger.requestGeminiFill(owner, prepared.operationId, approvedAt + 2, approvedAt + 20);
+      assert.ok(filling && filling !== "busy");
+      ledger.listGeminiFillChallenges(approvedAt + 3);
+      const result = boundary === "uncertain-fill" ? { ok: false as const, code: "FILL_UNCERTAIN" as const }
+        : boundary === "failed-fill" ? { ok: false as const, code: "DRAFT_PRESENT" as const }
+          : { ok: true as const, editor: "contenteditable" as const };
+      assert.equal(ledger.completeGeminiFill(target, filling.attemptId, result, approvedAt + 4), true);
+      await filling.result;
+      const listed = ledger.listGeminiSendReviews(target, approvedAt + 5);
+      if (!result.ok) {
+        assert.deepEqual(listed, { reviews: [], hasMore: false });
+        assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, approvedAt + 5), null);
+        assert.throws(() => ledger.approveGeminiSendReview(target, prepared.operationId, ordinary.reviewId, approvedAt + 5),
+          /SEND_REVIEW_UNAVAILABLE/);
+        continue;
+      }
+      const send = listed.reviews[0]!;
+      const consent = ledger.approveGeminiSendReview(target, prepared.operationId, send.reviewId, approvedAt + 6);
+      assert.equal(consent.expiresAt, Math.min(prepared.expiresAt, approval.expiresAt, grant.expiresAt));
+      assert.ok(ledger.getGeminiSendAuthorization(owner, prepared.operationId, approvedAt + 7));
+      let now = approvedAt + 8;
+      if (boundary.endsWith("expiry")) now = consent.expiresAt;
+      else if (boundary === "disconnect") ledger.disconnect(owner);
+      else if (boundary === "restart") {
+        const restarted = new PreparedMessageOperations(requests, database);
+        assert.equal(restarted.getGeminiSendAuthorization(owner, prepared.operationId, now), null);
+        assert.deepEqual(restarted.listGeminiSendReviews(target, now), { reviews: [], hasMore: false });
+        assert.throws(() => restarted.approveGeminiSendReview(target, prepared.operationId, send.reviewId, now), /SEND_REVIEW_UNAVAILABLE/);
+        restarted.disconnect(owner);
+        continue;
+      } else {
+        const getTarget = requests.getGeminiTarget.bind(requests);
+        requests.getGeminiTarget = (...args) => {
+          const live = getTarget(...args);
+          return live ? { ...live, url: live.url.replace("hl=en", "hl=fr") } : null;
+        };
+      }
+      assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, now), null);
+      assert.throws(() => ledger.approveGeminiSendReview(target, prepared.operationId, send.reviewId, now), /SEND_REVIEW_UNAVAILABLE/);
+      if (boundary === "approval-expiry") {
+        const renewed = ledger.listGeminiReviews(target, now).reviews[0]!;
+        ledger.approveGeminiReview(target, prepared.operationId, renewed.reviewId, now);
+        assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, now), null);
+        assert.throws(() => ledger.approveGeminiSendReview(target, prepared.operationId, send.reviewId, now), /SEND_REVIEW_UNAVAILABLE/);
+      }
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
 test("isolated Gemini fill jobs offer once and require issued exact-target completion", async () => {
   const database = new DatabaseSync(":memory:");
   const requests = new PendingConnectionRequests();
