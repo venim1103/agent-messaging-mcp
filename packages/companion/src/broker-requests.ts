@@ -112,6 +112,18 @@ const requestSchema = z.discriminatedUnion("kind", [
     target: fixtureTarget, operationId: z.uuid(), reviewId: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_gemini_read_challenges"), payload: z.strictObject({}) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_gemini_prepared_reviews"), payload: z.strictObject({
+    target: geminiTarget
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("approve_gemini_review"), payload: z.strictObject({
+    target: geminiTarget, operationId: z.uuid(), reviewId: z.uuid()
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_gemini_fill_reviews"), payload: z.strictObject({
+    target: geminiTarget
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("approve_gemini_fill_review"), payload: z.strictObject({
+    target: geminiTarget, operationId: z.uuid(), reviewId: z.uuid()
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_pending"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("approve_fixture"), payload: z.strictObject({
     pendingRequestId: z.uuid(),
@@ -171,6 +183,54 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
           preflightChecks: operations?.listFixturePreflightChallenges(now) ?? [],
           draftFills: operations?.listFixtureFillChallenges(now) ?? [] } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "list_gemini_prepared_reviews") {
+    if (role !== "relay") return { ...response, kind: "error" as const,
+      payload: { code: "PERMISSION_DENIED" } };
+    return operations
+      ? { ...response, kind: "gemini_prepared_reviews" as const,
+        payload: operations.listGeminiReviews(request.payload.target, now) }
+      : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+  }
+  if (request.kind === "approve_gemini_review") {
+    if (role !== "relay") return { ...response, kind: "error" as const,
+      payload: { code: "PERMISSION_DENIED" } };
+    if (!operations) return { ...response, kind: "error" as const,
+      payload: { code: "PREPARATION_UNAVAILABLE" } };
+    try {
+      return { ...response, kind: "gemini_review_approved" as const,
+        payload: operations.approveGeminiReview(request.payload.target, request.payload.operationId,
+          request.payload.reviewId, now) };
+    } catch (error) {
+      if (error instanceof Error && error.message === "REVIEW_UNAVAILABLE") {
+        return { ...response, kind: "error" as const, payload: { code: "REVIEW_UNAVAILABLE" } };
+      }
+      throw error;
+    }
+  }
+  if (request.kind === "list_gemini_fill_reviews") {
+    if (role !== "relay") return { ...response, kind: "error" as const,
+      payload: { code: "PERMISSION_DENIED" } };
+    return operations
+      ? { ...response, kind: "gemini_fill_reviews" as const,
+        payload: operations.listGeminiFillReviews(request.payload.target, now) }
+      : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+  }
+  if (request.kind === "approve_gemini_fill_review") {
+    if (role !== "relay") return { ...response, kind: "error" as const,
+      payload: { code: "PERMISSION_DENIED" } };
+    if (!operations) return { ...response, kind: "error" as const,
+      payload: { code: "PREPARATION_UNAVAILABLE" } };
+    try {
+      return { ...response, kind: "gemini_fill_review_approved" as const,
+        payload: operations.approveGeminiFillReview(request.payload.target, request.payload.operationId,
+          request.payload.reviewId, now) };
+    } catch (error) {
+      if (error instanceof Error && error.message === "FILL_REVIEW_UNAVAILABLE") {
+        return { ...response, kind: "error" as const, payload: { code: "FILL_REVIEW_UNAVAILABLE" } };
+      }
+      throw error;
+    }
   }
   if (request.kind === "list_fixture_prepared_reviews") {
     if (role !== "relay") return { ...response, kind: "error" as const,

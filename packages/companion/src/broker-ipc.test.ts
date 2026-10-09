@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { brokerRequestDeadline, connectBroker } from "./broker-client.js";
 import { BROKER_IDLE_TIMEOUT_MS, startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials, MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
-import { PreparedMessageOperations } from "./message-operations.js";
+import { MAX_PREPARED_REVIEWS, PreparedMessageOperations } from "./message-operations.js";
 import { encodeNativeFrame, MAX_NATIVE_FRAME_BYTES, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
@@ -42,6 +42,75 @@ async function exchange(socket: Socket, message: unknown): Promise<unknown> {
     socket.write(encodeNativeFrame(message));
   });
 }
+
+test("broker client validates bounded purpose-specific Gemini consent replies", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-consent-replies-"));
+  const directory = join(home, "broker");
+  const database = new DatabaseSync(":memory:");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-chat",
+    url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 4, documentId: "synthetic-document" };
+  const operationId = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+  const reviewId = "b66b3997-9d43-4554-8399-267d1fe9f75c";
+  const review = { operationId, reviewId, expiresAt: Date.now() + 120_000,
+    preview: { target: "gemini", text: "Synthetic bounded reply" } };
+  let reviews: unknown = { reviews: [review], hasMore: false };
+  const approval = { operationId, state: "approved", approvedAt: Date.now(), expiresAt: review.expiresAt };
+  let ordinary: unknown = approval;
+  let fill: unknown = { ...approval, state: "fill_approved" };
+  context.mock.method(PreparedMessageOperations.prototype, "listGeminiReviews", () => reviews as never);
+  context.mock.method(PreparedMessageOperations.prototype, "listGeminiFillReviews", () => reviews as never);
+  context.mock.method(PreparedMessageOperations.prototype, "approveGeminiReview", () => ordinary as never);
+  context.mock.method(PreparedMessageOperations.prototype, "approveGeminiFillReview", () => fill as never);
+  try {
+    facade = await connectBroker("facade", directory);
+    relay = await connectBroker("relay", directory);
+    const ownedFacade = facade;
+    const trustedRelay = relay;
+    assert.throws(() => ownedFacade.listGeminiPreparedReviews(target), /Broker role cannot perform/);
+    assert.throws(() => ownedFacade.approveGeminiFillReview(target, operationId, reviewId), /Broker role cannot perform/);
+    for (const list of [() => trustedRelay.listGeminiPreparedReviews(target), () => trustedRelay.listGeminiFillReviews(target)]) {
+      assert.deepEqual((await list()).payload, reviews);
+      reviews = { reviews: Array.from({ length: MAX_PREPARED_REVIEWS }, () => review), hasMore: true };
+      assert.deepEqual((await list()).payload, reviews);
+      for (const invalid of [
+        { reviews: Array.from({ length: MAX_PREPARED_REVIEWS + 1 }, () => review), hasMore: true },
+        { reviews: [{ ...review, approved: true }], hasMore: false },
+        { reviews: [{ ...review, preview: { ...review.preview, target: "fixture-alpha" } }], hasMore: false },
+        ...["x".repeat(2049), "\u00e9".repeat(2048), " text", "line\rbreak"].map(text =>
+          ({ reviews: [{ ...review, preview: { ...review.preview, text } }], hasMore: false })),
+        { reviews: [review], hasMore: false, selector: "button" }
+      ]) {
+        reviews = invalid;
+        await assert.rejects(list(), error => error instanceof Error && error.name === "ZodError");
+      }
+      reviews = { reviews: [review], hasMore: false };
+    }
+    assert.deepEqual((await trustedRelay.approveGeminiReview(target, operationId, reviewId)).payload, approval);
+    assert.deepEqual((await trustedRelay.approveGeminiFillReview(target, operationId, reviewId)).payload, fill);
+    for (const state of ["fill_approved", "send_approved"]) {
+      ordinary = { ...approval, state };
+      await assert.rejects(trustedRelay.approveGeminiReview(target, operationId, reviewId),
+        error => error instanceof Error && error.name === "ZodError");
+    }
+    for (const state of ["approved", "send_approved"]) {
+      fill = { ...approval, state };
+      await assert.rejects(trustedRelay.approveGeminiFillReview(target, operationId, reviewId),
+        error => error instanceof Error && error.name === "ZodError");
+    }
+    fill = { ...approval, state: "fill_approved", activated: true };
+    await assert.rejects(trustedRelay.approveGeminiFillReview(target, operationId, reviewId),
+      error => error instanceof Error && error.name === "ZodError");
+  } finally {
+    facade?.close();
+    relay?.close();
+    await broker.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("broker forwarding clips local budgets without renewing an upstream deadline", async () => {
   assert.equal(brokerRequestDeadline(1000), 6000);

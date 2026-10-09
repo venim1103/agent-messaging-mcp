@@ -44,6 +44,12 @@ const geminiMessage = z.strictObject({
   identityQuality: z.literal("uncertain"), generationState: z.literal("unknown")
 });
 const fixtureCursor = z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() });
+const geminiReview = z.strictObject({
+  operationId: z.uuid(), reviewId: z.uuid(), expiresAt: z.number().int().safe(),
+  preview: z.strictObject({ target: z.literal("gemini"), text: z.string().min(1).max(2048)
+    .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES
+      && text.trim() === text && !text.includes("\r")) })
+});
 
 const replySchema = z.discriminatedUnion("kind", [
   z.strictObject({
@@ -121,6 +127,28 @@ const replySchema = z.discriminatedUnion("kind", [
     draftFills: z.array(z.strictObject({ attemptId: z.uuid(), operationId: z.uuid(), target: fixtureTarget,
       text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), expiresAt: z.number().int().safe()
     })).max(MAX_PENDING_FIXTURE_FILLS) })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_prepared_reviews"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ reviews: z.array(geminiReview).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_review_approved"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), state: z.literal("approved"),
+      approvedAt: z.number().int().safe(), expiresAt: z.number().int().safe() })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_fill_reviews"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ reviews: z.array(geminiReview).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_fill_review_approved"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), state: z.literal("fill_approved"),
+      approvedAt: z.number().int().safe(), expiresAt: z.number().int().safe() })
   }),
   z.strictObject({
     kind: z.literal("fixture_prepared_reviews"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -409,6 +437,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "list_fixture_fill_reviews" | "approve_fixture_fill_review"
       | "list_fixture_send_reviews" | "approve_fixture_send_review"
       | "list_gemini_read_challenges"
+      | "list_gemini_prepared_reviews" | "approve_gemini_review"
+      | "list_gemini_fill_reviews" | "approve_gemini_fill_review"
       | "approve_fixture" | "approve_gemini"
       | "publish_fixture_snapshot" | "publish_gemini_snapshot"
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap"
@@ -422,6 +452,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         || kind === "list_fixture_dispatch_attempts" || kind === "complete_fixture_dispatch"
         || kind === "complete_fixture_fill"
         || kind === "list_gemini_read_challenges"
+        || kind === "list_gemini_prepared_reviews" || kind === "approve_gemini_review"
+        || kind === "list_gemini_fill_reviews" || kind === "approve_gemini_fill_review"
         || kind === "approve_fixture" || kind === "approve_gemini" || kind === "revoke_fixture"
         || kind === "revoke_all_fixture" || kind === "publish_fixture_snapshot"
         || kind === "publish_gemini_snapshot"
@@ -540,6 +572,12 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       approveFixtureSendReview: (target: FixtureTarget, operationId: string, reviewId: string) =>
         request("approve_fixture_send_review", { target, operationId, reviewId }),
       listGeminiReadChallenges: () => request("list_gemini_read_challenges", {}),
+      listGeminiPreparedReviews: (target: GeminiTarget) => request("list_gemini_prepared_reviews", { target }),
+      approveGeminiReview: (target: GeminiTarget, operationId: string, reviewId: string) =>
+        request("approve_gemini_review", { target, operationId, reviewId }),
+      listGeminiFillReviews: (target: GeminiTarget) => request("list_gemini_fill_reviews", { target }),
+      approveGeminiFillReview: (target: GeminiTarget, operationId: string, reviewId: string) =>
+        request("approve_gemini_fill_review", { target, operationId, reviewId }),
       approveFixture: (pendingRequestId: string, target: FixtureTarget) =>
         request("approve_fixture", { pendingRequestId, target }),
       approveGemini: (pendingRequestId: string, target: GeminiTarget) =>

@@ -16,6 +16,8 @@ import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parse
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
+  parseNativeGeminiPreparedReviews, parseNativeGeminiReviewApproval,
+  parseNativeGeminiFillReviews, parseNativeGeminiFillReviewApproval,
   parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeFixtureDispatchCheck, parseNativeFixtureDispatchChecks,
@@ -36,6 +38,39 @@ const request = {
   deadlineMs: now + 10_000,
   payload: {}
 };
+
+test("native Gemini draft review and fill consent reject arbitrary authority and invalid exact targets", () => {
+  const target = { origin: "https://gemini.google.com", conversationId: "synthetic-chat",
+    url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 3, documentId: "synthetic-document" };
+  for (const [kind, parse, approval] of [
+    ["list_gemini_prepared_reviews", parseNativeGeminiPreparedReviews, false],
+    ["approve_gemini_review", parseNativeGeminiReviewApproval, true],
+    ["list_gemini_fill_reviews", parseNativeGeminiFillReviews, false],
+    ["approve_gemini_fill_review", parseNativeGeminiFillReviewApproval, true]
+  ] as const) {
+    const message = { ...request, kind, payload: approval
+      ? { target, operationId: randomUUID(), reviewId: randomUUID() } : { target } };
+    assert.deepEqual(parse(message, now), message);
+    assert.deepEqual(parse({ ...message, deadlineMs: now + 30_000 }, now), { ...message, deadlineMs: now + 30_000 });
+    for (const invalid of [
+      { ...message, kind: "approve_gemini_send_review" }, { ...message, connectionGeneration: 1 },
+      { ...message, protocolVersion: 2 }, { ...message, deadlineMs: now },
+      { ...message, deadlineMs: now + 30_001 }, { ...message, deadlineMs: now + 0.5 },
+      { ...message, selector: "textarea" },
+      ...[{ approved: true }, { send: true }, { text: "Synthetic raw draft" }, { selector: "button" },
+        { command: "navigate" }, { recoveryToken: "a".repeat(64) }].map(extra =>
+        ({ ...message, payload: { ...message.payload, ...extra } })),
+      ...[{ origin: "http://127.0.0.1:8787" }, { url: "https://other.invalid/app/synthetic-chat" },
+        { url: `${target.url}#fragment` }, { conversationId: "other" }, { tabId: 0 },
+        { documentId: "line\nbreak" }, { url: "x".repeat(513) }].map(changed =>
+        ({ ...message, payload: { ...message.payload, target: { ...target, ...changed } } }))
+    ]) assert.throws(() => parse(invalid, now), /Invalid native Gemini/, kind);
+    if (approval) {
+      assert.throws(() => parse({ ...message, payload: { ...message.payload, operationId: "invalid" } }, now), /Invalid native Gemini/);
+      assert.throws(() => parse({ ...message, payload: { ...message.payload, reviewId: "invalid" } }, now), /Invalid native Gemini/);
+    }
+  }
+});
 
 test("native dispatch inspection accepts only bounded exact proof, never approval or submission", () => {
   const listing = { ...request, kind: "list_fixture_dispatch_checks" };
@@ -1137,6 +1172,32 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(unstartedCompletion.kind, "fixture_dispatch_recorded");
     assert.equal(unstartedCompletion.deadlineMs, completionEnvelope.deadlineMs);
     assert.deepEqual(unstartedCompletion.payload, { accepted: false });
+    assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, beforeSendReview.payload);
+    const geminiTarget = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-chat",
+      url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 4, documentId: "synthetic-gemini-document" };
+    assert.throws(() => owningFacade.listGeminiPreparedReviews(geminiTarget), /Broker role cannot perform/);
+    assert.throws(() => owningFacade.listGeminiFillReviews(geminiTarget), /Broker role cannot perform/);
+    assert.throws(() => owningFacade.approveGeminiReview(geminiTarget, prepared.payload.operationId, reviewId), /Broker role cannot perform/);
+    assert.throws(() => owningFacade.approveGeminiFillReview(geminiTarget, prepared.payload.operationId, fillReview.reviewId), /Broker role cannot perform/);
+    for (const [kind, expected] of [["list_gemini_prepared_reviews", "gemini_prepared_reviews"],
+      ["list_gemini_fill_reviews", "gemini_fill_reviews"]] as const) {
+      const envelope = { ...request, kind, deadlineMs: Date.now() + 10_000, payload: { target: geminiTarget } };
+      const [reply] = await exchangeFillReview(envelope) as [{ kind: string; deadlineMs: number; payload: unknown }];
+      assert.equal(reply.kind, expected, lastExchangeDiagnostic);
+      assert.equal(reply.deadlineMs, envelope.deadlineMs);
+      assert.deepEqual(reply.payload, { reviews: [], hasMore: false });
+    }
+    for (const [kind, code] of [["approve_gemini_review", "REVIEW_UNAVAILABLE"],
+      ["approve_gemini_fill_review", "FILL_REVIEW_UNAVAILABLE"]] as const) {
+      const envelope: typeof request & { payload: {
+        target: typeof geminiTarget; operationId: string; reviewId: string
+      } } = { ...request, kind, deadlineMs: Date.now() + 10_000,
+        payload: { target: geminiTarget, operationId: prepared.payload.operationId, reviewId } };
+      const [reply] = await exchangeFillReview(envelope) as [{ kind: string; deadlineMs: number; payload: unknown }];
+      assert.equal(reply.kind, "error", lastExchangeDiagnostic);
+      assert.equal(reply.deadlineMs, envelope.deadlineMs);
+      assert.deepEqual(reply.payload, { code });
+    }
     assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, beforeSendReview.payload);
     fillHost.stdin.end();
     const [fillExit] = await reviewPortClose;

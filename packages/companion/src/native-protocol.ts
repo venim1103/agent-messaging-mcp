@@ -247,6 +247,47 @@ function isValidGeminiTarget(target: z.infer<typeof geminiTargetSchema>): boolea
   }
 }
 
+const geminiPreparedReviewsSchema = fixturePreparedReviewsSchema.extend({
+  kind: z.literal("list_gemini_prepared_reviews"), payload: z.strictObject({ target: geminiTargetSchema })
+});
+
+export function parseNativeGeminiPreparedReviews(message: unknown, now = Date.now()) {
+  const result = geminiPreparedReviewsSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) throw new Error("Invalid native Gemini prepared review list");
+  return result.data;
+}
+
+const geminiReviewApprovalSchema = fixtureReviewApprovalSchema.extend({
+  kind: z.literal("approve_gemini_review"),
+  payload: z.strictObject({ target: geminiTargetSchema, operationId: z.uuid(), reviewId: z.uuid() })
+});
+
+export function parseNativeGeminiReviewApproval(message: unknown, now = Date.now()) {
+  const result = geminiReviewApprovalSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) throw new Error("Invalid native Gemini review approval");
+  return result.data;
+}
+
+const geminiFillReviewsSchema = geminiPreparedReviewsSchema.extend({ kind: z.literal("list_gemini_fill_reviews") });
+
+export function parseNativeGeminiFillReviews(message: unknown, now = Date.now()) {
+  const result = geminiFillReviewsSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) throw new Error("Invalid native Gemini fill review list");
+  return result.data;
+}
+
+const geminiFillReviewApprovalSchema = geminiReviewApprovalSchema.extend({ kind: z.literal("approve_gemini_fill_review") });
+
+export function parseNativeGeminiFillReviewApproval(message: unknown, now = Date.now()) {
+  const result = geminiFillReviewApprovalSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) throw new Error("Invalid native Gemini fill review approval");
+  return result.data;
+}
+
 const geminiApprovalSchema = z.strictObject({
   kind: z.literal("approve_gemini"),
   protocolVersion: z.literal(PROTOCOL_VERSION),

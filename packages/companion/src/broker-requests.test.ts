@@ -62,6 +62,77 @@ test("only a relay marks a gap for the exact approved Gemini URL and document", 
     "relay", Symbol("relay"), requests, 2002));
 });
 
+test("only the relay grants separate Gemini review and fill consent without browser input", () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  const operations = new PreparedMessageOperations(requests, database);
+  const owner = Symbol("Gemini owner");
+  const relay = Symbol("trusted relay");
+  try {
+    const envelope = { protocolVersion: PROTOCOL_VERSION,
+      requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: 10_000 };
+    const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-chat",
+      url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 4, documentId: "synthetic-document" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+    const prepared = operations.prepareGemini(owner, grant.connectionId, 1, "Synthetic consent transport only",
+      "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    for (const kind of ["list_gemini_prepared_reviews", "approve_gemini_review",
+      "list_gemini_fill_reviews", "approve_gemini_fill_review"]) {
+      const message = { ...envelope, kind, payload: kind.startsWith("approve")
+        ? { target, operationId: prepared.operationId, reviewId: envelope.requestId } : { target } };
+      for (const facade of [owner, Symbol("stranger")]) assert.deepEqual(
+        handleBrokerRequest(message, "facade", facade, requests, 2002, operations).payload, { code: "PERMISSION_DENIED" });
+      assert.deepEqual(handleBrokerRequest(message, "relay", relay, requests, 2002).payload, { code: "PREPARATION_UNAVAILABLE" });
+      assert.throws(() => handleBrokerRequest({ ...message, payload: { ...message.payload, approved: true } },
+        "relay", relay, requests, 2002, operations));
+    }
+    const list = { ...envelope, kind: "list_gemini_prepared_reviews", payload: { target } };
+    const first = handleBrokerRequest(list, "relay", relay, requests, 2002, operations);
+    if (first.kind !== "gemini_prepared_reviews") throw new Error("Expected Gemini preview");
+    const current = handleBrokerRequest(list, "relay", relay, requests, 2003, operations);
+    if (current.kind !== "gemini_prepared_reviews") throw new Error("Expected rotated Gemini preview");
+    const review = current.payload.reviews[0]!;
+    assert.deepEqual(review.preview, prepared.preview);
+    assert.equal(JSON.stringify(current.payload).includes(target.url), false);
+    const approval = { ...envelope, kind: "approve_gemini_review", payload: {
+      target, operationId: prepared.operationId, reviewId: review.reviewId
+    } };
+    assert.deepEqual(handleBrokerRequest({ ...approval, payload: { ...approval.payload,
+      reviewId: first.payload.reviews[0]!.reviewId } }, "relay", relay, requests, 2003, operations).payload,
+    { code: "REVIEW_UNAVAILABLE" });
+    assert.deepEqual(handleBrokerRequest({ ...approval, payload: { ...approval.payload,
+      target: { ...target, documentId: "other" } } }, "relay", relay, requests, 2003, operations).payload,
+    { code: "REVIEW_UNAVAILABLE" });
+    assert.equal(handleBrokerRequest(approval, "relay", relay, requests, 2003, operations).kind, "gemini_review_approved");
+    assert.deepEqual(handleBrokerRequest(approval, "relay", relay, requests, 2003, operations).payload, { code: "REVIEW_UNAVAILABLE" });
+    assert.equal(operations.getGeminiFillAuthorization(owner, prepared.operationId, 2003), null);
+    const fills = handleBrokerRequest({ ...list, kind: "list_gemini_fill_reviews" }, "relay", relay, requests, 2004, operations);
+    if (fills.kind !== "gemini_fill_reviews") throw new Error("Expected separate Gemini fill preview");
+    const fill = { ...approval, kind: "approve_gemini_fill_review",
+      payload: { ...approval.payload, reviewId: fills.payload.reviews[0]!.reviewId } };
+    assert.deepEqual(handleBrokerRequest({ ...fill, payload: { ...fill.payload, reviewId: review.reviewId } },
+      "relay", relay, requests, 2004, operations).payload, { code: "FILL_REVIEW_UNAVAILABLE" });
+    assert.deepEqual(handleBrokerRequest({ ...fill, payload: { ...fill.payload,
+      target: { ...target, url: target.url.replace("hl=en", "hl=fr") } } }, "relay", relay, requests, 2004, operations).payload,
+    { code: "FILL_REVIEW_UNAVAILABLE" });
+    const consent = handleBrokerRequest(fill, "relay", relay, requests, 2004, operations);
+    assert.equal(consent.kind, "gemini_fill_review_approved");
+    assert.deepEqual(consent.payload, { operationId: prepared.operationId, state: "fill_approved",
+      approvedAt: 2004, expiresAt: 2003 + FIXTURE_REVIEW_APPROVAL_TTL_MS });
+    assert.deepEqual(handleBrokerRequest(fill, "relay", relay, requests, 2004, operations).payload, { code: "FILL_REVIEW_UNAVAILABLE" });
+    assert.ok(operations.getGeminiFillAuthorization(owner, prepared.operationId, 2004));
+    assert.equal(operations.getGeminiFillAuthorization(Symbol("stranger"), prepared.operationId, 2004), null);
+    assert.equal(operations.getFixtureFillAuthorization(owner, prepared.operationId, 2004), null);
+    assert.equal(operations.getFixtureSendAuthorization(owner, prepared.operationId, 2004), null);
+    assert.deepEqual(operations.listGeminiFillChallenges(2004), []);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+  } finally {
+    operations.disconnect(owner);
+    database.close();
+  }
+});
+
 test("only the relay grants distinct fixture send consent after completed fill without dispatch", () => {
   const requests = new PendingConnectionRequests();
   const database = new DatabaseSync(":memory:");
