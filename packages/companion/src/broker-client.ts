@@ -6,10 +6,11 @@ import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
 import { fixtureDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
+  geminiFillStatusSchema,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureDispatchCheckResult,
-  type FixtureDispatchResult, type FixtureFillResult, type FixturePreflightResult } from "./message-operations.js";
+  type FixtureDispatchResult, type FixtureFillResult, type FixturePreflightResult, type GeminiFillResult } from "./message-operations.js";
 import type { FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
@@ -240,6 +241,23 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ accepted: z.boolean() })
   }),
   z.strictObject({
+    kind: z.literal("gemini_fill_challenges"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ fills: z.array(z.strictObject({ attemptId: z.uuid(), operationId: z.uuid(),
+      target: geminiTarget, text: geminiReview.shape.preview.shape.text, expiresAt: z.number().int().safe()
+    })).max(MAX_PENDING_FIXTURE_FILLS) })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_fill"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: geminiFillStatusSchema
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_fill_recorded"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ accepted: z.boolean() })
+  }),
+  z.strictObject({
     kind: z.literal("fixture_fill"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: fixtureFillStatusSchema
@@ -261,6 +279,12 @@ const replySchema = z.discriminatedUnion("kind", [
     kind: z.literal("fixture_disconnected"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ disconnected: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("gemini_message_prepared"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), connectionId: z.uuid(), state: z.literal("awaiting_approval"),
+      expiresAt: z.number().int().safe(), preview: geminiReview.shape.preview })
   }),
   z.strictObject({
     kind: z.literal("message_prepared"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -428,10 +452,12 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
       | "disconnect_fixture" | "prepare_fixture_message" | "get_prepared_operation"
+      | "prepare_gemini_message"
       | "check_fixture_preflight" | "complete_fixture_preflight"
       | "check_fixture_dispatch" | "list_fixture_dispatch_checks" | "complete_fixture_dispatch_check"
       | "dispatch_fixture_message" | "commit_fixture_message" | "list_fixture_dispatch_attempts" | "complete_fixture_dispatch"
       | "fill_fixture_draft" | "complete_fixture_fill"
+      | "fill_gemini_draft" | "list_gemini_fill_challenges" | "complete_gemini_fill"
       | "list_pending" | "list_fixture_read_challenges" | "list_fixture_prepared_reviews"
       | "approve_fixture_review"
       | "list_fixture_fill_reviews" | "approve_fixture_fill_review"
@@ -451,6 +477,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         || kind === "list_fixture_dispatch_checks" || kind === "complete_fixture_dispatch_check"
         || kind === "list_fixture_dispatch_attempts" || kind === "complete_fixture_dispatch"
         || kind === "complete_fixture_fill"
+        || kind === "list_gemini_fill_challenges" || kind === "complete_gemini_fill"
         || kind === "list_gemini_read_challenges"
         || kind === "list_gemini_prepared_reviews" || kind === "approve_gemini_review"
         || kind === "list_gemini_fill_reviews" || kind === "approve_gemini_fill_review"
@@ -541,6 +568,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       disconnectFixture: (connectionId: string) => request("disconnect_fixture", { connectionId }),
       prepareFixtureMessage: (connectionId: string, expectedGeneration: 1, text: string, idempotencyKey: string) =>
         request("prepare_fixture_message", { connectionId, expectedGeneration, text, idempotencyKey }),
+      prepareGeminiMessage: (connectionId: string, expectedGeneration: 1, text: string, idempotencyKey: string) =>
+        request("prepare_gemini_message", { connectionId, expectedGeneration, text, idempotencyKey }),
       getPreparedOperation: (operationId: string, recoveryToken?: string) =>
         request("get_prepared_operation", { operationId,
           ...(recoveryToken === undefined ? {} : { recoveryToken }) }),
@@ -558,6 +587,10 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       completeFixtureDispatch: (target: FixtureTarget, operationId: string, attemptId: string,
         observation: FixtureDispatchResult) => request("complete_fixture_dispatch", { target, operationId, attemptId, observation }),
       fillFixtureDraft: (operationId: string) => request("fill_fixture_draft", { operationId }),
+      fillGeminiDraft: (operationId: string) => request("fill_gemini_draft", { operationId }),
+      listGeminiFillChallenges: () => request("list_gemini_fill_challenges", {}),
+      completeGeminiFill: (target: GeminiTarget, attemptId: string, observation: GeminiFillResult) =>
+        request("complete_gemini_fill", { target, attemptId, observation }),
       completeFixtureFill: (target: FixtureTarget, attemptId: string, observation: FixtureFillResult) =>
         request("complete_fixture_fill", { target, attemptId, observation }),
       listPending: () => request("list_pending", {}),

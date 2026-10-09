@@ -18,6 +18,7 @@ import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parse
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
   parseNativeGeminiPreparedReviews, parseNativeGeminiReviewApproval,
   parseNativeGeminiFillReviews, parseNativeGeminiFillReviewApproval,
+  parseNativeGeminiFillChallenges, parseNativeGeminiFill,
   parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeFixtureDispatchCheck, parseNativeFixtureDispatchChecks,
@@ -38,6 +39,32 @@ const request = {
   deadlineMs: now + 10_000,
   payload: {}
 };
+
+test("native Gemini fill transport accepts only empty listing and fixed exact-target completion", () => {
+  const listing = { ...request, kind: "list_gemini_fill_challenges" };
+  assert.deepEqual(parseNativeGeminiFillChallenges(listing, now), listing);
+  for (const payload of [{ operationId: request.requestId }, { approved: true }, { selector: "input" }, { text: "Synthetic" }]) {
+    assert.throws(() => parseNativeGeminiFillChallenges({ ...listing, payload }, now), /Invalid native Gemini fill challenge/);
+  }
+  const completion = { ...request, kind: "complete_gemini_fill", payload: {
+    target: { origin: "https://gemini.google.com", conversationId: "synthetic-chat",
+      url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 4, documentId: "synthetic-document" },
+    attemptId: request.requestId, observation: { ok: true, editor: "contenteditable" }
+  } };
+  assert.deepEqual(parseNativeGeminiFill(completion, now), completion);
+  assert.deepEqual(parseNativeGeminiFill({ ...completion, payload: { ...completion.payload,
+    observation: { ok: false, code: "FILL_UNCERTAIN" } } }, now).payload.observation, { ok: false, code: "FILL_UNCERTAIN" });
+  for (const invalid of [
+    { ...completion, deadlineMs: now }, { ...completion, deadlineMs: now + 30_001 },
+    { ...completion, kind: "fill_gemini_draft" }, { ...completion, connectionGeneration: 1 },
+    { ...completion, payload: { ...completion.payload, attemptId: "invalid" } },
+    { ...completion, payload: { ...completion.payload, operationId: request.requestId } },
+    { ...completion, payload: { ...completion.payload, target: { ...completion.payload.target, url: "https://other.invalid/" } } },
+    { ...completion, payload: { ...completion.payload, observation: { ok: true, editor: "textarea" } } },
+    ...[{ activated: true }, { text: "Synthetic private draft" }, { retryAllowed: true }, { approved: true }].map(extra =>
+      ({ ...completion, payload: { ...completion.payload, observation: { ...completion.payload.observation, ...extra } } }))
+  ]) assert.throws(() => parseNativeGeminiFill(invalid, now), /Invalid native Gemini fill completion/);
+});
 
 test("native Gemini draft review and fill consent reject arbitrary authority and invalid exact targets", () => {
   const target = { origin: "https://gemini.google.com", conversationId: "synthetic-chat",
@@ -1199,6 +1226,63 @@ test("native relay lists only live broker pending IDs over real framing", { time
       assert.deepEqual(reply.payload, { code });
     }
     assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, beforeSendReview.payload);
+    const nativeFillTarget = { ...geminiTarget, tabId: 73 };
+    const nativeGeminiPending = await owningFacade.requestConnection();
+    if (nativeGeminiPending.kind !== "connection_requested") throw new Error("Expected synthetic Gemini pending request");
+    const [geminiApproved] = await exchangeFillReview({ ...request, kind: "approve_gemini", deadlineMs: Date.now() + 10_000,
+      payload: { pendingRequestId: nativeGeminiPending.payload.requestId, target: nativeFillTarget } }) as [{ kind: string }];
+    assert.equal(geminiApproved.kind, "gemini_approved");
+    const geminiGrant = await owningFacade.getConnection(nativeGeminiPending.payload.requestId);
+    if (geminiGrant.kind !== "connection_state" || geminiGrant.payload.state !== "ready_readonly") throw new Error("Expected synthetic Gemini grant");
+    const geminiPrepared = await owningFacade.prepareGeminiMessage(geminiGrant.payload.connectionId, 1,
+      "Synthetic native Gemini fill metadata", "c66b3997-9d43-4554-8399-267d1fe9f75c");
+    if (geminiPrepared.kind !== "gemini_message_prepared") throw new Error("Expected private native Gemini candidate");
+    for (const [listingKind, approvalKind, listedKind, approvedKind] of [
+      ["list_gemini_prepared_reviews", "approve_gemini_review", "gemini_prepared_reviews", "gemini_review_approved"],
+      ["list_gemini_fill_reviews", "approve_gemini_fill_review", "gemini_fill_reviews", "gemini_fill_review_approved"]
+    ] as const) {
+      const [listed] = await exchangeFillReview({ ...request, kind: listingKind, deadlineMs: Date.now() + 10_000,
+        payload: { target: nativeFillTarget } }) as [{ kind: string; payload: { reviews: { operationId: string; reviewId: string }[] } }];
+      assert.equal(listed.kind, listedKind);
+      assert.equal(listed.payload.reviews[0]?.operationId, geminiPrepared.payload.operationId);
+      const [approved] = await exchangeFillReview({ ...request, kind: approvalKind, deadlineMs: Date.now() + 10_000,
+        payload: { target: nativeFillTarget, operationId: geminiPrepared.payload.operationId, reviewId: listed.payload.reviews[0]!.reviewId } }) as [{ kind: string }];
+      assert.equal(approved.kind, approvedKind, lastExchangeDiagnostic);
+    }
+    const geminiFilling = owningFacade.fillGeminiDraft(geminiPrepared.payload.operationId);
+    let geminiAttemptId: string | undefined;
+    for (let index = 0; index < 40; index++) {
+      const [listed] = await exchangeFillReview({ ...request, kind: "list_gemini_fill_challenges", deadlineMs: Date.now() + 10_000,
+        payload: {} }) as [{ kind: string; payload: { fills: { attemptId: string; operationId: string; text: string }[] } }];
+      assert.equal(listed.kind, "gemini_fill_challenges");
+      const offer = listed.payload.fills[0];
+      if (offer) {
+        geminiAttemptId = offer.attemptId;
+        assert.equal(offer.operationId, geminiPrepared.payload.operationId);
+        assert.equal(offer.text, geminiPrepared.payload.preview.text);
+        break;
+      }
+      await setTimeout(10);
+    }
+    assert.ok(geminiAttemptId);
+    const [noReoffer] = await exchangeFillReview({ ...request, kind: "list_gemini_fill_challenges",
+      deadlineMs: Date.now() + 10_000, payload: {} }) as [{ payload: unknown }];
+    assert.deepEqual(noReoffer.payload, { fills: [] });
+    const geminiCompletion = { ...request, kind: "complete_gemini_fill", deadlineMs: Date.now() + 10_000,
+      payload: { target: nativeFillTarget, attemptId: geminiAttemptId, observation: { ok: true, editor: "contenteditable" } } };
+    const [geminiCompleted] = await exchangeFillReview(geminiCompletion) as [{ kind: string; payload: { accepted: boolean } }];
+    assert.equal(geminiCompleted.kind, "gemini_fill_recorded");
+    assert.deepEqual(geminiCompleted.payload, { accepted: true });
+    const filledGemini = await geminiFilling;
+    assert.equal(filledGemini.kind, "gemini_fill");
+    assert.equal("ok" in filledGemini.payload && filledGemini.payload.ok, true);
+    const [geminiReplay] = await exchangeFillReview({ ...geminiCompletion, deadlineMs: Date.now() + 10_000 }) as [{ payload: unknown }];
+    assert.deepEqual(geminiReplay.payload, { accepted: false });
+    assert.deepEqual((await owningFacade.fillGeminiDraft(geminiPrepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    const [nativeFillRevoked] = await exchangeFillReview({ ...request, kind: "revoke_fixture", deadlineMs: Date.now() + 10_000,
+      payload: { tabId: nativeFillTarget.tabId, observed: null } }) as [{ kind: string; payload: { count: number } }];
+    assert.equal(nativeFillRevoked.kind, "fixture_revoked");
+    assert.deepEqual(nativeFillRevoked.payload, { count: 1 });
     fillHost.stdin.end();
     const [fillExit] = await reviewPortClose;
     assert.equal(fillExit, 0, Buffer.concat(fillErrors).toString());

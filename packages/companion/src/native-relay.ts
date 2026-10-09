@@ -10,6 +10,7 @@ import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parse
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
   parseNativeGeminiPreparedReviews, parseNativeGeminiReviewApproval,
   parseNativeGeminiFillReviews, parseNativeGeminiFillReviewApproval,
+  parseNativeGeminiFillChallenges, parseNativeGeminiFill,
   parseNativeFixtureSendReviews, parseNativeFixtureSendReviewApproval,
   parseNativeFixtureFill, parseNativeFixturePreflight,
   parseNativeFixtureDispatchCheck, parseNativeFixtureDispatchChecks,
@@ -122,6 +123,10 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                   : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "complete_fixture_fill" ? parseNativeFixtureFill(message)
                   : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "list_gemini_fill_challenges" ? parseNativeGeminiFillChallenges(message)
+                  : typeof message === "object" && message !== null && "kind" in message
+                    && message.kind === "complete_gemini_fill" ? parseNativeGeminiFill(message)
+                  : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "list_gemini_read_challenges" ? parseNativeGeminiReadChallenges(message)
                     : typeof message === "object" && message !== null && "kind" in message
                     && message.kind === "mark_fixture_observation_gap" ? parseNativeFixtureGap(message)
@@ -136,11 +141,15 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | "gemini_prepared_reviews" | "gemini_review_approved" | "gemini_fill_reviews" | "gemini_fill_review_approved"
             | "fixture_send_reviews" | "fixture_send_review_approved"
             | "fixture_fill_recorded" | "fixture_preflight_recorded"
+            | "gemini_fill_challenges" | "gemini_fill_recorded"
             | "fixture_dispatch_checks" | "fixture_dispatch_check_recorded"
             | "fixture_dispatch_attempts" | "fixture_dispatch_recorded"
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
+            | { fills: ReadonlyArray<{ operationId: string; attemptId: string; target: {
+              origin: string; conversationId: string; url: string; tabId: number; documentId: string
+            }; text: string; expiresAt: number }> }
             | { attempts: ReadonlyArray<{ operationId: string; attemptId: string; target: {
               origin: string; conversationId: string; tabId: number; documentId: string
             }; text: string; expiresAt: number }> }
@@ -206,6 +215,17 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
                 kind = "error";
                 payload = { code: "FILL_REVIEW_UNAVAILABLE" };
               } else throw new Error("Broker refused fixture fill review approval");
+            } else if (request.kind === "list_gemini_fill_challenges") {
+              const result = await client.listGeminiFillChallenges();
+              if (result.kind !== "gemini_fill_challenges") throw new Error("Broker refused Gemini fill challenges");
+              kind = "gemini_fill_challenges";
+              payload = result.payload;
+            } else if (request.kind === "complete_gemini_fill") {
+              const result = await client.completeGeminiFill(request.payload.target, request.payload.attemptId,
+                request.payload.observation);
+              if (result.kind !== "gemini_fill_recorded") throw new Error("Broker refused Gemini fill completion");
+              kind = "gemini_fill_recorded";
+              payload = result.payload;
             } else if (request.kind === "list_gemini_prepared_reviews") {
               const result = await client.listGeminiPreparedReviews(request.payload.target);
               if (result.kind !== "gemini_prepared_reviews") throw new Error("Broker refused Gemini reviews");

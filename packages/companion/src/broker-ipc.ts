@@ -54,6 +54,19 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
             responses = responses.then(async () => {
               if (socket.destroyed) return;
               const reply = handleBrokerRequest(message, authenticatedRole, owner, requests, Date.now(), operations);
+              if (reply.kind === "gemini_fill_authorized") {
+                const pending = operations?.requestGeminiFill(owner, reply.payload.operationId, Date.now(), reply.deadlineMs);
+                if (!pending || pending === "busy") {
+                  await writeBrokerResponse(socket, { ...reply, kind: "error", payload: { code: "FILL_UNAVAILABLE" } });
+                  return;
+                }
+                const filled = await pending.result;
+                if (socket.destroyed) return;
+                await writeBrokerResponse(socket, { ...reply, kind: "gemini_fill", payload: filled ?? {
+                  operationId: reply.payload.operationId, completedAt: Date.now(), ok: false, code: "FILL_UNCERTAIN"
+                } });
+                return;
+              }
               if (reply.kind === "fixture_fill_authorized") {
                 const pending = operations?.requestFixtureFill(owner, reply.payload.operationId);
                 if (!pending || pending === "busy") {

@@ -472,6 +472,208 @@ test("broker waits for response drain before executing later commands and cleans
   }
 });
 
+test("authenticated private Gemini preparation remains owner-bound without fixture or recovery authority", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-prepare-ipc-"));
+  const directory = join(home, "broker");
+  const database = new DatabaseSync(":memory:");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+  const clients: Awaited<ReturnType<typeof connectBroker>>[] = [];
+  try {
+    const facade = await connectBroker("facade", directory);
+    const stranger = await connectBroker("facade", directory);
+    const relay = await connectBroker("relay", directory);
+    clients.push(facade, stranger, relay);
+    const pending = await facade.requestConnection();
+    if (pending.kind !== "connection_requested") throw new Error("Expected pending Gemini approval");
+    const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-chat",
+      url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 4, documentId: "synthetic-document" };
+    assert.equal((await relay.approveGemini(pending.payload.requestId, target)).kind, "gemini_approved");
+    const granted = await facade.getConnection(pending.payload.requestId);
+    if (granted.kind !== "connection_state" || granted.payload.state !== "ready_readonly") throw new Error("Expected Gemini grant");
+    const connectionId = granted.payload.connectionId;
+    const text = "Synthetic private Gemini preparation";
+    const key = "a66b3997-9d43-4554-8399-267d1fe9f75c";
+    assert.throws(() => relay.prepareGeminiMessage(connectionId, 1, text, key), /Broker role cannot perform/);
+    assert.deepEqual((await stranger.prepareGeminiMessage(connectionId, 1, text, key)).payload, { code: "CONNECTION_NOT_FOUND" });
+    assert.deepEqual((await facade.prepareFixtureMessage(connectionId, 1, text, key)).payload, { code: "CONNECTION_NOT_FOUND" });
+    for (const invalid of [" text", "line\rbreak", "x".repeat(2049), "\u00e9".repeat(2048)]) {
+      assert.deepEqual((await facade.prepareGeminiMessage(connectionId, 1, invalid, key)).payload, { code: "INVALID_MESSAGE_TEXT" });
+    }
+    const prepared = await facade.prepareGeminiMessage(connectionId, 1, text, key);
+    if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected private Gemini preparation");
+    assert.deepEqual(prepared.payload.preview, { target: "gemini", text });
+    assert.equal("recoveryToken" in prepared.payload, false);
+    assert.deepEqual((await facade.prepareGeminiMessage(connectionId, 1, text, key)).payload, prepared.payload);
+    assert.deepEqual((await facade.prepareGeminiMessage(connectionId, 1, "Changed text", key)).payload, { code: "IDEMPOTENCY_CONFLICT" });
+    const operationId = prepared.payload.operationId;
+    assert.deepEqual((await stranger.getPreparedOperation(operationId)).payload, { state: "unknown" });
+    const listed = await relay.listGeminiPreparedReviews(target);
+    if (listed.kind !== "gemini_prepared_reviews") throw new Error("Expected private Gemini reviews");
+    assert.deepEqual(listed.payload.reviews[0]?.preview, prepared.payload.preview);
+    const reviewId = listed.payload.reviews[0]!.reviewId;
+    assert.equal((await relay.approveGeminiReview(target, operationId, reviewId)).kind, "gemini_review_approved");
+    const fills = await relay.listGeminiFillReviews(target);
+    if (fills.kind !== "gemini_fill_reviews") throw new Error("Expected separate private fill reviews");
+    assert.deepEqual((await relay.approveGeminiFillReview(target, operationId, reviewId)).payload, { code: "FILL_REVIEW_UNAVAILABLE" });
+    assert.equal((await relay.approveGeminiFillReview(target, operationId, fills.payload.reviews[0]!.reviewId)).kind,
+      "gemini_fill_review_approved");
+    assert.deepEqual((await facade.fillFixtureDraft(operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    assert.deepEqual((await facade.commitFixtureMessage(operationId)).payload, { code: "DISPATCH_UNAVAILABLE" });
+    assert.deepEqual((await facade.getPreparedOperation(operationId, "a".repeat(64))).payload, { state: "unknown" });
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    const journal = JSON.stringify(database.prepare("SELECT * FROM prepared_message_operations").all());
+    assert.equal(journal.includes(text), false);
+    assert.equal(journal.includes(target.url), false);
+    assert.throws(() => relay.fillGeminiDraft(operationId), /Broker role cannot perform/);
+    assert.throws(() => facade.listGeminiFillChallenges(), /Broker role cannot perform/);
+    assert.deepEqual((await stranger.fillGeminiDraft(operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    const filling = facade.fillGeminiDraft(operationId);
+    let attemptId: string | undefined;
+    for (let index = 0; index < 40; index++) {
+      const listedFills = await relay.listGeminiFillChallenges();
+      if (listedFills.kind !== "gemini_fill_challenges") throw new Error("Expected private Gemini fill list");
+      const offer = listedFills.payload.fills[0];
+      if (offer) {
+        attemptId = offer.attemptId;
+        assert.equal(offer.operationId, operationId);
+        assert.equal(offer.text, text);
+        assert.deepEqual(offer.target, target);
+        assert.equal(offer.expiresAt <= granted.payload.expiresAt, true);
+        assert.equal(offer.expiresAt <= Date.now() + 4000, true);
+        break;
+      }
+      await new Promise<void>(done => setTimeout(done, 10));
+    }
+    assert.ok(attemptId, "Broker did not offer the consented Gemini fill");
+    assert.deepEqual((await relay.listGeminiFillChallenges()).payload, { fills: [] });
+    assert.throws(() => facade.completeGeminiFill(target, attemptId, { ok: true, editor: "contenteditable" }), /Broker role cannot perform/);
+    assert.deepEqual((await relay.completeGeminiFill({ ...target, url: target.url.replace("hl=en", "hl=fr") },
+      attemptId, { ok: true, editor: "contenteditable" })).payload, { accepted: false });
+    assert.deepEqual((await relay.completeGeminiFill(target, attemptId, { ok: true, editor: "contenteditable" })).payload,
+      { accepted: true });
+    const completed = await filling;
+    if (completed.kind !== "gemini_fill" || !completed.payload.ok) throw new Error("Expected fixed Gemini fill completion");
+    assert.equal(completed.payload.operationId, operationId);
+    assert.equal(completed.payload.editor, "contenteditable");
+    assert.deepEqual((await relay.completeGeminiFill(target, attemptId, { ok: true, editor: "contenteditable" })).payload,
+      { accepted: false });
+    assert.deepEqual((await facade.fillGeminiDraft(operationId)).payload, { code: "FILL_UNAVAILABLE" });
+  } finally {
+    for (const client of clients) client.close();
+    await broker.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("private Gemini fill IPC loses no authority after dropped replies, owner close or original deadline", { timeout: 10_000 }, async (context) => {
+  for (const outcome of ["offer-reply-loss", "completion-ack-loss", "owner-close", "original-deadline"]) {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-fill-loss-"));
+    const directory = join(home, "broker");
+    const database = new DatabaseSync(":memory:");
+    const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+    const clients: Awaited<ReturnType<typeof connectBroker>>[] = [];
+    let dropKind: string | undefined;
+    let dropped = 0;
+    let offered = 0;
+    let attemptId: string | undefined;
+    let expiresAt: number | undefined;
+    const originalWrite = Socket.prototype.write;
+    context.mock.method(Socket.prototype, "write", function(this: Socket, ...args: Parameters<Socket["write"]>) {
+      const chunk = args[0];
+      if (Buffer.isBuffer(chunk)) {
+        let message: { kind: string; payload?: { fills?: { attemptId: string; expiresAt: number }[] } } | undefined;
+        try { [message] = new NativeFrameDecoder().push(chunk) as [typeof message]; } catch {}
+        if (message?.kind === "gemini_fill_challenges" && message.payload?.fills?.length) {
+          offered++;
+          attemptId = message.payload.fills[0]!.attemptId;
+          expiresAt = message.payload.fills[0]!.expiresAt;
+        }
+        if (dropKind && message?.kind === dropKind && (dropKind !== "gemini_fill_challenges" || message.payload?.fills?.length)) {
+          dropKind = undefined;
+          dropped++;
+          return true;
+        }
+      }
+      return Reflect.apply(originalWrite, this, args) as boolean;
+    });
+    try {
+      const deadline = outcome === "original-deadline" ? Date.now() + 1000 : undefined;
+      const facade = await connectBroker("facade", directory, deadline);
+      const relay = await connectBroker("relay", directory);
+      const observer = await connectBroker("relay", directory);
+      clients.push(facade, relay, observer);
+      const pending = await facade.requestConnection();
+      if (pending.kind !== "connection_requested") throw new Error("Expected pending Gemini connection");
+      const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-chat",
+        url: "https://gemini.google.com/app/synthetic-chat?hl=en", tabId: 4, documentId: "synthetic-document" };
+      assert.equal((await relay.approveGemini(pending.payload.requestId, target)).kind, "gemini_approved");
+      const granted = await facade.getConnection(pending.payload.requestId);
+      if (granted.kind !== "connection_state" || granted.payload.state !== "ready_readonly") throw new Error("Expected Gemini grant");
+      const prepared = await facade.prepareGeminiMessage(granted.payload.connectionId, 1, "Synthetic IPC loss only",
+        "a66b3997-9d43-4554-8399-267d1fe9f75c");
+      if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected private preparation");
+      const operationId = prepared.payload.operationId;
+      const reviews = await relay.listGeminiPreparedReviews(target);
+      if (reviews.kind !== "gemini_prepared_reviews") throw new Error("Expected ordinary reviews");
+      await relay.approveGeminiReview(target, operationId, reviews.payload.reviews[0]!.reviewId);
+      const fills = await relay.listGeminiFillReviews(target);
+      if (fills.kind !== "gemini_fill_reviews") throw new Error("Expected separate fill reviews");
+      await relay.approveGeminiFillReview(target, operationId, fills.payload.reviews[0]!.reviewId);
+      const filling = facade.fillGeminiDraft(operationId);
+      const expectedLoss = outcome === "owner-close" || outcome === "original-deadline"
+        ? assert.rejects(filling, /closed|disconnected|timed out|reply expired/i) : undefined;
+      if (outcome === "offer-reply-loss") {
+        dropKind = "gemini_fill_challenges";
+        const losingRelay = await connectBroker("relay", directory, Date.now() + 500);
+        clients.push(losingRelay);
+        await assert.rejects(losingRelay.listGeminiFillChallenges(), /timed out|reply expired/i);
+        assert.equal(dropped, 1);
+      } else {
+        for (let index = 0; index < 40; index++) {
+          const listing = await relay.listGeminiFillChallenges();
+          if (listing.kind !== "gemini_fill_challenges") throw new Error("Expected Gemini fill list");
+          if (listing.payload.fills.length) break;
+          await new Promise<void>(done => setTimeout(done, 10));
+        }
+      }
+      assert.ok(attemptId, outcome);
+      assert.equal(offered, 1, outcome);
+      assert.deepEqual((await observer.listGeminiFillChallenges()).payload, { fills: [] });
+      if (outcome === "completion-ack-loss") {
+        dropKind = "gemini_fill_recorded";
+        const losingRelay = await connectBroker("relay", directory, Date.now() + 500);
+        clients.push(losingRelay);
+        await assert.rejects(losingRelay.completeGeminiFill(target, attemptId, { ok: true, editor: "contenteditable" }),
+          /timed out|reply expired/i);
+        assert.equal(dropped, 1);
+      } else if (outcome === "owner-close") facade.close();
+      else if (outcome === "original-deadline") assert.equal(expiresAt, deadline);
+      if (expectedLoss) await expectedLoss;
+      else {
+        const result = await filling;
+        if (result.kind !== "gemini_fill") throw new Error("Expected fixed fill outcome");
+        assert.equal(result.payload.ok, outcome === "completion-ack-loss");
+        if (!result.payload.ok) assert.equal(result.payload.code, "FILL_UNCERTAIN");
+        assert.deepEqual((await facade.fillGeminiDraft(operationId)).payload, { code: "FILL_UNAVAILABLE" });
+      }
+      assert.deepEqual((await observer.listGeminiFillChallenges()).payload, { fills: [] });
+      assert.deepEqual((await observer.completeGeminiFill(target, attemptId, { ok: true, editor: "contenteditable" })).payload,
+        { accepted: false });
+      assert.equal(offered, 1, outcome);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+    } finally {
+      context.mock.restoreAll();
+      for (const client of clients) client.close();
+      await broker.close();
+      database.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+
 test("authenticated fixture preparation remains owner-bound and cannot dispatch", async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-prepare-ipc-"));
   const directory = join(home, "broker");

@@ -1,6 +1,6 @@
 import * as z from "zod/v4";
 import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureFillResultSchema,
-  fixturePreflightResultSchema } from "./message-operations.js";
+  fixturePreflightResultSchema, geminiFillResultSchema } from "./message-operations.js";
 import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
   MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES } from "./pending-connections.js";
 
@@ -245,6 +245,27 @@ function isValidGeminiTarget(target: z.infer<typeof geminiTargetSchema>): boolea
   } catch {
     return false;
   }
+}
+
+const geminiFillChallengesSchema = geminiReadChallengesSchema.extend({ kind: z.literal("list_gemini_fill_challenges") });
+
+export function parseNativeGeminiFillChallenges(message: unknown, now = Date.now()) {
+  const result = geminiFillChallengesSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native Gemini fill challenge list");
+  }
+  return result.data;
+}
+
+const geminiFillSchema = fixtureFillSchema.extend({ kind: z.literal("complete_gemini_fill"),
+  payload: z.strictObject({ target: geminiTargetSchema, attemptId: z.uuid(), observation: geminiFillResultSchema })
+});
+
+export function parseNativeGeminiFill(message: unknown, now = Date.now()) {
+  const result = geminiFillSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
+    || !isValidGeminiTarget(result.data.payload.target)) throw new Error("Invalid native Gemini fill completion");
+  return result.data;
 }
 
 const geminiPreparedReviewsSchema = fixturePreparedReviewsSchema.extend({
