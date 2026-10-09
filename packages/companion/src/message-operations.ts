@@ -796,6 +796,21 @@ export class PreparedMessageOperations {
       || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?").get(operationId)) {
       throw new Error("OPERATION_UNAVAILABLE");
     }
+    return this.createRecoveryReceiptRecord(operationId);
+  }
+
+  createGeminiRecoveryReceipt(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.geminiContents.get(operationId);
+    const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
+    if (!operation || operation.owner !== owner || !live || !this.sameGeminiTarget(operation.target, live)
+      || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?").get(operationId)) {
+      throw new Error("OPERATION_UNAVAILABLE");
+    }
+    return this.createRecoveryReceiptRecord(operationId);
+  }
+
+  private createRecoveryReceiptRecord(operationId: string) {
     const retained = this.recoveryReceipts.get(operationId);
     if (retained) return Object.freeze({ operationId, recoveryToken: retained });
     if (this.database.prepare("SELECT 1 FROM message_operation_recovery WHERE operation_id = ?").get(operationId)) {
@@ -1157,6 +1172,51 @@ export class PreparedMessageOperations {
     return true;
   }
 
+  recordGeminiDispatchStart(owner: symbol, operationId: string, now = Date.now(), checkId?: string) {
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error("DISPATCH_UNAVAILABLE");
+    this.discardExpired(now);
+    const ownerId = this.owners.get(owner);
+    const record = this.database.prepare("SELECT owner_id FROM prepared_message_operations WHERE operation_id = ?")
+      .get(operationId) as { owner_id: string } | undefined;
+    if (!record || record.owner_id !== ownerId) throw new Error("APPROVAL_REQUIRED");
+    if (this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?")
+      .get(operationId)) throw new Error("DISPATCH_UNCERTAIN");
+    const operation = this.geminiContents.get(operationId);
+    const approval = this.approvals.get(operationId);
+    const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
+    if (!operation || operation.owner !== owner || !approval || approval.expiresAt <= now || !live
+      || !this.sameGeminiTarget(operation.target, live)) throw new Error("APPROVAL_REQUIRED");
+    if (!this.getGeminiSendAuthorization(owner, operationId, now)) throw new Error("SEND_APPROVAL_REQUIRED");
+    if (!this.database.prepare("SELECT 1 FROM message_operation_recovery WHERE operation_id = ?").get(operationId)) {
+      throw new Error("RECOVERY_REQUIRED");
+    }
+    if (!this.getGeminiDispatchProof(owner, operationId, checkId ?? "", now)) throw new Error("DISPATCH_CHECK_REQUIRED");
+    this.recordDispatchIntent(operationId, now);
+    this.approvals.delete(operationId);
+    this.reviewTokens.delete(operationId);
+    this.sendApprovals.delete(operationId);
+    this.sendReviewTokens.delete(operationId);
+    this.discardGeminiDispatchCheck(operationId);
+    return Object.freeze({ operationId, state: "dispatching" as const, startedAt: now });
+  }
+
+  private recordDispatchIntent(operationId: string, now: number): void {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      if (this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
+        LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+        WHERE evidence.operation_id IS NULL LIMIT 1`).get()) {
+        throw new Error("DISPATCH_UNCERTAIN");
+      }
+      this.database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, state)
+        VALUES (?, ?, 'dispatching')`).run(operationId, now);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   recordFixtureDispatchStart(owner: symbol, operationId: string, now = Date.now(), checkId?: string) {
     this.discardExpired(now);
     const ownerId = this.owners.get(owner);
@@ -1183,20 +1243,7 @@ export class PreparedMessageOperations {
       || check.checkedAt === null || check.checkedAt > now || check.expiresAt <= now) {
       throw new Error("DISPATCH_CHECK_REQUIRED");
     }
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      if (this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
-        LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
-        WHERE evidence.operation_id IS NULL LIMIT 1`).get()) {
-        throw new Error("DISPATCH_UNCERTAIN");
-      }
-      this.database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, state)
-        VALUES (?, ?, 'dispatching')`).run(operationId, now);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      this.database.exec("ROLLBACK");
-      throw error;
-    }
+    this.recordDispatchIntent(operationId, now);
     this.approvals.delete(operationId);
     this.reviewTokens.delete(operationId);
     this.sendApprovals.delete(operationId);
