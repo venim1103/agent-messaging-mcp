@@ -4,9 +4,16 @@ Build communication between an MCP agent and a browser chat explicitly selected 
 
 ## Start With Context
 
-- Read the newest relevant checkpoint in [HANDOFF.md](HANDOFF.md) before continuing implementation. Use [README.md](README.md) for setup/capabilities and [DESIGN.md](DESIGN.md) for architecture and authority contracts.
+- Read the newest relevant checkpoint in [HANDOFF.md](HANDOFF.md) before continuing implementation. Use [DEVELOPMENT.md](DEVELOPMENT.md) for setup, tool usage and technical reference, and [DESIGN.md](DESIGN.md) for architecture and authority contracts.
 - Check the actual worktree and nearby implementation/tests. Preserve user changes; do not assume services, grants or approvals survived a restart.
 - After an interrupted tool call with unknown outcome, verify whether it applied before repeating it. Distinguish completed, tested, staged and connected work.
+
+## Documentation Audience
+
+- [README.md](README.md) is the GitHub front page for visitors. Keep it a concise public introduction with plain-language capabilities, maturity/safety caveats, documentation links and licensing. Do not add discussions, progress updates, handovers, test counts, commit history, setup commands or technical implementation details there.
+- Put reusable setup, operating instructions, tool contracts and implementation reference in [DEVELOPMENT.md](DEVELOPMENT.md). Keep architecture and design rationale in [DESIGN.md](DESIGN.md).
+- Put changing implementation status, decisions/discussions, test evidence, failed-check history and next-session handover in [HANDOFF.md](HANDOFF.md). Clearly distinguish historical notes from current capabilities.
+- Keep stable agent workflow rules in this file. Update the public README only when the visitor-facing description or safety guidance genuinely changes, not at each development checkpoint.
 
 ## Work Independently
 
