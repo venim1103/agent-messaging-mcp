@@ -1395,15 +1395,17 @@ const geminiReviewProtocol = {
     refusal: "REVIEW_UNAVAILABLE" },
   fill: { list: "list_gemini_fill_reviews", reviews: "gemini_fill_reviews",
     approve: "approve_gemini_fill_review", approved: "gemini_fill_review_approved", state: "fill_approved",
-    refusal: "FILL_REVIEW_UNAVAILABLE" }
+    refusal: "FILL_REVIEW_UNAVAILABLE" },
+  send: { list: "list_gemini_send_reviews", reviews: "gemini_send_reviews",
+    approve: "approve_gemini_send_review", approved: "gemini_send_review_approved", state: "send_approved",
+    refusal: "SEND_REVIEW_UNAVAILABLE" }
 } as const;
 
 async function listFixtureReviewsForSelectedTab(tabId: number, expectedUrl: string,
   purpose: keyof typeof fixtureReviewProtocol = "review", provider: "fixture" | "gemini" = "fixture"): Promise<FixtureReviewsResult> {
   const gemini = provider === "gemini";
   const label = gemini ? "Gemini" : "Fixture";
-  if (gemini && purpose === "send") return { ok: false, error: "Gemini Send consent unavailable" };
-  const protocol = gemini ? geminiReviewProtocol[purpose === "fill" ? "fill" : "review"] : fixtureReviewProtocol[purpose];
+  const protocol = gemini ? geminiReviewProtocol[purpose] : fixtureReviewProtocol[purpose];
   try {
     if (!await ensureFixtureReset()) return { ok: false, error: `${label} grant reset unavailable` };
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -1535,8 +1537,7 @@ async function approveFixtureReviewForSelectedTab(tabId: number, expectedUrl: st
   provider: "fixture" | "gemini" = "fixture"): Promise<FixtureReviewApprovalResult> {
   const gemini = provider === "gemini";
   const label = gemini ? "Gemini" : "Fixture";
-  if (gemini && purpose === "send") return { ok: false, error: "Gemini Send consent unavailable" };
-  const protocol = gemini ? geminiReviewProtocol[purpose === "fill" ? "fill" : "review"] : fixtureReviewProtocol[purpose];
+  const protocol = gemini ? geminiReviewProtocol[purpose] : fixtureReviewProtocol[purpose];
   try {
     const [active] = await browser.tabs.query({ active: true, currentWindow: true });
     const tab = await browser.tabs.get(tabId);
@@ -1892,21 +1893,24 @@ export default defineBackground(() => {
       && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512) {
       return listPendingForSelectedTab(request.tabId, request.expectedUrl);
     }
-    if ((request.kind === "list_gemini_prepared_reviews" || request.kind === "list_gemini_fill_reviews")
+    if ((request.kind === "list_gemini_prepared_reviews" || request.kind === "list_gemini_fill_reviews"
+      || request.kind === "list_gemini_send_reviews")
       && Object.keys(request).length === 3
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
       && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512) {
       return listFixtureReviewsForSelectedTab(request.tabId, request.expectedUrl,
-        request.kind === "list_gemini_fill_reviews" ? "fill" : "review", "gemini");
+        request.kind === "list_gemini_send_reviews" ? "send" : request.kind === "list_gemini_fill_reviews" ? "fill" : "review", "gemini");
     }
-    if ((request.kind === "approve_gemini_review" || request.kind === "approve_gemini_fill_review")
+    if ((request.kind === "approve_gemini_review" || request.kind === "approve_gemini_fill_review"
+      || request.kind === "approve_gemini_send_review")
       && Object.keys(request).length === 5
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
       && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512
       && typeof request.operationId === "string" && /^[0-9a-f-]{36}$/.test(request.operationId)
       && typeof request.reviewId === "string" && /^[0-9a-f-]{36}$/.test(request.reviewId)) {
       return approveFixtureReviewForSelectedTab(request.tabId, request.expectedUrl,
-        request.operationId, request.reviewId, request.kind === "approve_gemini_fill_review" ? "fill" : "review", "gemini");
+        request.operationId, request.reviewId,
+        request.kind === "approve_gemini_send_review" ? "send" : request.kind === "approve_gemini_fill_review" ? "fill" : "review", "gemini");
     }
     if (request.kind === "approve_fixture" && Object.keys(request).length === 4
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0

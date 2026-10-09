@@ -1285,8 +1285,11 @@ test("worker and broker crashes after fixture activation never restore submit au
   for (const outcome of ["worker_crash", "broker_crash"]) await exerciseFixtureDispatch(outcome);
 });
 
-test("connected Gemini worker fills once and never retries lost script or completion results", { timeout: 25000 }, async () => {
+test("connected Gemini worker fills once and never retries lost script or completion results", { timeout: 25000 }, async (testContext) => {
+  let phase = "starting";
+  testContext.signal.addEventListener("abort", () => testContext.diagnostic(`Synthetic Gemini phase at test end: ${phase}`), { once: true });
   for (const outcome of ["observed", "script-result-loss", "completion-request-loss", "worker-stop", "broker-stop"]) {
+    testContext.signal.throwIfAborted();
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-worker-fill-"));
     const unpacked = join(profile, "unpacked-extension");
     await cp(extensionDirectory, unpacked, { recursive: true });
@@ -1353,14 +1356,17 @@ test("connected Gemini worker fills once and never retries lost script or comple
       const connection = await facade.getConnection(pending.payload.requestId);
       if (connection.kind !== "connection_state" || connection.payload.state !== "ready_readonly") throw new Error("Expected synthetic grant");
       const text = "Synthetic worker fill \u00e9\nSecond line";
+      phase = `${outcome}:preparing`;
       const prepared = await facade.prepareGeminiMessage(connection.payload.connectionId, 1, text, crypto.randomUUID());
       if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected private worker-fill preparation");
+      const consentReviewIds = [];
       for (const [list, approve] of [["list_gemini_prepared_reviews", "approve_gemini_review"],
         ["list_gemini_fill_reviews", "approve_gemini_fill_review"]]) {
         const reviews = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
           kind: list, tabId: selected.tabId, expectedUrl: url
         });
         assert.equal(reviews.ok, true);
+        consentReviewIds.push(reviews.reviews[0].reviewId);
         const approved = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
           kind: approve, tabId: selected.tabId, expectedUrl: url,
           operationId: prepared.payload.operationId, reviewId: reviews.reviews[0].reviewId
@@ -1487,21 +1493,92 @@ test("connected Gemini worker fills once and never retries lost script or comple
       assert.deepEqual((await facade.fillGeminiDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
       assert.deepEqual((await relay.listGeminiFillChallenges()).payload, { fills: [] });
       const status = await facade.getPreparedOperation(prepared.payload.operationId);
+      phase = `${outcome}:filled`;
+      testContext.diagnostic(`Synthetic Gemini fill result reached: ${outcome}`);
       if (outcome === "broker-stop") assert.deepEqual(status.payload, { state: "unknown" });
       else assert.equal(status.payload.draftFill.state, outcome === "observed" ? "filled" : "uncertain");
+      if (outcome === "observed") {
+        const reviewArgs = { tabId: selected.tabId, expectedUrl: url, operationId: prepared.payload.operationId };
+        for (const reviewId of consentReviewIds) {
+          const refused = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+            kind: "approve_gemini_send_review", ...reviewArgs, reviewId
+          });
+          assert.equal(refused.ok, false);
+        }
+        await popup.evaluate(() => {
+          const send = chrome.runtime.sendMessage;
+          chrome.runtime.sendMessage = async function(...args) {
+            const response = await Reflect.apply(send, chrome.runtime, args);
+            if (args[0]?.kind === "list_gemini_send_reviews") window.syntheticGeminiSendReview = response.reviews?.[0];
+            return response;
+          };
+        });
+        const showSend = async () => {
+          await popup.evaluate(() => document.getElementById("view-fixture-send-reviews").click());
+          await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+          assert.equal(await popup.locator("#fixture-review-heading").textContent(), "Gemini send consent");
+          assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
+          assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
+          assert.equal(await popup.getByRole("button", { name: "Approve Gemini send", exact: true }).count(), 1);
+          assert.equal(await popup.getByRole("button", { name: "Allow draft fill (no send)", exact: true }).count(), 0);
+          return popup.evaluate(() => window.syntheticGeminiSendReview);
+        };
+        const oldSend = await showSend();
+        phase = `${outcome}:first-send-review`;
+        const sendReview = await showSend();
+        phase = `${outcome}:rotated-send-review`;
+        assert.notEqual(sendReview.reviewId, oldSend.reviewId);
+        assert.equal(sendReview.operationId, prepared.payload.operationId);
+        assert.deepEqual(sendReview.preview, { target: "gemini", text });
+        assert.ok(sendReview.expiresAt <= connection.payload.expiresAt);
+        const approval = { kind: "approve_gemini_send_review", ...reviewArgs, reviewId: sendReview.reviewId };
+        const untrusted = await worker.evaluate(async ({ tabId, documentId, message }) => {
+          const [reply] = await chrome.scripting.executeScript({ target: { tabId, documentIds: [documentId] },
+            func: async request => { try { return await chrome.runtime.sendMessage(request); } catch { return null; } },
+            args: [message] });
+          return reply.result;
+        }, { ...selected, message: approval });
+        assert.notEqual(untrusted?.ok, true);
+        for (const message of [{ ...approval, reviewId: oldSend.reviewId },
+          { ...approval, expectedUrl: url.replace("hl=en", "hl=fr") },
+          { ...approval, kind: "approve_fixture_send_review" }, { ...approval, kind: "approve_gemini_fill_review" },
+          { ...approval, approved: true }, { ...approval, text: "Forged synthetic text" }]) {
+          const refused = await popup.evaluate(async request => {
+            try { return await chrome.runtime.sendMessage(request); } catch { return null; }
+          }, message);
+          assert.notEqual(refused?.ok, true);
+          assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, status.payload);
+        }
+        await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+        phase = `${outcome}:send-approval`;
+        await popup.getByText(`Approved Gemini send ${prepared.payload.operationId}. No message was sent.`, { exact: true })
+          .waitFor({ state: "visible", timeout: 4000 });
+        assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, status.payload);
+        assert.equal((await popup.evaluate(args => chrome.runtime.sendMessage(args), approval)).ok, false);
+        assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks: [] });
+        testContext.diagnostic("Synthetic Gemini Send consent completed without activation");
+      } else {
+        const reviews = await relay.listGeminiSendReviews({ origin: "https://gemini.google.com", conversationId: "synthetic-worker-fill",
+          url, tabId: selected.tabId, documentId: selected.documentId });
+        assert.deepEqual(reviews.payload, { reviews: [], hasMore: false });
+      }
       assert.equal(await page.locator("[contenteditable]").innerText(), text);
       assert.deepEqual(await page.evaluate(() => window.inputEvents), inputEvents);
       assert.equal(await nativeInsertCalls(), 1);
       assert.equal(await page.evaluate(() => window.controlActivations), 0);
     } finally {
+      phase = `${outcome}:browser-close`;
       facade?.close();
       relay?.close();
       await context?.close();
+      phase = `${outcome}:broker-close`;
       broker?.kill();
       if (brokerExit) await brokerExit;
       await rm(profile, { recursive: true, force: true });
+      testContext.diagnostic(`Synthetic Gemini scenario cleaned up: ${outcome}`);
     }
   }
+  phase = "complete";
 });
 
 test("test-only Gemini host access carries exact synthetic rows and later observations", { timeout: 20000 }, async () => {
@@ -1597,7 +1674,12 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
       "Synthetic trusted Gemini consent only", "c66b3997-9d43-4554-8399-267d1fe9f75c");
     if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected private Gemini candidate");
     const reviewArgs = { tabId: selected.tabId, expectedUrl: url };
-    assert.equal(await popup.locator("#view-fixture-send-reviews").isVisible(), false);
+    assert.equal(await popup.locator("#view-fixture-send-reviews").isVisible(), true);
+    assert.equal(await popup.locator("#view-fixture-send-reviews").textContent(), "Review Gemini send consent");
+    await popup.evaluate(() => document.getElementById("view-fixture-send-reviews").click());
+    await popup.locator("#fixture-review-result").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#fixture-reviews li").count(), 0);
+    assert.equal(await page.evaluate(() => window.controlActivations), 0);
     await popup.evaluate(() => document.getElementById("view-fixture-fill-reviews").click());
     await popup.locator("#fixture-review-result").waitFor({ state: "visible", timeout: 4000 });
     assert.equal(await popup.locator("#fixture-reviews li").count(), 0);

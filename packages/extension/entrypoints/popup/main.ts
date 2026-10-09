@@ -152,10 +152,11 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   pendingButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
   fixtureReviewButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
   fixtureFillReviewButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
-  fixtureSendReviewButton.hidden = url?.origin !== fixtureOrigin;
+  fixtureSendReviewButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
   if (selectedSavedGemini) {
     fixtureReviewButton.textContent = "Review Gemini drafts";
     fixtureFillReviewButton.textContent = "Review Gemini fill consent";
+    fixtureSendReviewButton.textContent = "Review Gemini send consent";
   }
   if (tab?.id != null && tab.url && url?.origin === fixtureOrigin) {
     selectedFixtureTab = { id: tab.id, url: tab.url };
@@ -183,16 +184,17 @@ const geminiReviewCommands = {
   review: { heading: "Prepared Gemini drafts", list: "list_gemini_prepared_reviews",
     approve: "approve_gemini_review", button: "Approve draft (no send)" },
   fill: { heading: "Gemini draft-fill consent", list: "list_gemini_fill_reviews",
-    approve: "approve_gemini_fill_review", button: "Allow draft fill (no send)" }
+    approve: "approve_gemini_fill_review", button: "Allow draft fill (no send)" },
+  send: { heading: "Gemini send consent", list: "list_gemini_send_reviews",
+    approve: "approve_gemini_send_review", button: "Approve Gemini send" }
 } as const;
 
 const reviewFixtureDrafts = async (purpose: keyof typeof fixtureReviewCommands) => {
   const gemini = selectedGeminiTab !== null;
-  if (gemini && purpose === "send") return;
   const selected = selectedGeminiTab ?? selectedFixtureTab;
   const targetLabel = gemini ? "gemini" : "fixture-alpha";
   const chatLabel = gemini ? "Gemini" : "fixture";
-  const commands = gemini ? geminiReviewCommands[purpose === "fill" ? "fill" : "review"] : fixtureReviewCommands[purpose];
+  const commands = gemini ? geminiReviewCommands[purpose] : fixtureReviewCommands[purpose];
   fixtureReviewButton.disabled = true;
   fixtureFillReviewButton.disabled = true;
   fixtureSendReviewButton.disabled = true;
@@ -250,7 +252,7 @@ const reviewFixtureDrafts = async (purpose: keyof typeof fixtureReviewCommands) 
           }
           row.remove();
           status.textContent = purpose === "send"
-            ? `Approved fixture send ${approved.operationId}. No message was sent.`
+            ? `Approved ${chatLabel} send ${approved.operationId}. No message was sent.`
             : purpose === "fill"
             ? `Allowed ${chatLabel} draft fill ${approved.operationId}. Editor unchanged. No message was sent.`
             : `Approved ${chatLabel} draft ${approved.operationId}. No message was sent.`;
