@@ -53,6 +53,17 @@ async function approveSyntheticGeminiSend(ledger: PreparedMessageOperations, own
   return ledger.approveGeminiSendReview(target, operationId, send.reviewId, now);
 }
 
+async function checkSyntheticGeminiDispatch(ledger: PreparedMessageOperations, owner: symbol, operationId: string,
+  target: GeminiTarget, text: string, now: number) {
+  const checking = ledger.requestGeminiDispatchInspection(owner, operationId, now);
+  assert.ok(checking !== "busy");
+  assert.ok(ledger.listGeminiDispatchChecks(now).some(check => check.operationId === operationId));
+  assert.equal(ledger.completeGeminiDispatchCheck(target, operationId, checking.checkId,
+    { ok: true, editor: "contenteditable", draftText: text, selected: true, writable: true, submitReady: true }, now), true);
+  assert.equal(await checking.result, true);
+  return checking.checkId;
+}
+
 test("Gemini fresh-proof and activation-result contracts refuse authority, extra claims and fixture editors", () => {
   const proof = { ok: true, editor: "contenteditable", draftText: "Synthetic exact draft \u00e9\nSecond line",
     selected: true, writable: true, submitReady: true };
@@ -384,6 +395,193 @@ test("isolated Gemini review and fill approval honor caps, expiry and authority 
       assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, now + 6), null);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count,
         outcome === "unresolved-dispatch" ? 1 : 0);
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
+test("staged Gemini durable jobs offer once under original proof lease and remain uncertain without provider evidence", async () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  const ledger = new PreparedMessageOperations(requests, database);
+  const owner = Symbol("Gemini job owner");
+  const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-job",
+    url: "https://gemini.google.com/app/synthetic-job?hl=en", tabId: 4, documentId: "synthetic-document" };
+  const pending = requests.create(owner, 1000);
+  const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+  try {
+    const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic one-offer job",
+      "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    const review = ledger.listGeminiReviews(target, 2002).reviews[0]!;
+    ledger.approveGeminiReview(target, prepared.operationId, review.reviewId, 2002);
+    await approveSyntheticGeminiSend(ledger, owner, prepared.operationId, target, 2003);
+    const receipt = ledger.createGeminiRecoveryReceipt(owner, prepared.operationId, 2003);
+    requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic job baseline" }], 2004);
+    const checking = ledger.requestGeminiDispatchInspection(owner, prepared.operationId, 2005);
+    assert.ok(checking !== "busy");
+    ledger.listGeminiDispatchChecks(2005);
+    assert.equal(ledger.completeGeminiDispatchCheck(target, prepared.operationId, checking.checkId,
+      { ok: true, editor: "contenteditable", draftText: prepared.preview.text, selected: true, writable: true, submitReady: true }, 2006), true);
+    assert.equal(await checking.result, true);
+    for (const deadline of [NaN, Infinity, 2007, 2007.5]) {
+      assert.throws(() => ledger.requestGeminiDispatch(owner, prepared.operationId, checking.checkId, 2007, deadline), /DISPATCH_UNAVAILABLE/);
+      assert.ok(ledger.getGeminiDispatchProof(owner, prepared.operationId, checking.checkId, 2007));
+    }
+    assert.throws(() => ledger.requestGeminiDispatch(Symbol("foreign"), prepared.operationId, checking.checkId, 2007), /APPROVAL_REQUIRED/);
+    const dispatch = ledger.requestGeminiDispatch(owner, prepared.operationId, checking.checkId, 2007, 2009);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+    const activated = { ok: true as const, editor: "contenteditable" as const, activated: true as const };
+    assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId, activated, 2007), false);
+    assert.throws(() => ledger.requestGeminiDispatch(owner, prepared.operationId, checking.checkId, 2007), /DISPATCH_UNCERTAIN/);
+    const [offered] = ledger.listGeminiDispatchAttempts(2007);
+    assert.deepEqual(offered, { operationId: prepared.operationId, attemptId: prepared.operationId, target,
+      text: prepared.preview.text, expiresAt: 2009 });
+    assert.equal(JSON.stringify(offered).includes(receipt.recoveryToken), false);
+    assert.deepEqual(ledger.listGeminiDispatchAttempts(2007), []);
+    assert.deepEqual(ledger.listFixtureDispatchAttempts(2007), []);
+    assert.equal(ledger.consumeFixtureDispatchAuthorization(owner, prepared.operationId, 2007), null);
+    assert.equal(ledger.completeGeminiDispatch({ ...target, url: target.url.replace("hl=en", "hl=fr") },
+      prepared.operationId, prepared.operationId, activated, 2008), false);
+    assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, "foreign-attempt", activated, 2008), false);
+    assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId,
+      { ...activated, delivered: true } as typeof activated, 2008), false);
+    assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId, activated, 2008), true);
+    const result = await dispatch.result;
+    assert.deepEqual(result, { operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2007 });
+    assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), result);
+    assert.deepEqual(ledger.listGeminiDispatchAttempts(2008), []);
+    assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId, activated, 2008), false);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 0);
+    assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, 2008), null);
+  } finally {
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("staged Gemini durable jobs never reoffer or restore authority after loss, expiry, cursor or owner change", async () => {
+  for (const mode of ["offer-loss", "completion-loss", "expired", "disconnected", "revoked", "restarted",
+    "cursor-before-offer", "cursor-after-offer", "refused-result"]) {
+    const requests = new PendingConnectionRequests();
+    const database = new DatabaseSync(":memory:");
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("Gemini job boundary");
+    const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-job-boundary",
+      url: "https://gemini.google.com/app/synthetic-job-boundary?hl=en", tabId: 4, documentId: "synthetic-document" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+    let restarted: PreparedMessageOperations | undefined;
+    try {
+      const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic uncertain job",
+        "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+      const review = ledger.listGeminiReviews(target, 2002).reviews[0]!;
+      ledger.approveGeminiReview(target, prepared.operationId, review.reviewId, 2002);
+      await approveSyntheticGeminiSend(ledger, owner, prepared.operationId, target, 2003);
+      const receipt = ledger.createGeminiRecoveryReceipt(owner, prepared.operationId, 2003);
+      requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic job boundary baseline" }], 2004);
+      const checkId = await checkSyntheticGeminiDispatch(ledger, owner, prepared.operationId, target, prepared.preview.text, 2005);
+      const originalProof = ledger.getGeminiDispatchProof(owner, prepared.operationId, checkId, 2006)!;
+      const dispatch = ledger.requestGeminiDispatch(owner, prepared.operationId, checkId, 2007);
+      const beforeOffer = ["expired", "disconnected", "revoked", "restarted", "cursor-before-offer"].includes(mode);
+      if (!beforeOffer) {
+        const [offered] = ledger.listGeminiDispatchAttempts(2007);
+        assert.equal(offered?.operationId, prepared.operationId);
+        assert.equal(offered?.expiresAt, originalProof.expiresAt);
+        assert.deepEqual(ledger.listGeminiDispatchAttempts(2007), []);
+      }
+      const activated = { ok: true as const, editor: "contenteditable" as const, activated: true as const };
+      if (mode === "disconnected") ledger.disconnect(owner);
+      else if (mode === "revoked") requests.revokeChangedTab(target.tabId, null);
+      else if (mode === "restarted") restarted = new PreparedMessageOperations(requests, database);
+      else if (mode === "cursor-before-offer" || mode === "cursor-after-offer" || mode === "completion-loss") {
+        requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic changed job baseline" },
+          { direction: "outgoing", text: prepared.preview.text }], 2008);
+      } else if (mode === "refused-result") {
+        assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId,
+          { ok: false, code: "DISPATCH_UNCERTAIN" }, 2008), true);
+      }
+      if (mode === "offer-loss" || mode === "expired") assert.deepEqual(ledger.listGeminiDispatchAttempts(originalProof.expiresAt), []);
+      else assert.deepEqual(ledger.listGeminiDispatchAttempts(2008), []);
+      const result = await dispatch.result;
+      assert.deepEqual(result, { operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2007 }, mode);
+      assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), result);
+      if (restarted) {
+        assert.deepEqual(restarted.listGeminiDispatchAttempts(2008), []);
+        assert.deepEqual(restarted.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), result);
+      }
+      assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId, activated, 2009), false);
+      assert.deepEqual(ledger.listGeminiDispatchAttempts(2009), []);
+      assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, 2009), null);
+      assert.equal(ledger.getGeminiDispatchProof(owner, prepared.operationId, checkId, 2009), null);
+      assert.throws(() => ledger.requestGeminiDispatch(owner, prepared.operationId, checkId, 2009), /APPROVAL_REQUIRED|DISPATCH_UNCERTAIN/);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 0);
+    } finally {
+      restarted?.disconnect(owner);
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
+test("staged Gemini and fixture durable jobs share one slot without consuming the waiting provider's consent", async () => {
+  for (const firstProvider of ["gemini", "fixture"]) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("shared submit capacity");
+    const ledger = new PreparedMessageOperations(requests, database);
+    try {
+      const fixtureTarget = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 3, documentId: "synthetic-fixture-document" };
+      const geminiTarget = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-shared-submit",
+        url: "https://gemini.google.com/app/synthetic-shared-submit?hl=en", tabId: 4, documentId: "synthetic-gemini-document" };
+      const fixturePending = requests.create(owner, 1000);
+      const fixtureGrant = requests.approve(fixturePending.requestId, fixtureTarget, 2000)!;
+      const geminiPending = requests.create(owner, 1000);
+      const geminiGrant = requests.approveGemini(geminiPending.requestId, geminiTarget, 2000)!;
+      const fixture = ledger.prepare(owner, fixtureGrant.connectionId, 1, "Synthetic fixture shared slot",
+        "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+      const fixtureReview = ledger.listFixtureReviews(fixtureTarget, 2002).reviews[0]!;
+      ledger.approveFixtureReview(fixtureTarget, fixture.operationId, fixtureReview.reviewId, 2002);
+      approveSyntheticSend(ledger, owner, fixture.operationId, fixtureTarget, 2003);
+      ledger.createRecoveryReceipt(owner, fixture.operationId, 2003);
+      requests.publishFixtureSnapshot(fixtureTarget, [], 2004);
+      ledger.recordFixtureDispatchBaseline(owner, fixture.operationId, 2004);
+      const fixtureCheck = checkSyntheticDispatch(ledger, owner, fixture.operationId, fixtureTarget, fixture.preview.text, 2005);
+      const gemini = ledger.prepareGemini(owner, geminiGrant.connectionId, 1, "Synthetic Gemini shared slot",
+        "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+      const geminiReview = ledger.listGeminiReviews(geminiTarget, 2002).reviews[0]!;
+      ledger.approveGeminiReview(geminiTarget, gemini.operationId, geminiReview.reviewId, 2002);
+      await approveSyntheticGeminiSend(ledger, owner, gemini.operationId, geminiTarget, 2003);
+      ledger.createGeminiRecoveryReceipt(owner, gemini.operationId, 2003);
+      requests.publishGeminiSnapshot(geminiTarget, [{ direction: "incoming", text: "Synthetic shared baseline" }], 2004);
+      const geminiCheck = await checkSyntheticGeminiDispatch(ledger, owner, gemini.operationId, geminiTarget, gemini.preview.text, 2005);
+      const first = firstProvider === "gemini" ? ledger.requestGeminiDispatch(owner, gemini.operationId, geminiCheck, 2007)
+        : ledger.requestFixtureDispatch(owner, fixture.operationId, fixtureCheck, 2007);
+      const requestSecond = (now: number) => firstProvider === "gemini"
+        ? ledger.requestFixtureDispatch(owner, fixture.operationId, fixtureCheck, now)
+        : ledger.requestGeminiDispatch(owner, gemini.operationId, geminiCheck, now);
+      assert.throws(() => requestSecond(2007), /DISPATCH_CHECK_BUSY/);
+      const waiting = firstProvider === "gemini" ? fixture : gemini;
+      assert.equal(ledger.getOperation(owner, waiting.operationId, 2007).state, "approved");
+      assert.ok(firstProvider === "gemini" ? ledger.getFixtureSendAuthorization(owner, waiting.operationId, 2007)
+        : ledger.getGeminiSendAuthorization(owner, waiting.operationId, 2007));
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      const refused = { ok: false as const, code: "DISPATCH_UNCERTAIN" as const };
+      if (firstProvider === "gemini") {
+        assert.equal(ledger.listGeminiDispatchAttempts(2007)[0]?.operationId, first.operationId);
+        assert.equal(ledger.completeGeminiDispatch(geminiTarget, gemini.operationId, gemini.operationId, refused, 2008), true);
+      } else {
+        assert.equal(ledger.listFixtureDispatchAttempts(2007)[0]?.operationId, first.operationId);
+        assert.equal(ledger.completeFixtureDispatch(fixtureTarget, fixture.operationId, fixture.operationId, refused, 2008), true);
+      }
+      assert.equal((await first.result).state, "dispatch_uncertain");
+      assert.throws(() => requestSecond(2009), /DISPATCH_UNCERTAIN/);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      assert.deepEqual(ledger.listGeminiDispatchAttempts(2009), []);
+      assert.deepEqual(ledger.listFixtureDispatchAttempts(2009), []);
     } finally {
       ledger.disconnect(owner);
       database.close();

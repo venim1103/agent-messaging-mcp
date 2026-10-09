@@ -167,6 +167,11 @@ type PendingFixtureDispatch = {
   owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number; startedAt: number;
   issued: boolean; timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureDispatchStatus) => void
 };
+type GeminiDispatchStatus = Readonly<{ operationId: string; state: "dispatch_uncertain"; startedAt: number }>;
+type PendingGeminiDispatch = {
+  owner: symbol; operationId: string; target: GeminiTarget; text: string; expiresAt: number; startedAt: number;
+  baseline: GeminiSnapshot; issued: boolean; timer: ReturnType<typeof setTimeout>; resolve: (status: GeminiDispatchStatus) => void
+};
 
 export class PreparedMessageOperations {
   private readonly owners = new Map<symbol, string>();
@@ -193,6 +198,7 @@ export class PreparedMessageOperations {
   }>();
   private readonly dispatchAuthorizations = new Map<string, FixtureDispatchAuthorization>();
   private readonly dispatchJobs = new Map<string, PendingFixtureDispatch>();
+  private readonly geminiDispatchJobs = new Map<string, PendingGeminiDispatch>();
   private readonly ambiguousEvidence = new Set<string>();
   private readonly preflightChecks = new Map<string, PendingFixturePreflight>();
   private readonly fillChecks = new Map<string, PendingFixtureFill>();
@@ -249,6 +255,7 @@ export class PreparedMessageOperations {
 
   private release(operationId: string): void {
     this.finishFixtureDispatch(operationId);
+    this.finishGeminiDispatch(operationId);
     for (const [challengeId, pending] of this.preflightChecks) {
       if (pending.operationId === operationId) this.finishPreflightCheck(challengeId, null);
     }
@@ -279,6 +286,9 @@ export class PreparedMessageOperations {
   private discardExpired(now: number): void {
     for (const [operationId, pending] of this.dispatchJobs) {
       if (pending.expiresAt <= now) this.finishFixtureDispatch(operationId);
+    }
+    for (const [operationId, pending] of this.geminiDispatchJobs) {
+      if (pending.expiresAt <= now) this.finishGeminiDispatch(operationId);
     }
     for (const [operationId, operation] of this.contents) {
       if (operation.expiresAt <= now) this.release(operationId);
@@ -1277,6 +1287,82 @@ export class PreparedMessageOperations {
       text: authorization.text, expiresAt: authorization.expiresAt });
   }
 
+  private finishGeminiDispatch(operationId: string): void {
+    const pending = this.geminiDispatchJobs.get(operationId);
+    if (!pending) return;
+    this.geminiDispatchJobs.delete(operationId);
+    clearTimeout(pending.timer);
+    pending.resolve(Object.freeze({ operationId, state: "dispatch_uncertain", startedAt: pending.startedAt }));
+  }
+
+  requestGeminiDispatch(owner: symbol, operationId: string, checkId: string, now = Date.now(),
+    deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) {
+      throw new Error("DISPATCH_UNAVAILABLE");
+    }
+    const status = this.getOperation(owner, operationId, now);
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") throw new Error("DISPATCH_UNCERTAIN");
+    if (status.state !== "approved") throw new Error("APPROVAL_REQUIRED");
+    if (this.dispatchJobs.size + this.geminiDispatchJobs.size >= MAX_PENDING_FIXTURE_DISPATCHES) throw new Error("DISPATCH_CHECK_BUSY");
+    const authorization = this.getGeminiSendAuthorization(owner, operationId, now);
+    const proof = this.getGeminiDispatchProof(owner, operationId, checkId, now);
+    if (!authorization || !proof) throw new Error("DISPATCH_UNAVAILABLE");
+    const expiresAt = Math.min(deadlineMs, authorization.expiresAt, proof.expiresAt);
+    const started = this.recordGeminiDispatchStart(owner, operationId, now, checkId);
+    let resolve!: PendingGeminiDispatch["resolve"];
+    const result = new Promise<GeminiDispatchStatus>(done => { resolve = done; });
+    const timer = setTimeout(() => this.finishGeminiDispatch(operationId), expiresAt - now);
+    this.geminiDispatchJobs.set(operationId, { owner, operationId, target: authorization.target, text: authorization.text,
+      expiresAt, startedAt: started.startedAt, baseline: proof.baseline, issued: false, timer, resolve });
+    return { operationId, result };
+  }
+
+  private freshGeminiDispatch(pending: PendingGeminiDispatch, now: number): boolean {
+    const operation = this.geminiContents.get(pending.operationId);
+    const live = operation && this.requests.getGeminiTarget(pending.owner, operation.connectionId, now);
+    const current = operation && this.requests.getGeminiSnapshot(pending.owner, operation.connectionId, now);
+    const intent = this.database.prepare("SELECT state, started_at FROM message_dispatch_attempts WHERE operation_id = ?")
+      .get(pending.operationId) as { state: string; started_at: number } | undefined;
+    return !!operation && operation.owner === pending.owner && operation.text === pending.text
+      && this.sameGeminiTarget(operation.target, pending.target) && !!live && this.sameGeminiTarget(live, pending.target)
+      && pending.startedAt <= now && pending.expiresAt > now
+      && intent?.state === "dispatching" && intent.started_at === pending.startedAt
+      && pending.baseline.capturedAt <= now && pending.baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS > now
+      && !!current && current !== "not_ready" && current.capturedAt <= now && current.capturedAt >= pending.baseline.capturedAt
+      && current.cursor.epoch === pending.baseline.cursor.epoch && current.cursor.sequence === pending.baseline.cursor.sequence
+      && !this.database.prepare("SELECT 1 FROM message_dispatch_evidence WHERE operation_id = ?").get(pending.operationId);
+  }
+
+  listGeminiDispatchAttempts(now = Date.now()) {
+    this.discardExpired(now);
+    const attempts: Array<Readonly<{ operationId: string; attemptId: string; target: GeminiTarget; text: string; expiresAt: number }>> = [];
+    for (const [operationId, pending] of this.geminiDispatchJobs) {
+      if (!this.freshGeminiDispatch(pending, now)) {
+        this.finishGeminiDispatch(operationId);
+        continue;
+      }
+      if (pending.issued) continue;
+      pending.issued = true;
+      attempts.push(Object.freeze({ operationId, attemptId: operationId, target: pending.target,
+        text: pending.text, expiresAt: pending.expiresAt }));
+    }
+    return attempts;
+  }
+
+  completeGeminiDispatch(target: GeminiTarget, operationId: string, attemptId: string,
+    observation: GeminiDispatchResult, now = Date.now()): boolean {
+    this.discardExpired(now);
+    const pending = this.geminiDispatchJobs.get(operationId);
+    if (!pending || !pending.issued || attemptId !== operationId || !this.sameGeminiTarget(pending.target, target)
+      || !geminiDispatchResultSchema.safeParse(observation).success) return false;
+    if (!this.freshGeminiDispatch(pending, now)) {
+      this.finishGeminiDispatch(operationId);
+      return false;
+    }
+    this.finishGeminiDispatch(operationId);
+    return true;
+  }
+
   private finishFixtureDispatch(operationId: string): void {
     const pending = this.dispatchJobs.get(operationId);
     if (!pending) return;
@@ -1311,7 +1397,7 @@ export class PreparedMessageOperations {
     const status = this.getOperation(owner, operationId, now);
     if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") throw new Error("DISPATCH_UNCERTAIN");
     if (status.state !== "approved") throw new Error("APPROVAL_REQUIRED");
-    if (this.dispatchJobs.size >= MAX_PENDING_FIXTURE_DISPATCHES) throw new Error("DISPATCH_CHECK_BUSY");
+    if (this.dispatchJobs.size + this.geminiDispatchJobs.size >= MAX_PENDING_FIXTURE_DISPATCHES) throw new Error("DISPATCH_CHECK_BUSY");
     const started = this.recordFixtureDispatchStart(owner, operationId, now, checkId);
     const authorization = this.consumeFixtureDispatchAuthorization(owner, operationId, now);
     if (!authorization) throw new Error("DISPATCH_UNCERTAIN");

@@ -14,8 +14,7 @@ An MCP agent converses with a browser chat that a person explicitly selected and
 
 ### Repository state
 
-- Source HEAD at review: `002d600` on `main`, not pushed; later commits are documentation-only. Its last exact gate passed build, both typechecks, **167/167 units and 20/20 e2e checks**.
-- **Uncommitted source in the worktree**, pre-existing and not written by the review: `packages/companion/src/message-operations.ts` adds `requestGeminiDispatch`, `listGeminiDispatchAttempts` and `completeGeminiDispatch`, a one-offer Gemini durable job that always settles `dispatch_uncertain`; `message-operations.test.ts` adds three units. During the review `npm run build:companion` compiled and those three units passed **3/3**. The exact gate was not run and nothing was committed. This is G1 below.
+- Latest source checkpoint: the staged Gemini one-offer dispatch job (entry below), committed after documentation commit `18d87a5`. Its exact gate passed build, both typechecks, **170/170 units and 20/20 e2e checks**. No source is left uncommitted.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
 ### Capability matrix
@@ -41,7 +40,7 @@ The trusted popup already offers Gemini pending-request approval, ordinary revie
 | Distinct Send consent | Connected privately; trusted popup |
 | Fresh challenged read plus exact-draft and Send-control proof (`check_gemini_dispatch`) | Connected privately; synthetic e2e |
 | Recovery receipt and durable intent (`recordGeminiDispatchStart`) | Ledger only |
-| One-offer dispatch job | Ledger only, **uncommitted** |
+| One-offer dispatch job | Ledger only; its post-offer freshness check must be relaxed before worker submit (G3) |
 | Commit orchestration in one original deadline (read, proof, intent, job) | Missing |
 | Relay-only dispatch list and completion transport | Missing |
 | Worker submit (the Gemini reservation namespace and `submitGeminiDraft` exist but are unconnected) | Missing |
@@ -52,7 +51,7 @@ The trusted popup already offers Gemini pending-request approval, ordinary revie
 
 ### Critical path
 
-1. **G1** Finish, gate and commit the uncommitted dispatch-job slice.
+1. **G1** Done: the dispatch-job slice is gated and committed.
 2. **G2** Read robustness: restart a stopped native watch without retrying writes (R2), and apply decision D8 so normal replies do not revoke grants (R1).
 3. **G3** Gemini commit end to end: orchestration, transport, worker submit with reservation, evidence rule (D9), public routing, SDK tests and sandboxed lifecycle and loss tests. Reuse fixture paths with a provider parameter where cheap (D5).
 4. **G4** Coordinated reload and one human-authorized installed acceptance: a disposable chat, exact neutral text, separate fill and Send approvals.
@@ -87,7 +86,15 @@ D1-D9 in DESIGN.md section 17 are all open: D1 per-message consent, D2 connectio
 
 ### Next step
 
-G1: review `git diff -- packages/companion/src/message-operations.ts packages/companion/src/message-operations.test.ts`, keep the uncertain-only settlement until D9 is decided, run the exact gate, record a short entry here and commit. Then G2's watch restart (R2), which needs no policy change. Ask the user for D1-D9 before R1 (D8), the evidence rule (D9) and G5.
+G2's watch restart (R2), which needs no policy change. Ask the user for D1-D9 before R1 (D8), the evidence rule (D9) and G5.
+
+## Staged Gemini One-Offer Dispatch Job (2026-10-09)
+
+- This slice was written in the previous session and left uncommitted; it was reviewed and committed unchanged at the user's request. Internal `requestGeminiDispatch` requires an owned approved Gemini operation, distinct Send authorization and a completed fresh proof. It records the durable intent through `recordGeminiDispatchStart` first, then creates one volatile job whose lease is the minimum of the original deadline, the Send consent and the proof lease.
+- `listGeminiDispatchAttempts` issues the job once and never re-offers it. `completeGeminiDispatch` accepts only the strict `geminiDispatchResultSchema` result for the exact issued target and attempt, and always settles `dispatch_uncertain` because no Gemini evidence rule exists yet (D9). Fixture and Gemini jobs share the existing one-pending-submit cap in both directions. Release, expiry and disconnect settle uncertain. There is no transport, worker or public route.
+- Three existing-file units cover the positive one-offer path (invalid deadlines, foreign owner, wrong target or attempt, an extra delivery claim, replay, receipt privacy), nine loss, expiry, owner, revocation, restart, cursor and refused-result modes, and the shared slot without consuming the waiting provider's consent.
+- Review note: after the offer, freshness still requires an unchanged cursor and a baseline under four seconds old. A real Send changes the page, so its completion would be refused and settle uncertain; the fixture checks freshness only before offering. G3 must relax this together with D9. The outcome is uncertain either way, so the current behavior is conservative, not unsafe.
+- The focused units passed **3/3** during the review. The exact gate `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e` then passed once: build, both typechecks, **170/170 units** (about 20 seconds) and **20/20 e2e checks** (about 82 seconds). No live chat, personal profile, installed service or browser grant was used.
 
 ## Deep Review and Documentation Restructure (2026-10-09)
 
