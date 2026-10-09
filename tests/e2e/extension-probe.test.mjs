@@ -1333,8 +1333,8 @@ test("connected Gemini worker fills once and never retries lost script or comple
           [contenteditable] { min-height:40px; width:480px; border:1px solid black }
         </style></head><body><main><div contenteditable="true" aria-label="Enter a prompt for Gemini"></div>
           <infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic existing row</p>
-          </user-query-content></user-query></infinite-scroller></main>
-          <button type="button" aria-label="Send message" onclick="window.controlActivations++">Send</button>
+          </user-query-content></user-query></infinite-scroller>
+          <button type="submit" aria-label="Send message" onclick="window.controlActivations++">Send</button></main>
           <script>window.controlActivations=0;window.inputEvents=[];
           document.querySelector('[contenteditable]').addEventListener('input',event=>window.inputEvents.push(event.isTrusted));</script>
         </body></html>` }));
@@ -1557,6 +1557,67 @@ test("connected Gemini worker fills once and never retries lost script or comple
         assert.equal((await popup.evaluate(args => chrome.runtime.sendMessage(args), approval)).ok, false);
         assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks: [] });
         testContext.diagnostic("Synthetic Gemini Send consent completed without activation");
+        await worker.evaluate(() => {
+          globalThis.syntheticGeminiProofMode = "positive";
+          globalThis.syntheticGeminiProofExecutions = 0;
+          const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+          chrome.scripting.executeScript = async details => {
+            const result = await execute(details);
+            if (details.func.toString().includes(".checkSubmit")) {
+              globalThis.syntheticGeminiProofExecutions++;
+              if (globalThis.syntheticGeminiProofMode === "result-loss") return [];
+              if (globalThis.syntheticGeminiProofMode === "grant-loss") {
+                await chrome.storage.session.remove(`gemini-grant-${details.target.tabId}`);
+              }
+            }
+            return result;
+          };
+        });
+        const bodyBeforeProof = await page.locator("body").innerHTML();
+        const focusBeforeProof = await page.evaluate(() => document.activeElement.outerHTML);
+        phase = `${outcome}:read-only-proof`;
+        const proof = await facade.checkGeminiDispatch(prepared.payload.operationId);
+        assert.equal(proof.kind, "gemini_dispatch_check");
+        assert.equal(proof.payload.ready, true);
+        assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks: [] });
+        assert.equal(await page.locator("body").innerHTML(), bodyBeforeProof);
+        assert.equal(await page.evaluate(() => document.activeElement.outerHTML), focusBeforeProof);
+        assert.equal(await worker.evaluate(() => globalThis.syntheticGeminiProofExecutions), 1);
+        assert.deepEqual((await facade.checkGeminiDispatch(prepared.payload.operationId)).payload, { code: "DISPATCH_CHECK_UNAVAILABLE" });
+        testContext.diagnostic("Synthetic Gemini read-only worker proof completed without activation");
+        const proofIds = new Set([proof.payload.checkId]);
+        for (const mode of ["changed-draft", "disabled-submit", "result-loss", "grant-loss"]) {
+          phase = `${outcome}:proof-${mode}`;
+          await page.evaluate(({ mode, text }) => {
+            document.querySelector("[contenteditable]").innerText = mode === "changed-draft" ? "Preserve this synthetic changed draft" : text;
+            document.querySelector("button").disabled = mode === "disabled-submit";
+            const row = document.createElement("model-response");
+            const content = document.createElement("model-response-content");
+            content.textContent = `Synthetic proof baseline ${mode}`;
+            row.append(content);
+            document.querySelector("infinite-scroller").append(row);
+          }, { mode, text });
+          const snapshot = await facade.readApprovedSnapshot(connection.payload.connectionId);
+          assert.equal(snapshot.kind, "gemini_snapshot");
+          assert.ok(snapshot.payload.messages.some(message => message.text === `Synthetic proof baseline ${mode}`));
+          await worker.evaluate(mode => { globalThis.syntheticGeminiProofMode = mode; }, mode);
+          const body = await page.locator("body").innerHTML();
+          const focused = await page.evaluate(() => document.activeElement.outerHTML);
+          const refused = await facade.checkGeminiDispatch(prepared.payload.operationId);
+          assert.equal(refused.kind, "gemini_dispatch_check", mode);
+          assert.equal(refused.payload.ready, false, mode);
+          assert.equal(proofIds.has(refused.payload.checkId), false);
+          proofIds.add(refused.payload.checkId);
+          assert.equal(await page.locator("body").innerHTML(), body, mode);
+          assert.equal(await page.evaluate(() => document.activeElement.outerHTML), focused, mode);
+          assert.deepEqual(await page.evaluate(() => window.inputEvents), inputEvents);
+          assert.equal(await nativeInsertCalls(), 1);
+          assert.equal(await page.evaluate(() => window.controlActivations), 0);
+          assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks: [] });
+        }
+        assert.equal(await worker.evaluate(() => globalThis.syntheticGeminiProofExecutions), 5);
+        await page.evaluate(text => { document.querySelector("[contenteditable]").innerText = text; }, text);
+        testContext.diagnostic("Synthetic Gemini read-only worker proof refused four unsafe/lost-result boundaries");
       } else {
         const reviews = await relay.listGeminiSendReviews({ origin: "https://gemini.google.com", conversationId: "synthetic-worker-fill",
           url, tabId: selected.tabId, documentId: selected.documentId });
