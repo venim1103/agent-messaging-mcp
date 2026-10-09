@@ -1,8 +1,8 @@
 # Browser Chat MCP: Design and Implementation Plan
 
-Status: proposed, for discussion before implementation.
+Status: accepted architecture, partly implemented as a local prototype. Original research: 2026-09-25. Implementation review: 2026-10-09.
 
-Research date: 2026-09-25. No application has been implemented or live chat integration tested as part of this document.
+Sections 1-16 keep the original research and rationale. Paragraphs marked **Implementation note (2026-10-09)** record where the prototype differs. Section 17 lists confirmed decisions and the open decisions D1-D9 that need the user's choice. Current status, evidence and the next step are in the dashboard at the top of [HANDOFF.md](HANDOFF.md); setup and tool reference are in [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## 1. Recommendation
 
@@ -121,6 +121,8 @@ flowchart LR
 
 Use one installed Node package with separate launcher modes for the facade, broker, and native host. These are small processes with different lifecycles, not separate services requiring a distributed deployment.
 
+**Implementation note (2026-10-09):** The facade, broker and native relay are separate compiled entry points in `packages/companion/dist`. There is no separate content script or side panel: the service worker injects self-contained, reviewed page functions with `scripting.executeScript` into the exact approved document, and the toolbar popup is the trusted panel.
+
 ### Why a native bridge?
 
 Native Messaging avoids exposing an unauthenticated browser-control HTTP or WebSocket listener. The host manifest names the exact allowed extension ID. The extension uses `runtime.connectNative` for bidirectional communication. [5]
@@ -149,6 +151,8 @@ The agent cannot choose CDP methods, coordinates, selectors, or executable expre
 
 Debugger access improves input reliability; it does not guarantee acceptance by every website or bypass browser/platform restrictions. Handle attachment rejection, user cancellation, and DevTools-triggered detachment explicitly. [8]
 
+**Implementation note (2026-10-09):** The connected fill and submit paths do not use `chrome.debugger`. They run reviewed page functions in the approved document: one `document.execCommand("insertText")` call to fill, whose browser-generated input events tested as trusted in synthetic pages, and one script-initiated `click()` on the verified Send control, which is not trusted user input. Identity, focus, draft and lease checks surround both. Fixture tests and one installed fixture send passed; live Gemini acceptance of either step is unverified. `debugger` stays declared only for two legacy popup probes, one of which types a fixed sentence into a real Gemini composer outside the operation ledger. Decision D6 covers removing them and the permission.
+
 ## 7. Connections and Authorization
 
 A connection is an application-level binding, not an MCP transport session.
@@ -168,6 +172,8 @@ Use stable conversation identifiers from the visible URL or supported DOM metada
 Suggested connection states are `pending`, `calibrating`, `ready_readonly`, `ready_write`, `paused`, `stale`, and `disconnected`. A stale or paused connection never executes queued writes automatically on recovery.
 
 Reloads require a fresh document check; browser or broker restarts invalidate active write grants. Cross-origin navigation, account changes, unexpected conversation changes, or revocation invalidate pending approvals. A tab ID reused later cannot revive an old connection.
+
+**Implementation note (2026-10-09):** Implemented connection states are `pending`, `expired`, `ready_readonly` and `stale`, plus `unknown` for foreign or forgotten requests. Every approval is read-only; write authority comes only from per-operation trusted consents (section 10), so `calibrating`, `ready_write` and `paused` do not exist. Grants last five minutes without renewal (decision D2), `generation` is always 1, and reapproval creates a new connection. A grant binds the owning facade socket, tab, Chrome document ID, origin and conversation ID, plus the exact saved-chat URL including any query for Gemini. Browser-instance identity is approximated by revoking all grants when the extension worker starts fresh.
 
 ## 8. Generic Adapter Strategy
 
@@ -195,6 +201,14 @@ Each adapter implements the same conceptual operations: detect compatibility, id
 Use bundled, reviewed TypeScript adapters for exceptional application behavior. Sharing the same rich-text editor does not imply two sites share message identity or conversation semantics.
 
 Initially support top-level DOM chat UIs. Open shadow roots can be handled explicitly; cross-origin frames need additional scoped permission and frame tracking. Canvas-only UIs, inaccessible structures, and closed shadow roots without a tested access path are not promised support.
+
+**Implementation note (2026-10-09):** The prototype has two hard-coded targets, the synthetic fixture and Gemini, with no adapter interface or calibration. Each capability is a separate provider-specific family in every layer: ledger methods, 52 private broker request kinds, client methods, native parsers, worker executors and popup commands. Several fixture-named functions are in fact provider-generic. This contradicts the rule above that adapters must not reimplement policy, and every new site would cost a full copy. Target before any second real site (decision D5):
+
+- One target schema with a `provider` field; the fixture becomes one provider.
+- Purpose- or phase-parameterized private commands, for example `list_reviews`/`approve_review` with `review`, `fill` or `send`, and `list_jobs`/`complete_job` with `read`, `fill`, `proof` or `submit`, instead of per-provider command families.
+- One ledger pipeline. Adapters supply text constraints, the editor kind and the outcome-evidence rule (section 10).
+- An extension adapter registry with `eligibleUrl`, `identify`, `observe`, `capture`, `inspectDraft`, `fill`, `submit` and `completion`, each a self-contained reviewed page function.
+- Every safety invariant unchanged: trusted consents, exact targets, one-offer leased jobs, durable intent, browser reservation and status-only recovery.
 
 ## 9. Reading and Observing Messages
 
@@ -239,6 +253,8 @@ Keep transcript data in bounded memory by default. Proposed starting limits are 
 
 Do not automatically scroll for history in the MVP. Later backfill must be separately authorized, bounded by time/message count, restore the viewport when practical, and identify gaps. The website itself may change presence or read receipts while a conversation is open; the integration cannot promise to suppress those effects.
 
+**Implementation note (2026-10-09):** A read sends a fresh broker challenge that the extension must answer within four seconds; a timeline observer throttled to 200 ms publishes later snapshots. Snapshots are capped at 32 rows, 2,048 UTF-16 units per message and 64 KiB, and each grant buffers 32 events or 256 KiB, far below the starting limits above. Events carry full rendered snapshots, at most two per wait call. Gemini rows always report `identityQuality: uncertain` and `generationState: unknown`. Any capture or parse failure revokes the grant, including more rows, a longer message or a row that momentarily lacks its content element, so ordinary Gemini replies can end a connection. Decisions D3 (completion signal) and D8 (window and failure policy) address this.
+
 ## 10. Sending Without Blind Retries
 
 Sending has external effects. A successful DOM click is not sufficient evidence that the message was accepted, delivered, or read.
@@ -254,21 +270,26 @@ Sending has external effects. A successful DOM click is not sufficient evidence 
 
 Default policy is approval for each send. A later explicitly granted autonomous mode can be limited to one conversation, a short lifetime, and a small message/rate budget. The agent must not be able to widen that grant itself.
 
-The prototype's ordinary **Approve draft (no send)** review and separate **Allow draft fill (no send)** consent are not authorization for this send flow. Submission needs distinct trusted send consent and a fresh exact current-draft check; past confirmed fill metadata cannot replace either guard. Its public operation state `approved` currently refers only to no-send review, not distinct send permission.
+### Implemented authority chain (prototype)
 
-The fixture implementation progressed through the checkpoints below. Their earlier no-public-commit limitations are superseded by the latest prototype tool note and [HANDOFF.md](HANDOFF.md); live Gemini submission remains unavailable.
+The prototype splits **Authorize** into three separate trusted popup consents and keeps every link's authority distinct. The chain is complete for the fixture; the [HANDOFF.md](HANDOFF.md) dashboard tracks which Gemini links are connected. Checkpoint history is in HANDOFF.md.
 
-Separate fixture-send review now has a private authenticated-relay-only native/broker path and a distinct trusted popup/worker command. It offers bounded exact previews only after completed fill, rejects facade approval and tokens from other review purposes, and pins the displayed expiry. The isolated popup flow verifies this consent boundary while leaving the editor/timeline unchanged and creating zero dispatch intents. Real installed-toolbar send approval remains unverified; the private fixture executor is described below, but no public commit tool exists and approval itself neither starts a journal intent nor performs a browser action.
+1. **Prepare** (`chat_prepare_message`): immutable text bound to owner, connection and exact target. SQLite stores only keyed digests. A private status-recovery receipt is returned.
+2. **Ordinary review** (**Approve draft (no send)**): short-lived. The public state `approved` means only this review, never send permission.
+3. **Fill consent** (**Allow draft fill (no send)**): a separate token, consumed once before any input.
+4. **Fill** (`chat_fill_draft`): one leased browser attempt into an empty editor with exact readback. Lost results are `FILL_UNCERTAIN` and are never retried.
+5. **Send consent** (**Approve fixture send** / **Approve Gemini send**): offered only after a successful fill, with its own token and expiry.
+6. **Fresh baseline and proof**: a challenged rendered snapshot taken after Send consent, then a read-only exact-draft and Send-control inspection, all inside the original request deadline.
+7. **Durable intent**: one `BEGIN IMMEDIATE` SQLite transaction refuses any other unresolved intent and records `dispatching` before consent and proof are consumed.
+8. **One-offer job and browser reservation**: the job is offered once and never re-offered. The worker writes and verifies a persistent operation-ID marker before acting.
+9. **Guarded activation**: identity, draft, control and lease are rechecked after focus, then one activation. Exceptions after activation begins are uncertain.
+10. **Reconcile**: only a unique new outgoing UI row yields `observed_in_ui`; everything else stays `dispatch_uncertain`. Receipts recover status only.
 
-Private dispatch inspection now connects the owning facade to a bounded relay-only native challenge list and trusted exact-prepared browser checks. It requires a post-send-consent baseline and keeps the minimum original-deadline/consent/four-second proof and baseline budget. Completed, invalidated or expired challenges cannot be replayed. Isolated actual-fill textarea/rich-editor flows verify readiness and changed-draft, disabled-submit and inactive-selection refusal without editor/timeline changes or intent. Inspection is read-only and is distinct from the guarded private execution below; public commit remains pending.
+Positive results are UI observations, never acceptance or delivery, and every fill and commit result carries `retryAllowed: false`. Decision D1 asks whether the three consents should become one for real use.
 
-The internal submit primitive provides immediate exact-composer/control guards and a document-local operation-ID one-shot check. Both-editor synthetic tests verify one activation, focus-time target/draft/control refusal and no replay after discarded result or post-activation exception. It is now invoked only by the trusted private fixture worker after durable intent and verified persistent reservation; its memory-only set alone has no durable restart guarantee. No public commit tool exists yet.
+### Gemini outcome evidence (proposed, decision D9)
 
-A separate internal reservation helper uses verified extension-local, non-evicted operation-ID-only markers, a 10,000-record bound, an original-lease deadline and worker concurrency exclusion. Disposable-extension tests verify replay refusal across orderly browser restart and fail-closed malformed/full/error/late-storage handling without activation. The worker now awaits this reservation and rechecks selected grant/document/URL before activation. Actual worker stop/wake and broker kill/restart after fixture activation restore no authority; these checks are not power-loss durability proof. Durable intent and no uncertain retries remain required.
-
-The internal ledger adapts durable intent and consumed one-shot authorization into at most one leased browser job, offered only once and never reoffered after a lost listing/result. Exact-target issued completion retains uncertainty unless the existing unique-row reconciler supplies observed-in-UI evidence. Timeout, owner loss/restart and invalid pre-offer observations cannot recover authority; receipts are status-only and unresolved intent still blocks the writer. Private broker/native transport clips that lease to the original facade request and preserves authenticated owned-start/relay-only list/completion boundaries. The fixture worker now reserves, guards, activates once and publishes fresh UI evidence within that lease. Controlled actual-browser script/native result loss, changed controls and worker/broker crashes retain one intent/marker and no restored job; positive evidence is observed-in-UI, not delivery. This is not exposed over MCP; installed-toolbar acceptance and public commit remain pending.
-
-The prototype's private journal start requires separate send consent, a fresh post-consent baseline, and one-shot exact-document/current-draft proof before durable intent. Its memory-only dispatch authorization is consumed at most once and is not recovered by receipts or UI evidence. A read-only fixture inspector compares exact prepared text in either supported editor while preserving drafts and focus; default preflight still requires an empty editor. Prepared-mode proof and guarded fixture execution now have trusted worker/native transport. Public `chat_commit_message` accepts only an owned fixture operation ID and resolves fresh snapshot/proof internally inside one original private request deadline before intent/activation. Fixed refusals/uncertainty and observed-in-UI evidence always prohibit automatic retry; status replay/recovery restores no authority. Live Gemini submission remains unavailable.
+Fixture evidence relies on stable row IDs. Gemini rows have none, so the staged Gemini job always ends `dispatch_uncertain`. Proposed rule: report `observed_in_ui` only when, under continuous observation since the post-consent baseline (same epoch, no gap), a later snapshot equals the baseline rows followed by exactly one new outgoing row whose text equals the prepared text, optionally followed by incoming rows. Window shifts, duplicates, edits or gaps stay uncertain.
 
 ### Result states
 
@@ -283,6 +304,8 @@ The prototype's private journal start requires separate send consent, a fresh po
 | `unknown` | A submission might have occurred, but its outcome cannot be established |
 
 Recipient delivery/read status is a separate optional observation, never inferred from `observed_in_ui`. Likewise, an AI reply beginning is useful evidence but does not identify a formal provider-side delivery receipt.
+
+**Implementation note (2026-10-09):** Implemented operation states are `awaiting_approval`, `approved` (ordinary no-send review only), `expired`, `stale`, `unknown`, `dispatch_uncertain` and `observed_in_ui`, plus `draftFill` metadata (`fill_approved`, `filling`, `filled`, `failed`, `uncertain`). `dispatching` exists only inside the journal, known pre-activation refusals are reported as `DISPATCH_UNAVAILABLE` instead of `failed_before_dispatch`, and `accepted_by_service` is not implemented.
 
 ### Idempotency and crash behavior
 
@@ -309,7 +332,9 @@ Keep the public tool list small and stable. Per-connection capabilities are retu
 | `chat_get_operation` | Operation ID, optional status-recovery secret | Current status and evidence; receipt recovery cannot restore approval or permit replay |
 | `chat_disconnect` | Connection handle | Revokes access and cancels pending work |
 
-Tool names use lowercase letters, digits, underscores, and hyphens for VS Code host compatibility. This table describes the intended interface, not a claim that every argument/capability is implemented. The prototype implements fixture-only `chat_prepare_message`, owned/receipt-recovered `chat_get_operation`, `chat_fill_draft` for one separately approved unsent fixture edit, and supervised fixture-only `chat_commit_message` after completed fill and distinct trusted send consent. Commit input contains only the owned operation ID; results distinguish fixed refusal/uncertainty from observed-in-UI evidence and always say `retryAllowed: false`. Gemini writes are unavailable. See [HANDOFF.md](HANDOFF.md) for current capabilities and verification. Use shared Zod schemas, bounded inputs, output schemas, and structured tool results. Include a serialized text representation where needed for older clients. Mark reads appropriately; mark sending as a non-read-only external action. Tool annotations help clients present risk but are not access controls.
+Tool names use lowercase letters, digits, underscores, and hyphens for VS Code host compatibility. This table describes the intended interface, not a claim that every argument/capability is implemented. Use shared Zod schemas, bounded inputs, output schemas, and structured tool results. Include a serialized text representation where needed for older clients. Mark reads appropriately; mark sending as a non-read-only external action. Tool annotations help clients present risk but are not access controls.
+
+**Implementation note (2026-10-09):** The prototype adds `chat_fill_draft` for one separately approved unsent fill, plus the diagnostic `browser_chat_feasibility`. `chat_request_connection` takes no label and `chat_read_messages` has no pagination token. Prepare, fill and commit are public for the fixture only; Gemini writes are private and incomplete. Commit accepts only an owned operation ID and always returns `retryAllowed: false`. Inputs use strict Zod schemas and results carry `structuredContent`, but no tool declares an output schema, and most refusals are plain `CODE: No chat was accessed.` text without retry guidance; fill and commit return structured codes. Per-provider availability is in the [DEVELOPMENT.md](DEVELOPMENT.md) tool reference and the [HANDOFF.md](HANDOFF.md) capability matrix.
 
 Domain failures should be actionable, for example `CONVERSATION_CHANGED`, `DRAFT_PRESENT`, `APPROVAL_REQUIRED`, `ADAPTER_STALE`, `BROWSER_DISCONNECTED`, `CURSOR_EXPIRED`, and `SEND_OUTCOME_UNKNOWN`. Return structured error details with whether a safe retry is possible. A transport failure after dispatch does not become a known send failure.
 
@@ -334,6 +359,8 @@ Start with stdio. If resources are added, serve private, immediately stale chat 
 Manifest V3 service workers can terminate and restart. A native-messaging connection keeps the worker alive while connected, but the design must still survive crashes, browser updates, sleep, tab discard, and native-host loss. Keep only recoverable routing state in extension session storage and authoritative operation state in the broker. [12]
 
 On reconnection, establish a fresh document/generation, resnapshot, and report any observation gap. Do not auto-replay pending sends. Background rendering and website updates can be throttled or stopped, so health reports must distinguish connected, observing, stale, and suspended states.
+
+**Implementation note (2026-10-09):** The broker is started by hand (`npm run dev:broker`); the MCP facade only connects and otherwise reports `BROKER_UNAVAILABLE` (decision D4). Each facade process is one owner, so restarting the MCP server or the broker drops that owner's grants and in-memory operations. The worker polls the broker through one persistent native port per provider. If that watch stops after a five-second reply timeout, a parse failure or a disconnect, it restarts only after a new approval or a worker restart, which also marks an observation gap; until then reads and browser jobs time out while the grant still looks ready. Health reporting is limited to snapshot age (`recent` or `old`). Other publications and completions open one short-lived native port each.
 
 ### Local, container, and remote hosts
 
@@ -386,6 +413,8 @@ Pin tested versions when implementation begins. Check native SQLite packaging on
 
 Keep three main code units initially: shared contracts/domain logic, the local companion/MCP package, and the extension with its bundled adapters. Keep tests adjacent to the behavior they cover and share a deterministic fixture-chat application. Do not create a generalized remote plugin platform or multiple browser backends before the first adapter works.
 
+**Implementation note (2026-10-09):** Actual choices are Node 24 with built-in `node:sqlite` (`DatabaseSync`) instead of `better-sqlite3`; `node:test` and `playwright-core` 1.63 with the container's Chromium instead of Vitest and `@playwright/test`; MCP SDK `@modelcontextprotocol/server` and `client` 2.1.0, Zod 4.6.5, TypeScript 5.9.3 and WXT 0.21.4. `dom-accessibility-api` and `devtools-protocol` are unused. There is no shared contracts package: Zod schemas live in the companion, and the extension re-validates native replies with hand-written checks, so every protocol change must be mirrored by hand.
+
 ## 15. Implementation Plan and Gates
 
 The following work starts only after approval of the design.
@@ -402,6 +431,16 @@ The following work starts only after approval of the design.
 For one engineer, a supervised useful alpha is approximately 2-3 weeks; a hardened local Chromium release is roughly 4-7 weeks. These are planning ranges, not commitments. Browser-store review, enterprise policy constraints, adapter breakage, remote deployment, and multi-OS installers can add substantial time.
 
 The earliest go/no-go is Phase 0. If the full-control extension's required permission or native installation is unacceptable, choose a separate Playwright-managed profile or a more limited read-only product; do not hide the tradeoff behind an unreliable synthetic-input fallback.
+
+### Status (2026-10-09)
+
+The effort column above is the original planning estimate, not a schedule.
+
+- **Phase 0:** done except a connector-driven live send. Container GUI, extension, native host, VS Code MCP, fixture input, live Gemini structure and read checks, and a debugger fill probe passed.
+- **Phase 1:** done for the fixture and one observed Gemini UI variant: installed-toolbar approval, reads, events and revocation. Read robustness gaps remain (HANDOFF findings R1 and R2).
+- **Phase 2:** fixture done, including installed-toolbar fill and send. Gemini consent, fill and proof are connected privately; dispatch, outcome evidence and public routing remain.
+- **Phase 3:** not started. There is no adapter interface, calibration, completion semantics or second site.
+- **Phase 4:** not started. There is no installer, broker auto-start, production popup or host matrix.
 
 ## 16. Verification Strategy
 
@@ -427,11 +466,32 @@ Acceptance requires correct message boundaries, successful plain-text submission
 
 Initially target observation-to-event latency under 500 ms at the 95th percentile for active fixture tabs, excluding network/model generation time. Target cached reads under 200 ms, bounded memory, and no full-page rescans per keystroke. Measure these during implementation; they are not current results. No latency target applies while the browser or website is suspended.
 
-## 17. Decisions to Confirm Before Building
+## 17. Decisions
 
-Recommended defaults are Chromium-first, Gemini as the first real AI-chat adapter, native companion installation, supervised sends, no permanent transcript storage, and local stdio transport.
+### Confirmed by the prototype
 
-Only a few product choices need confirmation: whether the install-time debugger permission is acceptable, whether the initial MCP host runs locally or in a remote/container environment, which second chat UI to validate, and whether the first delivery needs installers beyond Linux. None requires tying the architecture to a particular model provider.
+- Chromium first, developed in a rootless Podman devcontainer that holds Chromium, the extension, the native host, the broker and the MCP facade.
+- Gemini's web app is the first real AI-chat target; a local synthetic fixture is the deterministic test target.
+- Local stdio MCP, private Unix-socket IPC and Native Messaging; no network control listener.
+- Supervised sending with trusted extension-owned consent, durable intent, one guarded activation and no automatic retry.
+- No transcript persistence: private SQLite stores operation metadata, keyed digests and receipt hashes only.
+- The development extension declares `debugger`; the user accepted it for fixture and Gemini input probes (see D6).
+
+Still open from the original list: which second chat UI to validate, and whether installers beyond Linux are needed. None requires tying the architecture to a particular model provider.
+
+### Open decisions (review 2026-10-09)
+
+Each item needs an explicit user choice before implementation. The recommendation is a proposal, not authorization. The HANDOFF.md dashboard records which decisions are resolved.
+
+- **D1 Per-message consent.** Each message now needs three popup clicks: ordinary review, fill consent and Send consent. Options: keep three; one trusted **Approve and send this exact text** consent covering fill and Send for one operation while keeping fresh proof, durable intent, reservation and one activation; or a bounded autonomous grant (one conversation, short lifetime, small message and rate budget, visible and revocable) as section 10 anticipates. Recommendation: add the single consent for real chats after Gemini acceptance, keep three steps for tests, and consider autonomy only later. This changes an AGENTS.md safety rule, so it needs explicit approval.
+- **D2 Connection lifetime.** Grants end after five minutes without renewal. Options: keep; renewal by a human click in the popup with visible remaining time and a bounded total; or a duration chosen at approval. Recommendation: popup renewal, never agent-renewable.
+- **D3 Completion signal.** Gemini rows always report `generationState: unknown`. Options: a quiet-period `settled_heuristic`; a reviewed Gemini indicator, such as the Send/Stop control state, reporting `complete`; or both. Recommendation: both. The indicator needs a fresh human-authorized read-only DOM review of a disposable chat.
+- **D4 Broker start.** Options: keep the manual `npm run dev:broker`; let the facade start a detached broker on demand using the existing singleton and recovery checks, as section 4 intends; or add one `npm run dev` script for fixture and broker. Recommendation: on-demand start, keeping the manual script for debugging.
+- **D5 Provider-neutral pipeline (section 8).** Options: finish Gemini sending in the current style and consolidate before any second real site; or consolidate first. Recommendation: finish Gemini first, write the remaining steps provider-parameterized where cheap, and add no new provider-specific command families afterwards.
+- **D6 Debugger permission.** Options: keep it; remove the two legacy probes and `debugger` now; or remove them after the connected Gemini writer passes installed acceptance. Recommendation: decide after acceptance. If Gemini rejects `execCommand` input or the script-initiated Send click, add a reviewed debugger input step inside the operation chain rather than reviving the probes.
+- **D7 Checkpoint size.** Options: keep one small checkpoint per boundary (ledger, private transport, trusted UI, worker, public tool); or one checkpoint per authority boundary when it follows an established fixture pattern. Recommendation: the latter, with shorter handoff entries.
+- **D8 Observation window and failure policy.** Options: keep revoking the grant on any capture failure; or publish the newest rows with `omittedBefore`, mark or raise per-message caps within the 256 KiB frame limit, and when URL, document and conversation are unchanged skip a failed publication instead of revoking (challenged reads return `OBSERVATION_UNAVAILABLE`), revoking only on identity change. Recommendation: the latter; nothing unparsed is published either way.
+- **D9 Gemini outcome evidence.** Options: Gemini commits always end `dispatch_uncertain` and the agent reads to confirm; or the append-only rule in section 10. Recommendation: the append-only rule. It reports UI evidence only, never acceptance or delivery.
 
 The system's value should be **controlled, inspectable chat operations with explicit limitations**, rather than a claim that every website can be automated identically.
 

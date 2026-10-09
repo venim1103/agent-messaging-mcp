@@ -4,7 +4,7 @@ Build communication between an MCP agent and a browser chat explicitly selected 
 
 ## Start With Context
 
-- Read the newest relevant checkpoint in [HANDOFF.md](HANDOFF.md) before continuing implementation. Use [DEVELOPMENT.md](DEVELOPMENT.md) for setup, tool usage and technical reference, and [DESIGN.md](DESIGN.md) for architecture and authority contracts.
+- Read the **Current State Dashboard** at the top of [HANDOFF.md](HANDOFF.md) first, then the newest relevant checkpoint below it. Older dated entries are history; when they disagree with the dashboard, the dashboard wins. Use [DEVELOPMENT.md](DEVELOPMENT.md) for setup, tool usage and technical reference, and [DESIGN.md](DESIGN.md) for architecture, authority contracts and open decisions (section 17).
 - Check the actual worktree and nearby implementation/tests. Preserve user changes; do not assume services, grants or approvals survived a restart.
 - After an interrupted tool call with unknown outcome, verify whether it applied before repeating it. Distinguish completed, tested, staged and connected work.
 
@@ -12,13 +12,16 @@ Build communication between an MCP agent and a browser chat explicitly selected 
 
 - [README.md](README.md) is the GitHub front page for visitors. Keep it a concise public introduction with plain-language capabilities, maturity/safety caveats, documentation links and licensing. Do not add discussions, progress updates, handovers, test counts, commit history, setup commands or technical implementation details there.
 - Put reusable setup, operating instructions, tool contracts and implementation reference in [DEVELOPMENT.md](DEVELOPMENT.md). Keep architecture and design rationale in [DESIGN.md](DESIGN.md).
-- Put changing implementation status, decisions/discussions, test evidence, failed-check history and next-session handover in [HANDOFF.md](HANDOFF.md). Clearly distinguish historical notes from current capabilities.
+- Put changing implementation status, decisions/discussions, test evidence, failed-check history and next-session handover in [HANDOFF.md](HANDOFF.md). Keep its Current State Dashboard accurate in place at every checkpoint (capability matrix, Gemini chain, critical path, findings, next step) and add a short dated entry for the evidence. Clearly distinguish historical notes from current capabilities.
+- Record design questions that need the user's choice as numbered decisions in DESIGN.md section 17 and refer to them by ID; mark them resolved there and in the dashboard once the user decides.
+- Write for smaller models and file readers: keep every line under about 1,000 characters (readers truncate at 2,000), prefer short bullets, state each fact once and link to it, and cite the Safety Boundaries below instead of repeating standard caveats in every entry.
 - Keep stable agent workflow rules in this file. Update the public README only when the visitor-facing description or safety guidance genuinely changes, not at each development checkpoint.
 
 ## Work Independently
 
 - The user prefers autonomous implementation within the agreed scope. Make routine implementation/testing decisions without repeatedly asking permission; continue through verification and useful checkpoints until done or genuinely blocked.
 - Keep changes small and local. Form a concrete hypothesis, make the smallest useful edit and immediately run a focused check before expanding scope. Reuse existing tests/helpers and avoid unrelated cleanup.
+- Before adding a chat provider, a private command family or a new consent type, read DESIGN.md sections 8 and 17 (D1, D5). Do not add a provider by copying the fixture/Gemini command families.
 - Give concise progress updates explaining what changed, what was verified and what remains. Be explicit about uncertain evidence and missing authorization.
 - Do not spawn subagents unless requested by the user or required by an applicable skill.
 - Respect requests to pause, stop or finish for the day. Finish only the agreed checkpoint; a terminal notification or documentation request is not permission to resume paused implementation.

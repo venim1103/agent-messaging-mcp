@@ -4,7 +4,7 @@ Connect an AI assistant to a browser chat you explicitly select and approve, usi
 
 You choose the conversation and control access. Outgoing messages require separate approval, and your login stays in your browser: no provider API keys or exported credentials are needed.
 
-> **Experimental prototype.** Not ready for everyday use or personal conversations. Real-chat support is currently read-only; supervised sending is limited to a local test chat.
+> **Experimental prototype.** Not ready for everyday use or personal conversations. Real-chat support (starting with Google Gemini's web app) is currently read-only; supervised sending is limited to a local test chat.
 
 ## Documentation
 

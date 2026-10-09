@@ -1,6 +1,100 @@
 # Implementation Handoff
 
-Updated: 2026-10-09.
+Updated: 2026-10-09 (deep review).
+
+Start with the dashboard below. Everything after it is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture and open decisions D1-D9 in [DESIGN.md](DESIGN.md), section 17.
+
+## Current State Dashboard
+
+Keep this section current in place at every checkpoint, then add a short dated entry below it.
+
+### Aim
+
+An MCP agent converses with a browser chat that a person explicitly selected and approved, using the person's existing login: it reads the rendered conversation, waits for new messages and sends supervised messages. Gemini's web app is the first real target; other chat sites follow through reviewed adapters and later user calibration (DESIGN.md sections 8 and 15). No provider APIs, credential export or unrestricted browser control.
+
+### Repository state
+
+- Source HEAD at review: `002d600` on `main`, not pushed; later commits are documentation-only. Its last exact gate passed build, both typechecks, **167/167 units and 20/20 e2e checks**.
+- **Uncommitted source in the worktree**, pre-existing and not written by the review: `packages/companion/src/message-operations.ts` adds `requestGeminiDispatch`, `listGeminiDispatchAttempts` and `completeGeminiDispatch`, a one-offer Gemini durable job that always settles `dispatch_uncertain`; `message-operations.test.ts` adds three units. During the review `npm run build:companion` compiled and those three units passed **3/3**. The exact gate was not run and nothing was committed. This is G1 below.
+- Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
+
+### Capability matrix
+
+| Public tool | Local fixture | Gemini saved chat |
+| --- | --- | --- |
+| `chat_request_connection`, `chat_get_connection`, `chat_disconnect` | Works; installed toolbar verified | Works; installed toolbar verified on disposable chats |
+| `chat_read_messages` | Works; installed verified | Works; live verified; rows have uncertain identity and unknown completion; fragile (R1) |
+| `chat_wait_for_events` | Works; installed verified | Works; two live trials passed; two earlier trials failed, one leaving the grant `stale` (consistent with R1) and one losing the owner (`unknown`) before keepalive |
+| `chat_prepare_message` | Works | Public tool refuses with `CONNECTION_NOT_FOUND`; private `prepare_gemini_message` works |
+| `chat_fill_draft` | Works; installed textarea verified | Not public; private fill and worker connected, synthetic tests only |
+| `chat_commit_message` | Works; installed textarea verified (`observed_in_ui`) | Not available; chain incomplete |
+| `chat_get_operation` | Works | Only for privately prepared operations |
+
+The trusted popup already offers Gemini pending-request approval, ordinary review, fill consent and Send consent.
+
+### Gemini send chain
+
+| Link | State |
+| --- | --- |
+| Preparation, ordinary review, fill consent | Connected privately; trusted popup |
+| One-offer fill job and worker `insertText` fill | Connected privately; synthetic loss and crash e2e |
+| Distinct Send consent | Connected privately; trusted popup |
+| Fresh challenged read plus exact-draft and Send-control proof (`check_gemini_dispatch`) | Connected privately; synthetic e2e |
+| Recovery receipt and durable intent (`recordGeminiDispatchStart`) | Ledger only |
+| One-offer dispatch job | Ledger only, **uncommitted** |
+| Commit orchestration in one original deadline (read, proof, intent, job) | Missing |
+| Relay-only dispatch list and completion transport | Missing |
+| Worker submit (the Gemini reservation namespace and `submitGeminiDraft` exist but are unconnected) | Missing |
+| Gemini outcome evidence rule (D9) | Missing |
+| Public routing of prepare, fill, commit and status for Gemini connections | Missing |
+| Submit lifecycle and loss e2e (script or native loss, worker stop/wake, broker kill) | Missing |
+| Installed acceptance on a disposable chat | Missing; needs explicit human authorization for the exact text, fill and Send |
+
+### Critical path
+
+1. **G1** Finish, gate and commit the uncommitted dispatch-job slice.
+2. **G2** Read robustness: restart a stopped native watch without retrying writes (R2), and apply decision D8 so normal replies do not revoke grants (R1).
+3. **G3** Gemini commit end to end: orchestration, transport, worker submit with reservation, evidence rule (D9), public routing, SDK tests and sandboxed lifecycle and loss tests. Reuse fixture paths with a provider parameter where cheap (D5).
+4. **G4** Coordinated reload and one human-authorized installed acceptance: a disposable chat, exact neutral text, separate fill and Send approvals.
+5. **G5** Agent-loop usability: D1 consent, D2 lifetime, D3 completion and D4 broker start.
+6. **G6** Provider-neutral consolidation (D5) before any second site, then calibration and packaging (DESIGN.md section 15).
+
+### Findings: functional
+
+- **R1 Snapshot failures revoke the grant.** `captureGeminiSnapshot` in `packages/extension/lib/gemini-observation.ts` returns null for more than 32 rendered rows, any message over 2,048 characters, or a row that momentarily lacks its expected content element; the broker enforces the same caps. The worker then revokes the grant as `observation_unavailable`. Gemini answers longer than about 2,000 characters, which are common, and chats with more than 16 exchanges therefore end the connection. This is a plausible but unproven cause of the first live event-wait failure, which left the grant `stale`. The fixture has the same caps. Fix per D8.
+- **R2 The native watch is not restarted.** `startGeminiReadWatch` and `startFixtureReadWatch` stop after any five-second reply timeout, parse failure or port disconnect, and restart only after a new approval or a worker restart. Until then reads, fills and proofs time out while the grant still looks ready.
+- **R3 Five-minute grants** (`READONLY_CONNECTION_TTL_MS`) cannot be renewed; a longer conversation needs a new request and toolbar approval (D2).
+- **R4 Three popup clicks per message**, plus the prepare, fill and commit calls (D1).
+- **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer holds 32 events or 256 KiB, so streaming can expire cursors. Agents should treat events as change hints and re-read (D3).
+- **R6 Gemini commits would end uncertain.** Fixture evidence uses stable row IDs; Gemini rows have none (D9).
+- **R7 Setup and target limits.** The broker must be started by hand (D4). Only saved chats with exactly two path segments, such as `https://gemini.google.com/app/<id>`, qualify; new unsaved chats and multi-account paths such as `/u/<n>/app/<id>` do not. Fill and submit need the chat tab to stay active and visible.
+
+### Findings: architecture and maintainability
+
+- **A1 Provider duplication.** There are 52 private broker request kinds and parallel ledger, client, native, worker and popup families per provider, while DESIGN.md section 8 expects one policy pipeline with adapters. Several fixture-named items are provider-generic (`disconnect_fixture`, `revoke_all_fixture`, `revokeTrackedFixture`, `completeFixtureBrowserCheck`, the shared `MAX_PENDING_FIXTURE_DISPATCHES` cap). Do not add a provider by copying (D5).
+- **A2 Input mechanism drift.** Connected writers use `document.execCommand("insertText")` and a script-initiated `click()`, not `chrome.debugger`. `debugger` serves only two legacy popup probes, and the Gemini **Fill test draft** probe types a fixed sentence outside the operation ledger (D6). Whether live Gemini accepts the script-initiated Send click is unverified.
+- **A3 Model gaps.** `generation` is always 1, every connection is `ready_readonly` and write authority is per operation; there is no write mode or pause state. The popup is still a probe UI without the data-boundary disclosure that DESIGN.md section 13 asks for. The extension mirrors broker schemas by hand, so protocol changes must be made in both places.
+- **A4 Port churn.** Each snapshot publication and each worker completion opens a new native port and relay process. This is fine locally; measure before raising event rates.
+
+### Findings: process and documentation
+
+- The project has 139 commits in 15 days. Each boundary (ledger, private transport, trusted UI, worker, public tool) was a separate gated checkpoint with a long handoff entry (D7).
+- This file is about 260 KB. Before the review, two documentation lines exceeded the 2,000-character limit of agent file readers, and DEVELOPMENT.md was mostly dated history. The review added this dashboard, split those lines, rewrote DEVELOPMENT.md as a reference and added readability rules to AGENTS.md.
+
+### Pending user decisions
+
+D1-D9 in DESIGN.md section 17 are all open: D1 per-message consent, D2 connection lifetime, D3 completion signal, D4 broker start, D5 provider-neutral pipeline, D6 debugger permission, D7 checkpoint size, D8 observation window and failure policy, D9 Gemini outcome evidence.
+
+### Next step
+
+G1: review `git diff -- packages/companion/src/message-operations.ts packages/companion/src/message-operations.test.ts`, keep the uncertain-only settlement until D9 is decided, run the exact gate, record a short entry here and commit. Then G2's watch restart (R2), which needs no policy change. Ask the user for D1-D9 before R1 (D8), the evidence rule (D9) and G5.
+
+## Deep Review and Documentation Restructure (2026-10-09)
+
+- At the user's request, the whole project was reviewed against the aim, with emphasis on the design documentation. Only documentation changed: no source, test, configuration, service, browser, profile, grant or live chat was touched.
+- Findings, the critical path and pending decisions are in the dashboard above and DESIGN.md section 17. DESIGN.md gained a status header, implementation notes in sections 5-12 and 14-15, the implemented authority chain, a proposed Gemini evidence rule and decisions D1-D9. DEVELOPMENT.md was rewritten as a setup, tool and code reference; its former dated body remains in Git at `002d600`, and its evidence is preserved in the entries below. AGENTS.md gained reading-order, dashboard and line-length rules plus a provider guardrail. README.md names Gemini as the first real target. Two over-long lines in this file were split with soft line breaks; their text is unchanged.
+- To establish the worktree state, `npm run build:companion` and the three uncommitted Gemini dispatch-job units (`node --test --test-name-pattern='staged Gemini (durable jobs|and fixture durable jobs)' packages/companion/dist/message-operations.test.js`) passed **3/3**. The exact application gate was not run because no source changed.
+- Only documentation files were committed; the uncommitted source slice stays in the worktree for G1.
 
 ## Staged Gemini Durable Intent / Status Receipt (2026-10-09)
 
@@ -114,7 +208,15 @@ Updated: 2026-10-09.
 
 This document tells the next AI how to turn [DESIGN.md](DESIGN.md) into a working implementation. The design explains the architecture and tradeoffs; this handoff supplies the work order, concrete deliverables, and checks. **The opt-in broker and user-approved fixture-only connection work. Each MCP fixture read waits for a bounded exact-document browser challenge; real toolbar-approved reads, a chat switch, and a fixture message-to-MCP event wait passed. A supervised installed-toolbar fixture fill/send also returned unique outgoing UI evidence after separate draft, fill and send approvals, then disconnected. One explicitly authorized disposable Gemini chat returned an exact-document read and later rendered events after a prompt sent manually by the user; its owner disconnected. Gemini worker-wake gaps are synthetic-tested only. The connector has not sent a real-site message.** VS Code tool executions run in the Podman devcontainer, and the user confirmed that its Chromium fixture window is visible on Windows.
 
-The latest successful exact full gate passed build/typecheck, **142/142 unit tests and 19/19 e2e checks**, including sandboxed isolated Chromium cases and disposable private-socket readiness regressions. It covers staged Gemini fill contracts, provider-bound preparation/ordinary/fill consent, browser reservation, isolated native fill/guarded submit, read-only inspection and public supervised fixture commit `05b779b` below, following connected private execution `84319c6`, private dispatch transport `73427a9`, durable one-offer jobs `59cbedb`, persistent browser reservation `746ee56`, isolated guarded submit `70b70dc`, private exact-draft dispatch inspection `016dbca`, distinct trusted send consent `02eab49`, facade keepalive/process-test readiness `3f5451d`, client encoding-budget enforcement `7233791`, codec-refusal cleanup `ca69de2`, byte-first prepared-text validation `5aa3482`, recovery snapshot revalidation `8128629`, diagnostic-sink failure `4e137fb`, owned broker-test teardown `f4c6622`, native input terminal events `6b8b63d`, lazy wire decoding `0dc38fc`, fixture URL refusal `e03ee5e`, stream-finish settlement `349a101`, diagnostic/test lifecycle `96ccb60`, and unified native reply scheduling/shared drain-aware output `f166241`. Earlier gates stopped at **118/120 units** on two broker-startup checks and **119/120 units** on stale-credential rotation; their unknown causes remain recorded below. Earlier attempts stopped at **113/115 units** with a startup failure and timed-out case, then **115/115 units and 11/12 e2e checks**, and later **115/115 units and 12/13 e2e checks**, each browser failure refusing an unsafe runtime; all remain recorded below. The earlier unified-queue gate stopped at **107/110 units** on three broker-startup checks and did not reach browsers; its precise failure causes remain unknown. Earlier gates stopped at **99/100 units** and **102/103 units** and remain recorded. Companion deadline/privacy hardening is committed as `64f50fa`; browser sandbox verification, rich-editor test isolation, and strict refusal diagnostics as `a9d74c7`; popup review invalidation as `6455b56`; observation nesting as `88563c3`; native EOF as `54c5b88`; observation expansion as `410c57d`; encoder allocation as `902084a`; MCP readiness as `88640a6`; broker queue bounds as `9ec819c`; broker response backpressure as `9ac059a`; concurrent facade ownership as `63e01b5`. On October 6 the user reported time synchronization may be fixed and reopened time-sensitive workflows; synchronization itself is unverified and this green gate is not a clock-repair claim.
+The latest successful exact full gate passed build/typecheck, **142/142 unit tests and 19/19 e2e checks**, including sandboxed isolated Chromium cases and disposable private-socket readiness regressions.
+It covers staged Gemini fill contracts, provider-bound preparation/ordinary/fill consent, browser reservation, isolated native fill/guarded submit, read-only inspection and public supervised fixture commit `05b779b` below,
+following connected private execution `84319c6`, private dispatch transport `73427a9`, durable one-offer jobs `59cbedb`, persistent browser reservation `746ee56`, isolated guarded submit `70b70dc`, private exact-draft dispatch inspection `016dbca`, distinct trusted send consent `02eab49`, facade keepalive/process-test readiness `3f5451d`, client encoding-budget enforcement `7233791`, codec-refusal cleanup `ca69de2`, byte-first prepared-text validation `5aa3482`, recovery snapshot revalidation `8128629`, diagnostic-sink failure `4e137fb`, owned broker-test teardown `f4c6622`, native input terminal events `6b8b63d`, lazy wire decoding `0dc38fc`, fixture URL refusal `e03ee5e`, stream-finish settlement `349a101`, diagnostic/test lifecycle `96ccb60`, and unified native reply scheduling/shared drain-aware output `f166241`.
+Earlier gates stopped at **118/120 units** on two broker-startup checks and **119/120 units** on stale-credential rotation; their unknown causes remain recorded below.
+Earlier attempts stopped at **113/115 units** with a startup failure and timed-out case, then **115/115 units and 11/12 e2e checks**, and later **115/115 units and 12/13 e2e checks**, each browser failure refusing an unsafe runtime; all remain recorded below.
+The earlier unified-queue gate stopped at **107/110 units** on three broker-startup checks and did not reach browsers; its precise failure causes remain unknown.
+Earlier gates stopped at **99/100 units** and **102/103 units** and remain recorded.
+Companion deadline/privacy hardening is committed as `64f50fa`; browser sandbox verification, rich-editor test isolation, and strict refusal diagnostics as `a9d74c7`; popup review invalidation as `6455b56`; observation nesting as `88563c3`; native EOF as `54c5b88`; observation expansion as `410c57d`; encoder allocation as `902084a`; MCP readiness as `88640a6`; broker queue bounds as `9ec819c`; broker response backpressure as `9ac059a`; concurrent facade ownership as `63e01b5`.
+On October 6 the user reported time synchronization may be fixed and reopened time-sensitive workflows; synchronization itself is unverified and this green gate is not a clock-repair claim.
 
 ## Documentation Audience Separation (2026-10-09)
 
@@ -570,6 +672,8 @@ At the start of continuation, the internal consent checkpoint remained uncommitt
 - The native-host fixture subprocess has an unresolved intermittent deadline rejection (details below). Do not weaken its production deadline checks to force a passing test. The development broker or VS Code MCP process may predate local builds; restart them deliberately only for a needed test, never assume a running process has the latest schemas.
 
 ## 1. Start Here
+
+> **Historical (written 2026-10-01).** Sections 1-9 are the original onboarding plan. Still useful: section 3 (decisions to keep), section 7 (contracts), section 8 (required failure cases) and section 9 (how to work). Outdated: the tool list and suggested request in section 1, the environment table in section 2, the proposed `packages/core` layout in section 5 and the milestone checkboxes at the end. Use the dashboard at the top of this file and [DEVELOPMENT.md](DEVELOPMENT.md) instead.
 
 Read this document and [DESIGN.md](DESIGN.md), then inspect the current worktree before changing anything. Preserve any work added after this handoff. Do not spend another session redesigning the system unless a focused experiment disproves an important assumption.
 
