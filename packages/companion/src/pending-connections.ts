@@ -194,6 +194,10 @@ export class PendingConnectionRequests {
     return target?.origin === "https://gemini.google.com" ? target : null;
   }
 
+  getConnectionExpiresAt(owner: symbol, connectionId: string, now = Date.now()): number | null {
+    return this.liveGrant(owner, connectionId, now)?.connection.expiresAt ?? null;
+  }
+
   getGeminiSnapshot(owner: symbol, connectionId: string, now = Date.now()): GeminiSnapshot | "not_ready" | null {
     const grant = this.liveGrant(owner, connectionId, now);
     if (grant?.target.origin !== "https://gemini.google.com") return null;

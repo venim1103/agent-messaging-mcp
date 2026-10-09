@@ -140,6 +140,11 @@ type PendingFixtureFill = {
   owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number;
   timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureFillStatus | null) => void
 };
+type GeminiFillStatus = z.infer<typeof geminiFillStatusSchema>;
+type PendingGeminiFill = {
+  owner: symbol; operationId: string; target: GeminiTarget; text: string; expiresAt: number; issued: boolean;
+  timer: ReturnType<typeof setTimeout>; resolve: (status: GeminiFillStatus | null) => void
+};
 type PendingFixtureDispatch = {
   owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number; startedAt: number;
   issued: boolean; timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureDispatchStatus) => void
@@ -172,6 +177,7 @@ export class PreparedMessageOperations {
   private readonly ambiguousEvidence = new Set<string>();
   private readonly preflightChecks = new Map<string, PendingFixturePreflight>();
   private readonly fillChecks = new Map<string, PendingFixtureFill>();
+  private readonly geminiFillChecks = new Map<string, PendingGeminiFill>();
   private readonly digestKey = randomBytes(32);
 
   constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync) {
@@ -230,6 +236,9 @@ export class PreparedMessageOperations {
     for (const [attemptId, pending] of this.fillChecks) {
       if (pending.operationId === operationId) this.finishFillCheck(attemptId, null);
     }
+    for (const [attemptId, pending] of this.geminiFillChecks) {
+      if (pending.operationId === operationId) this.finishGeminiFillCheck(attemptId, null);
+    }
     this.contents.delete(operationId);
     this.geminiContents.delete(operationId);
     this.reviewTokens.delete(operationId);
@@ -272,6 +281,7 @@ export class PreparedMessageOperations {
     for (const [operationId, authorization] of this.dispatchAuthorizations) {
       if (authorization.expiresAt <= now) this.dispatchAuthorizations.delete(operationId);
     }
+    this.discardGeminiFillChecks(now);
   }
 
   prepare(owner: symbol, connectionId: string, expectedGeneration: number,
@@ -456,6 +466,74 @@ export class PreparedMessageOperations {
     this.consumedFillApprovals.add(operationId);
     this.fillStates.set(operationId, Object.freeze({ state: "uncertain", completedAt: now }));
     return authorization;
+  }
+
+  private finishGeminiFillCheck(attemptId: string, status: GeminiFillStatus | null, now = Date.now()): void {
+    const pending = this.geminiFillChecks.get(attemptId);
+    if (!pending) return;
+    this.geminiFillChecks.delete(attemptId);
+    clearTimeout(pending.timer);
+    const state: FixtureDraftFillState = status?.ok
+      ? { state: "filled", completedAt: status.completedAt, editor: status.editor }
+      : !status || status.code === "FILL_UNCERTAIN"
+        ? { state: "uncertain", completedAt: status?.completedAt ?? now }
+        : { state: "failed", completedAt: status.completedAt, code: status.code };
+    this.fillStates.set(pending.operationId, Object.freeze(state));
+    pending.resolve(status);
+  }
+
+  private discardGeminiFillChecks(now: number): void {
+    if (!this.geminiFillChecks.size) return;
+    const blocked = this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
+      LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+      WHERE evidence.operation_id IS NULL LIMIT 1`).get();
+    for (const [attemptId, pending] of this.geminiFillChecks) {
+      const operation = this.geminiContents.get(pending.operationId);
+      const live = operation && this.requests.getGeminiTarget(pending.owner, operation.connectionId, now);
+      const approval = this.approvals.get(pending.operationId);
+      if (blocked || pending.expiresAt <= now || !operation || operation.owner !== pending.owner
+        || !approval || approval.expiresAt <= now || !live || !this.sameGeminiTarget(pending.target, live)) {
+        this.finishGeminiFillCheck(attemptId, null, now);
+      }
+    }
+  }
+
+  requestGeminiFill(owner: symbol, operationId: string, now = Date.now(), deadlineMs = now + FIXTURE_FILL_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
+    const authorization = this.getGeminiFillAuthorization(owner, operationId, now);
+    const operation = this.geminiContents.get(operationId);
+    const grantExpiresAt = operation && this.requests.getConnectionExpiresAt(owner, operation.connectionId, now);
+    if (!authorization || !grantExpiresAt) return null;
+    this.listFixtureFillChallenges(now);
+    if (this.fillChecks.size + this.geminiFillChecks.size >= MAX_PENDING_FIXTURE_FILLS) return "busy" as const;
+    if (!this.consumeGeminiFillApproval(owner, operationId, now)) return null;
+    const attemptId = randomUUID();
+    const expiresAt = Math.min(deadlineMs, authorization.expiresAt, grantExpiresAt, now + FIXTURE_FILL_TIMEOUT_MS);
+    let resolve!: PendingGeminiFill["resolve"];
+    const result = new Promise<GeminiFillStatus | null>((done) => { resolve = done; });
+    const timer = setTimeout(() => this.finishGeminiFillCheck(attemptId, null), expiresAt - now);
+    this.geminiFillChecks.set(attemptId, { owner, operationId, target: authorization.target,
+      text: authorization.text, expiresAt, issued: false, timer, resolve });
+    this.fillStates.set(operationId, Object.freeze({ state: "filling", startedAt: now, expiresAt }));
+    return { attemptId, result };
+  }
+
+  listGeminiFillChallenges(now = Date.now()) {
+    this.discardExpired(now);
+    return [...this.geminiFillChecks].filter(([, pending]) => !pending.issued).map(([attemptId, pending]) => {
+      pending.issued = true;
+      return Object.freeze({ attemptId, operationId: pending.operationId, target: pending.target,
+        text: pending.text, expiresAt: pending.expiresAt });
+    });
+  }
+
+  completeGeminiFill(target: GeminiTarget, attemptId: string, observation: GeminiFillResult, now = Date.now()): boolean {
+    const parsed = geminiFillResultSchema.safeParse(observation);
+    this.discardExpired(now);
+    const pending = this.geminiFillChecks.get(attemptId);
+    if (!parsed.success || !pending?.issued || !this.sameGeminiTarget(pending.target, target)) return false;
+    this.finishGeminiFillCheck(attemptId, { ...parsed.data, operationId: pending.operationId, completedAt: now });
+    return true;
   }
 
   listFixtureReviews(target: FixtureTarget, now = Date.now()): Readonly<{
@@ -728,7 +806,7 @@ export class PreparedMessageOperations {
   requestFixtureFill(owner: symbol, operationId: string, now = Date.now()) {
     if (!this.getFixtureFillAuthorization(owner, operationId, now)) return null;
     this.listFixtureFillChallenges(now);
-    if (this.fillChecks.size >= MAX_PENDING_FIXTURE_FILLS) return "busy" as const;
+    if (this.fillChecks.size + this.geminiFillChecks.size >= MAX_PENDING_FIXTURE_FILLS) return "busy" as const;
     const authorization = this.consumeFixtureFillApproval(owner, operationId, now);
     if (!authorization) return null;
     const attemptId = randomUUID();
