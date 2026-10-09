@@ -46,7 +46,7 @@ Ask the user for a small, precise action when a test requires:
 
 - A real installed-browser gesture: selecting the exact tab/chat, approving through the trusted toolbar/popup, or restarting/reloading MCP or the extension when a human step is required.
 - Fresh authorization for real-site inspection/reads using their account. A synthetic test or an old grant is not permission for a live check.
-- A real-site connector draft fill or message submission. Obtain separate explicit authorization for the exact chat and text before filling, and separate send approval before any live submission. Read access, ordinary review, fill consent and manually typed drafts are not send permission.
+- A real-site connector draft fill or message submission during development. Obtain separate explicit authorization for the exact chat and text before filling, and separate send approval before any live submission. A live test of the autonomous mode instead needs the person's authorization for one bounded session: the exact chat, the planned messages and a message limit. Read access, ordinary review, fill consent and manually typed drafts are not send permission.
 - Visual acceptance that automation cannot establish, such as confirming the actual draft is present and unsent. Ask what was actually performed/observed, not just whether the user approves an action.
 - A genuine blocker, ambiguous requirement or proposed expansion of scope/security/environment constraints.
 
@@ -54,8 +54,8 @@ Prepare the autonomous prerequisites first. Explain the bounded action and expec
 
 ## Safety Boundaries
 
-- Keep connection approval, ordinary review, fill consent, send consent, fresh proof, durable intent and browser reservation distinct. Recovery receipts recover status, never write authority.
-- Never automatically retry or replace an uncertain fill/submit, restore consumed authority, or clear/submit a person's existing draft. Report uncertainty conservatively; UI observation is not provider acceptance or delivery.
+- Product authority (decided 2026-10-09, DESIGN.md D1): one trusted popup **Connect this chat** approval lets the agent read and send in that one chat until the connection ends; the agent can never create, widen or renew it. Keep that approval, fresh proof, durable intent and browser reservation distinct, and in the supervised mode keep ordinary review, fill consent and send consent distinct. Recovery receipts recover status, never write authority.
+- Never automatically retry or replace an uncertain fill/submit, restore consumed authority, or clear/submit a person's existing draft. Resolve unconfirmed sends only from page evidence or the person's popup choice, pausing that chat meanwhile (D10). Report uncertainty conservatively; UI observation is not provider acceptance or delivery.
 - Do not change clocks/NTP, host/network settings, browser profile locks, TLS/security or privilege configuration as a testing workaround. Ask before such separately scoped work. The tracked [clock diagnostic](tests/diagnostics/clock-probe.c) is optional and must not run without explicit authorization.
 - Keep sensitive profiles outside Git. Do not record real chat/draft text, full private URLs, credentials or recovery secrets in repository docs, logs, screenshots or memory.
 

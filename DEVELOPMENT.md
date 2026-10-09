@@ -3,12 +3,14 @@
 Reusable setup, operating instructions, tool contracts and code map for people and coding agents working on this repository.
 
 - Current status, evidence, review findings and the next step: the dashboard at the top of [HANDOFF.md](HANDOFF.md).
-- Architecture, design rationale and open decisions D1-D9: [DESIGN.md](DESIGN.md), section 17.
+- Target experience, architecture, design rationale and decisions D1-D13: [DESIGN.md](DESIGN.md), sections 2 and 17.
 - Workflow and safety rules: [AGENTS.md](AGENTS.md). Public introduction: [README.md](README.md).
 
 Dated test reports that used to fill this file were removed in the 2026-10-09 review. HANDOFF.md keeps that evidence, and the previous text is available with `git show 002d600:DEVELOPMENT.md`.
 
 > **Experimental.** The local fixture supports reads, events and supervised fill and send. A selected saved Gemini chat supports reads and events; Gemini writing is private, incomplete and refused by the public tools. Never connect personal conversations.
+
+The decided target is different: one **Connect this chat** approval in the popup, after which the agent chats on its own until the tab closes (DESIGN.md sections 2 and 17). This file describes the tools as they work today.
 
 ## Architecture in Brief
 

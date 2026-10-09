@@ -1,20 +1,20 @@
 # Implementation Handoff
 
-Updated: 2026-10-09 (deep review).
+Updated: 2026-10-09 (product decisions).
 
-Start with the dashboard below. Everything after it is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture and open decisions D1-D9 in [DESIGN.md](DESIGN.md), section 17.
+Start with the dashboard below. Everything after it is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
 ## Current State Dashboard
 
 Keep this section current in place at every checkpoint, then add a short dated entry below it.
 
-### Aim
+### Target experience (decided 2026-10-09)
 
-An MCP agent converses with a browser chat that a person explicitly selected and approved, using the person's existing login: it reads the rendered conversation, waits for new messages and sends supervised messages. Gemini's web app is the first real target; other chat sites follow through reviewed adapters and later user calibration (DESIGN.md sections 8 and 15). No provider APIs, credential export or unrestricted browser control.
+The person installs the extension and starts the MCP server in VS Code, opens a Gemini chat in the browser that has the extension (container Chromium for now, D12) and clicks **Connect this chat** once. From then on the agent reads and sends in that chat without further intervention. Closing the tab, switching to another chat, or restarting the browser or VS Code ends the connection; reloading the same chat keeps it. For now the chat tab must stay visible, though its own window is fine; later a hidden tab must work too (D11). Other chat sites follow through the provider-neutral pipeline (D5). No provider APIs, credential export or unrestricted browser control.
 
 ### Repository state
 
-- Latest source checkpoint: the staged Gemini one-offer dispatch job (entry below), committed after documentation commit `18d87a5`. Its exact gate passed build, both typechecks, **170/170 units and 20/20 e2e checks**. No source is left uncommitted.
+- Latest source checkpoint: `11dec64`, the staged Gemini one-offer dispatch job (entry below). Its exact gate passed build, both typechecks, **170/170 units and 20/20 e2e checks**. Later commits are documentation-only, and no source is left uncommitted.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
 ### Capability matrix
@@ -29,9 +29,11 @@ An MCP agent converses with a browser chat that a person explicitly selected and
 | `chat_commit_message` | Works; installed textarea verified (`observed_in_ui`) | Not available; chain incomplete |
 | `chat_get_operation` | Works | Only for privately prepared operations |
 
-The trusted popup already offers Gemini pending-request approval, ordinary review, fill consent and Send consent.
+The trusted popup already offers Gemini pending-request approval, ordinary review, fill consent and Send consent. These are today's supervised tools; the decided target replaces the per-message approvals with one connection approval (T2, T3).
 
 ### Gemini send chain
+
+This supervised chain stays for tests. The autonomous path (T3) reuses its fill, proof, intent, job, reservation and submit pieces.
 
 | Link | State |
 | --- | --- |
@@ -40,7 +42,7 @@ The trusted popup already offers Gemini pending-request approval, ordinary revie
 | Distinct Send consent | Connected privately; trusted popup |
 | Fresh challenged read plus exact-draft and Send-control proof (`check_gemini_dispatch`) | Connected privately; synthetic e2e |
 | Recovery receipt and durable intent (`recordGeminiDispatchStart`) | Ledger only |
-| One-offer dispatch job | Ledger only; its post-offer freshness check must be relaxed before worker submit (G3) |
+| One-offer dispatch job | Ledger only; its post-offer freshness check must be relaxed before worker submit (T3) |
 | Commit orchestration in one original deadline (read, proof, intent, job) | Missing |
 | Relay-only dispatch list and completion transport | Missing |
 | Worker submit (the Gemini reservation namespace and `submitGeminiDraft` exist but are unconnected) | Missing |
@@ -49,24 +51,27 @@ The trusted popup already offers Gemini pending-request approval, ordinary revie
 | Submit lifecycle and loss e2e (script or native loss, worker stop/wake, broker kill) | Missing |
 | Installed acceptance on a disposable chat | Missing; needs explicit human authorization for the exact text, fill and Send |
 
-### Critical path
+### Critical path to the target
 
-1. **G1** Done: the dispatch-job slice is gated and committed.
-2. **G2** Read robustness: restart a stopped native watch without retrying writes (R2), and apply decision D8 so normal replies do not revoke grants (R1).
-3. **G3** Gemini commit end to end: orchestration, transport, worker submit with reservation, evidence rule (D9), public routing, SDK tests and sandboxed lifecycle and loss tests. Reuse fixture paths with a provider parameter where cheap (D5).
-4. **G4** Coordinated reload and one human-authorized installed acceptance: a disposable chat, exact neutral text, separate fill and Send approvals.
-5. **G5** Agent-loop usability: D1 consent, D2 lifetime, D3 completion and D4 broker start.
-6. **G6** Provider-neutral consolidation (D5) before any second site, then calibration and packaging (DESIGN.md section 15).
+Done: G1, the dispatch-job slice (`11dec64`). Steps T1-T6 replace the earlier G2-G6 plan.
+
+1. **T1 Read robustness.** Restart a stopped native watch without retrying writes (R2). Apply D8: a newest-rows window with `omittedBefore`, explicit per-message truncation within the frame limit, and skipping instead of revoking when a capture fails but URL, document and conversation are unchanged (R1).
+2. **T2 Connection model.** Popup-first **Connect this chat**, picked up by the connected MCP agent through a new tool (D13). One approval grants reading and autonomous sending (D1). No fixed expiry: the connection ends on tab close, chat switch, browser or MCP server restart, or disconnect, and a reload of the same chat re-attaches using a one-time optional `gemini.google.com` host permission (D2). The MCP server starts the broker and connects at startup (D4).
+3. **T3 Autonomous send.** A provider-neutral `chat_send_message` runs fill, fresh proof, durable intent, the one-offer job, browser reservation and one guarded activation, reusing today's pieces (D5). Add the append-only evidence rule (D9) with a settle window, per-connection resolution of unconfirmed sends with a one-click popup fallback (D10, R8), and the runaway guard: one message at a time and a configurable hourly cap. Relax "active tab of the current window" to "visible tab" (D11). Sandboxed synthetic tests cover the loop and its loss and crash cases.
+4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
+5. **T5 Live acceptance.** Coordinated reload, then one human-authorized session on a disposable chat: connect once, the agent sends a few neutral messages and reads the complete replies without further clicks, then the tab is closed.
+6. **T6 Later.** Hidden-tab operation (D11, possibly debugger input per D6), a second chat site on the provider-neutral pipeline, calibration and packaging.
 
 ### Findings: functional
 
 - **R1 Snapshot failures revoke the grant.** `captureGeminiSnapshot` in `packages/extension/lib/gemini-observation.ts` returns null for more than 32 rendered rows, any message over 2,048 characters, or a row that momentarily lacks its expected content element; the broker enforces the same caps. The worker then revokes the grant as `observation_unavailable`. Gemini answers longer than about 2,000 characters, which are common, and chats with more than 16 exchanges therefore end the connection. This is a plausible but unproven cause of the first live event-wait failure, which left the grant `stale`. The fixture has the same caps. Fix per D8.
 - **R2 The native watch is not restarted.** `startGeminiReadWatch` and `startFixtureReadWatch` stop after any five-second reply timeout, parse failure or port disconnect, and restart only after a new approval or a worker restart. Until then reads, fills and proofs time out while the grant still looks ready.
-- **R3 Five-minute grants** (`READONLY_CONNECTION_TTL_MS`) cannot be renewed; a longer conversation needs a new request and toolbar approval (D2).
-- **R4 Three popup clicks per message**, plus the prepare, fill and commit calls (D1).
-- **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer holds 32 events or 256 KiB, so streaming can expire cursors. Agents should treat events as change hints and re-read (D3).
+- **R3 Five-minute grants** (`READONLY_CONNECTION_TTL_MS`) cannot be renewed; a longer conversation needs a new request and toolbar approval. Decided fix: D2 (T2).
+- **R4 Three popup clicks per message**, plus the prepare, fill and commit calls. Decided fix: one connection approval, D1 (T2, T3).
+- **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer holds 32 events or 256 KiB, so streaming can expire cursors. Agents should treat events as change hints and re-read (D3, T4).
 - **R6 Gemini commits would end uncertain.** Fixture evidence uses stable row IDs; Gemini rows have none (D9).
-- **R7 Setup and target limits.** The broker must be started by hand (D4). Only saved chats with exactly two path segments, such as `https://gemini.google.com/app/<id>`, qualify; new unsaved chats and multi-account paths such as `/u/<n>/app/<id>` do not. Fill and submit need the chat tab to stay active and visible.
+- **R7 Setup and target limits.** The broker must be started by hand (D4). Only saved chats with exactly two path segments, such as `https://gemini.google.com/app/<id>`, qualify; new unsaved chats and multi-account paths such as `/u/<n>/app/<id>` do not. Fill and submit need the chat tab to be the active tab of the current window and visible (D11 relaxes this to visible).
+- **R8 One unconfirmed send blocks all sending for good.** `recordDispatchIntent` refuses every new intent while any journal attempt lacks evidence: across all chats, across broker restarts, and nothing ever resolves such an attempt. Only fixture evidence clears it today, so the first unconfirmed Gemini send would stop all sending. D10 makes the barrier per connection and resolves it from page evidence or one popup click (T3). The development journal currently holds no unresolved attempt.
 
 ### Findings: architecture and maintainability
 
@@ -80,20 +85,28 @@ The trusted popup already offers Gemini pending-request approval, ordinary revie
 - The project has 139 commits in 15 days. Each boundary (ledger, private transport, trusted UI, worker, public tool) was a separate gated checkpoint with a long handoff entry (D7).
 - This file is about 260 KB. Before the review, two documentation lines exceeded the 2,000-character limit of agent file readers, and DEVELOPMENT.md was mostly dated history. The review added this dashboard, split those lines, rewrote DEVELOPMENT.md as a reference and added readability rules to AGENTS.md.
 
-### Pending user decisions
+### Decisions
 
-D1-D9 in DESIGN.md section 17 are all open: D1 per-message consent, D2 connection lifetime, D3 completion signal, D4 broker start, D5 provider-neutral pipeline, D6 debugger permission, D7 checkpoint size, D8 observation window and failure policy, D9 Gemini outcome evidence.
+Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Still open: D6, the debugger permission, decided after the first live test; D10a, whether the system may clear a leftover draft that exactly equals the agent's own not-sent text; D13a, which agent receives a chat when several MCP servers are connected; and which second chat site to support.
 
 ### Next step
 
-G2's watch restart (R2), which needs no policy change. Ask the user for D1-D9 before R1 (D8), the evidence rule (D9) and G5.
+T1 as one checkpoint (D7): the native watch restart (R2) and the D8 observation policy (R1). Then T2. Update README.md when the autonomous mode ships, because it still says outgoing messages need separate approval.
+
+## User Product Decisions (2026-10-09)
+
+- The user defined the target: install the extension, start the MCP server in VS Code, open a Gemini chat in the browser with the extension, approve that chat once, and the agent then chats without further intervention; closing the tab or the browser ends the connection.
+- Answers to the review questions: keep the devcontainer browser (D12); the person starts with **Connect** in the popup and the agent picks the chat up (D13); keep the tab visible for now, but a hidden chat must work later (D11); resolve unconfirmed sends from the page and pause only that chat when still unclear (D10); reloading the same chat keeps the connection, while switching chats or restarting the browser or VS Code ends it (D2); proceed with the technical recommendations D3, D4, D5, D7, D8, D9 and the runaway guard. D6 waits for the first live test.
+- D1 follows from the target: one popup approval grants autonomous reading and sending in that chat. The supervised three-consent flow stays for tests.
+- While applying the answers, the review found R8: the durable dispatch barrier is global and permanent, so the first unconfirmed send would block all later sends. D10 addresses it. A read-only count showed the development journal holds one attempt, with evidence, and nothing unresolved.
+- DESIGN.md now states the target experience and decisions D1-D13, AGENTS.md's safety boundaries describe the decided authority model, and the critical path above is re-planned as T1-T6. Documentation only; no source, service, browser or grant was touched.
 
 ## Staged Gemini One-Offer Dispatch Job (2026-10-09)
 
 - This slice was written in the previous session and left uncommitted; it was reviewed and committed unchanged at the user's request. Internal `requestGeminiDispatch` requires an owned approved Gemini operation, distinct Send authorization and a completed fresh proof. It records the durable intent through `recordGeminiDispatchStart` first, then creates one volatile job whose lease is the minimum of the original deadline, the Send consent and the proof lease.
 - `listGeminiDispatchAttempts` issues the job once and never re-offers it. `completeGeminiDispatch` accepts only the strict `geminiDispatchResultSchema` result for the exact issued target and attempt, and always settles `dispatch_uncertain` because no Gemini evidence rule exists yet (D9). Fixture and Gemini jobs share the existing one-pending-submit cap in both directions. Release, expiry and disconnect settle uncertain. There is no transport, worker or public route.
 - Three existing-file units cover the positive one-offer path (invalid deadlines, foreign owner, wrong target or attempt, an extra delivery claim, replay, receipt privacy), nine loss, expiry, owner, revocation, restart, cursor and refused-result modes, and the shared slot without consuming the waiting provider's consent.
-- Review note: after the offer, freshness still requires an unchanged cursor and a baseline under four seconds old. A real Send changes the page, so its completion would be refused and settle uncertain; the fixture checks freshness only before offering. G3 must relax this together with D9. The outcome is uncertain either way, so the current behavior is conservative, not unsafe.
+- Review note: after the offer, freshness still requires an unchanged cursor and a baseline under four seconds old. A real Send changes the page, so its completion would be refused and settle uncertain; the fixture checks freshness only before offering. T3 must relax this together with D9. The outcome is uncertain either way, so the current behavior is conservative, not unsafe.
 - The focused units passed **3/3** during the review. The exact gate `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e` then passed once: build, both typechecks, **170/170 units** (about 20 seconds) and **20/20 e2e checks** (about 82 seconds). No live chat, personal profile, installed service or browser grant was used.
 
 ## Deep Review and Documentation Restructure (2026-10-09)
