@@ -16,8 +16,9 @@ type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: s
 type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
 type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: number }[] }
   | { ok: false; error: string };
-type ChatAgent = { agentId: string; label: string; connectionCount: number };
-type ChatAgentsResult = { ok: true; agents: ChatAgent[] } | { ok: true; revoked: number; remainingAgents: number }
+type ChatAgent = { agentId: string; label: string; connectionCount: number; autonomous?: true };
+type ChatAgentsResult = { ok: true; agents: ChatAgent[]; countsKnown: boolean } | { ok: true; revoked: number; remainingAgents: number }
+  | { ok: true; agentId: string; expiresAt: null }
   | { ok: false; error: string };
 type ChatTarget = { origin: "http://127.0.0.1:8787"; conversationId: "fixture-alpha"; tabId: number; documentId: string }
   | { origin: "https://gemini.google.com"; conversationId: string; url: string; tabId: number; documentId: string };
@@ -48,8 +49,8 @@ const fixtureResetKey = "fixture-reset-done";
 const fixtureGrantKey = (tabId: number) => `fixture-grant-${tabId}`;
 const geminiGrantKey = (tabId: number) => `gemini-grant-${tabId}`;
 const geminiStatusKey = (tabId: number) => `gemini-grant-status-${tabId}`;
-type StoredFixtureGrant = { documentId: string; expiresAt: number; url?: string; revision?: string };
-type StoredGeminiGrant = { documentId: string; url: string; expiresAt: number; revision?: string };
+type StoredFixtureGrant = { documentId: string; expiresAt: number | null; url?: string; revision?: string };
+type StoredGeminiGrant = { documentId: string; url: string; expiresAt: number | null; revision?: string };
 type GeminiGrantStatus = { code: "target_changed" | "observation_unavailable"; recordedAt: number };
 type GrantCountRequest = { kind: "revoke_fixture"; payload: {
   tabId: number; observed: { documentId: string; conversationId: string } | null
@@ -70,6 +71,10 @@ let geminiReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefine
 type ReadWatchRestart = { timer?: ReturnType<typeof setTimeout>; delayMs: number };
 const fixtureWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
 const geminiWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
+
+function isLiveStoredExpiry(expiresAt: unknown): boolean {
+  return expiresAt === null || (typeof expiresAt === "number" && Number.isSafeInteger(expiresAt) && expiresAt > Date.now());
+}
 
 function mutateStoredGrant(key: string, action: () => Promise<void>): Promise<void> {
   const previous = grantStorageMutations.get(key) ?? Promise.resolve();
@@ -271,8 +276,7 @@ async function publishFixtureSnapshot(tabId: number, documentId: string, challen
     if (expiresAt <= Date.now()) return false;
     const key = fixtureGrantKey(tabId);
     const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
-    if (stored?.documentId !== documentId || typeof stored.expiresAt !== "number"
-      || stored.expiresAt <= Date.now()) return false;
+    if (stored?.documentId !== documentId || !isLiveStoredExpiry(stored.expiresAt)) return false;
     const [captured] = await browser.scripting.executeScript({
       target: { tabId, documentIds: [documentId] }, func: captureFixtureSnapshot
     });
@@ -359,8 +363,7 @@ async function publishGeminiSnapshot(tabId: number, expectedUrl: string,
     const key = geminiGrantKey(tabId);
     const stored = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
     if (stored?.documentId !== documentId || stored.url !== expectedUrl
-      || typeof stored.expiresAt !== "number" || !Number.isSafeInteger(stored.expiresAt)
-      || stored.expiresAt <= Date.now()) return false;
+      || !isLiveStoredExpiry(stored.expiresAt)) return false;
     const [captured] = await browser.scripting.executeScript({
       target: { tabId, documentIds: [documentId] }, func: captureGeminiSnapshot, args: [expectedUrl]
     });
@@ -440,8 +443,7 @@ async function hasTrackedFixtureGrant(): Promise<boolean> {
     if (!/^fixture-grant-[1-9]\d*$/.test(key) || typeof value !== "object" || value === null) return false;
     const grant = value as Partial<StoredFixtureGrant>;
     return typeof grant.documentId === "string" && /^[!-~]{1,128}$/.test(grant.documentId)
-      && typeof grant.expiresAt === "number" && Number.isSafeInteger(grant.expiresAt)
-      && grant.expiresAt > Date.now();
+      && isLiveStoredExpiry(grant.expiresAt);
   });
 }
 
@@ -452,8 +454,7 @@ async function hasTrackedGeminiGrant(): Promise<boolean> {
     const grant = value as Partial<StoredGeminiGrant>;
     return typeof grant.documentId === "string" && /^[!-~]{1,128}$/.test(grant.documentId)
       && typeof grant.url === "string" && isEligibleGeminiUrl(grant.url)
-      && typeof grant.expiresAt === "number" && Number.isSafeInteger(grant.expiresAt)
-      && grant.expiresAt > Date.now();
+      && isLiveStoredExpiry(grant.expiresAt);
   });
 }
 
@@ -471,18 +472,22 @@ function stopGeminiObservation(): void {
   delete scope.geminiMessagesNotifyTimer;
 }
 
-async function releaseDisconnectedGemini(activeTabIds: number[]): Promise<void> {
+async function releaseDisconnectedGrants(provider: "fixture" | "gemini", activeTabIds: number[],
+  baseline: Record<string, unknown>): Promise<void> {
   const active = new Set(activeTabIds);
-  const stored = await browser.storage.session.get(null);
-  for (const [key, value] of Object.entries(stored)) {
-    if (!/^gemini-grant-[1-9]\d*$/.test(key)) continue;
-    const tabId = Number(key.slice("gemini-grant-".length));
+  for (const [key, value] of Object.entries(baseline)) {
+    if (!new RegExp(`^${provider}-grant-[1-9]\\d*$`).test(key)) continue;
+    const tabId = Number(key.slice(`${provider}-grant-`.length));
     if (!Number.isSafeInteger(tabId) || active.has(tabId)) continue;
-    await browser.storage.session.remove(key);
-    const grant = value as StoredGeminiGrant | undefined;
+    const grant = value as StoredFixtureGrant | StoredGeminiGrant | undefined;
     if (typeof grant?.documentId !== "string" || !/^[!-~]{1,128}$/.test(grant.documentId)) continue;
-    void browser.scripting.executeScript({ target: { tabId, documentIds: [grant.documentId] },
-      func: stopGeminiObservation }).catch(() => {});
+    await mutateStoredGrant(key, async () => {
+      const latest = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
+      if (latest?.documentId !== grant.documentId || latest.expiresAt !== grant.expiresAt || latest.revision !== grant.revision) return;
+      await browser.storage.session.remove(key);
+      await browser.scripting.executeScript({ target: { tabId, documentIds: [grant.documentId] },
+        func: provider === "fixture" ? stopFixtureObservation : stopGeminiObservation }).catch(() => {});
+    });
   }
 }
 
@@ -493,8 +498,7 @@ async function markTrackedFixtureGaps(): Promise<boolean> {
     const tabId = Number(key.slice("fixture-grant-".length));
     const grant = value as StoredFixtureGrant | undefined;
     if (!Number.isSafeInteger(tabId) || typeof grant?.documentId !== "string"
-      || !/^[!-~]{1,128}$/.test(grant.documentId) || typeof grant.expiresAt !== "number"
-      || !Number.isSafeInteger(grant.expiresAt) || grant.expiresAt <= Date.now()) continue;
+      || !/^[!-~]{1,128}$/.test(grant.documentId) || !isLiveStoredExpiry(grant.expiresAt)) continue;
     if (!await sendGrantCountRequest({ kind: "mark_fixture_observation_gap", payload: {
       target: { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId,
         documentId: grant.documentId }
@@ -511,29 +515,13 @@ async function markTrackedGeminiGaps(): Promise<boolean> {
     const grant = value as StoredGeminiGrant | undefined;
     if (!Number.isSafeInteger(tabId) || typeof grant?.documentId !== "string"
       || !/^[!-~]{1,128}$/.test(grant.documentId) || typeof grant.url !== "string"
-      || !isEligibleGeminiUrl(grant.url) || typeof grant.expiresAt !== "number"
-      || !Number.isSafeInteger(grant.expiresAt) || grant.expiresAt <= Date.now()) continue;
+      || !isEligibleGeminiUrl(grant.url) || !isLiveStoredExpiry(grant.expiresAt)) continue;
     if (!await sendGrantCountRequest({ kind: "mark_gemini_observation_gap", payload: {
       target: { origin: geminiOrigin, conversationId: new URL(grant.url).pathname.split("/").filter(Boolean)[1]!,
         url: grant.url, tabId, documentId: grant.documentId }
     } })) return false;
   }
   return true;
-}
-
-async function releaseDisconnectedFixtures(activeTabIds: number[]): Promise<void> {
-  const active = new Set(activeTabIds);
-  const stored = await browser.storage.session.get(null);
-  for (const [key, value] of Object.entries(stored)) {
-    if (!/^fixture-grant-[1-9]\d*$/.test(key)) continue;
-    const tabId = Number(key.slice("fixture-grant-".length));
-    if (!Number.isSafeInteger(tabId) || active.has(tabId)) continue;
-    await browser.storage.session.remove(key);
-    const grant = value as StoredFixtureGrant | undefined;
-    if (typeof grant?.documentId !== "string" || !/^[!-~]{1,128}$/.test(grant.documentId)) continue;
-    void browser.scripting.executeScript({ target: { tabId, documentIds: [grant.documentId] },
-      func: stopFixtureObservation }).catch(() => {});
-  }
 }
 
 async function checkTrackedFixturePreflight(check: FixturePreflightChallenge | FixtureDispatchChallenge): Promise<void> {
@@ -976,6 +964,7 @@ function startFixtureReadWatch(): boolean {
     return false;
   }
   fixtureReadWatch = port;
+  let listedGrants: Record<string, unknown> = {};
   let requestId: string | null = null;
   let deadlineMs = 0;
   let responseTimer: ReturnType<typeof setTimeout> | undefined;
@@ -996,6 +985,7 @@ function startFixtureReadWatch(): boolean {
     try {
       if (!await hasTrackedFixtureGrant()) return stop();
       if (fixtureReadWatch !== port) return;
+      listedGrants = await browser.storage.session.get(null);
       requestId = crypto.randomUUID();
       phase = "read";
       deadlineMs = Date.now() + 5_000;
@@ -1039,15 +1029,14 @@ function startFixtureReadWatch(): boolean {
         }
         return;
       }
-      await releaseDisconnectedFixtures(listing.activeTabIds);
+      await releaseDisconnectedGrants("fixture", listing.activeTabIds, listedGrants);
       for (const check of listing.draftFills) await fillTrackedFixtureDraft(check);
       for (const check of listing.preflightChecks) await checkTrackedFixturePreflight(check);
       for (const challenge of listing.challenges) {
         if (challenge.expiresAt <= Date.now()) continue;
         const key = fixtureGrantKey(challenge.tabId);
         const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
-        if (!grant || grant.documentId !== challenge.documentId || typeof grant.expiresAt !== "number"
-          || grant.expiresAt <= Date.now()) continue;
+        if (!grant || grant.documentId !== challenge.documentId || !isLiveStoredExpiry(grant.expiresAt)) continue;
         if (!await queueFixtureSnapshot(challenge.tabId, challenge.documentId, challenge.challengeId)) {
           if (await classifyFixturePublicationFailure(challenge.tabId, challenge.documentId, grant.url) === "target_changed") {
             await revokeTrackedFixture(challenge.tabId);
@@ -1114,6 +1103,7 @@ function startGeminiReadWatch(): boolean {
     return false;
   }
   geminiReadWatch = port;
+  let listedGrants: Record<string, unknown> = {};
   let phase: "read" | "fill" | "proof" = "read";
   let requestId: string | null = null;
   let deadlineMs = 0;
@@ -1134,6 +1124,7 @@ function startGeminiReadWatch(): boolean {
     try {
       if (!await hasTrackedGeminiGrant()) return stop();
       if (geminiReadWatch !== port) return;
+      if (phase === "read") listedGrants = await browser.storage.session.get(null);
       requestId = crypto.randomUUID();
       deadlineMs = Date.now() + 5_000;
       responseTimer = setTimeout(stop, 5_000);
@@ -1175,13 +1166,13 @@ function startGeminiReadWatch(): boolean {
     if (!listing) return;
     geminiWatchRestart.delayMs = 1_000;
     void (async () => {
-      await releaseDisconnectedGemini(listing.activeTabIds);
+      await releaseDisconnectedGrants("gemini", listing.activeTabIds, listedGrants);
       for (const challenge of listing.challenges) {
         if (challenge.expiresAt <= Date.now()) continue;
         const key = geminiGrantKey(challenge.tabId);
         const grant = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
         if (!grant || grant.documentId !== challenge.documentId || grant.url !== challenge.url
-          || typeof grant.expiresAt !== "number" || grant.expiresAt <= Date.now()) continue;
+          || !isLiveStoredExpiry(grant.expiresAt)) continue;
         if (!await queueGeminiSnapshot(challenge.tabId, challenge.url,
           challenge.documentId, challenge.challengeId)) {
           if (await classifyGeminiPublicationFailure(challenge.tabId, challenge.url, challenge.documentId) === "target_changed") {
@@ -1273,8 +1264,10 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
             || !currentTab.active || currentTab.url !== expectedUrl) throw new Error();
           await mutateStoredGrant(fixtureGrantKey(tabId), async () => {
             if (settled || Date.now() >= deadlineMs) throw new Error();
+            const previous = (await browser.storage.session.get(fixtureGrantKey(tabId)))[fixtureGrantKey(tabId)] as StoredFixtureGrant | undefined;
             await browser.storage.session.set({ [fixtureGrantKey(tabId)]: {
-              documentId, expiresAt: payload.expiresAt as number, url: expectedUrl, revision: crypto.randomUUID()
+              documentId, expiresAt: previous?.documentId === documentId && previous.expiresAt === null ? null : payload.expiresAt as number,
+              url: expectedUrl, revision: crypto.randomUUID()
             } satisfies StoredFixtureGrant });
           });
           const [stillCurrent] = await browser.scripting.executeScript({
@@ -1393,8 +1386,11 @@ async function approveGemini(tabId: number, expectedUrl: string, pendingRequestI
             || !currentTab.active || currentTab.url !== expectedUrl) throw new Error();
           await mutateStoredGrant(geminiGrantKey(tabId), async () => {
             if (settled || Date.now() >= deadlineMs) throw new Error();
+            const previous = (await browser.storage.session.get(geminiGrantKey(tabId)))[geminiGrantKey(tabId)] as StoredGeminiGrant | undefined;
             await browser.storage.session.set({ [geminiGrantKey(tabId)]: {
-              documentId, url: expectedUrl, expiresAt: payload.expiresAt as number, revision: crypto.randomUUID()
+              documentId, url: expectedUrl,
+              expiresAt: previous?.documentId === documentId && previous.expiresAt === null ? null : payload.expiresAt as number,
+              revision: crypto.randomUUID()
             } satisfies StoredGeminiGrant });
           });
           await browser.storage.session.remove(geminiStatusKey(tabId));
@@ -1437,9 +1433,14 @@ async function approveGemini(tabId: number, expectedUrl: string, pendingRequestI
   }
 }
 
-async function selectedChatTarget(tabId: number, expectedUrl: string, documentId?: string): Promise<ChatTarget | null> {
+async function selectedChatTab(tabId: number, expectedUrl: string): Promise<boolean> {
+  if (!isEligibleGeminiUrl(expectedUrl) && new URL(expectedUrl).origin !== "http://127.0.0.1:8787") return false;
   const [active] = await browser.tabs.query({ active: true, currentWindow: true });
-  if (active?.id !== tabId || active.url !== expectedUrl) return null;
+  return active?.id === tabId && active.url === expectedUrl;
+}
+
+async function selectedChatTarget(tabId: number, expectedUrl: string, documentId?: string): Promise<ChatTarget | null> {
+  if (!await selectedChatTab(tabId, expectedUrl)) return null;
   const scriptTarget = { tabId, ...(documentId ? { documentIds: [documentId] } : {}) };
   let target: ChatTarget;
   if (isEligibleGeminiUrl(expectedUrl)) {
@@ -1453,81 +1454,119 @@ async function selectedChatTarget(tabId: number, expectedUrl: string, documentId
     target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId: identity.documentId };
   } else return null;
   if (!/^[!-~]{1,128}$/.test(target.documentId) || (documentId && target.documentId !== documentId)) return null;
-  const [current] = await browser.tabs.query({ active: true, currentWindow: true });
-  return current?.id === tabId && current.url === expectedUrl ? target : null;
+  return await selectedChatTab(tabId, expectedUrl) ? target : null;
+}
+
+function sendChatAgentRequest(kind: "list_chat_agents" | "list_available_agents" | "remove_chat_agent"
+  | "approve_chat_agent" | "disconnect_chat", payload: object, deadlineMs: number): Promise<{ kind: string; payload: Record<string, unknown> }> {
+  return new Promise((resolve, reject) => {
+    if (deadlineMs <= Date.now()) { reject(new Error("Agent request expired")); return; }
+    const requestId = crypto.randomUUID();
+    const port = browser.runtime.connectNative(nativeHostName);
+    let settled = false;
+    const finish = (reply?: { kind: string; payload: Record<string, unknown> }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      port.disconnect();
+      if (reply) resolve(reply);
+      else reject(new Error("Agent request unavailable or invalid"));
+    };
+    const timer = setTimeout(() => finish(), deadlineMs - Date.now());
+    port.onDisconnect.addListener(() => { void browser.runtime.lastError; finish(); });
+    port.onMessage.addListener((value: unknown) => {
+      if (settled || Date.now() >= deadlineMs || typeof value !== "object" || value === null || Array.isArray(value)) return finish();
+      const reply = value as Record<string, unknown>;
+      if (Object.keys(reply).length !== 6 || reply.protocolVersion !== protocolVersion || reply.requestId !== requestId
+        || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
+        || typeof reply.kind !== "string" || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) return finish();
+      finish({ kind: reply.kind, payload: reply.payload as Record<string, unknown> });
+    });
+    try { port.postMessage({ kind, protocolVersion, requestId, connectionGeneration: 0, deadlineMs, payload }); }
+    catch { finish(); }
+  });
+}
+
+async function observeApprovedChatTarget(target: ChatTarget): Promise<void> {
+  const scriptTarget = { tabId: target.tabId, documentIds: [target.documentId] };
+  const [identity] = target.origin === geminiOrigin
+    ? await browser.scripting.executeScript({ target: scriptTarget, func: observeGeminiIdentity, args: [target.url] })
+    : await browser.scripting.executeScript({ target: scriptTarget, func: observeFixtureIdentity });
+  if (identity?.frameId !== 0 || identity.documentId !== target.documentId || identity.result !== true) throw new Error();
+  const [messages] = target.origin === geminiOrigin
+    ? await browser.scripting.executeScript({ target: scriptTarget, func: observeGeminiMessages, args: [target.url] })
+    : await browser.scripting.executeScript({ target: scriptTarget, func: observeFixtureMessages });
+  if (messages?.frameId !== 0 || messages.documentId !== target.documentId || messages.result !== true) throw new Error();
+  if (!(target.origin === geminiOrigin ? startGeminiReadWatch() : startFixtureReadWatch())) throw new Error();
 }
 
 async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agentId?: string,
-  disconnectAll = false): Promise<ChatAgentsResult> {
+  action: "list" | "remove" | "disconnect" | "approve" = "list"): Promise<ChatAgentsResult> {
+  let attemptedApproval: ChatTarget | null = null;
   try {
     if (!await ensureFixtureReset()) return { ok: false, error: "Chat reset unavailable" };
-    const target = await selectedChatTarget(tabId, expectedUrl);
-    if (!target) return { ok: false, error: "Selected chat unavailable or changed" };
-    const grantKey = target.origin === geminiOrigin ? geminiGrantKey(tabId) : fixtureGrantKey(tabId);
-    const stored = (await browser.storage.session.get(grantKey))[grantKey] as StoredFixtureGrant | StoredGeminiGrant | undefined;
-    const verified = await selectedChatTarget(tabId, expectedUrl, target.documentId);
-    if (!verified || verified.conversationId !== target.conversationId) return { ok: false, error: "Selected chat changed" };
-    return await new Promise<ChatAgentsResult>((resolve) => {
-      const requestId = crypto.randomUUID();
-      const deadlineMs = Date.now() + 10_000;
-      const port = browser.runtime.connectNative(nativeHostName);
-      let settled = false;
-      const finish = (result: ChatAgentsResult) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(result);
-        port.disconnect();
-      };
-      const timer = setTimeout(() => finish({ ok: false, error: "Agent management timed out" }), 10_000);
-      port.onDisconnect.addListener(() => {
-        void browser.runtime.lastError;
-        finish({ ok: false, error: "Agent management unavailable" });
+    if (!await selectedChatTab(tabId, expectedUrl)) return { ok: false, error: "Selected chat changed" };
+    const target = await selectedChatTarget(tabId, expectedUrl).catch(() => null);
+    if (!target && action !== "list") return { ok: false, error: "Selected chat unavailable or changed" };
+    const grantKey = target ? target.origin === geminiOrigin ? geminiGrantKey(tabId) : fixtureGrantKey(tabId) : undefined;
+    const stored = grantKey ? (await browser.storage.session.get(grantKey))[grantKey] as StoredFixtureGrant | StoredGeminiGrant | undefined : undefined;
+    const verified = target ? await selectedChatTarget(tabId, expectedUrl, target.documentId) : null;
+    if (target && (!verified || verified.conversationId !== target.conversationId)) return { ok: false, error: "Selected chat changed" };
+    const deadlineMs = Date.now() + 10_000;
+    const kind = action === "approve" ? "approve_chat_agent" : action === "disconnect" ? "disconnect_chat"
+      : action === "remove" ? "remove_chat_agent" : target ? "list_chat_agents" : "list_available_agents";
+    if (action === "approve") attemptedApproval = target;
+    const reply = await sendChatAgentRequest(kind, target ? { target, ...(agentId ? { agentId } : {}) } : {}, deadlineMs);
+    const payload = reply.payload;
+    const current = target ? await selectedChatTarget(tabId, expectedUrl, target.documentId) : null;
+    if (Date.now() >= deadlineMs || (target ? !current || current.conversationId !== target.conversationId
+      : !await selectedChatTab(tabId, expectedUrl))) throw new Error();
+    if (action === "list") {
+      const agents = payload.agents;
+      if (reply.kind !== "chat_agents" || Object.keys(payload).length !== 1 || !Array.isArray(agents) || agents.length > 16
+        || !agents.every((item: unknown) => {
+          if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
+          const agent = item as Record<string, unknown>;
+          return Object.keys(agent).length === (agent.autonomous === true ? 4 : 3)
+            && (!Object.hasOwn(agent, "autonomous") || agent.autonomous === true)
+            && typeof agent.agentId === "string" && /^[0-9a-f-]{36}$/.test(agent.agentId)
+            && typeof agent.label === "string" && /^[ -~]{1,80}$/.test(agent.label) && agent.label.trim() === agent.label
+            && typeof agent.connectionCount === "number" && Number.isSafeInteger(agent.connectionCount) && agent.connectionCount >= 0;
+        }) || new Set(agents.map(item => item.agentId)).size !== agents.length) throw new Error();
+      return { ok: true, agents: agents as ChatAgent[], countsKnown: target !== null };
+    }
+    if (action === "approve") {
+      if (!target || !grantKey || !agentId || reply.kind !== "chat_agent_approved" || Object.keys(payload).length !== 2
+        || payload.agentId !== agentId || payload.expiresAt !== null) throw new Error();
+      await mutateStoredGrant(grantKey, async () => {
+        if (Date.now() >= deadlineMs) throw new Error();
+        await browser.storage.session.set({ [grantKey]: { documentId: target.documentId, url: expectedUrl,
+          expiresAt: null, revision: crypto.randomUUID() } satisfies StoredGeminiGrant });
       });
-      port.onMessage.addListener((value: unknown) => {
-        void (async () => {
-          if (settled || Date.now() >= deadlineMs || typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
-          const reply = value as Record<string, unknown>;
-          if (Object.keys(reply).length !== 6 || reply.protocolVersion !== protocolVersion || reply.requestId !== requestId
-            || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
-            || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) throw new Error();
-          const payload = reply.payload as Record<string, unknown>;
-          const current = await selectedChatTarget(tabId, expectedUrl, target.documentId);
-          if (settled || Date.now() >= deadlineMs || !current || current.conversationId !== target.conversationId) throw new Error();
-          if (agentId === undefined && !disconnectAll) {
-            const agents = payload.agents;
-            if (reply.kind !== "chat_agents" || Object.keys(payload).length !== 1 || !Array.isArray(agents) || agents.length > 16
-              || !agents.every((item: unknown) => {
-                if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
-                const agent = item as Record<string, unknown>;
-                return Object.keys(agent).length === 3 && typeof agent.agentId === "string" && /^[0-9a-f-]{36}$/.test(agent.agentId)
-                  && typeof agent.label === "string" && /^[ -~]{1,80}$/.test(agent.label) && agent.label.trim() === agent.label
-                  && typeof agent.connectionCount === "number" && Number.isSafeInteger(agent.connectionCount) && agent.connectionCount >= 0;
-              }) || new Set(agents.map(item => item.agentId)).size !== agents.length) throw new Error();
-            finish({ ok: true, agents: agents as ChatAgent[] });
-          } else {
-            if (reply.kind !== "chat_agent_removed" || Object.keys(payload).length !== 2
-              || typeof payload.revoked !== "number" || !Number.isSafeInteger(payload.revoked) || payload.revoked < 0
-              || typeof payload.remainingAgents !== "number" || !Number.isSafeInteger(payload.remainingAgents)
-              || payload.remainingAgents < 0 || payload.remainingAgents > 16) throw new Error();
-            if (payload.remainingAgents === 0 && stored) {
-              await mutateStoredGrant(grantKey, async () => {
-                const latest = (await browser.storage.session.get(grantKey))[grantKey] as StoredFixtureGrant | StoredGeminiGrant | undefined;
-                if (settled || Date.now() >= deadlineMs) throw new Error();
-                if (latest?.documentId === stored.documentId && latest.expiresAt === stored.expiresAt && latest.revision === stored.revision) {
-                  await browser.storage.session.remove(grantKey);
-                }
-              });
-            }
-            finish({ ok: true, revoked: payload.revoked, remainingAgents: payload.remainingAgents });
-          }
-        })().catch(() => finish({ ok: false, error: "Agent management invalid or selected chat changed" }));
+      await observeApprovedChatTarget(target);
+      const stable = await selectedChatTarget(tabId, expectedUrl, target.documentId);
+      if (Date.now() >= deadlineMs || !stable || stable.conversationId !== target.conversationId) throw new Error();
+      return { ok: true, agentId, expiresAt: null };
+    }
+    if (reply.kind !== "chat_agent_removed" || Object.keys(payload).length !== 2
+      || typeof payload.revoked !== "number" || !Number.isSafeInteger(payload.revoked) || payload.revoked < 0
+      || typeof payload.remainingAgents !== "number" || !Number.isSafeInteger(payload.remainingAgents)
+      || payload.remainingAgents < 0 || payload.remainingAgents > 16) throw new Error();
+    if (payload.remainingAgents === 0 && stored && grantKey) {
+      await mutateStoredGrant(grantKey, async () => {
+        const latest = (await browser.storage.session.get(grantKey))[grantKey] as StoredFixtureGrant | StoredGeminiGrant | undefined;
+        if (Date.now() >= deadlineMs) throw new Error();
+        if (latest?.documentId === stored.documentId && latest.expiresAt === stored.expiresAt && latest.revision === stored.revision) {
+          await browser.storage.session.remove(grantKey);
+        }
       });
-      port.postMessage({ kind: disconnectAll ? "disconnect_chat" : agentId === undefined ? "list_chat_agents" : "remove_chat_agent", protocolVersion,
-        requestId, connectionGeneration: 0, deadlineMs, payload: { target, ...(agentId ? { agentId } : {}) } });
-    });
+    }
+    return { ok: true, revoked: payload.revoked, remainingAgents: payload.remainingAgents };
   } catch {
-    return { ok: false, error: "Agent management unavailable" };
+    if (attemptedApproval && agentId) {
+      await sendChatAgentRequest("remove_chat_agent", { target: attemptedApproval, agentId }, Date.now() + 5000).catch(() => {});
+    }
+    return { ok: false, error: "Agent management invalid, unavailable or selected chat changed" };
   }
 }
 
@@ -2059,7 +2098,7 @@ export default defineBackground(() => {
       return browser.storage.session.get(geminiGrantKey(tabId)).then(async (stored) => {
         const grant = stored[geminiGrantKey(tabId)] as StoredGeminiGrant | undefined;
         if (!grant || grant.documentId !== documentId || !isEligibleGeminiUrl(grant.url)
-          || typeof grant.expiresAt !== "number" || grant.expiresAt <= Date.now()) return;
+          || !isLiveStoredExpiry(grant.expiresAt)) return;
         if (!await queueGeminiSnapshot(tabId, grant.url, documentId)) {
           if (await classifyGeminiPublicationFailure(tabId, grant.url, documentId) === "target_changed") {
             await revokeTrackedFixture(tabId, "target_changed");
@@ -2086,8 +2125,7 @@ export default defineBackground(() => {
       const documentId = sender.documentId;
       return browser.storage.session.get(fixtureGrantKey(tabId)).then(async (stored) => {
         const grant = stored[fixtureGrantKey(tabId)] as StoredFixtureGrant | undefined;
-        if (!grant || grant.documentId !== documentId || typeof grant.expiresAt !== "number"
-          || grant.expiresAt <= Date.now()) return;
+        if (!grant || grant.documentId !== documentId || !isLiveStoredExpiry(grant.expiresAt)) return;
         if (!await queueFixtureSnapshot(tabId, documentId)
           && await classifyFixturePublicationFailure(tabId, documentId, grant.url) === "target_changed") {
           await revokeTrackedFixture(tabId);
@@ -2109,13 +2147,17 @@ export default defineBackground(() => {
       || typeof message !== "object" || message === null || Array.isArray(message)) return;
 
     const request = message as Record<string, unknown>;
-    if ((request.kind === "list_chat_agents" || request.kind === "remove_chat_agent" || request.kind === "disconnect_chat")
-      && Object.keys(request).length === (request.kind === "remove_chat_agent" ? 4 : 3)
+    if ((request.kind === "list_chat_agents" || request.kind === "remove_chat_agent" || request.kind === "disconnect_chat"
+      || request.kind === "approve_chat_agent")
+      && Object.keys(request).length === (["remove_chat_agent", "approve_chat_agent"].includes(request.kind as string) ? 4 : 3)
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
       && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512
-      && (request.kind !== "remove_chat_agent" || (typeof request.agentId === "string" && /^[0-9a-f-]{36}$/.test(request.agentId)))) {
+      && (!["remove_chat_agent", "approve_chat_agent"].includes(request.kind as string)
+        || (typeof request.agentId === "string" && /^[0-9a-f-]{36}$/.test(request.agentId)))) {
       return manageSelectedChatAgents(request.tabId, request.expectedUrl,
-        request.kind === "remove_chat_agent" ? request.agentId as string : undefined, request.kind === "disconnect_chat");
+        typeof request.agentId === "string" ? request.agentId : undefined,
+        request.kind === "approve_chat_agent" ? "approve" : request.kind === "disconnect_chat" ? "disconnect"
+          : request.kind === "remove_chat_agent" ? "remove" : "list");
     }
     if (request.kind === "list_fixture_pending" && Object.keys(request).length === 2
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {

@@ -17,8 +17,9 @@ type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: s
 type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
 type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: number }[] }
   | { ok: false; error: string };
-type ChatAgent = { agentId: string; label: string; connectionCount: number };
-type ChatAgentsResult = { ok: true; agents: ChatAgent[] } | { ok: false; error: string };
+type ChatAgent = { agentId: string; label: string; connectionCount: number; autonomous?: true };
+type ChatAgentsResult = { ok: true; agents: ChatAgent[]; countsKnown: boolean } | { ok: false; error: string };
+type ChatAgentApprovalResult = { ok: true; agentId: string; expiresAt: null } | { ok: false; error: string };
 type ChatAgentRemovalResult = { ok: true; revoked: number; remainingAgents: number } | { ok: false; error: string };
 type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
@@ -146,7 +147,8 @@ async function refreshChatAgents(): Promise<void> {
       return;
     }
     const connected = response.agents.filter(agent => agent.connectionCount > 0).length;
-    agentCount.textContent = `${connected} connected / ${response.agents.length} available`;
+    agentCount.textContent = response.countsKnown ? `${connected} connected / ${response.agents.length} available`
+      : `${response.agents.length} agents available; chat status unavailable`;
     disconnectChatButton.disabled = connected === 0;
     for (const agent of response.agents) {
       const row = document.createElement("li");
@@ -158,8 +160,31 @@ async function refreshChatAgents(): Promise<void> {
       identity.className = "agent-instance";
       identity.textContent = agent.agentId;
       const state = document.createElement("p");
-      state.textContent = agent.connectionCount ? "Connected" : "Not connected";
+      state.textContent = agent.autonomous ? "Autonomous access" : agent.connectionCount ? "Supervised connection" : "Not connected";
       row.append(label, identity, state);
+      if (!agent.autonomous) {
+        const connect = document.createElement("button");
+        connect.type = "button";
+        connect.className = "agent-connect";
+        connect.textContent = "Connect this chat";
+        connect.addEventListener("click", async () => {
+          connect.disabled = true;
+          try {
+            const allowed = await browser.permissions.request({ origins: [`${new URL(selected.url).origin}/*`] });
+            if (!allowed) { status.textContent = "Site access denied; no connection created."; return; }
+            const approval = await browser.runtime.sendMessage({ kind: "approve_chat_agent", tabId: selected.id,
+              expectedUrl: selected.url, agentId: agent.agentId }) as ChatAgentApprovalResult;
+            status.textContent = approval?.ok ? "Agent connected. Autonomous sending is not yet available."
+              : approval?.error ?? "Connection unavailable; refresh status.";
+          } catch {
+            status.textContent = "Connection unavailable; refresh status.";
+          } finally {
+            connect.disabled = false;
+            await refreshChatAgents();
+          }
+        });
+        row.append(connect);
+      }
       if (agent.connectionCount > 0) {
         const remove = document.createElement("button");
         remove.type = "button";

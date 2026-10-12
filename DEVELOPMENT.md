@@ -10,7 +10,7 @@ Dated test reports that used to fill this file were removed in the 2026-10-09 re
 
 > **Experimental.** The local fixture supports reads, events and supervised fill and send. A selected saved Gemini chat supports reads and events; Gemini writing is private, incomplete and refused by the public tools. Never connect personal conversations.
 
-The decided target is different: one **Connect this chat** approval per agent in the popup, after which each approved agent chats on its own until its connection ends. Several agents may share a chat (DESIGN.md sections 2 and 17). The trusted roster and removal controls are synthetic-tested; popup-first autonomous admission/pickup and no-expiry lifetime are not implemented yet. This file describes the tools as they work today.
+The decided target is one **Connect this chat** approval per agent, after which each approved agent chats on its own until its connection ends. Several agents may share a chat (DESIGN.md sections 2 and 17). Popup-first admission, owned pickup and no-expiry grants support reads/events and are synthetic-tested. Autonomous sending and same-chat reload preservation are not implemented. This file describes today's tools, not the completed target.
 
 ## Architecture in Brief
 
@@ -86,7 +86,15 @@ Toolbar clicks, extension reloads and profile unlocks are human steps. Ask for t
 
 ## Agent Workflow
 
-### Connect and read
+### Popup-first connection
+
+1. Start the MCP facade. Its authenticated instance appears by label/UUID in the trusted popup; it does not need to create a pending request.
+2. Human: select an eligible chat, open the toolbar popup and choose **Connect this chat** on the intended agent's row. The click requests optional site access for that origin, then approves only that agent for the exact chat. Denial creates no connection. Each other or later agent needs a separate approval; removal/restart never silently restores access.
+3. `chat_wait_for_connection { timeoutMs? }` waits at most 20 seconds and returns `{ connections, timedOut }`. Zero is an immediate query; default is 20 seconds. Each returned connection has `requestId`, `connectionId`, `state: "ready"`, `generation: 1`, `origin`, `conversationId`, `capabilities: ["read", "send"]` and `expiresAt: null`. The caller sees only its own grants; the call never grants access.
+4. Use `chat_read_messages` and `chat_wait_for_events` as described below. `chat_get_connection { requestId }` also reports the current observation metadata. The send capability records the approved authority; no autonomous sending tool is available yet.
+5. `chat_disconnect` ends that owned grant. Human **Remove access** affects only that agent on this chat; **Disconnect all** affects all matching owners. Tab/chat/browser/owner termination ends access. Same-chat reload currently also ends access; preservation is still pending. Cancelling pickup closes the facade socket and ends all grants belonging to that owner.
+
+### Legacy connection and shared read tools
 
 1. `chat_request_connection` returns `{ requestId, state: "pending", expiresAt }`. The request expires after 60 seconds.
 2. Human: select the chat tab, click the extension's toolbar icon, choose **View pending requests**, then **Approve read-only fixture** or **Approve read-only Gemini chat** for that request.
@@ -100,6 +108,8 @@ For Gemini, treat events as change hints. A streaming reply produces many snapsh
 A missing or ambiguous message element skips publication when URL, document and conversation are unchanged. A challenged read then returns `OBSERVATION_UNAVAILABLE` after its original four-second budget; a later read can recover without reapproval. Identity changes still revoke the grant. No snapshot omission or truncation proves a complete history.
 
 ### Supervised send (fixture only)
+
+These controls still require the legacy finite read-only grant. Popup-first autonomous grants currently support reads/events, not the supervised or autonomous send pipeline.
 
 1. `chat_prepare_message { connectionId, expectedGeneration: 1, text, idempotencyKey }` with a new UUID key returns `operationId`, `awaiting_approval`, `expiresAt` (three minutes), the exact `preview` and a private `recoveryToken`.
 2. Human: **Review fixture drafts**, then **Approve draft (no send)**.
@@ -118,6 +128,7 @@ Each human approval lasts at most two minutes and ends with the preparation or c
 | `browser_chat_feasibility` | none | Fixed diagnostic text | Touches no browser |
 | `chat_request_connection` | none | `requestId`, `pending`, `expiresAt` | No tab is read before approval |
 | `chat_get_connection` | `requestId` | Connection state | Owner only; others see `unknown` |
+| `chat_wait_for_connection` | Optional `timeoutMs` 0-20000, default 20000 | Owned `connections`, `timedOut` | Popup-first grants only; no approval creation; cancellation ends owner grants |
 | `chat_read_messages` | `connectionId`, `limit` 1-32 | Fresh snapshot and cursor | Exact-document challenge, four seconds |
 | `chat_wait_for_events` | `connectionId`, `cursor`, `timeoutMs` 0-20000, `limit` 1-2 | `events`, `cursor`, `timedOut` | `CURSOR_EXPIRED` needs a new read; cancellation returns `CANCELLED` |
 | `chat_prepare_message` | `connectionId`, `expectedGeneration: 1`, `text`, `idempotencyKey` | Operation, exact preview, `recoveryToken` | Fixture only; the same key and text replay, changed text conflicts |
@@ -138,6 +149,7 @@ The toolbar popup is the only approval surface; page scripts and MCP calls canno
 
 - **Inspect this chat**: a read-only diagnostic. On the fixture it lists rows and checks the native bridge. On Gemini it shows only structure metadata (regions, editors, row lengths, **Send controls**, **Prompt state** and **Nearby prompt controls**), never chat text.
 - **View pending requests**, then **Approve read-only fixture** or **Approve read-only Gemini chat**.
+- Agent roster: **Connect this chat** per agent, **Remove access**, **Disconnect all** and **Refresh agents**. The consent text discloses read/send authority and influence from chat content, and states that autonomous sending is not yet available.
 - **Review fixture drafts** or **Review Gemini drafts**, then **Approve draft (no send)**.
 - **Review fixture draft fill** or **Review Gemini fill consent**, then **Allow draft fill (no send)**.
 - **Review fixture sending** or **Review Gemini send consent**, then **Approve fixture send** or **Approve Gemini send**.
@@ -154,11 +166,11 @@ Review lists show at most eight exact previews and clear when the tab, document,
 
 ## Agent Roster
 
-The selected eligible chat's popup lists all currently authenticated MCP facade instances and how many have live grants for that exact chat. Each row has a broker-minted instance UUID and a display label, plus **Remove access** when connected. **Disconnect all** removes all owners from that exact target; it does not close the tab or affect another chat. Refresh rereads the roster. Existing host permission is required for the worker's fixed identity check.
+The selected eligible chat's popup lists authenticated MCP facade instances, their labels/UUIDs, live exact-chat counts and supervised/autonomous status. Each row without autonomous access offers **Connect this chat**, including a legacy connected row; connected rows offer **Remove access**. **Disconnect all** removes all owners from that exact target, not another chat or the tab. Refresh rereads the roster. Before script permission, metadata-only listing shows available owners and unknown chat status; it cannot prove a zero connected count. Approval requests optional origin access directly from the trusted click, then verifies the exact document.
 
 The label defaults to the MCP client's reported name (sanitized/truncated to at most 80 printable ASCII characters), or `MCP agent`. Set `BROWSER_CHAT_AGENT_LABEL` in the MCP process environment to a nonempty, unpadded printable ASCII label of at most 80 characters. Invalid overrides are rejected. Labels are not verified model identities; two threads sharing one facade appear as one instance. Duplicate labels are distinguished by instance UUID. Restarting a facade creates a new instance, without inherited grants.
 
-Removal revokes matching grants and cancels pending reads. It does not undo an already activated send or restore consumed authority. A removed instance remains available but needs a fresh request and trusted approval; it is not silently readmitted. Current grants remain `ready_readonly` with five-minute expiry and per-message supervised write consent.
+Removal revokes matching grants and cancels pending reads. It does not undo an activated send or restore consumed authority. A removed instance remains available but needs a fresh trusted approval, without a pending request for popup-first access. Autonomous grants are `ready` with no expiry; legacy grants remain `ready_readonly` with five-minute expiry and per-message supervised write consent. Failed or uncertain admission setup makes one exact-agent/target removal attempt, never an approval retry or whole-chat compensation. If the native bridge is unavailable, this attempt cannot establish that revocation succeeded.
 
 ## Limits and Timers
 
@@ -166,6 +178,8 @@ Removal revokes matching grants and cancels pending reads. It does not undo an a
 | --- | --- | --- |
 | Pending connection request | 60 s; at most 100 pending | `pending-connections.ts` |
 | Read-only grant | 5 min without renewal; `generation` always 1 | `pending-connections.ts` |
+| Autonomous grant | No expiry; at most 100 records including revoked tombstones retained 60 s | `pending-connections.ts` |
+| Connection pickup | 20 s maximum; one pending wait per owner; only pickup uses 20 s plus 250 ms response headroom | `pending-connections.ts`, `broker-client.ts`, `broker-ipc.ts` |
 | Fresh read challenge | 4 s | `pending-connections.ts` |
 | Native watch recovery | One pending restart per provider; 1 s doubling to 10 s, reset on valid reply; requires a tracked unexpired grant | `background.ts` |
 | Snapshot | Newest 32 visible rows; 16,000 UTF-16 units per message with `truncated: true`; 96 KiB capture JSON; `omittedBefore` for dropped rows; unchanged-target failures skip publication | `gemini-observation.ts`, `fixture-observation.ts`, `pending-connections.ts` |
@@ -175,7 +189,7 @@ Removal revokes matching grants and cancels pending reads. It does not undo an a
 | Preparation | 3 min; 100 active and 10,000 recorded; keys kept one day after expiry; unresolved intents never pruned | `message-operations.ts` |
 | Consents | At most 2 min each, clipped; review lists show 8 | `message-operations.ts` |
 | Browser leases | Fill, proof and submit 4 s; one pending fill shared by providers; one pending submit; 16 proofs or preflights | `message-operations.ts` |
-| Facade requests | 5 s budget; keepalive every 60 s when idle; the broker drops idle sockets after 150 s | `broker-client.ts`, `broker-ipc.ts` |
+| Facade requests | 5 s except connection pickup; keepalive every 60 s when idle; idle sockets drop after 150 s | `broker-client.ts`, `broker-ipc.ts` |
 | Broker capacity | 16 sockets; 16 queued requests per socket | `broker-ipc.ts`, `broker-roles.ts` |
 | Agent registry | At most 16 authenticated facade instances, within the shared socket cap; labels 1-80 printable ASCII characters | `pending-connections.ts`, `broker-roles.ts` |
 | Native frames | 256 KiB; relay queue 16 | `native-framing.ts`, `native-relay.ts` |
@@ -186,6 +200,7 @@ Removal revokes matching grants and cancels pending reads. It does not undo an a
 - Broker sockets and Native Messaging use the same framing: UTF-8 JSON with a native-endian 32-bit length prefix, at most 256 KiB, in the envelope `{ kind, protocolVersion: 1, requestId, connectionGeneration: 0, deadlineMs, payload }`. Every schema is strict. Deadlines are absolute and only ever clipped, never extended.
 - Each broker socket authenticates once as `facade` (the MCP owner of grants and operations) or `relay` (the native host). Facade-only requests query state and start reads, preparation, fills, proofs and commits. Relay-only requests list and approve pending requests and reviews, list and complete browser challenges and jobs, publish snapshots, mark gaps and revoke grants. Facades cannot approve or complete browser work, and relays cannot read, prepare, fill or commit for an owner.
 - A facade hello may carry an optional `agentLabel` in its strict payload; relay hellos may not. The broker, never the client, creates `agentId`. Provider-neutral relay-only `list_chat_agents { target }` returns `chat_agents { agents: [{ agentId, label, connectionCount }] }`; IDs/labels are owner descriptors, not connection handles. `remove_chat_agent { target, agentId }` and `disconnect_chat { target }` return `chat_agent_removed { revoked, remainingAgents }`. Targets use the existing strict fixture/Gemini schema, with exact document and Gemini URL; the trusted worker pins the selected tab/document before and after each request. Removal replies describe the state at broker execution, not a promise that no later human approval occurred.
+- Relay-only `list_available_agents {}` uses the same descriptor reply without target access; its zero counts are placeholders, not a verified chat roster. A target-specific row includes optional `autonomous: true` only when that owner has a matching autonomous grant. Relay-only `approve_chat_agent { target, agentId }` returns `chat_agent_approved { agentId, expiresAt: null }`, never connection handles. Facade-only `wait_for_connection { timeoutMs }` returns `connection_pickup { connections, timedOut }` for that owner. Ready connection states include observation metadata. Strict bounds, original deadlines and role checks apply through every transport.
 - Write jobs (Gemini fill, Gemini proof and every submit job) are offered once and never re-offered. Read challenges and fixture fill and proof checks are listed until answered or expired; one-shot attempt IDs in the page stop a second fixture fill. Lost or late results become uncertainty, never retries.
 - A command spans `broker-requests.ts` (schema and role check), `broker-ipc.ts` (asynchronous orchestration), `broker-client.ts` (client method and reply schema), `native-protocol.ts` (relay parser), `native-relay.ts` (forwarding) and `entrypoints/background.ts` (hand-written extension validation). Change them together, and read DESIGN.md sections 8 and 17 before adding a command family.
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FIXTURE_READ_TIMEOUT_MS, GEMINI_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_GEMINI_SNAPSHOT_AGE_MS,
-  MAX_CONNECTED_AGENTS, MAX_PENDING_REQUESTS, PendingConnectionRequests,
+  MAX_AUTONOMOUS_CONNECTIONS, MAX_CONNECTION_WAIT_MS, MAX_CONNECTED_AGENTS, MAX_PENDING_REQUESTS, PendingConnectionRequests,
   PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS, type ApprovedTarget }
   from "./pending-connections.js";
 
@@ -64,6 +64,120 @@ for (const target of [
     requests.disconnect(first);
   });
 }
+
+for (const target of [
+  { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
+  { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
+    documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" }
+] as const) {
+  test(`${target.origin} autonomous grants remain owner-bound without expiry and keep finite read leases`, async () => {
+    const requests = new PendingConnectionRequests();
+    const first = Symbol("first owner");
+    const second = Symbol("second owner");
+    const firstAgent = requests.registerAgent(first);
+    const secondAgent = requests.registerAgent(second);
+    const now = 1000;
+    assert.equal(requests.approveAgent("unknown", target, now), null);
+    assert.equal(requests.approveAgent(firstAgent.agentId, { ...target, tabId: 0 }, now), null);
+    assert.equal(requests.approveAgent(firstAgent.agentId, { ...target, documentId: "" }, now), null);
+    assert.equal(requests.approveAgent(firstAgent.agentId, target, NaN), null);
+    const granted = requests.approveAgent(firstAgent.agentId, target, now);
+    const other = requests.approveAgent(secondAgent.agentId, target, now);
+    assert.ok(granted && other);
+    assert.equal(granted.expiresAt, null);
+    assert.equal(granted.state, "ready");
+    assert.deepEqual(granted.capabilities, ["read", "send"]);
+    assert.ok(Object.isFrozen(granted) && Object.isFrozen(granted.capabilities));
+    assert.notEqual(granted.connectionId, other.connectionId);
+    assert.equal(requests.get(second, granted.requestId, now), null);
+    assert.equal(requests.getConnectionExpiresAt(second, granted.connectionId, now), null);
+    const later = now + 10 * 365 * 24 * 60 * 60_000;
+    requests.create(second, later);
+    assert.equal(requests.get(first, granted.requestId, later)?.state, "ready");
+    assert.equal(requests.approveAgent(firstAgent.agentId, target, later), granted);
+    assert.equal(requests.getConnectionExpiresAt(first, granted.connectionId, later), Infinity);
+    const published = target.origin === "https://gemini.google.com"
+      ? requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic reply" }], later)
+      : requests.publishFixtureSnapshot(target, [{ id: "synthetic-row", direction: "incoming", text: "Synthetic reply" }], later);
+    assert.equal(published, 2);
+    assert.equal(requests.get(first, granted.requestId, later)?.state, "ready");
+    const challenged = target.origin === "https://gemini.google.com"
+      ? requests.requestFreshGeminiRead(first, granted.connectionId, later, later + 50)
+      : requests.requestFreshFixtureRead(first, granted.connectionId, later, later + 50);
+    assert.ok(challenged && challenged !== "busy");
+    const challenges = target.origin === "https://gemini.google.com"
+      ? requests.listGeminiReadChallenges(later) : requests.listFixtureReadChallenges(later);
+    assert.equal(challenges[0]?.expiresAt, later + 50);
+    assert.equal(requests.removeChatAgent(firstAgent.agentId, target, later), 1);
+    assert.equal(await challenged.result, null);
+    assert.equal(requests.get(first, granted.requestId, later)?.state, "stale");
+    assert.equal(requests.get(second, other.requestId, later)?.state, "ready");
+    const again = requests.approveAgent(firstAgent.agentId, target, later);
+    assert.ok(again);
+    assert.notEqual(again.connectionId, granted.connectionId);
+    requests.create(first, later + PENDING_REQUEST_TTL_MS);
+    assert.equal(requests.get(first, granted.requestId, later + PENDING_REQUEST_TTL_MS), null);
+    assert.equal(requests.get(first, again.requestId, later + PENDING_REQUEST_TTL_MS)?.state, "ready");
+    assert.equal(requests.disconnectFixture(second, again.connectionId, later), false);
+    requests.disconnect(first);
+    assert.equal(requests.approveAgent(firstAgent.agentId, target, later), null);
+    assert.equal(requests.get(second, other.requestId, later)?.state, "ready");
+    requests.disconnect(second);
+  });
+}
+
+test("connection pickup waits for only its approved registered owner and cancels without authority", async () => {
+  const requests = new PendingConnectionRequests();
+  const first = Symbol("first owner");
+  const second = Symbol("second owner");
+  const agent = requests.registerAgent(first);
+  requests.registerAgent(second);
+  const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+    tabId: 1, documentId: "synthetic-document" } as const;
+  assert.equal(requests.waitForConnection(Symbol("unregistered"), 1000, 1001), null);
+  for (const deadline of [999, NaN, Infinity, 1000 + MAX_CONNECTION_WAIT_MS + 1]) {
+    assert.equal(requests.waitForConnection(first, 1000, deadline), null);
+  }
+  assert.deepEqual(await requests.waitForConnection(first, 1000, 1000), { connections: [], timedOut: true });
+  const waiting = requests.waitForConnection(first, 1000, 2000);
+  const foreign = requests.waitForConnection(second, 1000, 2000);
+  assert.ok(waiting && waiting !== "busy" && foreign && foreign !== "busy");
+  assert.equal(requests.waitForConnection(first, 1000, 2000), "busy");
+  const connection = requests.approveAgent(agent.agentId, target, 1000);
+  assert.ok(connection);
+  assert.deepEqual(await waiting, { connections: [connection], timedOut: false });
+  assert.deepEqual(await requests.waitForConnection(first, 1000, 1000), { connections: [connection], timedOut: false });
+  requests.disconnect(second);
+  assert.deepEqual(await foreign, { connections: [], timedOut: false });
+  assert.equal(requests.removeChatAgent(agent.agentId, target, 1000), 1);
+  assert.deepEqual(await requests.waitForConnection(first, 1000, 1000), { connections: [], timedOut: true });
+  const timeout = requests.waitForConnection(first, 1000, 1001);
+  assert.ok(timeout && timeout !== "busy");
+  assert.deepEqual(await timeout, { connections: [], timedOut: true });
+  const late = requests.waitForConnection(first, 1000, 1001);
+  assert.ok(late && late !== "busy");
+  assert.ok(requests.approveAgent(agent.agentId, target, 1001));
+  assert.deepEqual(await late, { connections: [], timedOut: true });
+  assert.equal(requests.getConnectionExpiresAt(first, connection.connectionId, 1001), null);
+  requests.disconnect(first);
+});
+
+test("autonomous grant records are bounded including retained revocation tombstones", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("owner");
+  const agent = requests.registerAgent(owner);
+  const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+    tabId: 1, documentId: "synthetic-document" } as const;
+  for (let tabId = 1; tabId <= MAX_AUTONOMOUS_CONNECTIONS; tabId++) {
+    assert.ok(requests.approveAgent(agent.agentId, { ...target, tabId }, 1000));
+  }
+  assert.ok(requests.approveAgent(agent.agentId, target, 1000));
+  assert.equal(requests.approveAgent(agent.agentId, { ...target, tabId: 101 }, 1000), null);
+  assert.equal(requests.disconnectChat(target, 1000), 1);
+  assert.equal(requests.approveAgent(agent.agentId, target, 1000), null);
+  assert.ok(requests.approveAgent(agent.agentId, target, 1000 + PENDING_REQUEST_TTL_MS));
+  requests.disconnect(owner);
+});
 
 test("agent identity registration has bounded immutable labels and capacity", () => {
   const requests = new PendingConnectionRequests();

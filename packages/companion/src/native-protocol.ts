@@ -249,8 +249,11 @@ function isValidGeminiTarget(target: z.infer<typeof geminiTargetSchema>): boolea
 
 const chatAgentTargetSchema = z.union([fixtureTargetSchema, geminiTargetSchema.refine(isValidGeminiTarget)]);
 const chatAgentRequestSchema = z.discriminatedUnion("kind", [
+  pendingListSchema.extend({ kind: z.literal("list_available_agents"), payload: z.strictObject({}) }),
   pendingListSchema.extend({ kind: z.literal("list_chat_agents"), payload: z.strictObject({ target: chatAgentTargetSchema }) }),
   pendingListSchema.extend({ kind: z.literal("disconnect_chat"), payload: z.strictObject({ target: chatAgentTargetSchema }) }),
+  pendingListSchema.extend({ kind: z.literal("approve_chat_agent"),
+    payload: z.strictObject({ target: chatAgentTargetSchema, agentId: z.uuid() }) }),
   pendingListSchema.extend({ kind: z.literal("remove_chat_agent"),
     payload: z.strictObject({ target: chatAgentTargetSchema, agentId: z.uuid() }) })
 ]);

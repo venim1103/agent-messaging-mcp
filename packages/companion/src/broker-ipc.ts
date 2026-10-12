@@ -67,6 +67,18 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                 } });
                 return;
               }
+              if (reply.kind === "connection_wait_authorized") {
+                const now = Date.now();
+                const timeoutMs = Math.max(0, Math.min(reply.payload.timeoutMs, reply.deadlineMs - now - 250));
+                const pending = requests.waitForConnection(owner, now, now + timeoutMs);
+                if (!pending || pending === "busy") {
+                  await writeBrokerResponse(socket, { ...reply, kind: "error", payload: { code: "TOO_MANY_PENDING" } });
+                  return;
+                }
+                const pickup = await pending;
+                if (!socket.destroyed) await writeBrokerResponse(socket, { ...reply, kind: "connection_pickup", payload: pickup });
+                return;
+              }
               if (reply.kind === "fixture_fill_authorized") {
                 const pending = operations?.requestFixtureFill(owner, reply.payload.operationId);
                 if (!pending || pending === "busy") {

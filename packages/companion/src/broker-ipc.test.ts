@@ -95,9 +95,9 @@ for (const target of [
       const envelope = { protocolVersion: PROTOCOL_VERSION, connectionGeneration: 0, deadlineMs: Date.now() + 4000 };
       await exchange(rawFacade, { ...envelope, kind: "hello", requestId: randomUUID(), role: "facade",
         credential: credentials.facade, payload: {} });
-      for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat"]) {
+      for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat", "approve_chat_agent"]) {
         const denied = await exchange(rawFacade, { ...envelope, kind, requestId: randomUUID(),
-          payload: { target, ...(kind === "remove_chat_agent" ? { agentId: secondAgent.agentId } : {}) } });
+          payload: { target, ...(["remove_chat_agent", "approve_chat_agent"].includes(kind) ? { agentId: secondAgent.agentId } : {}) } });
         assert.ok(typeof denied === "object" && denied !== null && "payload" in denied);
         assert.deepEqual(denied.payload, { code: "PERMISSION_DENIED" });
       }
@@ -127,6 +127,31 @@ for (const target of [
     }
   });
 }
+
+test("autonomous pickup has its own bounded wait budget without relaxing ordinary requests", { timeout: 8000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-pickup-budget-"));
+  const directory = join(home, "broker");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials());
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  try {
+    facade = await connectBroker("facade", directory);
+    relay = await connectBroker("relay", directory);
+    const forbidden = relay;
+    assert.throws(() => forbidden.waitForConnection(0), /Broker role cannot perform/);
+    assert.equal(brokerRequestDeadline(1000), 6000);
+    assert.equal(brokerRequestDeadline(1000, undefined, 20_250), 21_250);
+    assert.equal(brokerRequestDeadline(1000, 1200, 20_250), 1200);
+    assert.throws(() => brokerRequestDeadline(1000, undefined, 20_251), /Invalid broker request deadline/);
+    assert.deepEqual((await facade.waitForConnection(5100)).payload, { connections: [], timedOut: true });
+    assert.equal((await facade.requestConnection()).kind, "connection_requested");
+  } finally {
+    facade?.close();
+    relay?.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("authentication deadlines do not expire persistent facade requests or relax upstream deadlines", { timeout: 5000 }, async (context) => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-auth-deadline-"));

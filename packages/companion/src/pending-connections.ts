@@ -4,6 +4,8 @@ import { ObservationBuffer } from "./observation-buffer.js";
 export const PENDING_REQUEST_TTL_MS = 60_000;
 export const MAX_PENDING_REQUESTS = 100;
 export const MAX_CONNECTED_AGENTS = 16;
+export const MAX_AUTONOMOUS_CONNECTIONS = 100;
+export const MAX_CONNECTION_WAIT_MS = 20_000;
 export const READONLY_CONNECTION_TTL_MS = 5 * 60_000;
 export const MAX_FIXTURE_SNAPSHOT_MESSAGES = 32;
 export const MAX_FIXTURE_SNAPSHOT_BYTES = 96 * 1024;
@@ -41,7 +43,7 @@ export type GeminiTarget = Readonly<{
 export type ApprovedTarget = FixtureTarget | GeminiTarget;
 
 export type ConnectedAgent = Readonly<{ agentId: string; label: string }>;
-export type ChatAgent = ConnectedAgent & Readonly<{ connectionCount: number }>;
+export type ChatAgent = ConnectedAgent & Readonly<{ connectionCount: number; autonomous?: true }>;
 
 export type ReadonlyConnection = Readonly<{
   requestId: string;
@@ -55,6 +57,14 @@ export type ReadonlyConnection = Readonly<{
 export type ReadonlyConnectionState = ReadonlyConnection & Readonly<{
   observation: Readonly<{ state: "not_observed" | "recent" | "old"; capturedAt: number | null }>;
 }>;
+export type AutonomousConnection = Readonly<Omit<ReadonlyConnection, "state" | "expiresAt"> & {
+  state: "ready";
+  capabilities: readonly ["read", "send"];
+  expiresAt: null;
+}>;
+export type ApprovedConnection = ReadonlyConnection | AutonomousConnection;
+export type ApprovedConnectionState = ApprovedConnection & Pick<ReadonlyConnectionState, "observation">;
+export type ConnectionPickup = Readonly<{ connections: ReadonlyArray<AutonomousConnection>; timedOut: boolean }>;
 
 export type FixtureMessage = Readonly<{ id: string; direction: "incoming" | "outgoing"; text: string; truncated?: true }>;
 export type FixtureSnapshot = Readonly<{
@@ -78,15 +88,21 @@ export type GeminiSnapshot = Readonly<{
 }>;
 
 type FixtureGrant = {
-  connection: ReadonlyConnection;
+  connection: ApprovedConnection;
   target: ApprovedTarget;
   stale: boolean;
+  revokedAt?: number;
   observations?: ObservationBuffer;
   snapshot?: FixtureSnapshot;
   geminiObservations?: ObservationBuffer;
   geminiSnapshot?: GeminiSnapshot;
 };
 type RequestRecord = { owner: symbol; expiresAt: number; grant?: FixtureGrant };
+type ConnectionWait = {
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+  resolve: (pickup: ConnectionPickup) => void;
+};
 type PendingFixtureRead = {
   owner: symbol;
   connectionId: string;
@@ -106,6 +122,7 @@ type PendingGeminiRead = {
 
 export class PendingConnectionRequests {
   private readonly agents = new Map<symbol, ConnectedAgent>();
+  private readonly connectionWaits = new Map<symbol, ConnectionWait>();
   private readonly requests = new Map<string, RequestRecord>();
   private readonly fixtureReads = new Map<string, PendingFixtureRead>();
   private readonly geminiReads = new Map<string, PendingGeminiRead>();
@@ -128,15 +145,63 @@ export class PendingConnectionRequests {
         || (second.origin === "https://gemini.google.com" && first.url === second.url));
   }
 
-  listChatAgents(target: ApprovedTarget, now = Date.now()): ReadonlyArray<ChatAgent> {
+  private isLiveGrant(grant: FixtureGrant, now: number): boolean {
+    return !grant.stale && now < (grant.connection.expiresAt ?? Infinity);
+  }
+
+  private recordExpiresAt(request: RequestRecord): number {
+    if (!request.grant) return request.expiresAt;
+    return request.grant.connection.expiresAt ?? request.grant.revokedAt ?? Infinity;
+  }
+
+  private pruneExpiredRecords(now: number): void {
+    for (const [requestId, request] of this.requests) {
+      if (this.recordExpiresAt(request) + PENDING_REQUEST_TTL_MS <= now) this.requests.delete(requestId);
+    }
+  }
+
+  private ownedAutonomousConnections(owner: symbol, now: number): ReadonlyArray<AutonomousConnection> {
+    return Object.freeze([...this.requests.values()].flatMap(request => {
+      const grant = request.grant;
+      return request.owner === owner && grant?.connection.state === "ready" && this.isLiveGrant(grant, now)
+        ? [grant.connection] : [];
+    }));
+  }
+
+  private finishConnectionWait(owner: symbol, pickup: ConnectionPickup, now = Date.now()): void {
+    const pending = this.connectionWaits.get(owner);
+    if (!pending) return;
+    this.connectionWaits.delete(owner);
+    clearTimeout(pending.timer);
+    pending.resolve(Object.freeze(pickup.connections.length && now >= pending.expiresAt
+      ? { connections: Object.freeze([]), timedOut: true } : pickup));
+  }
+
+  waitForConnection(owner: symbol, now = Date.now(), deadlineMs = now + MAX_CONNECTION_WAIT_MS) {
+    if (!this.agents.has(owner) || !Number.isSafeInteger(now) || !Number.isSafeInteger(deadlineMs) || deadlineMs < now
+      || deadlineMs > now + MAX_CONNECTION_WAIT_MS) return null;
+    const connections = this.ownedAutonomousConnections(owner, now);
+    if (connections.length || deadlineMs === now) return Promise.resolve(Object.freeze({ connections, timedOut: !connections.length }));
+    if (this.connectionWaits.has(owner)) return "busy" as const;
+    return new Promise<ConnectionPickup>(resolve => {
+      const timer = setTimeout(() => this.finishConnectionWait(owner, { connections: Object.freeze([]), timedOut: true }), deadlineMs - now);
+      this.connectionWaits.set(owner, { expiresAt: deadlineMs, timer, resolve });
+    });
+  }
+
+  listChatAgents(target?: ApprovedTarget, now = Date.now()): ReadonlyArray<ChatAgent> {
     return Object.freeze([...this.agents].map(([owner, agent]) => {
       let connectionCount = 0;
+      let autonomous = false;
       for (const request of this.requests.values()) {
         const grant = request.grant;
-        if (request.owner === owner && grant && !grant.stale && now < grant.connection.expiresAt
-          && this.matchesTarget(grant.target, target)) connectionCount++;
+        if (target && request.owner === owner && grant && this.isLiveGrant(grant, now)
+          && this.matchesTarget(grant.target, target)) {
+          connectionCount++;
+          autonomous ||= grant.connection.state === "ready";
+        }
       }
-      return Object.freeze({ ...agent, connectionCount });
+      return Object.freeze({ ...agent, connectionCount, ...(autonomous ? { autonomous: true as const } : {}) });
     }));
   }
 
@@ -146,9 +211,9 @@ export class PendingConnectionRequests {
     let revoked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (request.owner === entry[0] && grant && !grant.stale && now < grant.connection.expiresAt
+      if (request.owner === entry[0] && grant && this.isLiveGrant(grant, now)
         && this.matchesTarget(grant.target, target)) {
-        this.revokeGrant(grant);
+        this.revokeGrant(grant, now);
         revoked++;
       }
     }
@@ -159,8 +224,8 @@ export class PendingConnectionRequests {
     let revoked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (grant && !grant.stale && now < grant.connection.expiresAt && this.matchesTarget(grant.target, target)) {
-        this.revokeGrant(grant);
+      if (grant && this.isLiveGrant(grant, now) && this.matchesTarget(grant.target, target)) {
+        this.revokeGrant(grant, now);
         revoked++;
       }
     }
@@ -183,8 +248,9 @@ export class PendingConnectionRequests {
     pending.resolve(result);
   }
 
-  private revokeGrant(grant: FixtureGrant): void {
+  private revokeGrant(grant: FixtureGrant, now = Date.now()): void {
     grant.stale = true;
+    grant.revokedAt = now;
     grant.snapshot = undefined;
     grant.observations = undefined;
     grant.geminiSnapshot = undefined;
@@ -201,7 +267,7 @@ export class PendingConnectionRequests {
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (request.owner === owner && grant?.connection.connectionId === connectionId) {
-        return !grant.stale && now < grant.connection.expiresAt ? grant : null;
+        return this.isLiveGrant(grant, now) ? grant : null;
       }
     }
     return null;
@@ -209,12 +275,8 @@ export class PendingConnectionRequests {
 
   create(owner: symbol, now = Date.now()): PendingRequest {
     if (typeof owner !== "symbol") throw new TypeError("Caller identity must be broker-owned");
-    let pendingCount = 0;
-    for (const [requestId, request] of this.requests) {
-      if ((request.grant?.connection.expiresAt ?? request.expiresAt) + PENDING_REQUEST_TTL_MS <= now) {
-        this.requests.delete(requestId);
-      } else if (!request.grant && request.expiresAt > now) pendingCount++;
-    }
+    this.pruneExpiredRecords(now);
+    const pendingCount = [...this.requests.values()].filter(request => !request.grant && request.expiresAt > now).length;
     if (pendingCount >= MAX_PENDING_REQUESTS) throw new Error("Too many pending connections");
 
     const requestId = randomUUID();
@@ -223,16 +285,16 @@ export class PendingConnectionRequests {
     return { requestId, state: "pending", expiresAt };
   }
 
-  get(owner: symbol, requestId: string, now = Date.now()): PendingRequest | ReadonlyConnectionState
+  get(owner: symbol, requestId: string, now = Date.now()): PendingRequest | ApprovedConnectionState
     | Readonly<{ requestId: string; state: "stale" }> | null {
     const request = this.requests.get(requestId);
     if (!request || request.owner !== owner) return null;
-    const expiresAt = request.grant?.connection.expiresAt ?? request.expiresAt;
+    const expiresAt = this.recordExpiresAt(request);
     if (expiresAt + PENDING_REQUEST_TTL_MS <= now) {
       this.requests.delete(requestId);
       return null;
     }
-    if (request.grant?.stale && now < expiresAt) return { requestId, state: "stale" };
+    if (request.grant?.stale && (request.grant.connection.expiresAt === null || now < expiresAt)) return { requestId, state: "stale" };
     if (request.grant && now < expiresAt) {
       const capturedAt = request.grant.snapshot?.capturedAt ?? request.grant.geminiSnapshot?.capturedAt ?? null;
       return Object.freeze({ ...request.grant.connection, observation: Object.freeze({
@@ -260,7 +322,8 @@ export class PendingConnectionRequests {
   }
 
   getConnectionExpiresAt(owner: symbol, connectionId: string, now = Date.now()): number | null {
-    return this.liveGrant(owner, connectionId, now)?.connection.expiresAt ?? null;
+    const grant = this.liveGrant(owner, connectionId, now);
+    return grant ? grant.connection.expiresAt ?? Infinity : null;
   }
 
   getGeminiSnapshot(owner: symbol, connectionId: string, now = Date.now()): GeminiSnapshot | "not_ready" | null {
@@ -282,7 +345,7 @@ export class PendingConnectionRequests {
     if (grant?.target.origin !== "https://gemini.google.com" || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     if (this.geminiReads.size >= MAX_PENDING_GEMINI_READS) return "busy" as const;
     const challengeId = randomUUID();
-    const expiresAt = Math.min(now + GEMINI_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt);
+    const expiresAt = Math.min(now + GEMINI_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt ?? Infinity);
     let resolve!: PendingGeminiRead["resolve"];
     const result = new Promise<GeminiSnapshot | "not_ready" | null>((done) => { resolve = done; });
     const timer = setTimeout(() => this.finishGeminiRead(challengeId, "not_ready"), expiresAt - now);
@@ -304,7 +367,7 @@ export class PendingConnectionRequests {
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (grant?.target.origin === "https://gemini.google.com"
-        && !grant.stale && now < grant.connection.expiresAt) tabs.add(grant.target.tabId);
+        && this.isLiveGrant(grant, now)) tabs.add(grant.target.tabId);
     }
     return [...tabs].sort((first, second) => first - second);
   }
@@ -333,7 +396,7 @@ export class PendingConnectionRequests {
     let published = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (!grant || grant.stale || now >= grant.connection.expiresAt
+      if (!grant || !this.isLiveGrant(grant, now)
         || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
         || grant.target.url !== target.url || grant.target.tabId !== target.tabId
         || grant.target.documentId !== target.documentId) continue;
@@ -374,7 +437,7 @@ export class PendingConnectionRequests {
     if (grant?.target.origin !== "http://127.0.0.1:8787" || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     if (this.fixtureReads.size >= MAX_PENDING_FIXTURE_READS) return "busy" as const;
     const challengeId = randomUUID();
-    const expiresAt = Math.min(now + FIXTURE_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt);
+    const expiresAt = Math.min(now + FIXTURE_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt ?? Infinity);
     let resolve!: PendingFixtureRead["resolve"];
     const result = new Promise<FixtureSnapshot | "not_ready" | null>((done) => { resolve = done; });
     const timer = setTimeout(() => this.finishFixtureRead(challengeId, "not_ready"), expiresAt - now);
@@ -396,7 +459,7 @@ export class PendingConnectionRequests {
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (grant?.target.origin === "http://127.0.0.1:8787"
-        && !grant.stale && now < grant.connection.expiresAt) tabs.add(grant.target.tabId);
+        && this.isLiveGrant(grant, now)) tabs.add(grant.target.tabId);
     }
     return [...tabs].sort((first, second) => first - second);
   }
@@ -404,7 +467,7 @@ export class PendingConnectionRequests {
   disconnectFixture(owner: symbol, connectionId: string, now = Date.now()): boolean {
     const grant = this.liveGrant(owner, connectionId, now);
     if (!grant) return false;
-    this.revokeGrant(grant);
+    this.revokeGrant(grant, now);
     return true;
   }
 
@@ -412,7 +475,7 @@ export class PendingConnectionRequests {
     let marked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (!grant || grant.stale || now >= grant.connection.expiresAt
+      if (!grant || !this.isLiveGrant(grant, now)
         || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
         || grant.target.tabId !== target.tabId || grant.target.documentId !== target.documentId) continue;
       if (!grant.snapshot && (!grant.observations || grant.observations.bookmark().sequence === 0)) continue;
@@ -430,7 +493,7 @@ export class PendingConnectionRequests {
     let marked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (!grant || grant.stale || now >= grant.connection.expiresAt
+      if (!grant || !this.isLiveGrant(grant, now)
         || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
         || grant.target.url !== target.url || grant.target.tabId !== target.tabId
         || grant.target.documentId !== target.documentId) continue;
@@ -468,7 +531,7 @@ export class PendingConnectionRequests {
     let published = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (!grant || grant.stale || now >= grant.connection.expiresAt
+      if (!grant || !this.isLiveGrant(grant, now)
         || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
         || grant.target.tabId !== target.tabId || grant.target.documentId !== target.documentId) continue;
       grant.observations ??= new ObservationBuffer(observationLimits);
@@ -493,26 +556,54 @@ export class PendingConnectionRequests {
   }
 
   approve(requestId: string, target: FixtureTarget, now = Date.now()): ReadonlyConnection | null {
-    if (target.origin !== "http://127.0.0.1:8787" || target.conversationId !== "fixture-alpha"
-      || !Number.isSafeInteger(target.tabId) || target.tabId < 1
-      || !/^[!-~]{1,128}$/.test(target.documentId)) return null;
+    if (target.origin !== "http://127.0.0.1:8787" || !this.validTarget(target)) return null;
     return this.createGrant(requestId, target, now);
   }
 
   approveGemini(requestId: string, target: GeminiTarget, now = Date.now()): ReadonlyConnection | null {
+    if (target.origin !== "https://gemini.google.com" || !this.validTarget(target)) return null;
+    return this.createGrant(requestId, target, now);
+  }
+
+  approveAgent(agentId: string, target: ApprovedTarget, now = Date.now()): AutonomousConnection | null {
+    const entry = [...this.agents].find(([, agent]) => agent.agentId === agentId);
+    if (!entry || !Number.isSafeInteger(now) || now < 0 || !this.validTarget(target)) return null;
+    const owner = entry[0];
+    this.pruneExpiredRecords(now);
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (request.owner === owner && grant?.connection.state === "ready" && this.isLiveGrant(grant, now)
+        && this.matchesTarget(grant.target, target)) return grant.connection;
+    }
+    if ([...this.requests.values()].filter(request => request.grant?.connection.state === "ready").length
+      >= MAX_AUTONOMOUS_CONNECTIONS) return null;
+    const pending = this.create(owner, now);
+    const connection: AutonomousConnection = Object.freeze({ requestId: pending.requestId, state: "ready",
+      connectionId: randomUUID(), generation: 1, origin: target.origin, conversationId: target.conversationId,
+      capabilities: Object.freeze(["read", "send"] as const), expiresAt: null });
+    this.requests.get(pending.requestId)!.grant = { connection, target: Object.freeze({ ...target }), stale: false };
+    this.finishConnectionWait(owner, { connections: this.ownedAutonomousConnections(owner, now), timedOut: false }, now);
+    return connection;
+  }
+
+  private validTarget(target: ApprovedTarget): boolean {
+    if (target.origin === "http://127.0.0.1:8787") {
+      return target.conversationId === "fixture-alpha" && Number.isSafeInteger(target.tabId) && target.tabId > 0
+        && /^[!-~]{1,128}$/.test(target.documentId);
+    }
     if (target.origin !== "https://gemini.google.com" || !Number.isSafeInteger(target.tabId) || target.tabId < 1
-      || !/^[!-~]{1,128}$/.test(target.documentId) || target.url.length > 512) return null;
+      || !/^[!-~]{1,128}$/.test(target.documentId) || target.url.length > 512) return false;
     try {
       const url = new URL(target.url);
       const route = url.pathname.split("/").filter(Boolean);
       if (url.origin !== target.origin || url.username || url.password || url.hash
         || url.href !== target.url || route.length !== 2
         || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))
-        || route[1] !== target.conversationId) return null;
+        || route[1] !== target.conversationId) return false;
     } catch {
-      return null;
+      return false;
     }
-    return this.createGrant(requestId, target, now);
+    return true;
   }
 
   private createGrant(requestId: string, target: ApprovedTarget, now: number): ReadonlyConnection | null {
@@ -532,25 +623,25 @@ export class PendingConnectionRequests {
     return connection;
   }
 
-  revokeChangedTab(tabId: number, observed: { documentId: string; conversationId: string } | null): number {
+  revokeChangedTab(tabId: number, observed: { documentId: string; conversationId: string } | null, now = Date.now()): number {
     let revoked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (grant && grant.target.tabId === tabId && !grant.stale
         && (!observed || grant.target.documentId !== observed.documentId
           || grant.target.conversationId !== observed.conversationId)) {
-        this.revokeGrant(grant);
+        this.revokeGrant(grant, now);
         revoked++;
       }
     }
     return revoked;
   }
 
-  revokeAllFixtures(): number {
+  revokeAllFixtures(now = Date.now()): number {
     let revoked = 0;
     for (const request of this.requests.values()) {
       if (request.grant && !request.grant.stale) {
-        this.revokeGrant(request.grant);
+        this.revokeGrant(request.grant, now);
         revoked++;
       }
     }
@@ -566,6 +657,7 @@ export class PendingConnectionRequests {
 
   disconnect(owner: symbol): void {
     this.agents.delete(owner);
+    this.finishConnectionWait(owner, { connections: Object.freeze([]), timedOut: false });
     for (const [challengeId, pending] of this.fixtureReads) {
       if (pending.owner === owner) this.finishFixtureRead(challengeId, null);
     }

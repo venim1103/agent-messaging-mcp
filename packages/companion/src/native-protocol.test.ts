@@ -44,13 +44,16 @@ const request = {
 };
 
 test("native agent roster and removal accept only bounded exact-target envelopes", () => {
+  const available = { ...request, kind: "list_available_agents", payload: {} };
+  assert.deepEqual(parseNativeChatAgentRequest(available, now), available);
+  assert.throws(() => parseNativeChatAgentRequest({ ...available, payload: { approved: true } }, now), /Invalid native chat agent request/);
   for (const target of [
     { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
     { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
       documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat?hl=en" }
   ]) {
-    for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat"]) {
-      const payload = { target, ...(kind === "remove_chat_agent" ? { agentId: request.requestId } : {}) };
+    for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat", "approve_chat_agent"]) {
+      const payload = { target, ...(["remove_chat_agent", "approve_chat_agent"].includes(kind) ? { agentId: request.requestId } : {}) };
       const message = { ...request, kind, payload };
       assert.deepEqual(parseNativeChatAgentRequest(message, now), message);
       for (const invalid of [

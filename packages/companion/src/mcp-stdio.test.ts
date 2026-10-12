@@ -65,7 +65,7 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     await client.connect(transport);
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
-      "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_read_messages",
+      "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_wait_for_connection", "chat_read_messages",
       "chat_wait_for_events", "chat_prepare_message", "chat_fill_draft", "chat_commit_message", "chat_get_operation", "chat_disconnect"
     ]);
     assert.ok(tools.every((tool) => /^[a-z0-9_-]+$/.test(tool.name)));
@@ -88,6 +88,86 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     await client.close();
   }
 });
+
+for (const target of [
+  { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
+  { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
+    documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" }
+] as const) {
+  test(`${target.origin} SDK picks up only its individually approved autonomous connection`, { timeout: 5000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-pickup-"));
+    const directory = join(home, ".config/agent-messaging-mcp/broker");
+    let broker: Awaited<ReturnType<typeof startBrokerSocket>> | undefined;
+    const clients = [new Client({ name: "pickup-one", version: "0.0.1" }), new Client({ name: "pickup-two", version: "0.0.1" })] as const;
+    const environment = { ...process.env };
+    delete environment.BROWSER_CHAT_AGENT_LABEL;
+    const options = { command: process.execPath, args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+      env: { ...environment, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    try {
+      await mkdir(join(home, ".config/agent-messaging-mcp"), { recursive: true, mode: 0o700 });
+      broker = await startBrokerSocket(directory, createBrokerCredentials());
+      await Promise.all(clients.map(client => client.connect(new StdioClientTransport(options))));
+      for (const client of clients) {
+        const empty = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+        assert.equal(empty.isError, undefined);
+        assert.deepEqual(empty.structuredContent, { connections: [], timedOut: true });
+      }
+      relay = await connectBroker("relay", directory);
+      const roster = await relay.listChatAgents(target);
+      if (roster.kind !== "chat_agents") throw new Error("Expected registered owners");
+      const first = roster.payload.agents.find(agent => agent.label === "pickup-one");
+      const second = roster.payload.agents.find(agent => agent.label === "pickup-two");
+      assert.ok(first && second);
+      const waiting = clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 1000 } });
+      const approved = await relay.approveChatAgent(target, first.agentId);
+      assert.equal(approved.kind, "chat_agent_approved");
+      assert.deepEqual(approved.payload, { agentId: first.agentId, expiresAt: null });
+      const picked = await waiting;
+      assert.equal(picked.isError, undefined);
+      const pickup = picked.structuredContent as { connections: { requestId: string; connectionId: string;
+        state: string; expiresAt: null; capabilities: string[] }[]; timedOut: boolean };
+      assert.equal(pickup.timedOut, false);
+      assert.equal(pickup.connections.length, 1);
+      const connection = pickup.connections[0]!;
+      assert.equal(connection.state, "ready");
+      assert.equal(connection.expiresAt, null);
+      assert.deepEqual(connection.capabilities, ["read", "send"]);
+      const connectedRoster = await relay.listChatAgents(target);
+      if (connectedRoster.kind !== "chat_agents") throw new Error("Expected connected roster");
+      assert.equal(connectedRoster.payload.agents.find(agent => agent.agentId === first.agentId)?.autonomous, true);
+      const available = await relay.listAvailableAgents();
+      if (available.kind !== "chat_agents") throw new Error("Expected available owners");
+      assert.ok(available.payload.agents.every(agent => agent.connectionCount === 0 && agent.autonomous === undefined));
+      const state = await clients[0].callTool({ name: "chat_get_connection", arguments: { requestId: connection.requestId } });
+      assert.equal(state.isError, undefined);
+      assert.equal((state.structuredContent as { state: string }).state, "ready");
+      const foreign = await clients[1].callTool({ name: "chat_get_connection", arguments: { requestId: connection.requestId } });
+      assert.deepEqual(foreign.structuredContent, { state: "unknown" });
+      assert.deepEqual((await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        { connections: [], timedOut: true });
+      assert.equal((await relay.approveChatAgent(target, second.agentId)).kind, "chat_agent_approved");
+      const other = await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      const otherPickup = other.structuredContent as typeof pickup;
+      assert.equal(otherPickup.connections.length, 1);
+      assert.notEqual(otherPickup.connections[0]?.connectionId, connection.connectionId);
+      await relay.removeChatAgent(target, first.agentId);
+      assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        { connections: [], timedOut: true });
+      assert.deepEqual((await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        otherPickup);
+      for (const argumentsValue of [{ timeoutMs: 20_001 }, { timeoutMs: -1 }, { timeoutMs: 0, agentId: second.agentId },
+        { timeoutMs: 0, approved: true }]) {
+        assert.equal((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: argumentsValue })).isError, true);
+      }
+    } finally {
+      relay?.close();
+      await Promise.all(clients.map(client => client.close()));
+      await broker?.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}
 
 test("two MCP facades auto-start one private broker before any tool call", { timeout: 10000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-auto-start-"));

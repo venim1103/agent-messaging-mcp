@@ -145,6 +145,29 @@ server.registerTool("chat_get_connection", {
   }
 });
 
+server.registerTool("chat_wait_for_connection", {
+  description: "Wait up to 20 seconds for autonomous connections approved for this MCP agent in the trusted popup. This never creates or widens approval and never returns another agent's connections. Sending tools are still being implemented.",
+  inputSchema: z.object({ timeoutMs: z.number().int().min(0).max(20_000).optional() }).strict(),
+  annotations: { readOnlyHint: true, idempotentHint: true }
+}, async ({ timeoutMs }, extra) => {
+  const cancel = () => { broker?.close(); };
+  extra.mcpReq.signal.addEventListener("abort", cancel, { once: true });
+  try {
+    if (extra.mcpReq.signal.aborted) return blocked("CANCELLED");
+    const client = await pendingBroker();
+    if (extra.mcpReq.signal.aborted) { client.close(); return blocked("CANCELLED"); }
+    const result = await client.waitForConnection(timeoutMs);
+    if (extra.mcpReq.signal.aborted) return blocked("CANCELLED");
+    if (result.kind === "error") return blocked(result.payload.code);
+    if (result.kind !== "connection_pickup") return unavailable();
+    return { content: [{ type: "text", text: JSON.stringify(result.payload) }], structuredContent: result.payload };
+  } catch {
+    return extra.mcpReq.signal.aborted ? blocked("CANCELLED") : unavailable();
+  } finally {
+    extra.mcpReq.signal.removeEventListener("abort", cancel);
+  }
+});
+
 server.registerTool("chat_read_messages", {
   description: "Read a fresh rendered-only snapshot from an owned, toolbar-approved fixture or Gemini chat after an exact-document browser challenge. Gemini results contain the selected chat's visible message text, not complete history.",
   inputSchema: z.object({ connectionId: z.uuid(), limit: z.number().int().min(1).max(32).optional() }).strict(),

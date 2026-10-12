@@ -81,7 +81,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           continue;
         }
         const request = typeof message === "object" && message !== null && "kind" in message
-          && (message.kind === "list_chat_agents" || message.kind === "remove_chat_agent" || message.kind === "disconnect_chat")
+          && (message.kind === "list_chat_agents" || message.kind === "remove_chat_agent" || message.kind === "disconnect_chat"
+            || message.kind === "approve_chat_agent" || message.kind === "list_available_agents")
           ? parseNativeChatAgentRequest(message)
           : typeof message === "object" && message !== null && "kind" in message
           && message.kind === "approve_fixture" ? parseNativeFixtureApproval(message)
@@ -150,7 +151,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               : parseNativePendingList(message);
               queueNativeReply(async () => {
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
-          let kind: "chat_agents" | "chat_agent_removed" | "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
+          let kind: "chat_agents" | "chat_agent_removed" | "chat_agent_approved" | "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
             | "fixture_approved" | "fixture_review_approved" | "gemini_approved" | "fixture_revoked"
             | "fixture_fill_reviews" | "fixture_fill_review_approved"
             | "gemini_prepared_reviews" | "gemini_review_approved" | "gemini_fill_reviews" | "gemini_fill_review_approved"
@@ -164,7 +165,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
-            | { agents: ReadonlyArray<ChatAgent> } | { revoked: number; remainingAgents: number }
+            | { agents: ReadonlyArray<ChatAgent> } | { revoked: number; remainingAgents: number } | { agentId: string; expiresAt: null }
             | { fills: ReadonlyArray<{ operationId: string; attemptId: string; target: {
               origin: string; conversationId: string; url: string; tabId: number; documentId: string
             }; text: string; expiresAt: number }> }
@@ -198,10 +199,20 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               if (result.kind !== "chat_agents") throw new Error("Broker refused chat agent list");
               kind = "chat_agents";
               payload = result.payload;
+            } else if (request.kind === "list_available_agents") {
+              const result = await client.listAvailableAgents();
+              if (result.kind !== "chat_agents") throw new Error("Broker refused available agents");
+              kind = "chat_agents";
+              payload = result.payload;
             } else if (request.kind === "remove_chat_agent") {
               const result = await client.removeChatAgent(request.payload.target, request.payload.agentId);
               if (result.kind !== "chat_agent_removed") throw new Error("Broker refused chat agent removal");
               kind = "chat_agent_removed";
+              payload = result.payload;
+            } else if (request.kind === "approve_chat_agent") {
+              const result = await client.approveChatAgent(request.payload.target, request.payload.agentId);
+              if (result.kind !== "chat_agent_approved") throw new Error("Broker refused agent approval");
+              kind = "chat_agent_approved";
               payload = result.payload;
             } else if (request.kind === "disconnect_chat") {
               const result = await client.disconnectChat(request.payload.target);

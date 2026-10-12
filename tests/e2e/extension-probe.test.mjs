@@ -1247,6 +1247,200 @@ for (const provider of ["fixture", "gemini"]) {
   });
 }
 
+for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
+  ["failure", "lifetime"].map(scenario => ({ provider, scenario })))) {
+  test(`${provider} popup autonomous admission (${scenario}) is per agent and preserves other owners`, { timeout: 20000 }, async (testContext) => {
+    const profile = await mkdtemp(join(tmpdir(), "agent-messaging-autonomous-test-"));
+    const unpacked = join(profile, "unpacked-extension");
+    await cp(extensionDirectory, unpacked, { recursive: true });
+    const manifestPath = join(unpacked, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.host_permissions = ["http://127.0.0.1:8787/*", "https://gemini.google.com/*"];
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const directory = join(profile, ".config/agent-messaging-mcp/broker");
+    const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
+    const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
+    const clients = [new Client({ name: "Autonomous one", version: "0.0.1" }), new Client({ name: "Autonomous two", version: "0.0.1" })];
+    let context;
+    let broker;
+    let brokerExit;
+    try {
+      testContext.signal.throwIfAborted();
+      context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
+        executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+        args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
+      const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+      const extensionId = new URL(worker.url()).hostname;
+      await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+      broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+      brokerExit = once(broker, "exit");
+      let ready = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        ready = await brokerSocketReady(join(directory, "broker.sock"));
+        if (ready) break;
+        await setTimeout(25);
+      }
+      assert.equal(ready, true, "Autonomous broker did not start");
+      const options = { command: process.execPath, args: [mcpEntry],
+        env: { ...process.env, HOME: profile, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
+      delete options.env.BROWSER_CHAT_AGENT_LABEL;
+      await Promise.all(clients.map(client => client.connect(new StdioClientTransport(options))));
+      for (const client of clients) {
+        assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+          { connections: [], timedOut: true });
+      }
+      const page = await context.newPage();
+      const url = provider === "fixture" ? "http://127.0.0.1:8787/" : "https://gemini.google.com/app/synthetic-autonomous";
+      const html = provider === "fixture" ? await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8")
+        : `<!doctype html><main><infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic user row</p></user-query-content></user-query>
+          <model-response><model-response-content>Synthetic reply</model-response-content></model-response></infinite-scroller>
+          <div contenteditable="true" aria-label="Enter a prompt for Gemini"></div><button type="submit" aria-label="Send message">Send</button></main>`;
+      await page.route(url, route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
+      await page.goto(url);
+      const selected = await worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+        globalThis.withheldChatAccess = true;
+        chrome.scripting.executeScript = options => globalThis.withheldChatAccess
+          ? Promise.reject(new Error("Synthetic withheld host access")) : execute(options);
+        return { tabId: tab.id, url: tab.url };
+      });
+      const popup = await context.newPage();
+      await page.bringToFront();
+      await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+      await popup.getByText("2 agents available; chat status unavailable", { exact: true }).waitFor({ timeout: 4000 });
+      await worker.evaluate(() => { globalThis.withheldChatAccess = false; });
+      await popup.evaluate(() => {
+        const request = chrome.permissions.request.bind(chrome.permissions);
+        globalThis.agentPermissionRequests = [];
+        globalThis.denyNextAgentPermission = true;
+        chrome.permissions.request = options => {
+          globalThis.agentPermissionRequests.push({ origins: options.origins, gesture: navigator.userActivation.isActive });
+          if (globalThis.denyNextAgentPermission) {
+            globalThis.denyNextAgentPermission = false;
+            return Promise.resolve(false);
+          }
+          return request(options);
+        };
+      });
+      const row = label => popup.locator("#agent-list li").filter({ hasText: label });
+      const waitCount = (count, available = 2) => popup.waitForFunction(({ count, available }) =>
+        document.querySelector("#agent-count")?.textContent === `${count} connected / ${available} available`,
+      { count, available }, { timeout: 4000 });
+      await row("Autonomous one").getByRole("button", { name: "Connect this chat" }).click();
+      await popup.getByText("Site access denied; no connection created.", { exact: true }).waitFor({ timeout: 4000 });
+      await waitCount(0);
+      assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        { connections: [], timedOut: true });
+      const waitStartedAt = performance.now();
+      const waiting = clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 2000 } })
+        .then(reply => ({ reply, elapsedMs: performance.now() - waitStartedAt }));
+      await row("Autonomous one").getByRole("button", { name: "Connect this chat" }).click();
+      await waitCount(1);
+      const boundedWait = await waiting;
+      assert.equal(boundedWait.reply.isError, undefined);
+      if (boundedWait.reply.structuredContent.timedOut) {
+        assert.deepEqual(boundedWait.reply.structuredContent, { connections: [], timedOut: true });
+        assert.ok(boundedWait.elapsedMs >= 2000, "Pickup timed out before its requested wait elapsed");
+      }
+      const firstPickup = await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      assert.equal(firstPickup.isError, undefined);
+      assert.equal(firstPickup.structuredContent.connections.length, 1, JSON.stringify(firstPickup.structuredContent));
+      const first = firstPickup.structuredContent.connections[0];
+      if (!boundedWait.reply.structuredContent.timedOut) {
+        assert.deepEqual(boundedWait.reply.structuredContent.connections, [first]);
+      }
+      assert.equal(first.state, "ready");
+      assert.equal(first.expiresAt, null);
+      assert.deepEqual(first.capabilities, ["read", "send"]);
+      const permissions = await popup.evaluate(() => globalThis.agentPermissionRequests);
+      assert.equal(permissions.length, 2);
+      assert.ok(permissions.every(request => request.gesture === true
+        && JSON.stringify(request.origins) === JSON.stringify([`${new URL(url).origin}/*`])));
+      assert.deepEqual((await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        { connections: [], timedOut: true });
+      const key = `${provider}-grant-${selected.tabId}`;
+      assert.equal(await worker.evaluate(async key => (await chrome.storage.session.get(key))[key].expiresAt, key), null);
+      const firstRead = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: first.connectionId } });
+      assert.equal(firstRead.isError, undefined);
+      await row("Autonomous two").getByRole("button", { name: "Connect this chat" }).click();
+      await waitCount(2);
+      const otherPickup = await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      const second = otherPickup.structuredContent.connections[0];
+      const otherRead = await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } });
+      assert.equal(otherRead.isError, undefined);
+      assert.notDeepEqual(otherRead.structuredContent.cursor, firstRead.structuredContent.cursor);
+      if (scenario === "failure") {
+        await popup.locator("#agent-panel").screenshot({ path: join(tmpdir(), `agent-messaging-${provider}-autonomous.png`) });
+      }
+      const firstAgentId = await row("Autonomous one").getAttribute("data-agent-id");
+      for (const extra of [{ approved: true }, { connectionId: first.connectionId }]) {
+        assert.equal(await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+          kind: "approve_chat_agent", tabId: selected.tabId, expectedUrl: url, agentId: firstAgentId, ...extra
+        }), undefined);
+      }
+      await row("Autonomous one").getByRole("button", { name: "Remove access" }).click();
+      await waitCount(1);
+      assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        { connections: [], timedOut: true });
+      let later;
+      if (scenario === "failure") {
+        await worker.evaluate(agentId => {
+          const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+          chrome.runtime.connectNative = (...args) => {
+            const port = connect(...args);
+            const listen = port.onMessage.addListener.bind(port.onMessage);
+            port.onMessage.addListener = listener => listen(reply => listener(reply.kind === "chat_agent_approved" && reply.payload.agentId === agentId
+              ? { ...reply, payload: { ...reply.payload, approved: true } } : reply));
+            return port;
+          };
+        }, firstAgentId);
+        await row("Autonomous one").getByRole("button", { name: "Connect this chat" }).click();
+        await popup.getByText("Agent management invalid, unavailable or selected chat changed", { exact: true }).waitFor({ timeout: 4000 });
+        await waitCount(1);
+        assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+          { connections: [], timedOut: true });
+        assert.deepEqual((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).structuredContent.cursor,
+          otherRead.structuredContent.cursor);
+      } else {
+        await clients[0].close();
+        later = new Client({ name: "Autonomous later", version: "0.0.1" });
+        clients.push(later);
+        await later.connect(new StdioClientTransport(options));
+        assert.deepEqual((await later.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+          { connections: [], timedOut: true });
+        await popup.getByRole("button", { name: "Refresh agents" }).click();
+        await waitCount(1);
+        await row("Autonomous later").getByRole("button", { name: "Connect this chat" }).click();
+        await waitCount(2);
+        const latePickup = await later.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+        const late = latePickup.structuredContent.connections[0];
+        assert.notEqual(late.connectionId, first.connectionId);
+      }
+      await page.close();
+      let ended = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        testContext.signal.throwIfAborted();
+        const state = await clients[1].callTool({ name: "chat_get_connection", arguments: { requestId: second.requestId } });
+        ended = state.structuredContent.state === "stale";
+        if (ended) break;
+        await setTimeout(25);
+      }
+      assert.equal(ended, true, "Closing the tab did not end autonomous access");
+      if (later) {
+        assert.deepEqual((await later.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+          { connections: [], timedOut: true });
+      }
+    } finally {
+      await Promise.all(clients.map(client => client.close().catch(() => {})));
+      await context?.close();
+      broker?.kill("SIGTERM");
+      if (brokerExit) await brokerExit;
+      await rm(profile, { recursive: true, force: true });
+    }
+  });
+}
+
 async function exerciseFixtureDispatch(outcome) {
   let mcpClient;
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-dispatch-test-"));

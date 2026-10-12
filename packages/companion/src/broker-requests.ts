@@ -36,9 +36,16 @@ const geminiMessage = z.strictObject({
 
 const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("keep_alive"), payload: z.strictObject({}) }),
+  z.strictObject({ ...envelope, kind: z.literal("wait_for_connection"), payload: z.strictObject({
+    timeoutMs: z.number().int().min(0).max(20_000)
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("approve_chat_agent"), payload: z.strictObject({
+    target: z.union([fixtureTarget, geminiTarget]), agentId: z.uuid()
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_chat_agents"), payload: z.strictObject({
     target: z.union([fixtureTarget, geminiTarget])
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_available_agents"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("disconnect_chat"), payload: z.strictObject({
     target: z.union([fixtureTarget, geminiTarget])
   }) }),
@@ -204,10 +211,23 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       ? { ...response, kind: "pending_list" as const, payload: { requests: requests.listPending(now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
-  if (request.kind === "list_chat_agents") {
+  if (request.kind === "list_chat_agents" || request.kind === "list_available_agents") {
     return role === "relay"
-      ? { ...response, kind: "chat_agents" as const, payload: { agents: requests.listChatAgents(request.payload.target, now) } }
+      ? { ...response, kind: "chat_agents" as const, payload: { agents: requests.listChatAgents(
+        request.kind === "list_chat_agents" ? request.payload.target : undefined, now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "wait_for_connection") {
+    return role === "facade"
+      ? { ...response, kind: "connection_wait_authorized" as const, payload: request.payload }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "approve_chat_agent") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    const connection = requests.approveAgent(request.payload.agentId, request.payload.target, now);
+    return connection ? { ...response, kind: "chat_agent_approved" as const,
+      payload: { agentId: request.payload.agentId, expiresAt: connection.expiresAt } }
+      : { ...response, kind: "error" as const, payload: { code: "APPROVAL_INVALID" } };
   }
   if (request.kind === "remove_chat_agent" || request.kind === "disconnect_chat") {
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
