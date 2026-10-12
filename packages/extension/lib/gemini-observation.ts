@@ -1,4 +1,4 @@
-export type GeminiRenderedMessage = { direction: "incoming" | "outgoing"; text: string };
+export type GeminiRenderedMessage = { direction: "incoming" | "outgoing"; text: string; truncated?: true };
 
 export function inspectGeminiDraft(input: { expectedUrl: string; text: string; draftMode?: "empty" | "prepared"; checkSubmit?: boolean }):
   { ok: true; editor: "contenteditable" } | { ok: false;
@@ -377,7 +377,7 @@ export function observeGeminiMessages(expectedUrl: string): boolean {
   return true;
 }
 
-export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiRenderedMessage[] } | null {
+export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiRenderedMessage[]; omittedBefore: boolean } | null {
   if (location.origin !== "https://gemini.google.com"
     || (expectedUrl !== undefined && location.href !== expectedUrl)) return null;
   const url = new URL(location.href);
@@ -393,10 +393,11 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
   if (timelines.length !== 1) return null;
   const timeline = timelines[0]!;
   const rows = [...timeline.querySelectorAll<HTMLElement>("user-query, model-response")].filter(visible);
-  if (!rows.length || rows.length > 32) return null;
+  if (!rows.length) return null;
 
   const messages: GeminiRenderedMessage[] = [];
-  for (const row of rows) {
+  let omittedBefore = rows.length > 32;
+  for (const [index, row] of rows.entries()) {
     if (row.closest("infinite-scroller") !== timeline) return null;
     let text: string;
     if (row.localName === "user-query") {
@@ -411,9 +412,30 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
       text = content[0]!.innerText.trim();
     }
     if (!text && row.localName === "model-response") continue;
-    if (!text || text.length > 2048) return null;
-    messages.push({ direction: row.localName === "user-query" ? "outgoing" : "incoming", text });
+    if (!text) return null;
+    if (index < rows.length - 32) continue;
+    messages.push({ direction: row.localName === "user-query" ? "outgoing" : "incoming",
+      text: text.slice(0, 16_000), ...(text.length > 16_000 ? { truncated: true as const } : {}) });
   }
-  return messages.length && new TextEncoder().encode(JSON.stringify(messages)).length <= 64 * 1024
-    ? { messages } : null;
+  if (!messages.length) return null;
+  const size = () => new TextEncoder().encode(JSON.stringify({ messages, omittedBefore })).length;
+  while (size() > 96 * 1024 && messages.length > 1) {
+    messages.shift();
+    omittedBefore = true;
+  }
+  if (size() > 96 * 1024) {
+    const newest = messages[0]!;
+    const text = newest.text;
+    newest.truncated = true;
+    let lower = 0;
+    let upper = text.length;
+    while (lower < upper) {
+      const length = Math.ceil((lower + upper) / 2);
+      newest.text = text.slice(0, length);
+      if (size() <= 96 * 1024) lower = length;
+      else upper = length - 1;
+    }
+    newest.text = text.slice(0, lower);
+  }
+  return { messages, omittedBefore };
 }

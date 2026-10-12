@@ -129,6 +129,82 @@ test("broker client validates bounded purpose-specific Gemini consent replies", 
   }
 });
 
+test("broker observation replies preserve bounded flags and refuse extra fields", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-observation-replies-"));
+  const directory = join(home, "broker");
+  const database = new DatabaseSync(":memory:");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let observed: unknown;
+  let eventPage: unknown;
+  context.mock.method(PendingConnectionRequests.prototype, "requestFreshFixtureRead", () =>
+    ({ result: Promise.resolve(observed) }) as never);
+  context.mock.method(PendingConnectionRequests.prototype, "requestFreshGeminiRead", () =>
+    ({ result: Promise.resolve(observed) }) as never);
+  context.mock.method(PendingConnectionRequests.prototype, "readFixtureEvents", () => eventPage as never);
+  context.mock.method(PendingConnectionRequests.prototype, "readGeminiEvents", () => eventPage as never);
+  const cursor = { epoch: "c66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 };
+  try {
+    facade = await connectBroker("facade", directory);
+    relay = await connectBroker("relay", directory);
+    const ownedFacade = facade;
+    for (const provider of ["fixture", "gemini"] as const) {
+      const pending = await facade.requestConnection();
+      if (pending.kind !== "connection_requested") throw new Error("Expected a pending request");
+      const target = provider === "fixture" ? { origin: "http://127.0.0.1:8787" as const,
+        conversationId: "fixture-alpha" as const, tabId: 3, documentId: "synthetic-fixture" }
+        : { origin: "https://gemini.google.com" as const, conversationId: "synthetic-chat",
+          url: "https://gemini.google.com/app/synthetic-chat", tabId: 4, documentId: "synthetic-gemini" };
+      if (target.origin === "http://127.0.0.1:8787") await relay.approveFixture(pending.payload.requestId, target);
+      else await relay.approveGemini(pending.payload.requestId, target);
+      const grant = await facade.getConnection(pending.payload.requestId);
+      if (grant.kind !== "connection_state" || grant.payload.state !== "ready_readonly") throw new Error("Expected a grant");
+      const row = { direction: "incoming" as const, text: "x".repeat(16000), truncated: true as const,
+        ...(provider === "fixture" ? { id: "row-1" } : { identityQuality: "uncertain", generationState: "unknown" }) };
+      const snapshot = { coverage: "rendered_only", generation: 1, capturedAt: Date.now(), cursor,
+        messages: [row], omittedBefore: true };
+      observed = snapshot;
+      const read = await facade.readApprovedSnapshot(grant.payload.connectionId);
+      assert.deepEqual(read.payload, snapshot, "Capture omissions must survive when the caller limit omits nothing");
+      observed = { ...snapshot, omittedBefore: false };
+      const complete = await facade.readApprovedSnapshot(grant.payload.connectionId);
+      if (complete.kind !== "fixture_snapshot" && complete.kind !== "gemini_snapshot") throw new Error("Expected a snapshot");
+      assert.equal(complete.payload.omittedBefore, false);
+      for (const invalid of [{ ...snapshot, extra: true }, { ...snapshot, omittedBefore: "true" },
+        { ...snapshot, messages: [{ ...row, text: "x".repeat(16001) }] },
+        { ...snapshot, messages: [{ ...row, truncated: false }] },
+        { ...snapshot, messages: [{ ...row, delivered: true }] }]) {
+        observed = invalid;
+        await assert.rejects(ownedFacade.readApprovedSnapshot(grant.payload.connectionId),
+          error => error instanceof Error && error.name === "ZodError");
+      }
+      const rows = Array.from({ length: 6 }, (_, index) => ({ ...row,
+        ...(provider === "fixture" ? { id: `row-${index}` } : {}) }));
+      const event = { epoch: cursor.epoch, sequence: 2,
+        payload: { kind: `${provider}_snapshot`, messages: rows, omittedBefore: true } };
+      eventPage = { state: "ok", cursor: { ...cursor, sequence: 3 },
+        events: [event, { ...event, sequence: 3 }] };
+      const events = await facade.readApprovedEvents(grant.payload.connectionId, cursor, 2);
+      assert.deepEqual(events.payload, eventPage);
+      assert.ok(encodeNativeFrame(events).length <= MAX_NATIVE_FRAME_BYTES + 4);
+      for (const payload of [{ ...event.payload, omittedBefore: "true" },
+        { ...event.payload, retryAllowed: true }, { ...event.payload, messages: [{ ...row, truncated: false }] },
+        { ...event.payload, messages: [{ ...row, extra: true }] }]) {
+        eventPage = { state: "ok", cursor: { ...cursor, sequence: 2 }, events: [{ ...event, payload }] };
+        await assert.rejects(ownedFacade.readApprovedEvents(grant.payload.connectionId, cursor, 2),
+          error => error instanceof Error && error.name === "ZodError");
+      }
+    }
+  } finally {
+    facade?.close();
+    relay?.close();
+    await broker.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("broker client refuses over-cap or authority-bearing Gemini proof replies", { timeout: 5000 }, async (context) => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-proof-replies-"));
   const directory = join(home, "broker");

@@ -67,7 +67,7 @@ test("fixture observation captures bounded rows and notices changes without read
       status: 200, contentType: "text/html", body: html
     }));
     await page.goto("http://127.0.0.1:8787/");
-    assert.deepEqual(await page.evaluate(captureFixtureSnapshot), { messages: [
+    assert.deepEqual(await page.evaluate(captureFixtureSnapshot), { omittedBefore: false, messages: [
       { id: "fixture-1", direction: "incoming", text: "Can you read this message?" },
       { id: "fixture-2", direction: "outgoing", text: "Yes. This is a local test conversation." }
     ] });
@@ -91,8 +91,45 @@ test("fixture observation captures bounded rows and notices changes without read
     assert.equal(await page.evaluate(captureFixtureSnapshot), null);
     await page.goto("http://127.0.0.1:8787/");
     await page.locator("ol#messages").evaluate((timeline) => timeline.insertAdjacentHTML("beforeend",
-      '<li data-message-id="large" data-direction="incoming"><p>' + "x".repeat(2049) + "</p></li>"));
-    assert.equal(await page.evaluate(captureFixtureSnapshot), null);
+      '<li data-message-id="large" data-direction="incoming"><p>' + "x".repeat(16001) + "</p></li>"));
+    const long = await page.evaluate(captureFixtureSnapshot);
+    assert.equal(long.messages.at(-1).text, "x".repeat(16000));
+    assert.equal(long.messages.at(-1).truncated, true);
+    assert.equal(long.omittedBefore, false);
+    await page.locator("ol#messages").evaluate(timeline => {
+      timeline.replaceChildren();
+      for (let index = 0; index < 33; index++) {
+        const row = document.createElement("li");
+        row.dataset.messageId = `window-${index}`;
+        row.dataset.direction = "incoming";
+        const paragraph = document.createElement("p");
+        paragraph.textContent = `Row ${index}`;
+        row.append(paragraph);
+        timeline.append(row);
+      }
+    });
+    const windowed = await page.evaluate(captureFixtureSnapshot);
+    assert.equal(windowed.omittedBefore, true);
+    assert.equal(windowed.messages.length, 32);
+    assert.equal(windowed.messages[0].id, "window-1");
+    assert.equal(windowed.messages.at(-1).id, "window-32");
+    await page.locator("ol#messages p").evaluateAll(paragraphs => {
+      for (const paragraph of paragraphs) paragraph.textContent = "\u00e9".repeat(16000);
+    });
+    const byteBounded = await page.evaluate(captureFixtureSnapshot);
+    assert.equal(byteBounded.omittedBefore, true);
+    assert.ok(byteBounded.messages.length < 32);
+    assert.equal(byteBounded.messages.at(-1).id, "window-32");
+    assert.ok(Buffer.byteLength(JSON.stringify(byteBounded)) <= 96 * 1024);
+    await page.locator("ol#messages").evaluate(timeline => {
+      const newest = timeline.lastElementChild;
+      timeline.replaceChildren(newest);
+      newest.querySelector("p").textContent = "\u0000".repeat(16000);
+    });
+    const escaped = await page.evaluate(captureFixtureSnapshot);
+    assert.equal(escaped.messages[0].truncated, undefined);
+    assert.equal(escaped.messages[0].text.length, 16000);
+    assert.ok(Buffer.byteLength(JSON.stringify(escaped)) <= 96 * 1024);
     await page.goto("about:blank");
     assert.equal(await page.evaluate(captureFixtureSnapshot), null);
   } finally {

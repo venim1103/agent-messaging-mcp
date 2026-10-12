@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-12 (T1a checkpoint).
+Updated: 2026-10-12 (T1 complete; awaiting D13a before T2).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -14,7 +14,7 @@ The person installs the extension and starts the MCP server in VS Code, opens a 
 
 ### Repository state
 
-- Latest source checkpoint: T1a native-watch recovery (2026-10-12 entry below), after `64ae52f`. Its exact gate passed build, both typechecks, **170/170 units and 20/20 e2e checks**. T1b remains next.
+- Latest source checkpoint: T1b observation window and failure policy (2026-10-12 entry below), after T1a `75ad536`. Its repaired exact gate passed build, both typechecks, **173/173 units and 20/20 e2e checks**. T1 is complete; T2 is not started.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
 ### Capability matrix
@@ -22,7 +22,7 @@ The person installs the extension and starts the MCP server in VS Code, opens a 
 | Public tool | Local fixture | Gemini saved chat |
 | --- | --- | --- |
 | `chat_request_connection`, `chat_get_connection`, `chat_disconnect` | Works; installed toolbar verified | Works; installed toolbar verified on disposable chats |
-| `chat_read_messages` | Works; installed verified | Works; live verified; rows have uncertain identity and unknown completion; fragile (R1) |
+| `chat_read_messages` | Works; installed verified; T1 robustness synthetic-tested | Works; earlier live reads verified; T1 robustness synthetic-tested; identity uncertain and completion unknown |
 | `chat_wait_for_events` | Works; installed verified | Works; two live trials passed; two earlier trials failed, one leaving the grant `stale` (consistent with R1) and one losing the owner (`unknown`) before keepalive |
 | `chat_prepare_message` | Works | Public tool refuses with `CONNECTION_NOT_FOUND`; private `prepare_gemini_message` works |
 | `chat_fill_draft` | Works; installed textarea verified | Not public; private fill and worker connected, synthetic tests only |
@@ -53,9 +53,9 @@ This supervised chain stays for tests. The autonomous path (T3) reuses its fill,
 
 ### Critical path to the target
 
-Done: G1, the dispatch-job slice (`11dec64`). Steps T1-T6 replace the earlier G2-G6 plan. The exact changes, tests, completion criteria and ask-points for each step are in **Implementation Plan T1-T6** below the dashboard.
+Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). Steps T1-T6 replace the earlier G2-G6 plan. The exact changes, tests, completion criteria and ask-points for each step are in **Implementation Plan T1-T6** below the dashboard.
 
-1. **T1 Read robustness.** T1a done: stopped native watches restart with bounded backoff (R2). Next T1b applies D8: a newest-rows window with `omittedBefore`, explicit per-message truncation within the frame limit, and skipping instead of revoking when a capture fails but URL, document and conversation are unchanged (R1).
+1. **T1 Read robustness: done.** Stopped native watches restart with bounded backoff (R2). D8 captures the newest 32 visible rows with `omittedBefore`, per-message truncation at 16,000 UTF-16 units and a 96 KiB capture cap. Identity-preserving failures skip publication; changed targets still revoke (R1). Synthetic evidence only for these changes.
 2. **T2 Connection model.** Popup-first **Connect this chat**, picked up by the connected MCP agent through a new tool (D13). One approval grants reading and autonomous sending (D1). No fixed expiry: the connection ends on tab close, chat switch, browser or MCP server restart, or disconnect, and a reload of the same chat re-attaches using a one-time optional `gemini.google.com` host permission (D2). The MCP server starts the broker and connects at startup (D4).
 3. **T3 Autonomous send.** A provider-neutral `chat_send_message` runs fill, fresh proof, durable intent, the one-offer job, browser reservation and one guarded activation, reusing today's pieces (D5). Add the append-only evidence rule (D9) with a settle window, per-connection resolution of unconfirmed sends with a one-click popup fallback (D10, R8), and the runaway guard: one message at a time and a configurable hourly cap. Relax "active tab of the current window" to "visible tab" (D11). Sandboxed synthetic tests cover the loop and its loss and crash cases.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
@@ -64,11 +64,11 @@ Done: G1, the dispatch-job slice (`11dec64`). Steps T1-T6 replace the earlier G2
 
 ### Findings: functional
 
-- **R1 Snapshot failures revoke the grant.** `captureGeminiSnapshot` in `packages/extension/lib/gemini-observation.ts` returns null for more than 32 rendered rows, any message over 2,048 characters, or a row that momentarily lacks its expected content element; the broker enforces the same caps. The worker then revokes the grant as `observation_unavailable`. Gemini answers longer than about 2,000 characters, which are common, and chats with more than 16 exchanges therefore end the connection. This is a plausible but unproven cause of the first live event-wait failure, which left the grant `stale`. The fixture has the same caps. Fix per D8.
+- **R1 Fixed (T1b, D8).** Both providers capture a newest-32-visible-row window, explicitly flag omitted rows and truncated text, and stay within 96 KiB. Missing or ambiguous row structure still fails capture, but unchanged exact targets retain their grants; challenged reads then return `OBSERVATION_UNAVAILABLE`, and later captures can recover. URL/document/conversation changes still revoke. The earlier live failure's cause remains unproven; this fix is synthetic-tested, not newly live-verified.
 - **R2 Fixed (T1a).** Both native watches schedule at most one restart timer after timeout, parse failure or port disconnect: 1 s doubling to 10 s, reset after a valid reply. The timer rechecks tracked unexpired grants before connecting. Disposable-browser checks verify fixture and Gemini reads recover without reapproval and a consumed Gemini fill job is not re-offered.
 - **R3 Five-minute grants** (`READONLY_CONNECTION_TTL_MS`) cannot be renewed; a longer conversation needs a new request and toolbar approval. Decided fix: D2 (T2).
 - **R4 Three popup clicks per message**, plus the prepare, fill and commit calls. Decided fix: one connection approval, D1 (T2, T3).
-- **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer holds 32 events or 256 KiB, so streaming can expire cursors. Agents should treat events as change hints and re-read (D3, T4).
+- **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer now holds 128 events or 4 MiB (T1b), so streaming can still expire cursors. Agents should treat events as change hints and re-read (D3, T4).
 - **R6 Gemini commits would end uncertain.** Fixture evidence uses stable row IDs; Gemini rows have none (D9).
 - **R7 Setup and target limits.** The broker must be started by hand (D4). Only saved chats with exactly two path segments, such as `https://gemini.google.com/app/<id>`, qualify; new unsaved chats and multi-account paths such as `/u/<n>/app/<id>` do not. Fill and submit need the chat tab to be the active tab of the current window and visible (D11 relaxes this to visible).
 - **R8 One unconfirmed send blocks all sending for good.** `recordDispatchIntent` refuses every new intent while any journal attempt lacks evidence: across all chats, across broker restarts, and nothing ever resolves such an attempt. Only fixture evidence clears it today, so the first unconfirmed Gemini send would stop all sending. D10 makes the barrier per connection and resolves it from page evidence or one popup click (T3). The development journal currently holds no unresolved attempt.
@@ -91,7 +91,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Still open: D6, 
 
 ### Next step
 
-T1b from the Implementation Plan below. It needs no user decision. T1a is committed separately; ask the user to confirm D13a before starting T2.
+Await the user's D13a confirmation before T2: exactly one connected facade receives a popup connection; with none, the offer waits for pickup or tab close; with several, the popup refuses. T1a is `75ad536`; T1b is the newest checkpoint below. No T2 implementation or live access has started.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -155,6 +155,15 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T1b Observation Window And Failure Policy (2026-10-12)
+
+- Both self-contained capture functions retain the newest 32 visible rows and flag `omittedBefore`. Text over 16,000 UTF-16 units is cut with `truncated: true`; oldest rows are dropped under byte pressure to fit 96 KiB, with a further single-row cut available if necessary. Empty Gemini streaming rows still count toward the visible-row window. Ambiguous structure remains a capture failure.
+- Publication, native parsing/forwarding, broker/client snapshot and event schemas, and event deduplication preserve the flags. Read replies combine capture omission with caller-limit omission. Per-grant buffers now hold 128 events or 4 MiB; checks cover each retention boundary and two large events inside the unchanged 256 KiB frame cap.
+- Worker challenge and mutation handlers skip failed captures only when the exact URL, document and conversation remain unchanged. Actual sandboxed fixture/Gemini worker tests verify `OBSERVATION_UNAVAILABLE` without revocation, later recovery, Gemini window/truncation flags, ambiguous capture refusal without revocation and URL-change revocation. No uncertain fill/send retry was added.
+- First exact gate passed build/typechecks but stopped at 166/173 units (seven assertion failures), so e2e did not run. Six failures came from fixture reconciliation rejecting the new strict event field; one was an old SDK event-shape assertion. The schema repair accepts the new observation bounds but conservatively refuses evidence from truncated matches or omitted baseline/events/current rows. The focused repair first passed 7/8; the old 33-event overflow case was below the new cap. Publishing 129 events retained its uncertainty assertion, and the same focused checks passed 8/8.
+- Other focused corrections: a 96,000-byte escaped row is below 96 KiB, so the single-row test now asserts exact uncut text; the popup target-change assertion now uses its existing fixed wording; the new IPC test narrows its reply union. A rejected out-of-order patch was verified not to have applied before correction. No deadline, assertion, sandbox or authority check was weakened, and the failed gate was not blindly rerun.
+- New exact gate `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e` passed build, both typechecks, 173/173 units and 20/20 e2e checks. DEVELOPMENT.md documents the changed limits and failure policy. No installed reload, personal profile or live Gemini access was used. Stop before T2 for D13a; later ask D10a before T3 and obtain live authorization for T4/T5 (AGENTS.md Safety Boundaries).
 
 ## T1a Native-Watch Recovery (2026-10-12)
 

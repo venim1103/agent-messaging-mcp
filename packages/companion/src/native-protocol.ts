@@ -396,9 +396,10 @@ const geminiSnapshotSchema = z.strictObject({
   payload: z.strictObject({
     target: geminiTargetSchema,
     messages: z.array(z.strictObject({
-      direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(2048)
+      direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(16_000),
+      truncated: z.literal(true).optional()
     })).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES),
-    challengeId: z.uuid().optional()
+    challengeId: z.uuid().optional(), omittedBefore: z.boolean().optional()
   })
 });
 
@@ -406,7 +407,8 @@ export function parseNativeGeminiSnapshot(message: unknown, now = Date.now()) {
   const result = geminiSnapshotSchema.safeParse(message);
   if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
     || !isValidGeminiTarget(result.data.payload.target)
-    || Buffer.byteLength(JSON.stringify(result.data.payload.messages), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
+    || Buffer.byteLength(JSON.stringify({ messages: result.data.payload.messages,
+      omittedBefore: result.data.payload.omittedBefore ?? false }), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
     throw new Error("Invalid native Gemini snapshot");
   }
   return result.data;
@@ -439,16 +441,18 @@ const fixtureSnapshotSchema = z.strictObject({
     target: fixtureTargetSchema,
     messages: z.array(z.strictObject({
       id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
-      direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
+      direction: z.enum(["incoming", "outgoing"]), text: z.string().max(16_000),
+      truncated: z.literal(true).optional()
     })).max(MAX_FIXTURE_SNAPSHOT_MESSAGES),
-    challengeId: z.uuid().optional()
+    challengeId: z.uuid().optional(), omittedBefore: z.boolean().optional()
   })
 });
 
 export function parseNativeFixtureSnapshot(message: unknown, now = Date.now()) {
   const result = fixtureSnapshotSchema.safeParse(message);
   if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000
-    || Buffer.byteLength(JSON.stringify(result.data.payload.messages), "utf8") > MAX_FIXTURE_SNAPSHOT_BYTES
+    || Buffer.byteLength(JSON.stringify({ messages: result.data.payload.messages,
+      omittedBefore: result.data.payload.omittedBefore ?? false }), "utf8") > MAX_FIXTURE_SNAPSHOT_BYTES
     || new Set(result.data.payload.messages.map((entry) => entry.id)).size !== result.data.payload.messages.length) {
     throw new Error("Invalid native fixture snapshot");
   }

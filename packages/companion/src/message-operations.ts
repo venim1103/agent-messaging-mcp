@@ -94,8 +94,9 @@ export const fixtureDraftFillStateSchema = z.discriminatedUnion("state", [
 ]);
 const fixtureObservationSchema = z.strictObject({
   kind: z.literal("fixture_snapshot"),
+  omittedBefore: z.boolean(),
   messages: z.array(z.strictObject({ id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
-    direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
+    direction: z.enum(["incoming", "outgoing"]), text: z.string().max(16_000), truncated: z.literal(true).optional()
   })).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
 });
 
@@ -134,6 +135,7 @@ type FixtureDispatchBaseline = Readonly<{
   capturedAt: number;
   cursor: Readonly<{ epoch: string; sequence: number }>;
   messageIds: ReadonlyArray<string>;
+  omittedBefore: boolean;
 }>;
 type FixtureDispatchCheck = Readonly<{
   checkId: string; owner: symbol; target: FixtureTarget; text: string; createdAt: number; expiresAt: number;
@@ -967,7 +969,7 @@ export class PreparedMessageOperations {
     const snapshot = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
     if (!snapshot || snapshot === "not_ready" || snapshot.capturedAt > now) throw new Error("OBSERVATION_UNAVAILABLE");
     const baseline = Object.freeze({ capturedAt: snapshot.capturedAt, cursor: snapshot.cursor,
-      messageIds: Object.freeze(snapshot.messages.map((message) => message.id)) });
+      messageIds: Object.freeze(snapshot.messages.map((message) => message.id)), omittedBefore: snapshot.omittedBefore });
     this.dispatchBaselines.set(operationId, baseline);
     this.discardFixtureDispatchCheck(operationId);
     return Object.freeze({ operationId, capturedAt: baseline.capturedAt, cursor: baseline.cursor });
@@ -1468,11 +1470,12 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     const baseline = this.dispatchBaselines.get(operationId);
     const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
-    if (!operation || operation.owner !== owner || !baseline || !live || this.ambiguousEvidence.has(operationId)
+    if (!operation || operation.owner !== owner || !baseline || baseline.omittedBefore || !live || this.ambiguousEvidence.has(operationId)
       || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
       || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId) return status;
     const snapshot = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
-    if (!snapshot || snapshot === "not_ready" || snapshot.capturedAt < status.startedAt || snapshot.capturedAt > now
+    if (!snapshot || snapshot === "not_ready" || snapshot.omittedBefore
+      || snapshot.capturedAt < status.startedAt || snapshot.capturedAt > now
       || snapshot.cursor.epoch !== baseline.cursor.epoch || snapshot.cursor.sequence <= baseline.cursor.sequence) return status;
     const events = this.requests.readFixtureEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
     if (!events || events === "not_ready" || events.state !== "ok"
@@ -1481,9 +1484,9 @@ export class PreparedMessageOperations {
     const matchingIds = new Set<string>();
     for (const event of events.events) {
       const observation = fixtureObservationSchema.safeParse(event.payload);
-      if (!observation.success) return status;
+      if (!observation.success || observation.data.omittedBefore) return status;
       for (const message of observation.data.messages) {
-        if (!known.has(message.id) && message.direction === "outgoing" && message.text === operation.text) {
+        if (!message.truncated && !known.has(message.id) && message.direction === "outgoing" && message.text === operation.text) {
           matchingIds.add(message.id);
         }
       }
@@ -1492,7 +1495,7 @@ export class PreparedMessageOperations {
       this.ambiguousEvidence.add(operationId);
       return status;
     }
-    const matches = snapshot.messages.filter((message) => !known.has(message.id)
+    const matches = snapshot.messages.filter((message) => !message.truncated && !known.has(message.id)
       && message.direction === "outgoing" && message.text === operation.text);
     if (matches.length > 1) this.ambiguousEvidence.add(operationId);
     if (matches.length !== 1 || !matches[0]) return status;

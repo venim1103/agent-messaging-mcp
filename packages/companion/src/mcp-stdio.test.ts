@@ -397,7 +397,7 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
       epoch: string; sequence: number
     }; timedOut: boolean };
     assert.equal(eventPage.timedOut, false);
-    assert.deepEqual(eventPage.events[0]?.payload, { kind: "fixture_snapshot", messages: later });
+    assert.deepEqual(eventPage.events[0]?.payload, { kind: "fixture_snapshot", messages: later, omittedBefore: false });
     assert.equal(eventPage.cursor.sequence, cursor.sequence + 1);
     const expired = await clientOne.callTool({ name: "chat_wait_for_events", arguments: {
       connectionId, cursor: { epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 }, timeoutMs: 0

@@ -177,7 +177,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
               await writeBrokerResponse(socket, snapshot && snapshot !== "not_ready"
                 ? { ...reply, kind: reply.kind === "fixture_read_authorized" ? "fixture_snapshot" : "gemini_snapshot", payload: {
                   ...snapshot, messages: snapshot.messages.slice(-reply.payload.limit),
-                  omittedBefore: snapshot.messages.length > reply.payload.limit
+                  omittedBefore: snapshot.omittedBefore || snapshot.messages.length > reply.payload.limit
                 } }
                 : { ...reply, kind: "error", payload: {
                   code: snapshot === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND"

@@ -420,13 +420,13 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
     assert.deepEqual(await page.evaluate(() => window.identityNotifications), [{ kind: "gemini_identity_changed" }]);
     assert.equal((await page.evaluate(() => window.messageNotifications)).length, 1);
     await page.goto("https://gemini.google.com/app/disposable-chat");
-    assert.deepEqual(await page.evaluate(captureGeminiSnapshot), { messages: [
+    assert.deepEqual(await page.evaluate(captureGeminiSnapshot), { omittedBefore: false, messages: [
       { direction: "outgoing", text: "First line\nSecond line \u00e9" },
       { direction: "incoming", text: "OK" },
       { direction: "outgoing", text: "OK" }
     ] });
     await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = ""; });
-    assert.deepEqual(await page.evaluate(captureGeminiSnapshot), { messages: [
+    assert.deepEqual(await page.evaluate(captureGeminiSnapshot), { omittedBefore: false, messages: [
       { direction: "outgoing", text: "First line\nSecond line \u00e9" },
       { direction: "outgoing", text: "OK" }
     ] });
@@ -463,8 +463,49 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
     await page.goto("https://gemini.google.com/app/disposable-chat");
     await page.reload();
     await page.locator("model-response-content p").evaluate((paragraph) => {
-      paragraph.textContent = "x".repeat(2049);
+      paragraph.textContent = "x".repeat(16001);
     });
+    const long = await page.evaluate(captureGeminiSnapshot);
+    assert.equal(long.messages[1].text, "x".repeat(16000));
+    assert.equal(long.messages[1].truncated, true);
+    assert.equal(long.omittedBefore, false);
+    await page.locator("infinite-scroller").evaluate(timeline => {
+      timeline.replaceChildren();
+      for (let index = 0; index < 33; index++) {
+        const row = document.createElement("model-response");
+        const content = document.createElement("model-response-content");
+        content.textContent = `Row ${index}`;
+        row.append(content);
+        timeline.append(row);
+      }
+    });
+    const windowed = await page.evaluate(captureGeminiSnapshot);
+    assert.equal(windowed.omittedBefore, true);
+    assert.equal(windowed.messages.length, 32);
+    assert.equal(windowed.messages[0].text, "Row 1");
+    assert.equal(windowed.messages.at(-1).text, "Row 32");
+    await page.locator("model-response-content").last().evaluate(content => { content.textContent = ""; });
+    const emptyNewest = await page.evaluate(captureGeminiSnapshot);
+    assert.equal(emptyNewest.omittedBefore, true);
+    assert.equal(emptyNewest.messages.length, 31);
+    assert.equal(emptyNewest.messages[0].text, "Row 1");
+    await page.locator("model-response-content").evaluateAll(contents => {
+      for (const content of contents) content.textContent = "\u00e9".repeat(16000);
+    });
+    const byteBounded = await page.evaluate(captureGeminiSnapshot);
+    assert.equal(byteBounded.omittedBefore, true);
+    assert.ok(byteBounded.messages.length < 32);
+    assert.ok(Buffer.byteLength(JSON.stringify(byteBounded)) <= 96 * 1024);
+    await page.locator("infinite-scroller").evaluate(timeline => {
+      const newest = timeline.lastElementChild;
+      timeline.replaceChildren(newest);
+      newest.querySelector("model-response-content").textContent = "\u0000".repeat(16000);
+    });
+    const escaped = await page.evaluate(captureGeminiSnapshot);
+    assert.equal(escaped.messages[0].truncated, undefined);
+    assert.equal(escaped.messages[0].text.length, 16000);
+    assert.ok(Buffer.byteLength(JSON.stringify(escaped)) <= 96 * 1024);
+    await page.locator("model-response-content").evaluate(content => content.remove());
     assert.equal(await page.evaluate(captureGeminiSnapshot), null);
     await page.goto("about:blank");
     assert.equal(await page.evaluate(captureGeminiSnapshot), null);

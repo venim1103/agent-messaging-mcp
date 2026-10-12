@@ -193,7 +193,7 @@ test("bounded fixture snapshots belong only to live matching grants and retain a
   if (!events || events === "not_ready" || events.state !== "ok") throw new Error("Expected one later observation");
   assert.equal(events.events.length, 1);
   assert.equal(events.cursor.sequence, 2);
-  assert.deepEqual(events.events[0]?.payload, { kind: "fixture_snapshot", messages });
+  assert.deepEqual(events.events[0]?.payload, { kind: "fixture_snapshot", messages, omittedBefore: false });
   assert.deepEqual(requests.readFixtureEvents(owner, grant.connectionId, { epoch: "other", sequence: 1 }, 1, 2002),
     { state: "expired", resnapshot: true });
   assert.equal(requests.getFixtureSnapshot(owner, grant.connectionId, grant.expiresAt), null);
@@ -202,6 +202,87 @@ test("bounded fixture snapshots belong only to live matching grants and retain a
   assert.equal(requests.readFixtureEvents(owner, grant.connectionId, initial.cursor, 1, 2003), null);
   assert.equal(requests.publishFixtureSnapshot(target, messages, 2003), 0);
 });
+
+for (const provider of ["fixture", "gemini"] as const) {
+  test(`${provider} observation flags participate in deduplication and bounded event retention`, () => {
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("reader");
+    const pending = requests.create(owner, 1000);
+    const fixtureTarget = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "CHROME-doc_window" };
+    const geminiTarget = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
+      url: "https://gemini.google.com/app/disposable-chat", tabId: 4, documentId: "CHROME-doc_window" };
+    const grant = (provider === "fixture" ? requests.approve(pending.requestId, fixtureTarget, 2000)
+      : requests.approveGemini(pending.requestId, geminiTarget, 2000))!;
+    const publish = (text: string, truncated?: true, omittedBefore = false, count = 1) => {
+      const rows = Array.from({ length: count }, () => ({ direction: "incoming" as const, text,
+        ...(truncated ? { truncated } : {}) }));
+      return provider === "fixture"
+        ? requests.publishFixtureSnapshot(fixtureTarget, rows.map((row, index) => ({ ...row, id: `row-${index}` })),
+          2001, undefined, omittedBefore)
+        : requests.publishGeminiSnapshot(geminiTarget, rows, 2001, undefined, omittedBefore);
+    };
+    const snapshot = () => {
+      const result = provider === "fixture" ? requests.getFixtureSnapshot(owner, grant.connectionId, 2001)
+        : requests.getGeminiSnapshot(owner, grant.connectionId, 2001);
+      if (!result || result === "not_ready") throw new Error("Expected a snapshot");
+      return result;
+    };
+    const events = (cursor: ReturnType<typeof snapshot>["cursor"], limit = 2) => provider === "fixture"
+      ? requests.readFixtureEvents(owner, grant.connectionId, cursor, limit, 2001)
+      : requests.readGeminiEvents(owner, grant.connectionId, cursor, limit, 2001);
+    assert.equal(publish("x".repeat(16000)), 1);
+    const initial = snapshot();
+    assert.equal(initial.omittedBefore, false);
+    assert.equal(initial.messages[0]?.truncated, undefined);
+    assert.equal(publish("x".repeat(16000), true), 1);
+    assert.equal(snapshot().messages[0]?.truncated, true);
+    assert.equal(snapshot().cursor.sequence, initial.cursor.sequence + 1);
+    assert.equal(publish("x".repeat(16000), true, true), 1);
+    assert.equal(snapshot().omittedBefore, true);
+    assert.equal(snapshot().cursor.sequence, initial.cursor.sequence + 2);
+    publish("x".repeat(16000), true, true);
+    assert.equal(snapshot().cursor.sequence, initial.cursor.sequence + 2);
+    const flagged = events(initial.cursor);
+    if (!flagged || flagged === "not_ready" || flagged.state !== "ok") throw new Error("Expected flag events");
+    assert.equal(flagged.events.length, 2);
+    assert.equal((flagged.events[0]?.payload as { omittedBefore: boolean }).omittedBefore, false);
+    assert.equal((flagged.events[1]?.payload as { omittedBefore: boolean }).omittedBefore, true);
+    assert.throws(() => publish("x".repeat(16001)), /Invalid .* snapshot/);
+    assert.throws(() => publish("x", undefined, false, 33), /Invalid .* snapshot/);
+    assert.throws(() => publish("x".repeat(16000), true, false, 7), /Invalid .* snapshot/);
+    const beforeLarge = snapshot().cursor;
+    publish("x".repeat(16000), true, true, 6);
+    publish("y".repeat(16000), true, true, 6);
+    const large = events(beforeLarge);
+    if (!large || large === "not_ready" || large.state !== "ok") throw new Error("Expected two large events");
+    assert.equal(large.events.length, 2);
+    assert.ok(Buffer.byteLength(JSON.stringify(large)) < 256 * 1024);
+    const retained = snapshot().cursor;
+    for (let index = 0; index < 128; index++) publish(`Small ${index}`);
+    const atCapacity = events(retained);
+    assert.ok(atCapacity && atCapacity !== "not_ready" && atCapacity.state === "ok");
+    publish("Evict oldest");
+    assert.deepEqual(events(retained), { state: "expired", resnapshot: true });
+    const byteRetained = snapshot().cursor;
+    for (let index = 0; index < 43; index++) publish(String(index).padEnd(16000, "z"), true, true, 6);
+    const belowByteCap = events(byteRetained);
+    assert.ok(belowByteCap && belowByteCap !== "not_ready" && belowByteCap.state === "ok");
+    publish("Byte pressure".padEnd(16000, "z"), true, true, 6);
+    assert.deepEqual(events(byteRetained), { state: "expired", resnapshot: true });
+    if (provider === "fixture") {
+      assert.throws(() => requests.publishFixtureSnapshot(fixtureTarget,
+        [{ id: "row", direction: "incoming", text: "x", truncated: false } as never], 2001), /Invalid fixture snapshot/);
+      assert.throws(() => requests.publishFixtureSnapshot(fixtureTarget,
+        [{ id: "row", direction: "incoming", text: "x", extra: true } as never], 2001), /Invalid fixture snapshot/);
+    } else {
+      assert.throws(() => requests.publishGeminiSnapshot(geminiTarget,
+        [{ direction: "incoming", text: "x", truncated: false } as never], 2001), /Invalid Gemini snapshot/);
+      assert.throws(() => requests.publishGeminiSnapshot(geminiTarget,
+        [{ direction: "incoming", text: "x", extra: true } as never], 2001), /Invalid Gemini snapshot/);
+    }
+  });
+}
 
 test("fresh fixture read challenges belong to a live owner and expire or cancel without exposing rows", async () => {
   const requests = new PendingConnectionRequests();
@@ -386,12 +467,12 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   const events = requests.readGeminiEvents(owner, granted!.connectionId, snapshot.cursor, 1, 2003);
   if (!events || events === "not_ready" || events.state !== "ok") throw new Error("Expected one Gemini update");
   assert.equal(events.cursor.sequence, snapshot.cursor.sequence + 1);
-  assert.deepEqual(events.events[0]?.payload, { kind: "gemini_snapshot", messages: later.map((message) => ({
+  assert.deepEqual(events.events[0]?.payload, { kind: "gemini_snapshot", omittedBefore: false, messages: later.map((message) => ({
     ...message, identityQuality: "uncertain", generationState: "unknown"
   })) });
   assert.deepEqual(requests.readGeminiEvents(owner, granted!.connectionId, { epoch: "other", sequence: 1 }, 1, 2003),
     { state: "expired", resnapshot: true });
-  assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "x".repeat(2049) }], 2002),
+  assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "x".repeat(16001) }], 2002),
     /Invalid Gemini snapshot/);
   assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: 0 as never }], 2002),
     /Invalid Gemini snapshot/);

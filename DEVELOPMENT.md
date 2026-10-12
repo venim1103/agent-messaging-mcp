@@ -86,11 +86,13 @@ Toolbar clicks, extension reloads and profile unlocks are human steps. Ask for t
 1. `chat_request_connection` returns `{ requestId, state: "pending", expiresAt }`. The request expires after 60 seconds.
 2. Human: select the chat tab, click the extension's toolbar icon, choose **View pending requests**, then **Approve read-only fixture** or **Approve read-only Gemini chat** for that request.
 3. `chat_get_connection { requestId }` returns `ready_readonly` with `connectionId`, `origin`, `conversationId`, `generation: 1`, `expiresAt` (five minutes after approval, no renewal) and `observation` age (`not_observed`, `recent` or `old`, not a presence signal). Other states are `pending`, `expired`, `stale` (revoked) and `unknown` (foreign or forgotten).
-4. `chat_read_messages { connectionId, limit? }` returns a fresh rendered snapshot with `coverage: "rendered_only"`, `capturedAt`, `cursor`, `messages` and `omittedBefore`. Fixture rows have stable IDs; Gemini rows carry `identityQuality: "uncertain"` and `generationState: "unknown"`.
+4. `chat_read_messages { connectionId, limit? }` returns a fresh rendered snapshot with `coverage: "rendered_only"`, `capturedAt`, `cursor`, `messages` and `omittedBefore`. That flag covers capture-window/byte omissions and caller-limit omissions. A cut message has `truncated: true`; its text is not complete. Fixture rows have stable IDs; Gemini rows carry `identityQuality: "uncertain"` and `generationState: "unknown"`.
 5. `chat_wait_for_events { connectionId, cursor, timeoutMs?, limit? }` waits up to 20 seconds and returns `{ state: "ok", events, cursor, timedOut }`. Each event holds a full rendered snapshot, not a delta. On `CURSOR_EXPIRED`, call `chat_read_messages` again.
 6. `chat_disconnect { connectionId }` returns `{ disconnected }` and leaves the tab open.
 
-For Gemini, treat events as change hints. A streaming reply produces many snapshots, the 32-event buffer can expire a cursor, and completion is unknown, so wait until events stop for a while and then read again. A reply longer than 2,048 characters or a chat with more than 32 rendered rows currently ends the grant (HANDOFF finding R1).
+For Gemini, treat events as change hints. A streaming reply produces many snapshots; the 128-event/4 MiB buffer can still expire a cursor, and completion is unknown, so wait until events stop for a while and then read again. Captures keep the newest 32 visible rows, cap each message at 16,000 UTF-16 units and drop oldest rows until the capture fits 96 KiB. Snapshot events carry the same omission and truncation flags.
+
+A missing or ambiguous message element skips publication when URL, document and conversation are unchanged. A challenged read then returns `OBSERVATION_UNAVAILABLE` after its original four-second budget; a later read can recover without reapproval. Identity changes still revoke the grant. No snapshot omission or truncation proves a complete history.
 
 ### Supervised send (fixture only)
 
@@ -121,6 +123,8 @@ Each human approval lasts at most two minutes and ends with the preparation or c
 
 Operation states are `awaiting_approval`, `approved` (ordinary no-send review only), `expired`, `stale`, `unknown`, `dispatch_uncertain` and `observed_in_ui`. `draftFill` reports `fill_approved`, `filling`, `filled`, `failed` or `uncertain`; `filled` describes a past readback, not the current draft. `observed_in_ui` is UI evidence, not acceptance or delivery.
 
+Fixture send reconciliation stays uncertain when its baseline, an intervening event or the current capture omitted rows. A truncated outgoing row cannot prove an exact text match. Status recovery does not restore write authority.
+
 Most refusals are text of the form `CODE: No chat was accessed.` Codes include `BROKER_UNAVAILABLE`, `CONNECTION_NOT_FOUND`, `OBSERVATION_UNAVAILABLE`, `CURSOR_EXPIRED`, `CANCELLED`, `TOO_MANY_PENDING`, `PREPARATION_UNAVAILABLE`, `GENERATION_MISMATCH`, `INVALID_MESSAGE_TEXT`, `INVALID_IDEMPOTENCY_KEY`, `IDEMPOTENCY_CONFLICT`, `OPERATION_EXPIRED`, `OPERATION_UNAVAILABLE`, `TOO_MANY_PREPARED` and `DISPATCH_UNCERTAIN`. Fill and commit return structured codes; losing the broker connection during either becomes `FILL_UNCERTAIN` or `DISPATCH_UNCERTAIN`.
 
 ## Trusted Popup
@@ -139,7 +143,7 @@ Review lists show at most eight exact previews and clear when the tab, document,
 ## Gemini Target Rules
 
 - Eligible: a saved chat URL with exactly two path segments, such as `https://gemini.google.com/app/<id>`, with an optional query (bound exactly), no fragment and at most 512 characters. New unsaved chats (`/app`) and multi-account paths such as `/u/<n>/app/<id>` are not eligible.
-- A grant binds the tab, Chrome document, exact URL and conversation ID. Reloading, navigating or closing the tab, reloading the extension or an observation failure makes it `stale`.
+- A grant binds the tab, Chrome document, exact URL and conversation ID. Reloading, navigating or closing the tab, or reloading the extension makes it `stale`. Capture failures alone no longer revoke an unchanged target; they cannot authorize reading a changed target.
 - Reads parse `user-query` and `model-response` rows inside one visible `infinite-scroller` in one `main` region. Fill and submit also need the tab active and visible, one prompt editor labeled `Enter a prompt for Gemini` (empty before filling) and one visible `Send message` submit button.
 - These selectors reflect one observed UI variant and can break whenever Gemini changes its page.
 
@@ -151,8 +155,8 @@ Review lists show at most eight exact previews and clear when the tab, document,
 | Read-only grant | 5 min without renewal; `generation` always 1 | `pending-connections.ts` |
 | Fresh read challenge | 4 s | `pending-connections.ts` |
 | Native watch recovery | One pending restart per provider; 1 s doubling to 10 s, reset on valid reply; requires a tracked unexpired grant | `background.ts` |
-| Snapshot | 32 rows, 2,048 UTF-16 units per message, 64 KiB; a failed capture revokes the grant | `gemini-observation.ts`, `fixture-observation.ts`, `pending-connections.ts` |
-| Observation buffer per grant | 32 events, 256 KiB | `pending-connections.ts` |
+| Snapshot | Newest 32 visible rows; 16,000 UTF-16 units per message with `truncated: true`; 96 KiB capture JSON; `omittedBefore` for dropped rows; unchanged-target failures skip publication | `gemini-observation.ts`, `fixture-observation.ts`, `pending-connections.ts` |
+| Observation buffer per grant | 128 events, 4 MiB; both bounds can expire cursors | `pending-connections.ts` |
 | Event wait | 20 s maximum, 2 events per call, 200 ms polling | `mcp-stdio.ts` |
 | Prepared text | 4,000 UTF-8 bytes; Gemini also 2,048 UTF-16 units, no surrounding whitespace, no carriage return | `message-operations.ts` |
 | Preparation | 3 min; 100 active and 10,000 recorded; keys kept one day after expiry; unresolved intents never pruned | `message-operations.ts` |
@@ -222,8 +226,8 @@ Browser-test rules: launch Chromium with `chromiumSandbox: true`, because Playwr
 ## Troubleshooting
 
 - `BROKER_UNAVAILABLE`: start `npm run dev:broker`; the facade reconnects on the next call. Read-only calls can then be repeated, but an uncertain fill or commit must not be.
-- `CONNECTION_NOT_FOUND` or `stale`: the grant expired after five minutes; the tab reloaded, navigated or closed; the conversation changed; the extension reloaded; an observation failed (HANDOFF R1); or the MCP server restarted and became a new owner. Request a new connection.
-- `OBSERVATION_UNAVAILABLE`: the extension did not answer within four seconds. The tab may be gone or capture unavailable (HANDOFF R1). Stopped native watches automatically resume polling with bounded 1-10 s backoff while a tracked grant remains. A later read can succeed without reapproval; this never retries an uncertain fill or send. Worker wake still marks an observation gap.
+- `CONNECTION_NOT_FOUND` or `stale`: the grant expired after five minutes; the tab reloaded, navigated or closed; the conversation changed; the extension reloaded; or the MCP server restarted and became a new owner. Request a new connection.
+- `OBSERVATION_UNAVAILABLE`: no valid capture answered the fresh challenge within four seconds. Missing/ambiguous row content with unchanged identity is skipped, not revoked; a later read may recover. Stopped native watches resume polling with bounded 1-10 s backoff while a tracked grant remains. Neither behavior retries an uncertain fill or send. Worker wake still marks an observation gap.
 - No pending request in the popup: the request expired after 60 seconds, or the selected tab is not the fixture or an eligible saved Gemini chat.
 - Native bridge unavailable: check the registration with `--preview`, the extension ID, the launcher path and that the manifest is in the profile Chromium is using.
 - Tools missing or outdated: rebuild and restart the MCP server.

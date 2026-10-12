@@ -818,7 +818,7 @@ test("a relay publishes bounded fixture rows but only the owning facade reads an
   const observed = handleBrokerRequest(eventRead, "facade", owner, requests, 2002);
   assert.equal(observed.kind, "fixture_events");
   if (observed.kind !== "fixture_events" || observed.payload.state !== "ok") throw new Error("Expected a later event");
-  assert.deepEqual(observed.payload.events[0]?.payload, { kind: "fixture_snapshot", messages: later });
+  assert.deepEqual(observed.payload.events[0]?.payload, { kind: "fixture_snapshot", messages: later, omittedBefore: false });
   assert.equal(observed.payload.cursor.sequence, 2);
   assert.deepEqual(handleBrokerRequest({ ...eventRead, payload: { ...eventRead.payload,
     cursor: { epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 } } },
@@ -905,7 +905,7 @@ test("generic event reads follow the owned Gemini grant and not a caller-selecte
   requests.publishGeminiSnapshot(target, laterRows, 2002);
   const later = handleBrokerRequest(read, "facade", owner, requests, 2002);
   if (later.kind !== "gemini_events" || later.payload.state !== "ok") throw new Error("Expected Gemini update");
-  assert.deepEqual(later.payload.events[0]?.payload, { kind: "gemini_snapshot", messages: laterRows.map((row) => ({
+  assert.deepEqual(later.payload.events[0]?.payload, { kind: "gemini_snapshot", omittedBefore: false, messages: laterRows.map((row) => ({
     ...row, identityQuality: "uncertain", generationState: "unknown"
   })) });
   assert.deepEqual(handleBrokerRequest({ ...read, payload: { ...read.payload,

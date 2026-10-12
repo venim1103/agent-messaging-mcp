@@ -154,7 +154,7 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
     const events = await facade.readFixtureEvents(connectionId, snapshot.payload.cursor, 1);
     if (events.kind !== "fixture_events" || events.payload.state !== "ok") throw new Error("Expected fixture events");
     assert.equal(events.payload.cursor.sequence, 2);
-    assert.deepEqual(events.payload.events[0]?.payload, { kind: "fixture_snapshot", messages: later });
+    assert.deepEqual(events.payload.events[0]?.payload, { kind: "fixture_snapshot", messages: later, omittedBefore: false });
     assert.deepEqual((await facade.readFixtureEvents(connectionId, {
       epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 2
     })).payload, { state: "expired", resnapshot: true });
@@ -285,7 +285,7 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
       throw new Error("Expected an owned Gemini event update");
     }
     assert.equal(eventPage.payload.cursor.sequence, freshGemini.payload.cursor.sequence + 1);
-    assert.deepEqual(eventPage.payload.events[0]?.payload, { kind: "gemini_snapshot",
+    assert.deepEqual(eventPage.payload.events[0]?.payload, { kind: "gemini_snapshot", omittedBefore: false,
       messages: laterRows.map((row) => ({ ...row, identityQuality: "uncertain", generationState: "unknown" })) });
     assert.throws(() => facade.markGeminiObservationGap(geminiTarget), /Broker role cannot perform/);
     assert.deepEqual((await relay.markGeminiObservationGap({ ...geminiTarget,

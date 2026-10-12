@@ -30,7 +30,8 @@ const helloResult = z.strictObject({
 });
 const fixtureMessage = z.strictObject({
   id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
-  direction: z.enum(["incoming", "outgoing"]), text: z.string().max(2048)
+  direction: z.enum(["incoming", "outgoing"]), text: z.string().max(16_000),
+  truncated: z.literal(true).optional()
 });
 const fixtureTarget = z.strictObject({
   origin: z.literal("http://127.0.0.1:8787"), conversationId: z.literal("fixture-alpha"),
@@ -42,7 +43,8 @@ const geminiTarget = z.strictObject({
   tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
 });
 const geminiMessage = z.strictObject({
-  direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(2048),
+  direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(16_000),
+  truncated: z.literal(true).optional(),
   identityQuality: z.literal("uncertain"), generationState: z.literal("unknown")
 });
 const fixtureCursor = z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() });
@@ -379,7 +381,7 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ state: z.literal("ok"), cursor: fixtureCursor,
         events: z.array(z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().positive(),
           payload: z.strictObject({ kind: z.literal("fixture_snapshot"),
-            messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES) })
+            messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES), omittedBefore: z.boolean() })
         })).max(MAX_FIXTURE_EVENTS_PER_READ) })
     ])
   }),
@@ -391,7 +393,7 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ state: z.literal("ok"), cursor: fixtureCursor,
         events: z.array(z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().positive(),
           payload: z.strictObject({ kind: z.literal("gemini_snapshot"),
-            messages: z.array(geminiMessage).max(MAX_GEMINI_SNAPSHOT_MESSAGES) })
+            messages: z.array(geminiMessage).max(MAX_GEMINI_SNAPSHOT_MESSAGES), omittedBefore: z.boolean() })
         })).max(MAX_GEMINI_EVENTS_PER_READ) })
     ])
   }),
@@ -655,11 +657,13 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         request("approve_fixture", { pendingRequestId, target }),
       approveGemini: (pendingRequestId: string, target: GeminiTarget) =>
         request("approve_gemini", { pendingRequestId, target }),
-      publishFixtureSnapshot: (target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>, challengeId?: string) =>
-        request("publish_fixture_snapshot", { target, messages,
+      publishFixtureSnapshot: (target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>, challengeId?: string,
+        omittedBefore = false) =>
+        request("publish_fixture_snapshot", { target, messages, omittedBefore,
           ...(challengeId === undefined ? {} : { challengeId }) }),
-      publishGeminiSnapshot: (target: GeminiTarget, messages: ReadonlyArray<GeminiRenderedMessage>, challengeId?: string) =>
-        request("publish_gemini_snapshot", { target, messages,
+      publishGeminiSnapshot: (target: GeminiTarget, messages: ReadonlyArray<GeminiRenderedMessage>, challengeId?: string,
+        omittedBefore = false) =>
+        request("publish_gemini_snapshot", { target, messages, omittedBefore,
           ...(challengeId === undefined ? {} : { challengeId }) }),
       markFixtureObservationGap: (target: FixtureTarget) => request("mark_fixture_observation_gap", { target }),
       markGeminiObservationGap: (target: GeminiTarget) => request("mark_gemini_observation_gap", { target }),

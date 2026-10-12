@@ -43,7 +43,7 @@ const fixtureResetKey = "fixture-reset-done";
 const fixtureGrantKey = (tabId: number) => `fixture-grant-${tabId}`;
 const geminiGrantKey = (tabId: number) => `gemini-grant-${tabId}`;
 const geminiStatusKey = (tabId: number) => `gemini-grant-status-${tabId}`;
-type StoredFixtureGrant = { documentId: string; expiresAt: number };
+type StoredFixtureGrant = { documentId: string; expiresAt: number; url?: string };
 type StoredGeminiGrant = { documentId: string; url: string; expiresAt: number };
 type GeminiGrantStatus = { code: "target_changed" | "observation_unavailable"; recordedAt: number };
 type GrantCountRequest = { kind: "revoke_fixture"; payload: {
@@ -93,10 +93,27 @@ async function classifyGeminiPublicationFailure(tabId: number, expectedUrl: stri
   try {
     if ((await browser.tabs.get(tabId)).url !== expectedUrl) return "target_changed";
     const [current] = await browser.scripting.executeScript({
-      target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
+      target: { tabId, documentIds: [documentId] }, func: () => location.href
     });
-    return current?.frameId === 0 && current.documentId === documentId
+    return current?.frameId === 0 && current.documentId === documentId && current.result === expectedUrl
+      && (await browser.tabs.get(tabId)).url === expectedUrl
       ? "observation_unavailable" : "target_changed";
+  } catch {
+    return "target_changed";
+  }
+}
+
+async function classifyFixturePublicationFailure(tabId: number, documentId: string,
+  expectedUrl?: string): Promise<GeminiGrantStatus["code"]> {
+  try {
+    const tab = await browser.tabs.get(tabId);
+    if (!tab.url || new URL(tab.url).origin !== "http://127.0.0.1:8787"
+      || (expectedUrl !== undefined && tab.url !== expectedUrl)) return "target_changed";
+    const [current] = await browser.scripting.executeScript({
+      target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
+    });
+    return current?.frameId === 0 && current.documentId === documentId && current.result === "fixture-alpha"
+      && (await browser.tabs.get(tabId)).url === tab.url ? "observation_unavailable" : "target_changed";
   } catch {
     return "target_changed";
   }
@@ -286,7 +303,8 @@ async function publishFixtureSnapshot(tabId: number, documentId: string, challen
         kind: "publish_fixture_snapshot", protocolVersion, requestId, connectionGeneration: 0,
         deadlineMs, payload: { target: {
           origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId
-        }, messages, ...(challengeId === undefined ? {} : { challengeId }) }
+        }, messages, omittedBefore: captured.result!.omittedBefore,
+        ...(challengeId === undefined ? {} : { challengeId }) }
       });
     });
     if (!published) return false;
@@ -372,7 +390,8 @@ async function publishGeminiSnapshot(tabId: number, expectedUrl: string,
       port.postMessage({ kind: "publish_gemini_snapshot", protocolVersion, requestId,
         connectionGeneration: 0, deadlineMs, payload: { target: {
           origin: geminiOrigin, conversationId, url: expectedUrl, tabId, documentId
-        }, messages, ...(challengeId === undefined ? {} : { challengeId }) } });
+        }, messages, omittedBefore: captured.result!.omittedBefore,
+        ...(challengeId === undefined ? {} : { challengeId }) } });
     });
     if (!published) return false;
     const [current] = await browser.scripting.executeScript({
@@ -1013,7 +1032,9 @@ function startFixtureReadWatch(): boolean {
         if (!grant || grant.documentId !== challenge.documentId || typeof grant.expiresAt !== "number"
           || grant.expiresAt <= Date.now()) continue;
         if (!await queueFixtureSnapshot(challenge.tabId, challenge.documentId, challenge.challengeId)) {
-          await revokeTrackedFixture(challenge.tabId);
+          if (await classifyFixturePublicationFailure(challenge.tabId, challenge.documentId, grant.url) === "target_changed") {
+            await revokeTrackedFixture(challenge.tabId);
+          }
         }
       }
       if (fixtureReadWatch === port) {
@@ -1146,8 +1167,9 @@ function startGeminiReadWatch(): boolean {
           || typeof grant.expiresAt !== "number" || grant.expiresAt <= Date.now()) continue;
         if (!await queueGeminiSnapshot(challenge.tabId, challenge.url,
           challenge.documentId, challenge.challengeId)) {
-          await revokeTrackedFixture(challenge.tabId,
-            await classifyGeminiPublicationFailure(challenge.tabId, challenge.url, challenge.documentId));
+          if (await classifyGeminiPublicationFailure(challenge.tabId, challenge.url, challenge.documentId) === "target_changed") {
+            await revokeTrackedFixture(challenge.tabId, "target_changed");
+          }
         }
       }
       phase = "fill";
@@ -1233,7 +1255,7 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
           if (current?.documentId !== documentId || current.result !== "fixture-alpha"
             || !currentTab.active || currentTab.url !== expectedUrl) throw new Error();
           await browser.storage.session.set({ [fixtureGrantKey(tabId)]: {
-            documentId, expiresAt: payload.expiresAt
+            documentId, expiresAt: payload.expiresAt, url: expectedUrl
           } satisfies StoredFixtureGrant });
           const [stillCurrent] = await browser.scripting.executeScript({
             target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
@@ -1922,7 +1944,9 @@ export default defineBackground(() => {
         if (!grant || grant.documentId !== documentId || !isEligibleGeminiUrl(grant.url)
           || typeof grant.expiresAt !== "number" || grant.expiresAt <= Date.now()) return;
         if (!await queueGeminiSnapshot(tabId, grant.url, documentId)) {
-          await revokeTrackedFixture(tabId, await classifyGeminiPublicationFailure(tabId, grant.url, documentId));
+          if (await classifyGeminiPublicationFailure(tabId, grant.url, documentId) === "target_changed") {
+            await revokeTrackedFixture(tabId, "target_changed");
+          }
         }
       }).catch(() => {});
     }
@@ -1947,7 +1971,10 @@ export default defineBackground(() => {
         const grant = stored[fixtureGrantKey(tabId)] as StoredFixtureGrant | undefined;
         if (!grant || grant.documentId !== documentId || typeof grant.expiresAt !== "number"
           || grant.expiresAt <= Date.now()) return;
-        if (!await queueFixtureSnapshot(tabId, documentId)) await revokeTrackedFixture(tabId);
+        if (!await queueFixtureSnapshot(tabId, documentId)
+          && await classifyFixturePublicationFailure(tabId, documentId, grant.url) === "target_changed") {
+          await revokeTrackedFixture(tabId);
+        }
       }).catch(() => {});
     }
     if (typeof message === "object" && message !== null && !Array.isArray(message)

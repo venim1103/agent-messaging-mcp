@@ -5,10 +5,10 @@ export const PENDING_REQUEST_TTL_MS = 60_000;
 export const MAX_PENDING_REQUESTS = 100;
 export const READONLY_CONNECTION_TTL_MS = 5 * 60_000;
 export const MAX_FIXTURE_SNAPSHOT_MESSAGES = 32;
-export const MAX_FIXTURE_SNAPSHOT_BYTES = 64 * 1024;
+export const MAX_FIXTURE_SNAPSHOT_BYTES = 96 * 1024;
 export const MAX_FIXTURE_SNAPSHOT_AGE_MS = 30_000;
 export const MAX_GEMINI_SNAPSHOT_MESSAGES = 32;
-export const MAX_GEMINI_SNAPSHOT_BYTES = 64 * 1024;
+export const MAX_GEMINI_SNAPSHOT_BYTES = 96 * 1024;
 export const MAX_GEMINI_SNAPSHOT_AGE_MS = 30_000;
 export const MAX_GEMINI_EVENTS_PER_READ = 2;
 export const GEMINI_READ_TIMEOUT_MS = 4_000;
@@ -16,6 +16,7 @@ export const MAX_PENDING_GEMINI_READS = 16;
 export const MAX_FIXTURE_EVENTS_PER_READ = 2;
 export const FIXTURE_READ_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_READS = 16;
+const observationLimits = { maxEvents: 128, maxBytes: 4 * 1024 * 1024 };
 
 export type PendingRequest = Readonly<{
   requestId: string;
@@ -51,20 +52,22 @@ export type ReadonlyConnectionState = ReadonlyConnection & Readonly<{
   observation: Readonly<{ state: "not_observed" | "recent" | "old"; capturedAt: number | null }>;
 }>;
 
-export type FixtureMessage = Readonly<{ id: string; direction: "incoming" | "outgoing"; text: string }>;
+export type FixtureMessage = Readonly<{ id: string; direction: "incoming" | "outgoing"; text: string; truncated?: true }>;
 export type FixtureSnapshot = Readonly<{
   coverage: "rendered_only";
   generation: 1;
   capturedAt: number;
   cursor: Readonly<{ epoch: string; sequence: number }>;
+  omittedBefore: boolean;
   messages: ReadonlyArray<FixtureMessage>;
 }>;
-export type GeminiRenderedMessage = Readonly<{ direction: "incoming" | "outgoing"; text: string }>;
+export type GeminiRenderedMessage = Readonly<{ direction: "incoming" | "outgoing"; text: string; truncated?: true }>;
 export type GeminiSnapshot = Readonly<{
   coverage: "rendered_only";
   generation: 1;
   capturedAt: number;
   cursor: Readonly<{ epoch: string; sequence: number }>;
+  omittedBefore: boolean;
   messages: ReadonlyArray<Readonly<GeminiRenderedMessage & {
     identityQuality: "uncertain"; generationState: "unknown"
   }>>;
@@ -245,12 +248,15 @@ export class PendingConnectionRequests {
   }
 
   publishGeminiSnapshot(target: GeminiTarget, messages: ReadonlyArray<GeminiRenderedMessage>,
-    now = Date.now(), challengeId?: string): number {
+    now = Date.now(), challengeId?: string, omittedBefore = false): number {
     if (!messages.length || messages.length > MAX_GEMINI_SNAPSHOT_MESSAGES
+      || typeof omittedBefore !== "boolean"
       || messages.some((message) => typeof message !== "object" || message === null
+        || Object.keys(message).some((key) => !["direction", "text", "truncated"].includes(key))
+        || ("truncated" in message && message.truncated !== true)
         || (message.direction !== "incoming" && message.direction !== "outgoing")
-        || typeof message.text !== "string" || !message.text || message.text.length > 2048)
-      || Buffer.byteLength(JSON.stringify(messages), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
+        || typeof message.text !== "string" || !message.text || message.text.length > 16_000)
+      || Buffer.byteLength(JSON.stringify({ messages, omittedBefore }), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
       throw new Error("Invalid Gemini snapshot");
     }
     const pending = challengeId ? this.geminiReads.get(challengeId) : undefined;
@@ -260,6 +266,7 @@ export class PendingConnectionRequests {
       || pending.target.documentId !== target.documentId
       || !this.liveGrant(pending.owner, pending.connectionId, now))) return 0;
     const normalized = messages.map((message) => Object.freeze({ direction: message.direction, text: message.text,
+      ...(message.truncated ? { truncated: true as const } : {}),
       identityQuality: "uncertain" as const, generationState: "unknown" as const }));
     let published = 0;
     for (const request of this.requests.values()) {
@@ -268,14 +275,16 @@ export class PendingConnectionRequests {
         || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
         || grant.target.url !== target.url || grant.target.tabId !== target.tabId
         || grant.target.documentId !== target.documentId) continue;
-      grant.geminiObservations ??= new ObservationBuffer({ maxEvents: 32, maxBytes: 256 * 1024 });
+      grant.geminiObservations ??= new ObservationBuffer(observationLimits);
       const previous = grant.geminiSnapshot?.messages;
-      if (!previous || previous.length !== normalized.length || normalized.some((message, index) =>
-        message.direction !== previous[index]?.direction || message.text !== previous[index]?.text)) {
-        grant.geminiObservations.append({ kind: "gemini_snapshot", messages: normalized });
+      if (!previous || grant.geminiSnapshot?.omittedBefore !== omittedBefore
+        || previous.length !== normalized.length || normalized.some((message, index) =>
+        message.direction !== previous[index]?.direction || message.text !== previous[index]?.text
+          || message.truncated !== previous[index]?.truncated)) {
+        grant.geminiObservations.append({ kind: "gemini_snapshot", messages: normalized, omittedBefore });
       }
       grant.geminiSnapshot = Object.freeze({ coverage: "rendered_only", generation: 1, capturedAt: now,
-        cursor: grant.geminiObservations.bookmark(), messages: Object.freeze(normalized) });
+        cursor: grant.geminiObservations.bookmark(), messages: Object.freeze(normalized), omittedBefore });
       published++;
     }
     if (pending && challengeId) {
@@ -346,7 +355,7 @@ export class PendingConnectionRequests {
         || grant.target.tabId !== target.tabId || grant.target.documentId !== target.documentId) continue;
       if (!grant.snapshot && (!grant.observations || grant.observations.bookmark().sequence === 0)) continue;
       grant.snapshot = undefined;
-      grant.observations = new ObservationBuffer({ maxEvents: 32, maxBytes: 256 * 1024 });
+      grant.observations = new ObservationBuffer(observationLimits);
       for (const [challengeId, pending] of this.fixtureReads) {
         if (pending.connectionId === grant.connection.connectionId) this.finishFixtureRead(challengeId, "not_ready");
       }
@@ -366,7 +375,7 @@ export class PendingConnectionRequests {
       if (!grant.geminiSnapshot
         && (!grant.geminiObservations || grant.geminiObservations.bookmark().sequence === 0)) continue;
       grant.geminiSnapshot = undefined;
-      grant.geminiObservations = new ObservationBuffer({ maxEvents: 32, maxBytes: 256 * 1024 });
+      grant.geminiObservations = new ObservationBuffer(observationLimits);
       for (const [challengeId, pending] of this.geminiReads) {
         if (pending.connectionId === grant.connection.connectionId) this.finishGeminiRead(challengeId, "not_ready");
       }
@@ -376,9 +385,16 @@ export class PendingConnectionRequests {
   }
 
   publishFixtureSnapshot(target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>,
-    now = Date.now(), challengeId?: string): number {
+    now = Date.now(), challengeId?: string, omittedBefore = false): number {
     if (messages.length > MAX_FIXTURE_SNAPSHOT_MESSAGES
-      || Buffer.byteLength(JSON.stringify(messages), "utf8") > MAX_FIXTURE_SNAPSHOT_BYTES
+      || typeof omittedBefore !== "boolean"
+      || messages.some((message) => typeof message !== "object" || message === null
+        || Object.keys(message).some((key) => !["id", "direction", "text", "truncated"].includes(key))
+        || ("truncated" in message && message.truncated !== true)
+        || typeof message.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(message.id)
+        || (message.direction !== "incoming" && message.direction !== "outgoing")
+        || typeof message.text !== "string" || message.text.length > 16_000)
+      || Buffer.byteLength(JSON.stringify({ messages, omittedBefore }), "utf8") > MAX_FIXTURE_SNAPSHOT_BYTES
       || new Set(messages.map((message) => message.id)).size !== messages.length) {
       throw new Error("Invalid fixture snapshot");
     }
@@ -393,16 +409,17 @@ export class PendingConnectionRequests {
       if (!grant || grant.stale || now >= grant.connection.expiresAt
         || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
         || grant.target.tabId !== target.tabId || grant.target.documentId !== target.documentId) continue;
-      grant.observations ??= new ObservationBuffer({ maxEvents: 32, maxBytes: 256 * 1024 });
+      grant.observations ??= new ObservationBuffer(observationLimits);
       const previous = grant.snapshot?.messages;
-      if (!previous || previous.length !== messages.length || messages.some((message, index) =>
+      if (!previous || grant.snapshot?.omittedBefore !== omittedBefore
+        || previous.length !== messages.length || messages.some((message, index) =>
         message.id !== previous[index]?.id || message.direction !== previous[index]?.direction
-          || message.text !== previous[index]?.text)) {
-        grant.observations.append({ kind: "fixture_snapshot", messages });
+          || message.text !== previous[index]?.text || message.truncated !== previous[index]?.truncated)) {
+        grant.observations.append({ kind: "fixture_snapshot", messages, omittedBefore });
       }
       grant.snapshot = Object.freeze({
         coverage: "rendered_only", generation: 1, capturedAt: now,
-        cursor: grant.observations.bookmark(),
+        cursor: grant.observations.bookmark(), omittedBefore,
         messages: Object.freeze(messages.map((message) => Object.freeze({ ...message })))
       });
       published++;

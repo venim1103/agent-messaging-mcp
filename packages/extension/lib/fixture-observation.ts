@@ -1,4 +1,4 @@
-type FixtureMessage = { id: string; direction: "incoming" | "outgoing"; text: string };
+type FixtureMessage = { id: string; direction: "incoming" | "outgoing"; text: string; truncated?: true };
 type FixturePreflight = { ok: true; editor: "textarea" | "rich" } | { ok: false;
   code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_PRESENT" | "SUBMIT_UNAVAILABLE"
 };
@@ -7,16 +7,17 @@ type FixtureSubmit = { ok: true; editor: "textarea" | "rich"; activated: true } 
   code: "TARGET_CHANGED" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE"
     | "DISPATCH_UNAVAILABLE" | "DISPATCH_UNCERTAIN" };
 
-export function captureFixtureSnapshot(): { messages: FixtureMessage[] } | null {
+export function captureFixtureSnapshot(): { messages: FixtureMessage[]; omittedBefore: boolean } | null {
   if (location.origin !== "http://127.0.0.1:8787") return null;
   const roots = document.querySelectorAll<HTMLElement>("main[data-conversation-id]");
   if (roots.length !== 1 || roots[0]?.dataset.conversationId !== "fixture-alpha") return null;
   const timelines = roots[0].querySelectorAll<HTMLOListElement>("ol#messages[role=log]");
-  if (timelines.length !== 1 || !timelines[0] || timelines[0].children.length > 32) return null;
+  if (timelines.length !== 1 || !timelines[0]) return null;
 
   const messages: FixtureMessage[] = [];
   const ids = new Set<string>();
   for (const row of timelines[0].children) {
+    if (row instanceof HTMLElement && !row.getClientRects().length) continue;
     if (!(row instanceof HTMLLIElement)) return null;
     const id = row.getAttribute("data-message-id");
     const direction = row.getAttribute("data-direction");
@@ -24,11 +25,32 @@ export function captureFixtureSnapshot(): { messages: FixtureMessage[] } | null 
     if (!id || !/^[A-Za-z0-9_-]{1,128}$/.test(id) || ids.has(id)
       || (direction !== "incoming" && direction !== "outgoing") || paragraphs.length !== 1) return null;
     const text = paragraphs[0]!.innerText;
-    if (text.length > 2048) return null;
     ids.add(id);
-    messages.push({ id, direction, text });
+    messages.push({ id, direction, text: text.slice(0, 16_000),
+      ...(text.length > 16_000 ? { truncated: true as const } : {}) });
   }
-  return new TextEncoder().encode(JSON.stringify(messages)).length <= 64 * 1024 ? { messages } : null;
+  let omittedBefore = messages.length > 32;
+  if (omittedBefore) messages.splice(0, messages.length - 32);
+  const size = () => new TextEncoder().encode(JSON.stringify({ messages, omittedBefore })).length;
+  while (size() > 96 * 1024 && messages.length > 1) {
+    messages.shift();
+    omittedBefore = true;
+  }
+  if (size() > 96 * 1024) {
+    const newest = messages[0]!;
+    const text = newest.text;
+    newest.truncated = true;
+    let lower = 0;
+    let upper = text.length;
+    while (lower < upper) {
+      const length = Math.ceil((lower + upper) / 2);
+      newest.text = text.slice(0, length);
+      if (size() <= 96 * 1024) lower = length;
+      else upper = length - 1;
+    }
+    newest.text = text.slice(0, lower);
+  }
+  return { messages, omittedBefore };
 }
 
 export function inspectFixturePreflight(input: {

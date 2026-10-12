@@ -536,6 +536,10 @@ test("native Gemini snapshots accept bounded synthetic rows only for an exact sa
   const challenged = { ...snapshot, payload: { ...snapshot.payload,
     challengeId: "a66b3997-9d43-4554-8399-267d1fe9f75c" } };
   assert.deepEqual(parseNativeGeminiSnapshot(challenged, now), challenged);
+  const windowed = { ...snapshot, payload: { ...snapshot.payload, omittedBefore: true,
+    messages: [{ direction: "incoming", text: "x".repeat(16000), truncated: true }] } };
+  assert.deepEqual(parseNativeGeminiSnapshot(windowed, now), windowed);
+  assert.deepEqual(parseNativeGeminiSnapshot({ ...windowed, payload: { ...windowed.payload, omittedBefore: false } }, now).payload.omittedBefore, false);
   for (const invalid of [
     { ...snapshot, kind: "evaluate" },
     { ...snapshot, deadlineMs: now },
@@ -549,7 +553,10 @@ test("native Gemini snapshots accept bounded synthetic rows only for an exact sa
     { ...snapshot, payload: { ...snapshot.payload, messages: [] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "" }] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "system", text: "No" }] } },
-    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x".repeat(2049) }] } },
+    { ...snapshot, payload: { ...snapshot.payload, omittedBefore: "true" } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x", truncated: false }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x", extra: true }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x".repeat(16001) }] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: Array.from({ length: 32 }, () => ({
       direction: "incoming", text: "é".repeat(2048)
     })) } }
@@ -620,6 +627,10 @@ test("native fixture snapshots accept only bounded rows from the exact local fix
   const challenged = { ...snapshot, payload: { ...snapshot.payload,
     challengeId: "a66b3997-9d43-4554-8399-267d1fe9f75c" } };
   assert.deepEqual(parseNativeFixtureSnapshot(challenged, now), challenged);
+  const windowed = { ...snapshot, payload: { ...snapshot.payload, omittedBefore: true,
+    messages: [{ id: "fixture-1", direction: "incoming", text: "x".repeat(16000), truncated: true }] } };
+  assert.deepEqual(parseNativeFixtureSnapshot(windowed, now), windowed);
+  assert.deepEqual(parseNativeFixtureSnapshot({ ...windowed, payload: { ...windowed.payload, omittedBefore: false } }, now).payload.omittedBefore, false);
   for (const invalid of [
     { ...snapshot, kind: "evaluate" },
     { ...snapshot, deadlineMs: now },
@@ -629,7 +640,10 @@ test("native fixture snapshots accept only bounded rows from the exact local fix
       origin: "https://gemini.google.com" } } },
     { ...snapshot, payload: { ...snapshot.payload, target: { ...snapshot.payload.target, documentId: "" } } },
     { ...snapshot, payload: { ...snapshot.payload, messages: [...snapshot.payload.messages, snapshot.payload.messages[0]] } },
-    { ...snapshot, payload: { ...snapshot.payload, messages: [{ ...snapshot.payload.messages[0], text: "x".repeat(2049) }] } },
+    { ...snapshot, payload: { ...snapshot.payload, omittedBefore: "true" } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ ...snapshot.payload.messages[0], truncated: false }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ ...snapshot.payload.messages[0], extra: true }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ ...snapshot.payload.messages[0], text: "x".repeat(16001) }] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: [{ id: "fixture-1", direction: "system", text: "No" }] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: Array.from({ length: 32 }, (_, index) => ({
       id: `fixture-${index}`, direction: "incoming", text: "é".repeat(2048)

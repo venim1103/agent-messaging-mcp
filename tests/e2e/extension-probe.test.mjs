@@ -750,6 +750,15 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     assert.equal(afterNativeLoss.kind, "fixture_snapshot", "Fixture native watch did not recover without reapproval");
     assert.deepEqual(afterNativeLoss.payload.messages, beforeNativeLoss.payload.messages);
     assert.equal(await worker.evaluate(() => globalThis.syntheticFixtureWatches.length), 2);
+    await fixture.locator("ol#messages li").first().evaluate(row => {
+      globalThis.syntheticMissingParagraph = row.querySelector("p");
+      globalThis.syntheticMissingParagraph.remove();
+    });
+    assert.deepEqual((await facade.readFixtureSnapshot(connection.payload.connectionId)).payload,
+      { code: "OBSERVATION_UNAVAILABLE" });
+    assert.equal((await facade.getConnection(created.payload.requestId)).payload.state, "ready_readonly");
+    await fixture.locator("ol#messages li").first().evaluate(row => row.append(globalThis.syntheticMissingParagraph));
+    assert.equal((await facade.readFixtureSnapshot(connection.payload.connectionId)).kind, "fixture_snapshot");
     const text = "Synthetic <script>alert(1)</script> &\nSecond line";
     const prepared = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text,
       "b66b3997-9d43-4554-8399-267d1fe9f75c");
@@ -1969,21 +1978,51 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
       kind: "approve_gemini", tabId, expectedUrl, pendingRequestId
     }), { tabId: selected.tabId, expectedUrl: url, pendingRequestId: second.payload.requestId });
     assert.equal(secondApproval?.ok, true, JSON.stringify(secondApproval));
+    const secondState = await facade.getConnection(second.payload.requestId);
+    assert.equal(secondState.payload.state, "ready_readonly");
+    await page.locator("model-response-content").evaluate(content => {
+      globalThis.syntheticMissingContent = content;
+      content.remove();
+    });
+    assert.deepEqual((await facade.readApprovedSnapshot(secondState.payload.connectionId)).payload,
+      { code: "OBSERVATION_UNAVAILABLE" });
+    assert.equal((await facade.getConnection(second.payload.requestId)).payload.state, "ready_readonly");
+    await page.locator("model-response").evaluate(row => row.append(globalThis.syntheticMissingContent));
+    assert.equal((await facade.readApprovedSnapshot(secondState.payload.connectionId)).kind, "gemini_snapshot");
+    await page.locator("infinite-scroller").evaluate(timeline => {
+      for (let index = 0; index < 33; index++) {
+        const row = document.createElement("model-response");
+        const content = document.createElement("model-response-content");
+        content.textContent = index === 32 ? "x".repeat(16001) : `Synthetic window row ${index}`;
+        row.append(content);
+        timeline.append(row);
+      }
+    });
+    const windowed = await facade.readApprovedSnapshot(secondState.payload.connectionId);
+    assert.equal(windowed.kind, "gemini_snapshot");
+    assert.equal(windowed.payload.messages.length, 32);
+    assert.equal(windowed.payload.omittedBefore, true);
+    assert.equal(windowed.payload.messages.at(-1).truncated, true);
+    assert.equal(windowed.payload.messages.at(-1).text, "x".repeat(16000));
     await page.locator("main").evaluate((main) => {
       const timeline = main.querySelector("infinite-scroller");
       main.append(timeline.cloneNode(true));
       timeline.querySelector("model-response-content p").textContent = "Synthetic ambiguous timeline";
     });
-    let ambiguousRevoked = false;
+    assert.deepEqual((await facade.readApprovedSnapshot(secondState.payload.connectionId)).payload,
+      { code: "OBSERVATION_UNAVAILABLE" });
+    assert.equal((await facade.getConnection(second.payload.requestId)).payload.state, "ready_readonly");
+    await page.evaluate(() => history.replaceState({}, "", "?hl=fr"));
+    let targetRevoked = false;
     for (let attempt = 0; attempt < 80; attempt++) {
       const current = await facade.getConnection(second.payload.requestId);
-      if (current.payload.state === "stale") { ambiguousRevoked = true; break; }
+      if (current.payload.state === "stale") { targetRevoked = true; break; }
       await setTimeout(25);
     }
-    assert.equal(ambiguousRevoked, true, "Ambiguous Gemini timeline did not revoke its grant");
+    assert.equal(targetRevoked, true, "Changed Gemini URL did not revoke its grant");
     await popup.waitForFunction(async (tabId) => {
       const key = `gemini-grant-status-${tabId}`;
-      return (await chrome.storage.session.get(key))[key]?.code === "observation_unavailable";
+      return (await chrome.storage.session.get(key))[key]?.code === "target_changed";
     }, selected.tabId, { timeout: 4000 });
     const status = await popup.evaluate(async (tabId) => {
       const key = `gemini-grant-status-${tabId}`;
@@ -1995,7 +2034,7 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     await popup.evaluate(() => document.querySelector("#inspect").click());
     await popup.getByText("Last read-only grant", { exact: true }).waitFor({ timeout: 4000 });
     const diagnostic = await popup.locator("#messages li").filter({ hasText: "Last read-only grant" }).innerText();
-    assert.match(diagnostic, /Observation unavailable; grant revoked/);
+    assert.equal(diagnostic, "Last read-only grant\n\nTarget or document changed/unavailable");
     assert.equal(diagnostic.includes("https://"), false);
     assert.equal(diagnostic.includes("Synthetic ambiguous timeline"), false);
   } finally {

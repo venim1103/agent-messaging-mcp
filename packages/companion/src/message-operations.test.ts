@@ -2863,6 +2863,9 @@ test("only one new exact outgoing fixture row records durable UI evidence", asyn
     requests.publishFixtureSnapshot(target, [...before, { id: "fixture-3", direction: "outgoing", text: `${text}!` }], 2007);
     assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2008).state, "dispatch_uncertain");
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 0);
+    requests.publishFixtureSnapshot(target, [...before, { id: "large-incoming", direction: "incoming",
+      text: "x".repeat(16000), truncated: true }], 2008);
+    assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2008).state, "dispatch_uncertain");
     requests.publishFixtureSnapshot(target, [...before, { id: "fixture-3", direction: "outgoing", text }], 2009);
     const observed = ledger.reconcileFixtureObservation(owner, prepared.operationId, 2010);
     assert.deepEqual(observed, { operationId: prepared.operationId, state: "observed_in_ui",
@@ -2897,7 +2900,7 @@ test("only one new exact outgoing fixture row records durable UI evidence", asyn
 
 test("ambiguous rows, observation gaps, and revoked fixture grants stay uncertain", () => {
   for (const failure of ["ambiguity", "ambiguity_history", "historical_matches", "epoch", "overflow", "revoked",
-    "no_baseline", "changed_baseline", "old_baseline", "unsupported_text"]) {
+    "no_baseline", "changed_baseline", "old_baseline", "unsupported_text", "truncated", "omitted_rows", "omitted_baseline"]) {
     const database = new DatabaseSync(":memory:");
     try {
       const requests = new PendingConnectionRequests();
@@ -2915,7 +2918,8 @@ test("ambiguous rows, observation gaps, and revoked fixture grants stay uncertai
       assert.ok(review);
       ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2003);
       approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
-      requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Before" }], 2003);
+      requests.publishFixtureSnapshot(target, [{ id: "fixture-2", direction: "outgoing", text: "Before" }],
+        2003, undefined, failure === "omitted_baseline");
       if (failure !== "no_baseline") ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
       if (failure === "no_baseline" || failure === "unsupported_text") {
         assert.throws(() => ledger.requestFixtureDispatchCheck(owner, prepared.operationId, 2004),
@@ -2938,7 +2942,7 @@ test("ambiguous rows, observation gaps, and revoked fixture grants stay uncertai
       ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2005, checkId);
       if (failure === "epoch") requests.markFixtureObservationGap(target, 2006);
       if (failure === "overflow") {
-        for (let index = 0; index < 33; index++) {
+        for (let index = 0; index < 129; index++) {
           requests.publishFixtureSnapshot(target,
             [{ id: "fixture-2", direction: "outgoing", text: `Revision ${index}` }], 2006);
         }
@@ -2955,7 +2959,8 @@ test("ambiguous rows, observation gaps, and revoked fixture grants stay uncertai
           "dispatch_uncertain", failure);
       }
       requests.publishFixtureSnapshot(target, [{ id: "fixture-3", direction: "outgoing",
-        text }], 2008);
+        text, ...(failure === "truncated" ? { truncated: true as const } : {}) }],
+        2008, undefined, failure === "omitted_rows");
       if (failure === "revoked") requests.revokeChangedTab(3, null);
       assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, 2009).state,
         "dispatch_uncertain", failure);

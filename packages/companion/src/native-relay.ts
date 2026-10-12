@@ -388,13 +388,13 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               payload = result.payload;
             } else if (request.kind === "publish_gemini_snapshot") {
               const result = await client.publishGeminiSnapshot(request.payload.target, request.payload.messages,
-                request.payload.challengeId);
+                request.payload.challengeId, request.payload.omittedBefore);
               if (result.kind !== "gemini_snapshot_published") throw new Error("Broker refused Gemini snapshot");
               kind = "gemini_snapshot_published";
               payload = result.payload;
             } else {
               const result = await client.publishFixtureSnapshot(request.payload.target, request.payload.messages,
-                request.payload.challengeId);
+                request.payload.challengeId, request.payload.omittedBefore);
               if (result.kind !== "fixture_snapshot_published") throw new Error("Broker refused fixture snapshot");
               kind = "fixture_snapshot_published";
               payload = result.payload;
