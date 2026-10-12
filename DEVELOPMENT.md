@@ -150,6 +150,7 @@ Review lists show at most eight exact previews and clear when the tab, document,
 | Pending connection request | 60 s; at most 100 pending | `pending-connections.ts` |
 | Read-only grant | 5 min without renewal; `generation` always 1 | `pending-connections.ts` |
 | Fresh read challenge | 4 s | `pending-connections.ts` |
+| Native watch recovery | One pending restart per provider; 1 s doubling to 10 s, reset on valid reply; requires a tracked unexpired grant | `background.ts` |
 | Snapshot | 32 rows, 2,048 UTF-16 units per message, 64 KiB; a failed capture revokes the grant | `gemini-observation.ts`, `fixture-observation.ts`, `pending-connections.ts` |
 | Observation buffer per grant | 32 events, 256 KiB | `pending-connections.ts` |
 | Event wait | 20 s maximum, 2 events per call, 200 ms polling | `mcp-stdio.ts` |
@@ -222,7 +223,7 @@ Browser-test rules: launch Chromium with `chromiumSandbox: true`, because Playwr
 
 - `BROKER_UNAVAILABLE`: start `npm run dev:broker`; the facade reconnects on the next call. Read-only calls can then be repeated, but an uncertain fill or commit must not be.
 - `CONNECTION_NOT_FOUND` or `stale`: the grant expired after five minutes; the tab reloaded, navigated or closed; the conversation changed; the extension reloaded; an observation failed (HANDOFF R1); or the MCP server restarted and became a new owner. Request a new connection.
-- `OBSERVATION_UNAVAILABLE`: the extension did not answer within four seconds. The tab may be gone, or the worker's native watch may have stopped (HANDOFF R2); reloading the extension restarts it and marks an observation gap.
+- `OBSERVATION_UNAVAILABLE`: the extension did not answer within four seconds. The tab may be gone or capture unavailable (HANDOFF R1). Stopped native watches automatically resume polling with bounded 1-10 s backoff while a tracked grant remains. A later read can succeed without reapproval; this never retries an uncertain fill or send. Worker wake still marks an observation gap.
 - No pending request in the popup: the request expired after 60 seconds, or the selected tab is not the fixture or an eligible saved Gemini chat.
 - Native bridge unavailable: check the registration with `--preview`, the extension ID, the launcher path and that the manifest is in the profile Chromium is using.
 - Tools missing or outdated: rebuild and restart the MCP server.

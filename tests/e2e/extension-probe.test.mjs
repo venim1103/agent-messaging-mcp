@@ -721,6 +721,20 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
 
     const created = await facade.requestConnection();
     if (created.kind !== "connection_requested") throw new Error("Expected fixture request");
+    await worker.evaluate(() => {
+      const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+      globalThis.syntheticFixtureWatches = [];
+      chrome.runtime.connectNative = (...args) => {
+        const port = connect(...args);
+        const post = port.postMessage.bind(port);
+        port.postMessage = message => {
+          if (message.kind === "list_fixture_read_challenges"
+            && !globalThis.syntheticFixtureWatches.includes(port)) globalThis.syntheticFixtureWatches.push(port);
+          post(message);
+        };
+        return port;
+      };
+    });
     const approved = await popup.evaluate(({ tabId, expectedUrl, pendingRequestId }) => chrome.runtime.sendMessage({
       kind: "approve_fixture", tabId, expectedUrl, pendingRequestId
     }), { ...reviewArgs, pendingRequestId: created.payload.requestId });
@@ -729,6 +743,13 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     if (connection.kind !== "connection_state" || connection.payload.state !== "ready_readonly") {
       throw new Error("Expected approved fixture handle");
     }
+    const beforeNativeLoss = await facade.readFixtureSnapshot(connection.payload.connectionId);
+    assert.equal(beforeNativeLoss.kind, "fixture_snapshot");
+    await worker.evaluate(() => globalThis.syntheticFixtureWatches[0].disconnect());
+    const afterNativeLoss = await facade.readFixtureSnapshot(connection.payload.connectionId);
+    assert.equal(afterNativeLoss.kind, "fixture_snapshot", "Fixture native watch did not recover without reapproval");
+    assert.deepEqual(afterNativeLoss.payload.messages, beforeNativeLoss.payload.messages);
+    assert.equal(await worker.evaluate(() => globalThis.syntheticFixtureWatches.length), 2);
     const text = "Synthetic <script>alert(1)</script> &\nSecond line";
     const prepared = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text,
       "b66b3997-9d43-4554-8399-267d1fe9f75c");
@@ -1722,6 +1743,26 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     assert.equal(await page.locator("body").innerHTML(), beforeInspection);
     assert.equal(await page.evaluate(() => window.controlActivations), 0);
     assert.equal((await facade.getConnection(created.payload.requestId)).payload.state, "pending");
+    await worker.evaluate(() => {
+      const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+      globalThis.syntheticGeminiWatches = [];
+      globalThis.syntheticGeminiFillOffers = [];
+      chrome.runtime.connectNative = (...args) => {
+        const port = connect(...args);
+        const post = port.postMessage.bind(port);
+        port.postMessage = message => {
+          if (message.kind === "list_gemini_read_challenges"
+            && !globalThis.syntheticGeminiWatches.includes(port)) globalThis.syntheticGeminiWatches.push(port);
+          post(message);
+        };
+        port.onMessage.addListener(reply => {
+          if (reply.kind === "gemini_fill_challenges") {
+            globalThis.syntheticGeminiFillOffers.push(...reply.payload.fills.map(fill => fill.attemptId));
+          }
+        });
+        return port;
+      };
+    });
     const approved = await popup.evaluate(({ tabId, expectedUrl, pendingRequestId }) => chrome.runtime.sendMessage({
       kind: "approve_gemini", tabId, expectedUrl, pendingRequestId
     }), { tabId: selected.tabId, expectedUrl: url, pendingRequestId: created.payload.requestId });
@@ -1833,6 +1874,16 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     ]);
     assert.equal("url" in read.payload, false);
     assert.equal(JSON.stringify(read.payload).includes("Private draft"), false);
+    assert.equal(await worker.evaluate(() => globalThis.syntheticGeminiWatches.length), 1);
+    await worker.evaluate(() => globalThis.syntheticGeminiWatches[0].disconnect());
+    const afterNativeLoss = await facade.readApprovedSnapshot(state.payload.connectionId);
+    assert.equal(afterNativeLoss.kind, "gemini_snapshot", "Stopped native watch did not recover without reapproval");
+    assert.deepEqual(afterNativeLoss.payload.messages, read.payload.messages);
+    assert.equal(await worker.evaluate(() => globalThis.syntheticGeminiWatches.length), 2);
+    const fillOffers = await worker.evaluate(() => globalThis.syntheticGeminiFillOffers);
+    assert.equal(fillOffers.length, 1, "Read watch restart re-offered a consumed fill job");
+    assert.equal(new Set(fillOffers).size, fillOffers.length);
+    assert.equal((await facade.getConnection(created.payload.requestId)).payload.state, "ready_readonly");
     await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = ""; });
     let streaming;
     for (let attempt = 0; attempt < 80; attempt++) {

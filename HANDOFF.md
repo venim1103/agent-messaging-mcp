@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-09 (handover).
+Updated: 2026-10-12 (T1a checkpoint).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -14,7 +14,7 @@ The person installs the extension and starts the MCP server in VS Code, opens a 
 
 ### Repository state
 
-- Latest source checkpoint: `11dec64`, the staged Gemini one-offer dispatch job (entry below). Its exact gate passed build, both typechecks, **170/170 units and 20/20 e2e checks**. Later commits are documentation-only, and no source is left uncommitted.
+- Latest source checkpoint: T1a native-watch recovery (2026-10-12 entry below), after `64ae52f`. Its exact gate passed build, both typechecks, **170/170 units and 20/20 e2e checks**. T1b remains next.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
 ### Capability matrix
@@ -55,7 +55,7 @@ This supervised chain stays for tests. The autonomous path (T3) reuses its fill,
 
 Done: G1, the dispatch-job slice (`11dec64`). Steps T1-T6 replace the earlier G2-G6 plan. The exact changes, tests, completion criteria and ask-points for each step are in **Implementation Plan T1-T6** below the dashboard.
 
-1. **T1 Read robustness.** Restart a stopped native watch without retrying writes (R2). Apply D8: a newest-rows window with `omittedBefore`, explicit per-message truncation within the frame limit, and skipping instead of revoking when a capture fails but URL, document and conversation are unchanged (R1).
+1. **T1 Read robustness.** T1a done: stopped native watches restart with bounded backoff (R2). Next T1b applies D8: a newest-rows window with `omittedBefore`, explicit per-message truncation within the frame limit, and skipping instead of revoking when a capture fails but URL, document and conversation are unchanged (R1).
 2. **T2 Connection model.** Popup-first **Connect this chat**, picked up by the connected MCP agent through a new tool (D13). One approval grants reading and autonomous sending (D1). No fixed expiry: the connection ends on tab close, chat switch, browser or MCP server restart, or disconnect, and a reload of the same chat re-attaches using a one-time optional `gemini.google.com` host permission (D2). The MCP server starts the broker and connects at startup (D4).
 3. **T3 Autonomous send.** A provider-neutral `chat_send_message` runs fill, fresh proof, durable intent, the one-offer job, browser reservation and one guarded activation, reusing today's pieces (D5). Add the append-only evidence rule (D9) with a settle window, per-connection resolution of unconfirmed sends with a one-click popup fallback (D10, R8), and the runaway guard: one message at a time and a configurable hourly cap. Relax "active tab of the current window" to "visible tab" (D11). Sandboxed synthetic tests cover the loop and its loss and crash cases.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
@@ -65,7 +65,7 @@ Done: G1, the dispatch-job slice (`11dec64`). Steps T1-T6 replace the earlier G2
 ### Findings: functional
 
 - **R1 Snapshot failures revoke the grant.** `captureGeminiSnapshot` in `packages/extension/lib/gemini-observation.ts` returns null for more than 32 rendered rows, any message over 2,048 characters, or a row that momentarily lacks its expected content element; the broker enforces the same caps. The worker then revokes the grant as `observation_unavailable`. Gemini answers longer than about 2,000 characters, which are common, and chats with more than 16 exchanges therefore end the connection. This is a plausible but unproven cause of the first live event-wait failure, which left the grant `stale`. The fixture has the same caps. Fix per D8.
-- **R2 The native watch is not restarted.** `startGeminiReadWatch` and `startFixtureReadWatch` stop after any five-second reply timeout, parse failure or port disconnect, and restart only after a new approval or a worker restart. Until then reads, fills and proofs time out while the grant still looks ready.
+- **R2 Fixed (T1a).** Both native watches schedule at most one restart timer after timeout, parse failure or port disconnect: 1 s doubling to 10 s, reset after a valid reply. The timer rechecks tracked unexpired grants before connecting. Disposable-browser checks verify fixture and Gemini reads recover without reapproval and a consumed Gemini fill job is not re-offered.
 - **R3 Five-minute grants** (`READONLY_CONNECTION_TTL_MS`) cannot be renewed; a longer conversation needs a new request and toolbar approval. Decided fix: D2 (T2).
 - **R4 Three popup clicks per message**, plus the prepare, fill and commit calls. Decided fix: one connection approval, D1 (T2, T3).
 - **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer holds 32 events or 256 KiB, so streaming can expire cursors. Agents should treat events as change hints and re-read (D3, T4).
@@ -91,7 +91,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Still open: D6, 
 
 ### Next step
 
-T1 from the Implementation Plan below, in one or two gated checkpoints. It needs no user decision. Ask the user to confirm D13a before starting T2.
+T1b from the Implementation Plan below. It needs no user decision. T1a is committed separately; ask the user to confirm D13a before starting T2.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -155,6 +155,13 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T1a Native-Watch Recovery (2026-10-12)
+
+- Both watches restart polling after stop with one pending timer and bounded 1-10 s exponential backoff, reset after valid replies. Each timer rechecks tracked grant expiry; stopped ports ignore late replies. No write authority, offer policy or uncertain-result retry changed.
+- Existing sandboxed fixture and synthetic Gemini worker tests disconnect the actual native watch, then obtain fresh reads without reapproval. Gemini also verifies the consumed fill attempt was offered exactly once and the private human draft remained untouched. Focused checks passed 2/2 at original limits.
+- Exact gate `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e` passed once: build, both typechecks, 170/170 units and 20/20 e2e checks. No gate failed. Source diagnostics and scoped diff checks passed. No installed profile, service, grant or live site was used.
+- Next: T1b capture window, protocol flags, buffers and identity-preserving failure policy. R1 remains open. Human decision D13a remains required before T2; see AGENTS.md Safety Boundaries.
 
 ## Handover Preparation (2026-10-09)
 

@@ -61,6 +61,25 @@ const fixtureSnapshotJobs = new Map<number, Promise<boolean>>();
 const geminiSnapshotJobs = new Map<number, Promise<boolean>>();
 let fixtureReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 let geminiReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
+type ReadWatchRestart = { timer?: ReturnType<typeof setTimeout>; delayMs: number };
+const fixtureWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
+const geminiWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
+
+function scheduleReadWatchRestart(state: ReadWatchRestart, hasGrant: () => Promise<boolean>,
+  start: () => boolean): void {
+  if (state.timer !== undefined) return;
+  state.timer = setTimeout(() => {
+    void hasGrant().then((tracked) => {
+      state.timer = undefined;
+      if (tracked) start();
+      else state.delayMs = 1_000;
+    }).catch(() => {
+      state.timer = undefined;
+      scheduleReadWatchRestart(state, hasGrant, start);
+    });
+  }, state.delayMs);
+  state.delayMs = Math.min(state.delayMs * 2, 10_000);
+}
 
 async function recordGeminiGrantStatus(tabId: number, code: GeminiGrantStatus["code"]): Promise<void> {
   const key = geminiStatusKey(tabId);
@@ -911,10 +930,13 @@ function parseGeminiReadChallenges(value: unknown, requestId: string, deadlineMs
 
 function startFixtureReadWatch(): boolean {
   if (fixtureReadWatch) return true;
+  clearTimeout(fixtureWatchRestart.timer);
+  fixtureWatchRestart.timer = undefined;
   let port: ReturnType<typeof browser.runtime.connectNative>;
   try {
     port = browser.runtime.connectNative(nativeHostName);
   } catch {
+    scheduleReadWatchRestart(fixtureWatchRestart, hasTrackedFixtureGrant, startFixtureReadWatch);
     return false;
   }
   fixtureReadWatch = port;
@@ -927,9 +949,11 @@ function startFixtureReadWatch(): boolean {
   function stop() {
     if (fixtureReadWatch !== port) return;
     fixtureReadWatch = undefined;
+    requestId = null;
     clearTimeout(responseTimer);
     clearTimeout(pollTimer);
     port.disconnect();
+    scheduleReadWatchRestart(fixtureWatchRestart, hasTrackedFixtureGrant, startFixtureReadWatch);
   }
 
   async function poll() {
@@ -948,6 +972,7 @@ function startFixtureReadWatch(): boolean {
   }
 
   port.onMessage.addListener((value: unknown) => {
+    if (fixtureReadWatch !== port) return;
     if (!requestId) return stop();
     clearTimeout(responseTimer);
     const listing = (() => {
@@ -959,6 +984,7 @@ function startFixtureReadWatch(): boolean {
     })();
     requestId = null;
     if (!listing) return;
+    fixtureWatchRestart.delayMs = 1_000;
     void (async () => {
       if (listing.kind === "submit") {
         for (const check of listing.attempts) await submitTrackedFixtureDraft(check);
@@ -1040,10 +1066,13 @@ function parseGeminiBrowserChecks(value: unknown, requestId: string, deadlineMs:
 
 function startGeminiReadWatch(): boolean {
   if (geminiReadWatch) return true;
+  clearTimeout(geminiWatchRestart.timer);
+  geminiWatchRestart.timer = undefined;
   let port: ReturnType<typeof browser.runtime.connectNative>;
   try {
     port = browser.runtime.connectNative(nativeHostName);
   } catch {
+    scheduleReadWatchRestart(geminiWatchRestart, hasTrackedGeminiGrant, startGeminiReadWatch);
     return false;
   }
   geminiReadWatch = port;
@@ -1056,9 +1085,11 @@ function startGeminiReadWatch(): boolean {
   function stop() {
     if (geminiReadWatch !== port) return;
     geminiReadWatch = undefined;
+    requestId = null;
     clearTimeout(responseTimer);
     clearTimeout(pollTimer);
     port.disconnect();
+    scheduleReadWatchRestart(geminiWatchRestart, hasTrackedGeminiGrant, startGeminiReadWatch);
   }
 
   async function poll() {
@@ -1077,6 +1108,7 @@ function startGeminiReadWatch(): boolean {
   }
 
   port.onMessage.addListener((value: unknown) => {
+    if (geminiReadWatch !== port) return;
     if (!requestId) return stop();
     clearTimeout(responseTimer);
     if (phase !== "read") {
@@ -1086,6 +1118,7 @@ function startGeminiReadWatch(): boolean {
       })();
       requestId = null;
       if (!checks) return;
+      geminiWatchRestart.delayMs = 1_000;
       void (async () => {
         for (const check of checks) {
           if ("checkId" in check) await checkTrackedGeminiDraft(check);
@@ -1102,6 +1135,7 @@ function startGeminiReadWatch(): boolean {
     })();
     requestId = null;
     if (!listing) return;
+    geminiWatchRestart.delayMs = 1_000;
     void (async () => {
       await releaseDisconnectedGemini(listing.activeTabIds);
       for (const challenge of listing.challenges) {
