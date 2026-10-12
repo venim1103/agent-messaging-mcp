@@ -1,7 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { spawn } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as waitForBroker } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import * as z from "zod/v4";
 import { connectBroker } from "./broker-client.js";
 import { MAX_PREPARED_MESSAGE_BYTES } from "./message-operations.js";
@@ -11,6 +15,39 @@ const runtimeDirectory = join(homedir(), ".config/agent-messaging-mcp/broker");
 let broker: Awaited<ReturnType<typeof connectBroker>> | undefined;
 let connectingBroker: ReturnType<typeof connectBroker> | undefined;
 let facadeClosed = false;
+let brokerStartAttempted = false;
+
+async function connectFacadeBroker() {
+  const deadlineMs = Date.now() + 5000;
+  try {
+    return await connectBroker("facade", runtimeDirectory, undefined, deadlineMs);
+  } catch (error) {
+    if (facadeClosed || brokerStartAttempted || process.env.BROWSER_CHAT_AUTO_START_BROKER === "0"
+      || !(error instanceof Error && "code" in error
+        && (error.code === "ENOENT" || error.code === "ECONNREFUSED"))) throw error;
+  }
+  brokerStartAttempted = true;
+  let spawnFailed = false;
+  const child = spawn(process.execPath, [fileURLToPath(new URL("./broker-process.js", import.meta.url))],
+    { detached: true, stdio: "ignore" });
+  child.once("error", () => { spawnFailed = true; });
+  child.unref();
+  while (!facadeClosed && !spawnFailed && Date.now() < deadlineMs) {
+    try {
+      const socket = await stat(join(runtimeDirectory, "broker.sock"));
+      if (!socket.isSocket() || socket.uid !== process.getuid?.() || (socket.mode & 0o077) !== 0) {
+        throw new Error("Broker socket has unsafe ownership or permissions");
+      }
+      return await connectBroker("facade", runtimeDirectory, undefined, deadlineMs);
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error
+        && (error.code === "ENOENT" || error.code === "ECONNREFUSED"))) throw error;
+    }
+    const remaining = deadlineMs - Date.now();
+    if (remaining > 0) await waitForBroker(Math.min(25, remaining));
+  }
+  throw new Error("Broker startup unavailable");
+}
 
 function closeFacadeBroker() {
   facadeClosed = true;
@@ -26,7 +63,7 @@ async function pendingBroker() {
   if (facadeClosed) throw new Error("MCP stdio is closed");
   if (broker?.closed) broker = undefined;
   if (broker) return broker;
-  const connection = connectingBroker ??= connectBroker("facade", runtimeDirectory);
+  const connection = connectingBroker ??= connectFacadeBroker();
   try {
     const connected = await connection;
     if (facadeClosed) {
@@ -42,7 +79,7 @@ async function pendingBroker() {
 function unavailable() {
   broker?.close();
   broker = undefined;
-  return { isError: true, content: [{ type: "text" as const, text: "BROKER_UNAVAILABLE: Start the private local broker; no chat was accessed." }] };
+  return { isError: true, content: [{ type: "text" as const, text: "BROKER_UNAVAILABLE: Check private broker startup; no chat was accessed." }] };
 }
 
 function blocked(code: string) {
@@ -246,6 +283,8 @@ server.registerTool("chat_disconnect", {
     return unavailable();
   }
 });
+
+if (process.env.BROWSER_CHAT_AUTO_START_BROKER !== "0") void pendingBroker().catch(() => {});
 
 server.connect(new StdioServerTransport()).catch((error: unknown) => {
   process.stderr.write(`${error instanceof Error ? error.message : "MCP stdio connection failed"}\n`);

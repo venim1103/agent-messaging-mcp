@@ -28,7 +28,7 @@ For the first supported AI-chat integration, use Gemini's browser interface. It 
 3. From then on the agent reads and sends messages in that chat without further intervention.
 4. Closing the tab, switching to another chat, or restarting the browser or VS Code ends the connection. Reloading the same chat keeps it.
 
-**Revision (2026-10-12, D13a):** Multiple agents may connect to the same chat. The person must see the connected-agent count and a distinguishable entry for each agent, and be able to remove one agent's access without disconnecting the others. Each agent keeps its own grant and request/operation ownership. Admission of additional agents is the open D13b decision below.
+**Revision (2026-10-12, D13a, D13b):** Multiple agents may connect to the same chat, each with one trusted popup approval for its own autonomous access. The person must see the connected-agent count and a distinguishable entry for each agent, and be able to remove one agent's access without disconnecting the others. Each agent keeps its own grant and request/operation ownership; new or revoked agents cannot join automatically.
 
 For now everything runs in the Podman devcontainer (D12), and the chat tab must stay visible, though its own window is fine; later a hidden tab must work too (D11). Section 17 records the decisions behind this. The original scope below assumed per-message approval; where it differs, the target experience wins.
 
@@ -100,7 +100,7 @@ The browser's `activeTab` grant requires a supported user gesture. It can surviv
 
 **Decision (2026-10-09, D13 and D1):** The person starts the connection from the popup with **Connect this chat**, and the MCP agent picks it up with a dedicated tool instead of creating a pending request first. One approval grants reading and autonomous sending in that chat, so the target flow has no read-only or send-with-approval choice. The existing agent-first request flow remains for tests.
 
-**Revision (2026-10-12, D13a):** A chat may have several agent connections. The trusted popup must show their count, distinguishable names/instance IDs, connection status and an individual **Remove access** action; also offer **Disconnect all**. Pending requests and pickup must remain bound to the correct agent, never a shared handle. D13b decides whether additional agents require approval or can join automatically.
+**Revision (2026-10-12, D13a, D13b):** A chat may have several agent connections, each approved once by the person in the trusted popup. Show their count, distinguishable names/instance IDs, connection status and an individual **Remove access** action; also offer **Disconnect all**. Pending requests and pickup must remain bound to the approved agent, never a shared handle or authorization for a future arrival. Approval covers autonomous read/send until that connection ends, not each message; revocation requires fresh approval to reconnect.
 
 ### While connected
 
@@ -538,7 +538,7 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D12 Target platform: decided.** Keep the devcontainer: container Chromium, native host, broker and MCP server in one container (section 12).
 - **D13 Connection start: decided.** The person clicks **Connect this chat** first and the agent picks the chat up (section 4).
 - **D13a Agent binding: revised and decided (2026-10-12).** Multiple agents may connect to the same chat. Show how many and which agents have access, with individual removal. Supersedes the earlier exclusive-recipient decision and the several-facade refusal proposal. Grants, requests and operations remain individually owned; writes to the shared composer must be serialized. Section 7 explains the facade identity limit.
-- **D13b Additional-agent admission: open.** Before T2, decide whether every additional agent needs trusted popup approval (recommended), or whether connecting a chat authorizes subsequent agents to join automatically. Approval and individual revocation must have clear semantics; do not silently widen D1's authority or automatically re-admit a revoked agent. The recommended flow approves an agent once for autonomous read/send, not each message.
+- **D13b Additional-agent admission: decided (2026-10-12).** The user chose per-agent approval once. Each agent needs its own trusted popup approval for autonomous read/send in the selected chat, not per-message approval. No automatic admission of later arrivals or silent re-admission after removal. A disconnected, restarted or revoked owner needs fresh approval; same-chat reload preserves the existing owner's connection (D2).
 
 The system's value should be **controlled, inspectable chat operations with explicit limitations**, rather than a claim that every website can be automated identically.
 

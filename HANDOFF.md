@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-12 (T1 complete; multi-agent D13a revised; D13b admission pending).
+Updated: 2026-10-12 (T1 and T2a complete; D13a/D13b decided; remaining T2 connection work pending).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -12,11 +12,11 @@ Keep this section current in place at every checkpoint, then add a short dated e
 
 The person installs the extension and starts the MCP server in VS Code, opens a Gemini chat in the browser that has the extension (container Chromium for now, D12) and clicks **Connect this chat** once. From then on the agent reads and sends in that chat without further intervention. Closing the tab, switching to another chat, or restarting the browser or VS Code ends the connection; reloading the same chat keeps it. For now the chat tab must stay visible, though its own window is fine; later a hidden tab must work too (D11). Other chat sites follow through the provider-neutral pipeline (D5). No provider APIs, credential export or unrestricted browser control.
 
-Revision (2026-10-12, D13a): multiple agents may connect to the same chat. The trusted popup must show their count and distinguishable identities and allow individual access removal without affecting the others. Separate grants and request/operation ownership remain mandatory; shared-composer writes are serialized. Whether additional agents need approval is open D13b, not implicit authorization for future agents.
+Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat, each approved once in the trusted popup for autonomous access. Show the count and distinguishable identities and allow individual removal without affecting the others. Separate grants and request/operation ownership remain mandatory; shared-composer writes are serialized. No automatic admission of later arrivals or silent re-admission after removal.
 
 ### Repository state
 
-- Latest source checkpoint: T1b observation window and failure policy (2026-10-12 entry below), after T1a `75ad536`. Its repaired exact gate passed build, both typechecks, **173/173 units and 20/20 e2e checks**. T1 is complete; T2 is not started.
+- Latest source checkpoint: T2a broker auto-start/startup facade connection (2026-10-12 entry below), after T1b `11d2bd1` and T1a `75ad536`. Its repaired exact gate passed build, both typechecks, **176/176 units and 20/20 e2e checks**. T1 and T2a are complete. Remaining T2 roster, per-agent approval/pickup/revocation and lifetime work is not implemented.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
 ### Capability matrix
@@ -58,7 +58,7 @@ This supervised chain stays for tests. The autonomous path (T3) reuses its fill,
 Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). Steps T1-T6 replace the earlier G2-G6 plan. The exact changes, tests, completion criteria and ask-points for each step are in **Implementation Plan T1-T6** below the dashboard.
 
 1. **T1 Read robustness: done.** Stopped native watches restart with bounded backoff (R2). D8 captures the newest 32 visible rows with `omittedBefore`, per-message truncation at 16,000 UTF-16 units and a 96 KiB capture cap. Identity-preserving failures skip publication; changed targets still revoke (R1). Synthetic evidence only for these changes.
-2. **T2 Connection model.** Popup-first **Connect this chat**, agent-bound requests/pickup, multiple agents per chat with a count/roster and individual access removal (revised D13a). Resolve additional-agent admission (D13b) first. Approved agents read and send autonomously (D1). No fixed expiry; reloading the same chat re-attaches with one-time optional host permission (D2). Individual disconnect/restart ends that owner's grant; target/browser changes end all grants for that chat. The MCP server starts the broker and connects at startup (D4).
+2. **T2 Connection model: in progress.** Startup connection and detached broker auto-start (D4) are gated in T2a. Still pending: popup-first **Connect this chat**, agent-bound pickup, count/roster and individual access removal (D13a), one popup approval per agent with no automatic admission/re-admission (D13b), autonomous read/send authority (D1) and no-expiry/same-chat reload lifetime (D2). Individual disconnect/restart ends that owner's grant; target/browser changes end all grants for that chat.
 3. **T3 Autonomous send.** A provider-neutral `chat_send_message` runs fill, fresh proof, durable intent, the one-offer job, browser reservation and one guarded activation, reusing today's pieces (D5). Add the append-only evidence rule (D9) with a settle window, per-connection resolution of unconfirmed sends with a one-click popup fallback (D10, R8), and the runaway guard: one message at a time and a configurable hourly cap. Relax "active tab of the current window" to "visible tab" (D11). Sandboxed synthetic tests cover the loop and its loss and crash cases.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
 5. **T5 Live acceptance.** Coordinated reload, then one human-authorized session on a disposable chat: connect once, the agent sends a few neutral messages and reads the complete replies without further clicks, then the tab is closed.
@@ -72,7 +72,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 - **R4 Three popup clicks per message**, plus the prepare, fill and commit calls. Decided fix: one connection approval, D1 (T2, T3).
 - **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer now holds 128 events or 4 MiB (T1b), so streaming can still expire cursors. Agents should treat events as change hints and re-read (D3, T4).
 - **R6 Gemini commits would end uncertain.** Fixture evidence uses stable row IDs; Gemini rows have none (D9).
-- **R7 Setup and target limits.** The broker must be started by hand (D4). Only saved chats with exactly two path segments, such as `https://gemini.google.com/app/<id>`, qualify; new unsaved chats and multi-account paths such as `/u/<n>/app/<id>` do not. Fill and submit need the chat tab to be the active tab of the current window and visible (D11 relaxes this to visible).
+- **R7 Setup and target limits.** Automatic broker start/startup facade connection is gated in T2a (D4); manual start is optional debugging. Only saved chats with exactly two path segments, such as `https://gemini.google.com/app/<id>`, qualify; new unsaved chats and multi-account paths such as `/u/<n>/app/<id>` do not. Fill and submit need the chat tab to be the active tab of the current window and visible (D11 relaxes this to visible).
 - **R8 One unconfirmed send blocks all sending for good.** `recordDispatchIntent` refuses every new intent while any journal attempt lacks evidence: across all chats, across broker restarts, and nothing ever resolves such an attempt. Only fixture evidence clears it today, so the first unconfirmed Gemini send would stop all sending. D10 makes the barrier per connection and resolves it from page evidence or one popup click (T3). The development journal currently holds no unresolved attempt.
 
 ### Findings: architecture and maintainability
@@ -89,11 +89,11 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 ### Decisions
 
-Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a (2026-10-12) allows multiple agents per chat with a visible roster/count and individual revocation; it supersedes exclusivity. Still open: D13b additional-agent admission (before T2), D10a clearing the agent's own leftover draft (before T3), D6 debugger permission (after T5), and the second chat site.
+Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a allows multiple agents per chat with a visible roster/count and individual revocation; D13b requires approval once per agent (2026-10-12). Still open: D10a clearing the agent's own leftover draft (before T3), D6 debugger permission (after T5), and the second chat site.
 
 ### Next step
 
-Clarify D13b before T2: approve each additional agent once in the trusted popup (recommended), or allow automatic joining after the chat is connected? Multiple recipients are now allowed; do not implement the old exclusive-pickup/refusal rule. Use the revised T2 tests and roster requirements below. T1a is `75ad536`; T1b is `11d2bd1`. No T2 implementation or live access has started.
+Continue T2 with the multi-agent roster and individually approved connection/pickup/revocation path (D13a, D13b), then no-expiry grants and same-chat reload re-attachment (D2). No automatic admission or exclusive-pickup/refusal rule. Use the revised T2 tests below. D10a remains the user ask-point before T3; no live access or real-chat approval has occurred.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -116,11 +116,11 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 - Tests: unit checks for the new bounds, strict refusal of other extra fields and deduplication that includes the new flags. Synthetic-page checks for more than 32 rows, a 16,001-unit message, a transient model row without `model-response-content` (no revocation, and a later publication works) and a URL change (still revokes).
 - Done when: the exact gate passes, the dashboard marks R1 and R2 fixed, and the DEVELOPMENT.md limits and troubleshooting entries are updated.
 
-### T2 Connection model (revised multi-agent D13a; ask D13b first)
+### T2 Connection model (multi-agent D13a and per-agent approval D13b decided)
 
 - **Broker start (D4):** `packages/companion/src/mcp-stdio.ts` connects at startup. If the socket is missing or refuses, it spawns `broker-process.js` detached with `stdio: "ignore"` (never the MCP stdout), waits within a bounded loop for the owner-only private socket and connects. Racing facades are safe because the broker refuses a second instance. `mcp-stdio.test.ts` currently expects `BROKER_UNAVAILABLE` without a broker (around line 161); keep a way to disable auto-start in tests.
 - **Connect this chat (D13, D1):** add the popup action for an eligible fixture or Gemini tab. Its text states that the agent may read and send in this chat on its own until the tab closes, and that chat content can influence what it sends. The click requests optional host permission for that origin (`optional_host_permissions` in `packages/extension/wxt.config.ts`; `permissions.request` must run inside the click handler), then a new relay-only command creates an autonomous grant.
-- **D13a (revised 2026-10-12):** allow several agents on one chat with distinct owned grants. No exclusive pickup or several-facade refusal. Bind each request and pickup to its own owner; D13b must decide admission of additional agents before implementation.
+- **D13a, D13b (2026-10-12):** allow several agents on one chat with distinct owned grants, each approved once in the trusted popup. No exclusive pickup, several-facade refusal, automatic admission of later arrivals or silent re-admission after revocation. The person approves an identifiable current owner before pickup; a restarted or removed owner needs fresh approval. Same-chat reload preserves approved connections (D2).
 - **Roster and revocation:** the trusted popup shows the connected count, distinguishable display labels and broker-minted instance IDs, status, **Remove access** per agent and **Disconnect all**. An agent cannot revoke another agent. Individual removal denies that owner's future reads/writes, cancels unstarted work and prevents silent re-admission; other owners stay connected. Retain uncertain in-flight status, never promise to undo an already activated send. Current owners are facade sockets, not automatically separate models or VS Code chat sessions (DESIGN.md section 7).
 - **Pickup tool:** `chat_wait_for_connection { timeoutMs }` (at most 20 s) returns connections offered to this agent. `chat_request_connection` stays for tests.
 - **Grant model:** autonomous grants report state `ready` with read and send capability and no expiry (`expiresAt: null`). Keep clipping correct wherever expiry feeds deadlines: `liveGrant`, read challenges, `getConnectionExpiresAt` and the extension's stored grants. Legacy read-only grants keep the five-minute TTL.
@@ -159,6 +159,18 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T2a Broker Startup (2026-10-12)
+
+- The facade now connects at startup and, only for missing/refused runtime connections, attempts one detached `broker-process.js` start with ignored stdio. Readiness and authentication share a five-second startup budget; existing owner-only socket/key checks remain unchanged. Unsafe runtimes and authentication failures are not replaced. `BROWSER_CHAT_AUTO_START_BROKER=0` preserves lazy manual-broker behavior in tests/debugging.
+- A new isolated-HOME SDK test starts two real facades before any tool call, verifies private broker readiness, distinct owned request handles, foreign-handle denial and unchanged credentials, then stops only recorded test-HOME brokers. A second test refuses an unsafe socket without spawning or changing permissions. Existing concurrent-owner and manual unavailable-broker cases remain covered.
+- First focused build failed because the promise timer import shadowed the existing callback timer. Aliasing it repaired the same slice; the focused SDK startup/ownership/opt-out checks passed 3/3, then 4/4 with unsafe-socket refusal. A scoped teardown exit-race repair retained HOME ownership checks; both startup tests passed 2/2. DEVELOPMENT.md describes auto-start and its opt-out. Per-agent admission/roster/autonomous authority remains planned, not implemented. No live-site or installed-profile access or real-chat approval occurred.
+- First exact gate passed build/typechecks and 175/175 units, but e2e ended 18/20: the two fixture submit loss/crash checks got `DISPATCH_UNAVAILABLE` instead of uncertainty on later status/replay calls. The startup deadline had been passed as the connector's request-wide upstream deadline, expiring the persistent facade after five seconds and disabling its keepalive. Repair separates the authentication-only deadline from unchanged upstream request clipping. The same two e2e checks passed 2/2; a new test-local IPC deadline regression plus both startup checks passed 3/3. No timeouts, polling, consent or uncertainty assertions changed. A new exact gate after this substantive repair passed build/typechecks, **176/176 units and 20/20 e2e checks**; the failed gate was not blindly retried.
+
+## D13b Per-Agent Approval (2026-10-12)
+
+- The user chose per-agent approval once. DESIGN.md D13b and the current dashboard/T2 plan now require one trusted popup approval for each owner's autonomous access, not per-message approval or automatic admission of future agents. Individual removal requires fresh approval to reconnect; a same-chat reload does not require reapproval.
+- Decision recorded before T2a implementation (entry above). Scoped decision-content, added-line-length, link, whitespace and document-diagnostic checks passed. The policy choice is not a real-chat grant or live-site authorization. D10a still requires a user choice before T3.
 
 ## D13a Multi-Agent Revision (2026-10-12)
 

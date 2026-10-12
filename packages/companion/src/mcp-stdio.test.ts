@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,11 @@ import { startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials } from "./broker-roles.js";
 import { openPrivateOperationDatabase, PreparedMessageOperations } from "./message-operations.js";
 import { PendingConnectionRequests } from "./pending-connections.js";
+
+const brokerStartupObserver = `import { appendFileSync } from "node:fs";
+  import { join } from "node:path";
+  if (process.argv[1]?.endsWith("/broker-process.js"))
+    appendFileSync(join(process.env.HOME, "broker-pids"), String(process.pid) + "\\n", { mode: 0o600 });`;
 
 async function brokerSocketReady(socketPath: string): Promise<boolean> {
   try {
@@ -52,7 +57,8 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
   const client = new Client({ name: "browser-chat-test", version: "0.0.1" });
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))]
+    args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+    env: { ...process.env, BROWSER_CHAT_AUTO_START_BROKER: "0" }
   });
 
   try {
@@ -80,6 +86,90 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     }]);
   } finally {
     await client.close();
+  }
+});
+
+test("two MCP facades auto-start one private broker before any tool call", { timeout: 10000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-auto-start-"));
+  const runtimeDirectory = join(home, ".config/agent-messaging-mcp/broker");
+  const options = { command: process.execPath,
+    args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+    env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "1",
+      NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(brokerStartupObserver)}` } };
+  const clients = [new Client({ name: "auto-start-one", version: "0.0.1" }),
+    new Client({ name: "auto-start-two", version: "0.0.1" })] as const;
+  try {
+    await Promise.all(clients.map((client) => client.connect(new StdioClientTransport(options))));
+    let ready = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      ready = await brokerSocketReady(join(runtimeDirectory, "broker.sock"));
+      if (ready) break;
+      await setTimeout(25);
+    }
+    assert.equal(ready, true, "Broker must start before a tool is invoked");
+    const credential = await readFile(join(runtimeDirectory, "facade.key"), "utf8");
+    const created = await Promise.all(clients.map((client) => client.callTool({
+      name: "chat_request_connection", arguments: {}
+    })));
+    const handles = created.map((result) => {
+      assert.equal(result.isError, undefined);
+      const handle = result.structuredContent as { requestId: string; state: string };
+      assert.equal(handle.state, "pending");
+      return handle;
+    });
+    assert.equal(new Set(handles.map((handle) => handle.requestId)).size, 2);
+    const foreign = await clients[1].callTool({ name: "chat_get_connection",
+      arguments: { requestId: handles[0]!.requestId } });
+    assert.deepEqual(foreign.structuredContent, { state: "unknown" });
+    assert.equal(await readFile(join(runtimeDirectory, "facade.key"), "utf8"), credential);
+  } finally {
+    await Promise.all(clients.map((client) => client.close()));
+    const recorded = await readFile(join(home, "broker-pids"), "utf8").catch(() => "");
+    for (const value of recorded.trim().split("\n").filter(Boolean)) {
+      const pid = Number(value);
+      assert.ok(Number.isSafeInteger(pid) && pid > 0);
+      const environment = await readFile(`/proc/${pid}/environ`, "utf8").catch(() => "");
+      if (!environment.split("\0").includes(`HOME=${home}`)) continue;
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+      }
+    }
+    for (let attempt = 0; attempt < 80; attempt++) {
+      if (!await brokerSocketReady(join(runtimeDirectory, "broker.sock"))) break;
+      await setTimeout(25);
+    }
+    assert.equal(await brokerSocketReady(join(runtimeDirectory, "broker.sock")), false);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("MCP auto-start refuses unsafe existing sockets without spawning or changing permissions", { timeout: 5000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-unsafe-start-"));
+  const parent = join(home, ".config/agent-messaging-mcp");
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const runtimeDirectory = join(parent, "broker");
+  const broker = await startBrokerSocket(runtimeDirectory, createBrokerCredentials());
+  const socketPath = join(runtimeDirectory, "broker.sock");
+  const credential = await readFile(join(runtimeDirectory, "facade.key"), "utf8");
+  const client = new Client({ name: "unsafe-runtime", version: "0.0.1" });
+  try {
+    await chmod(socketPath, 0o666);
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+      env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "1",
+        NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(brokerStartupObserver)}` } }));
+    const unavailable = await client.callTool({ name: "chat_request_connection", arguments: {} });
+    assert.equal(unavailable.isError, true);
+    assert.match(unavailable.content[0]?.type === "text" ? unavailable.content[0].text : "", /BROKER_UNAVAILABLE/);
+    assert.equal((await stat(socketPath)).mode & 0o777, 0o666);
+    assert.equal(await readFile(join(runtimeDirectory, "facade.key"), "utf8"), credential);
+    await assert.rejects(readFile(join(home, "broker-pids")), { code: "ENOENT" });
+  } finally {
+    await client.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
   }
 });
 
@@ -149,7 +239,8 @@ test("two real MCP clients cannot reuse each other's pending handles", { timeout
   const brokerEntry = fileURLToPath(new URL("./broker-process.js", import.meta.url));
   const clientOne = new Client({ name: "client-one", version: "0.0.1" });
   const clientTwo = new Client({ name: "client-two", version: "0.0.1" });
-  const options = { command: process.execPath, args: [entry], env: { ...process.env, HOME: home } };
+  const options = { command: process.execPath, args: [entry],
+    env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
   const brokerDirectory = join(home, ".config/agent-messaging-mcp/broker");
   let broker: ReturnType<typeof spawn> | undefined;
   let brokerExit: ReturnType<typeof once> | undefined;

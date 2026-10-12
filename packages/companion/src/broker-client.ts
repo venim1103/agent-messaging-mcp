@@ -420,8 +420,10 @@ export function brokerRequestDeadline(now: number, upstreamDeadlineMs?: number):
   return Math.min(localDeadline, upstreamDeadlineMs ?? localDeadline);
 }
 
-export async function connectBroker(role: BrokerRole, runtimeDirectory: string, upstreamDeadlineMs?: number) {
+export async function connectBroker(role: BrokerRole, runtimeDirectory: string, upstreamDeadlineMs?: number,
+  authenticationDeadlineMs?: number) {
   brokerRequestDeadline(Date.now(), upstreamDeadlineMs);
+  if (authenticationDeadlineMs !== undefined) brokerRequestDeadline(Date.now(), authenticationDeadlineMs);
   const directory = await stat(runtimeDirectory);
   const keyPath = join(runtimeDirectory, `${role}.key`);
   const key = await stat(keyPath);
@@ -441,7 +443,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
     await once(socket, "connect");
     const requestId = randomUUID();
     const startedAt = Date.now();
-    const deadlineMs = brokerRequestDeadline(startedAt, upstreamDeadlineMs);
+    const deadlineMs = Math.min(brokerRequestDeadline(startedAt, upstreamDeadlineMs),
+      brokerRequestDeadline(startedAt, authenticationDeadlineMs));
     const decoder = new NativeFrameDecoder();
     const response = new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => socket.destroy(new Error("Broker authentication timed out")), deadlineMs - startedAt);

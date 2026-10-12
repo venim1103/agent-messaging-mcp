@@ -43,6 +43,35 @@ async function exchange(socket: Socket, message: unknown): Promise<unknown> {
   });
 }
 
+test("authentication deadlines do not expire persistent facade requests or relax upstream deadlines", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-auth-deadline-"));
+  const directory = join(home, "broker");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials());
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let now = Date.now();
+  context.mock.method(Date, "now", () => now);
+  try {
+    const authenticationDeadline = now + 1000;
+    facade = await connectBroker("facade", directory, undefined, authenticationDeadline);
+    relay = await connectBroker("relay", directory, authenticationDeadline);
+    const pending = await facade.requestConnection();
+    if (pending.kind !== "connection_requested") throw new Error("Expected owned pending request");
+    now = authenticationDeadline + 1;
+    assert.deepEqual((await facade.getConnection(pending.payload.requestId)).payload, pending.payload);
+    assert.equal((await facade.requestConnection()).kind, "connection_requested");
+    const scopedRelay = relay;
+    await assert.rejects(scopedRelay.listPending(), /Invalid broker request deadline/);
+    await assert.rejects(connectBroker("facade", directory, undefined, now), /Invalid broker request deadline/);
+    await assert.rejects(connectBroker("facade", directory, undefined, now + 30_001), /Invalid broker request deadline/);
+  } finally {
+    facade?.close();
+    relay?.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("broker client validates bounded purpose-specific Gemini consent replies", { timeout: 5000 }, async (context) => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-consent-replies-"));
   const directory = join(home, "broker");

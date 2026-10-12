@@ -10,7 +10,7 @@ Dated test reports that used to fill this file were removed in the 2026-10-09 re
 
 > **Experimental.** The local fixture supports reads, events and supervised fill and send. A selected saved Gemini chat supports reads and events; Gemini writing is private, incomplete and refused by the public tools. Never connect personal conversations.
 
-The decided target is different: one **Connect this chat** approval in the popup, after which the agent chats on its own until the tab closes (DESIGN.md sections 2 and 17). This file describes the tools as they work today.
+The decided target is different: one **Connect this chat** approval per agent in the popup, after which each approved agent chats on its own until its connection ends. Several agents may share a chat, with a visible roster and individual removal (DESIGN.md sections 2 and 17). Those connection controls are not implemented yet; this file describes the tools as they work today.
 
 ## Architecture in Brief
 
@@ -21,7 +21,7 @@ MCP host <-> stdio facade <-> private Unix-socket broker <-> native relay <-> ex
 | Component | Entry point | Started by | Responsibility |
 | --- | --- | --- | --- |
 | MCP facade | `packages/companion/dist/mcp-stdio.js` | The MCP host, via [.vscode/mcp.json](.vscode/mcp.json) | Public tools; connects to the broker in the `facade` role; each process is one owner |
-| Broker | `packages/companion/dist/broker-process.js` | `npm run dev:broker`, by hand | Grants, operation ledger, observation buffers, deadlines and role checks |
+| Broker | `packages/companion/dist/broker-process.js` | MCP facade on demand; `npm run dev:broker` for foreground debugging | Grants, operation ledger, observation buffers, deadlines and role checks |
 | Native relay | `packages/companion/dist/native-relay.js`, through a launcher | Chromium, once per `connectNative` port | Validates and forwards frames in the `relay` role; no chat logic |
 | Extension | `packages/extension/.output/chrome-mv3` | Loaded unpacked in container Chromium | Trusted popup, service worker and injected page functions |
 
@@ -39,14 +39,19 @@ Private state, never committed:
 Everything runs inside the Podman devcontainer ([devcontainer.json](.devcontainer/devcontainer.json)): Chromium, the extension, the native host, the broker and the MCP facade. Browsers on the Windows or WSL host cannot be used, and their tabs and logins are not reachable. Port 8787 is forwarded only for optional viewing of the fixture.
 
 1. Open the repository in the devcontainer. Post-create runs `npm ci && npm run build && npm run restore:native -- --browser chromium --user-data-dir "$HOME/.local/share/agent-messaging-mcp/chromium-dev"`. For an existing checkout, run `npm ci` and `npm run build`.
-2. Start the fixture and the broker in two terminals; both keep running:
+2. For fixture development, start the fixture in a terminal; it keeps running:
 
    ```bash
    npm run dev:fixture
-   npm run dev:broker
    ```
 
-   The fixture serves `http://127.0.0.1:8787/` (textarea) and `http://127.0.0.1:8787/?editor=rich` (contenteditable). Its **Switch chat** button changes the conversation in place. The broker refuses a second instance (`Broker is already running`) and recovers only its own dead runtime. Stop it with Ctrl+C.
+   The fixture serves `http://127.0.0.1:8787/` (textarea) and `http://127.0.0.1:8787/?editor=rich` (contenteditable). Its **Switch chat** button changes the conversation in place. Gemini development does not need this fixture server.
+
+   Starting the MCP facade also connects it to the broker. If the runtime is missing or its socket refuses, the facade makes at most one detached broker-start attempt and checks readiness within a five-second absolute startup budget. The child uses ignored stdio, never MCP stdout. Private directory/key/socket ownership, modes and authenticated role checks remain mandatory; unsafe runtimes or failed authentication do not trigger a replacement. Concurrent facades share the broker but keep separate owners; a detached broker stays running when a facade exits.
+
+   The startup budget clips only authentication, not the persistent facade's later requests or keepalive. The private connector's separate upstream deadline still clips every request made by a short-lived native relay. Neither deadline grants or renews chat authority.
+
+   `npm run dev:broker` remains available for foreground debugging (stop with Ctrl+C). It refuses a second instance (`Broker is already running`) and recovers only its own dead runtime. Set `BROWSER_CHAT_AUTO_START_BROKER=0` in the MCP process environment to disable eager connection and auto-start for tests/manual debugging; tool calls then connect lazily to an already running broker.
 3. Start container Chromium with the development profile:
 
    ```bash
@@ -66,14 +71,14 @@ Everything runs inside the Podman devcontainer ([devcontainer.json](.devcontaine
 6. Verify the chain:
    - `browser_chat_feasibility` returns `MCP stdio diagnostic OK. No browser data was read or sent.`
    - On the fixture tab, the toolbar popup's **Inspect this chat** lists the fixture rows and `Native bridge ready (protocol v1). Nothing was sent.`
-   - `chat_request_connection` returns a pending request. `BROKER_UNAVAILABLE` means the broker is not running.
+   - `chat_request_connection` returns a pending request. `BROKER_UNAVAILABLE` means private broker startup/connection failed; inspect ownership, permissions and startup state rather than retrying uncertain writes.
 
 ## Coordinated Restart After Source Changes
 
 Running processes keep the code they started with.
 
 1. Run `npm run build`.
-2. Look for a running broker (`pgrep -af broker-process`). Stop it with Ctrl+C in its terminal, then start `npm run dev:broker` again. This ends every grant and consent; unresolved dispatch intents survive only as status.
+2. Look for a running broker (`pgrep -af broker-process`). Stop the verified broker with Ctrl+C in its debug terminal, or SIGTERM its verified owned PID if it was started detached. Start `npm run dev:broker` again, or let the restarted MCP facade auto-start it. This ends every grant and consent; unresolved dispatch intents survive only as status. Do not signal an unverified process.
 3. Restart the MCP server (**MCP: List Servers**) so the facade reconnects and tool descriptions refresh. The new facade is a new owner: old request, connection and operation IDs return `unknown`.
 4. Reload the extension in `chrome://extensions`, which revokes its grants, then select the chat tab again.
 
