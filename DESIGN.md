@@ -28,6 +28,8 @@ For the first supported AI-chat integration, use Gemini's browser interface. It 
 3. From then on the agent reads and sends messages in that chat without further intervention.
 4. Closing the tab, switching to another chat, or restarting the browser or VS Code ends the connection. Reloading the same chat keeps it.
 
+**Revision (2026-10-12, D13a):** Multiple agents may connect to the same chat. The person must see the connected-agent count and a distinguishable entry for each agent, and be able to remove one agent's access without disconnecting the others. Each agent keeps its own grant and request/operation ownership. Admission of additional agents is the open D13b decision below.
+
 For now everything runs in the Podman devcontainer (D12), and the chat tab must stay visible, though its own window is fine; later a hidden tab must work too (D11). Section 17 records the decisions behind this. The original scope below assumed per-message approval; where it differs, the target experience wins.
 
 ### Initial scope
@@ -97,6 +99,8 @@ This is the practical equivalent of the proposed window click: **activate the ta
 The browser's `activeTab` grant requires a supported user gesture. It can survive same-origin navigation, but it is revoked on cross-origin navigation or tab closure. Application authorization must be narrower than this: selecting another conversation on the same origin must not silently authorize that conversation. [4]
 
 **Decision (2026-10-09, D13 and D1):** The person starts the connection from the popup with **Connect this chat**, and the MCP agent picks it up with a dedicated tool instead of creating a pending request first. One approval grants reading and autonomous sending in that chat, so the target flow has no read-only or send-with-approval choice. The existing agent-first request flow remains for tests.
+
+**Revision (2026-10-12, D13a):** A chat may have several agent connections. The trusted popup must show their count, distinguishable names/instance IDs, connection status and an individual **Remove access** action; also offer **Disconnect all**. Pending requests and pickup must remain bound to the correct agent, never a shared handle. D13b decides whether additional agents require approval or can join automatically.
 
 ### While connected
 
@@ -187,6 +191,12 @@ Reloads require a fresh document check; browser or broker restarts invalidate ac
 **Implementation note (2026-10-09):** Implemented connection states are `pending`, `expired`, `ready_readonly` and `stale`, plus `unknown` for foreign or forgotten requests. Every approval is read-only; write authority comes only from per-operation trusted consents (section 10), so `calibrating`, `ready_write` and `paused` do not exist. Grants last five minutes without renewal (decision D2), `generation` is always 1, and reapproval creates a new connection. A grant binds the owning facade socket, tab, Chrome document ID, origin and conversation ID, plus the exact saved-chat URL including any query for Gemini. Browser-instance identity is approximated by revoking all grants when the extension worker starts fresh.
 
 **Decision (2026-10-09, D2):** Connections have no fixed expiry. They end when the tab closes, the tab shows another chat, the browser or MCP server restarts, or the agent or person disconnects. A reload of the same chat re-attaches to the new document after an observation gap. This needs host permission for the chat's site, requested once during **Connect this chat**, because `activeTab` ends on navigation. A connection with an unresolved send stays readable but pauses sending (D10).
+
+**Revision (2026-10-12, D13a):** Multiple approved owners may bind the same target. An agent disconnect or its facade restart ends only that owner's grant; tab/chat/browser changes end every grant for that target. Individual popup revocation must deny subsequent reads and writes for that owner and invalidate its unstarted work, without revoking other owners or silently allowing the removed agent to reclaim access. Revocation cannot undo an activation that already occurred; retain conservative status for in-flight uncertain operations.
+
+The current broker identifies a facade socket, not an individual model or every chat session inside an MCP host. Add a broker-minted instance ID and a bounded display label for the roster. Host/configuration-reported names are labels, not authenticated model identity; clients sharing a facade cannot be counted as distinct agents without an explicit supported identity boundary. Do not promise automatic identification of separate VS Code chat sessions or models.
+
+Independent readers retain independent cursors. Writers share one composer: serialize the whole fill/proof/submit/evidence sequence, not just each browser input call. Concurrent requests must remain bounded and owner-specific, and must not interleave drafts, consume another owner's authority, or retry uncertain writes. The hourly guard and unresolved-send pause apply to the shared conversation across all agents.
 
 ## 8. Generic Adapter Strategy
 
@@ -527,7 +537,8 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D11 Hidden tab: decided, phased.** First the chat tab must stay visible; its own window is fine, so "active tab of the current window" relaxes to "visible tab". Later a hidden tab must work too, so that only closing the tab or the browser disconnects.
 - **D12 Target platform: decided.** Keep the devcontainer: container Chromium, native host, broker and MCP server in one container (section 12).
 - **D13 Connection start: decided.** The person clicks **Connect this chat** first and the agent picks the chat up (section 4).
-- **D13a Agent binding: partially decided (2026-10-12).** The user confirmed that only one agent may receive a chat. Recipient selection remains open before T2: when several agents are connected, should the popup refuse, or may one agent exclusively claim the chat? The existing proposal is to bind the sole connected agent, wait for pickup or tab close when none is connected, and refuse when several are connected; exclusivity alone does not confirm that selection policy.
+- **D13a Agent binding: revised and decided (2026-10-12).** Multiple agents may connect to the same chat. Show how many and which agents have access, with individual removal. Supersedes the earlier exclusive-recipient decision and the several-facade refusal proposal. Grants, requests and operations remain individually owned; writes to the shared composer must be serialized. Section 7 explains the facade identity limit.
+- **D13b Additional-agent admission: open.** Before T2, decide whether every additional agent needs trusted popup approval (recommended), or whether connecting a chat authorizes subsequent agents to join automatically. Approval and individual revocation must have clear semantics; do not silently widen D1's authority or automatically re-admit a revoked agent. The recommended flow approves an agent once for autonomous read/send, not each message.
 
 The system's value should be **controlled, inspectable chat operations with explicit limitations**, rather than a claim that every website can be automated identically.
 

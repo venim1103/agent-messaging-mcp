@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-12 (T1 complete; D13a exclusivity confirmed, selection pending).
+Updated: 2026-10-12 (T1 complete; multi-agent D13a revised; D13b admission pending).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -11,6 +11,8 @@ Keep this section current in place at every checkpoint, then add a short dated e
 ### Target experience (decided 2026-10-09)
 
 The person installs the extension and starts the MCP server in VS Code, opens a Gemini chat in the browser that has the extension (container Chromium for now, D12) and clicks **Connect this chat** once. From then on the agent reads and sends in that chat without further intervention. Closing the tab, switching to another chat, or restarting the browser or VS Code ends the connection; reloading the same chat keeps it. For now the chat tab must stay visible, though its own window is fine; later a hidden tab must work too (D11). Other chat sites follow through the provider-neutral pipeline (D5). No provider APIs, credential export or unrestricted browser control.
+
+Revision (2026-10-12, D13a): multiple agents may connect to the same chat. The trusted popup must show their count and distinguishable identities and allow individual access removal without affecting the others. Separate grants and request/operation ownership remain mandatory; shared-composer writes are serialized. Whether additional agents need approval is open D13b, not implicit authorization for future agents.
 
 ### Repository state
 
@@ -56,7 +58,7 @@ This supervised chain stays for tests. The autonomous path (T3) reuses its fill,
 Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). Steps T1-T6 replace the earlier G2-G6 plan. The exact changes, tests, completion criteria and ask-points for each step are in **Implementation Plan T1-T6** below the dashboard.
 
 1. **T1 Read robustness: done.** Stopped native watches restart with bounded backoff (R2). D8 captures the newest 32 visible rows with `omittedBefore`, per-message truncation at 16,000 UTF-16 units and a 96 KiB capture cap. Identity-preserving failures skip publication; changed targets still revoke (R1). Synthetic evidence only for these changes.
-2. **T2 Connection model.** Popup-first **Connect this chat**, picked up by the connected MCP agent through a new tool (D13). One approval grants reading and autonomous sending (D1). No fixed expiry: the connection ends on tab close, chat switch, browser or MCP server restart, or disconnect, and a reload of the same chat re-attaches using a one-time optional `gemini.google.com` host permission (D2). The MCP server starts the broker and connects at startup (D4).
+2. **T2 Connection model.** Popup-first **Connect this chat**, agent-bound requests/pickup, multiple agents per chat with a count/roster and individual access removal (revised D13a). Resolve additional-agent admission (D13b) first. Approved agents read and send autonomously (D1). No fixed expiry; reloading the same chat re-attaches with one-time optional host permission (D2). Individual disconnect/restart ends that owner's grant; target/browser changes end all grants for that chat. The MCP server starts the broker and connects at startup (D4).
 3. **T3 Autonomous send.** A provider-neutral `chat_send_message` runs fill, fresh proof, durable intent, the one-offer job, browser reservation and one guarded activation, reusing today's pieces (D5). Add the append-only evidence rule (D9) with a settle window, per-connection resolution of unconfirmed sends with a one-click popup fallback (D10, R8), and the runaway guard: one message at a time and a configurable hourly cap. Relax "active tab of the current window" to "visible tab" (D11). Sandboxed synthetic tests cover the loop and its loss and crash cases.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
 5. **T5 Live acceptance.** Coordinated reload, then one human-authorized session on a disposable chat: connect once, the agent sends a few neutral messages and reads the complete replies without further clicks, then the tab is closed.
@@ -77,7 +79,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 - **A1 Provider duplication.** There are 52 private broker request kinds and parallel ledger, client, native, worker and popup families per provider, while DESIGN.md section 8 expects one policy pipeline with adapters. Several fixture-named items are provider-generic (`disconnect_fixture`, `revoke_all_fixture`, `revokeTrackedFixture`, `completeFixtureBrowserCheck`, the shared `MAX_PENDING_FIXTURE_DISPATCHES` cap). Do not add a provider by copying (D5).
 - **A2 Input mechanism drift.** Connected writers use `document.execCommand("insertText")` and a script-initiated `click()`, not `chrome.debugger`. `debugger` serves only two legacy popup probes, and the Gemini **Fill test draft** probe types a fixed sentence outside the operation ledger (D6). Whether live Gemini accepts the script-initiated Send click is unverified.
-- **A3 Model gaps.** `generation` is always 1, every connection is `ready_readonly` and write authority is per operation; there is no write mode or pause state. The popup is still a probe UI without the data-boundary disclosure that DESIGN.md section 13 asks for. The extension mirrors broker schemas by hand, so protocol changes must be made in both places.
+- **A3 Model gaps.** `generation` is always 1, every connection is `ready_readonly` and write authority is per operation; there is no write mode or pause state. The popup lacks the data-boundary disclosure and multi-agent roster/removal controls. Broker owners are facade sockets, not automatically distinct models or VS Code chat sessions; the new roster needs broker instance IDs and clearly labeled display names (DESIGN.md section 7). The extension mirrors broker schemas by hand, so protocol changes must be made in both places.
 - **A4 Port churn.** Each snapshot publication and each worker completion opens a new native port and relay process. This is fine locally; measure before raising event rates.
 
 ### Findings: process and documentation
@@ -87,11 +89,11 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 ### Decisions
 
-Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). D13a exclusivity was confirmed on 2026-10-12: only one agent may receive a chat. Still open: D6, the debugger permission, decided after the first live test (T5); D10a, whether the system may clear a leftover draft that exactly equals the agent's own not-sent text (ask before T3); D13a recipient selection when several agents are connected (confirm before T2); and which second chat site to support.
+Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a (2026-10-12) allows multiple agents per chat with a visible roster/count and individual revocation; it supersedes exclusivity. Still open: D13b additional-agent admission (before T2), D10a clearing the agent's own leftover draft (before T3), D6 debugger permission (after T5), and the second chat site.
 
 ### Next step
 
-Await the remaining D13a selection decision before T2. One recipient per chat is confirmed; clarify whether several connected agents cause popup refusal (the existing proposal) or allow one exclusive pickup. The proposal still waits for pickup or tab close when no agent is connected. T1a is `75ad536`; T1b is `11d2bd1`. No T2 implementation or live access has started.
+Clarify D13b before T2: approve each additional agent once in the trusted popup (recommended), or allow automatic joining after the chat is connected? Multiple recipients are now allowed; do not implement the old exclusive-pickup/refusal rule. Use the revised T2 tests and roster requirements below. T1a is `75ad536`; T1b is `11d2bd1`. No T2 implementation or live access has started.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -114,15 +116,16 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 - Tests: unit checks for the new bounds, strict refusal of other extra fields and deduplication that includes the new flags. Synthetic-page checks for more than 32 rows, a 16,001-unit message, a transient model row without `model-response-content` (no revocation, and a later publication works) and a URL change (still revokes).
 - Done when: the exact gate passes, the dashboard marks R1 and R2 fixed, and the DEVELOPMENT.md limits and troubleshooting entries are updated.
 
-### T2 Connection model (ask the user to confirm D13a first)
+### T2 Connection model (revised multi-agent D13a; ask D13b first)
 
 - **Broker start (D4):** `packages/companion/src/mcp-stdio.ts` connects at startup. If the socket is missing or refuses, it spawns `broker-process.js` detached with `stdio: "ignore"` (never the MCP stdout), waits within a bounded loop for the owner-only private socket and connects. Racing facades are safe because the broker refuses a second instance. `mcp-stdio.test.ts` currently expects `BROKER_UNAVAILABLE` without a broker (around line 161); keep a way to disable auto-start in tests.
 - **Connect this chat (D13, D1):** add the popup action for an eligible fixture or Gemini tab. Its text states that the agent may read and send in this chat on its own until the tab closes, and that chat content can influence what it sends. The click requests optional host permission for that origin (`optional_host_permissions` in `packages/extension/wxt.config.ts`; `permissions.request` must run inside the click handler), then a new relay-only command creates an autonomous grant.
-- **D13a:** one recipient per chat is confirmed (2026-10-12). Selection remains open. The existing proposal binds the sole connected facade; with none, the offer waits until an agent picks it up or the tab closes; with several, the popup refuses. Do not treat exclusivity as confirmation of the several-facade refusal policy.
+- **D13a (revised 2026-10-12):** allow several agents on one chat with distinct owned grants. No exclusive pickup or several-facade refusal. Bind each request and pickup to its own owner; D13b must decide admission of additional agents before implementation.
+- **Roster and revocation:** the trusted popup shows the connected count, distinguishable display labels and broker-minted instance IDs, status, **Remove access** per agent and **Disconnect all**. An agent cannot revoke another agent. Individual removal denies that owner's future reads/writes, cancels unstarted work and prevents silent re-admission; other owners stay connected. Retain uncertain in-flight status, never promise to undo an already activated send. Current owners are facade sockets, not automatically separate models or VS Code chat sessions (DESIGN.md section 7).
 - **Pickup tool:** `chat_wait_for_connection { timeoutMs }` (at most 20 s) returns connections offered to this agent. `chat_request_connection` stays for tests.
 - **Grant model:** autonomous grants report state `ready` with read and send capability and no expiry (`expiresAt: null`). Keep clipping correct wherever expiry feeds deadlines: `liveGrant`, read challenges, `getConnectionExpiresAt` and the extension's stored grants. Legacy read-only grants keep the five-minute TTL.
 - **Lifetime (D2):** tab close, chat switch, extension reload, browser restart (`ensureFixtureReset`) and owner disconnect already revoke. Change the `tabs.onUpdated` handler near the end of `background.ts` so a reload of the same exact URL re-attaches: after load, confirm identity in the new document, rebind the broker target through a new relay-only command, mark an observation gap and reinstall observers. Any other URL change still revokes.
-- **Tests:** units for offer binding with zero, one and several facades, no-expiry clipping, rebind and gap; SDK tests for the pickup tool; disposable-browser tests for Connect, reload re-attach, chat switch and tab close.
+- **Tests:** units and SDK checks for several facades receiving distinct handles on one chat, independent reads/cursors, strict owner-bound request/status/pickup, roster count/labels, duplicate display names distinguished by instance IDs, one owner's disconnect/restart and individual human removal leaving others intact, denied cross-owner revocation and no silent re-admission. Retain no-expiry/deadline/rebind/gap cases. Disposable-browser tests cover Connect/admission per D13b, roster/removal, same-chat reload, chat switch and tab close ending all target grants.
 - **Done when:** the gate passes, DEVELOPMENT.md documents the new flow and tools, and the capability matrix is updated.
 
 ### T3 Autonomous send (ask the user about D10a first)
@@ -134,6 +137,7 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 - **Barrier (R8):** scope `recordDispatchIntent` to one conversation. Store on each attempt a conversation key: an HMAC of origin and conversation ID under a persistent 32-byte key kept in a new single-row table of the same private database, because `digestKey` is random per process. Record resolutions (`sent` or `not_sent`, by page or person) in a new table. An attempt without evidence or resolution blocks only its own conversation; older attempts without a key keep the current global behavior.
 - **Popup:** for a connected chat, list unresolved sends with **Sent** and **Not sent** buttons through new relay-only commands, plus **Disconnect**.
 - **Runaway guard:** one send in flight (the shared pending-submit cap already allows only one globally) and an hourly cap per conversation, counted from journal attempts and set by an environment variable such as `BROWSER_CHAT_MAX_SENDS_PER_HOUR` (default 60).
+- **Shared chat (revised D13a):** serialize the entire fill/proof/submit/evidence sequence across all owners of the same composer, not just script calls. Concurrent send requests stay bounded and owner-specific; no interleaved drafts, duplicate activation or automatic uncertain retry. The hourly cap and unresolved-send pause are shared by the conversation. Test two owners contending for the same chat, revocation while waiting/in flight, and uncertainty pausing every writer on that chat without ending other chats.
 - **Visible tab (D11):** the Gemini write executors (`fillTrackedGeminiDraft`, `checkTrackedGeminiDraft` and the new submit executor) require the active tab of the current window via `tabs.query({ active: true, currentWindow: true })`. Require instead that the target tab is active in its own window (`tabs.get(tabId).active`) and visible. Popup approvals keep the current-window check.
 - **Tests:** units for pipeline states, idempotency, guard, per-conversation barrier and resolution. Disposable-browser tests on synthetic Gemini pages for sent, not sent, unresolved with popup resolution, hidden-tab refusal, and the existing loss cases (script result loss, native completion loss, worker stop and wake, broker kill), always with at most one activation.
 - **Done when:** the gate passes, and DEVELOPMENT.md, the dashboard and README.md (outgoing messages no longer need separate approval) are updated.
@@ -155,6 +159,12 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## D13a Multi-Agent Revision (2026-10-12)
+
+- The user revised the earlier exclusive-recipient decision: multiple agents may connect to the same chat, and the person must see how many/which agents have access and be able to remove access individually. DESIGN.md sections 2, 4, 7 and 17 and the dashboard/T2-T3 plan now reflect that requirement. The earlier exclusivity entry is history, not the current rule.
+- Nearby code confirms ownership is per facade socket, current grants can bind several owners to the same target, and `disconnectFixture` revokes only the owned grant. There is no agent roster, trusted per-agent removal transport or automatic model/session identity. Those remain T2 work, not implemented capability.
+- D13b remains open: whether additional agents require their own popup approval or can join an already connected chat automatically. Recommend per-agent approval once for autonomous read/send. No source, services, grant or browser access changed. Validation passed: decision content, added-line lengths, local links, document diagnostics and `git diff --check`; no source gate rerun. The source gate remains T1b's 173/173 units and 20/20 e2e checks.
 
 ## D13a Exclusive Recipient Confirmation (2026-10-12)
 
