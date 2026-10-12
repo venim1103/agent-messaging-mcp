@@ -12,12 +12,12 @@ import { fixtureDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillSt
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureDispatchCheckResult,
   type FixtureDispatchResult, type FixtureFillResult, type FixturePreflightResult, type GeminiFillResult,
   type GeminiDispatchCheckResult } from "./message-operations.js";
-import type { FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
+import type { ApprovedTarget, FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_EVENTS_PER_READ,
   MAX_GEMINI_SNAPSHOT_MESSAGES,
-  MAX_PENDING_FIXTURE_READS, MAX_PENDING_GEMINI_READS, MAX_PENDING_REQUESTS }
+  MAX_CONNECTED_AGENTS, MAX_PENDING_FIXTURE_READS, MAX_PENDING_GEMINI_READS, MAX_PENDING_REQUESTS }
   from "./pending-connections.js";
 
 const helloResult = z.strictObject({
@@ -56,6 +56,20 @@ const geminiReview = z.strictObject({
 });
 
 const replySchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("chat_agents"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ agents: z.array(z.strictObject({
+      agentId: z.uuid(), label: z.string().regex(/^[ -~]{1,80}$/).refine(label => label.trim() === label),
+      connectionCount: z.number().int().safe().nonnegative()
+    })).max(MAX_CONNECTED_AGENTS).refine(agents => new Set(agents.map(agent => agent.agentId)).size === agents.length) })
+  }),
+  z.strictObject({
+    kind: z.literal("chat_agent_removed"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ revoked: z.number().int().safe().nonnegative(),
+      remainingAgents: z.number().int().min(0).max(MAX_CONNECTED_AGENTS) })
+  }),
   z.strictObject({
     kind: z.literal("kept_alive"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
@@ -421,7 +435,7 @@ export function brokerRequestDeadline(now: number, upstreamDeadlineMs?: number):
 }
 
 export async function connectBroker(role: BrokerRole, runtimeDirectory: string, upstreamDeadlineMs?: number,
-  authenticationDeadlineMs?: number) {
+  authenticationDeadlineMs?: number, agentLabel?: string) {
   brokerRequestDeadline(Date.now(), upstreamDeadlineMs);
   if (authenticationDeadlineMs !== undefined) brokerRequestDeadline(Date.now(), authenticationDeadlineMs);
   const directory = await stat(runtimeDirectory);
@@ -472,7 +486,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
     });
     socket.write(encodeNativeFrame({
       kind: "hello", protocolVersion: PROTOCOL_VERSION, requestId, connectionGeneration: 0,
-      deadlineMs, role, credential, payload: {}
+      deadlineMs, role, credential, payload: { ...(agentLabel !== undefined ? { agentLabel } : {}) }
     }));
     const reply = helloResult.parse(await response);
     if (reply.requestId !== requestId || reply.payload.role !== role
@@ -482,7 +496,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
     }
     let nextRequest: Promise<void> = Promise.resolve();
     let pendingRequests = 0;
-    const request = (kind: "keep_alive" | "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
+    const request = (kind: "keep_alive" | "list_chat_agents" | "remove_chat_agent" | "disconnect_chat"
+      | "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
       | "disconnect_fixture" | "prepare_fixture_message" | "get_prepared_operation"
@@ -505,7 +520,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "publish_fixture_snapshot" | "publish_gemini_snapshot"
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap"
       | "mark_gemini_observation_gap", payload: object) => {
-      if (kind === "list_pending" || kind === "list_fixture_read_challenges"
+      if (kind === "list_chat_agents" || kind === "remove_chat_agent" || kind === "disconnect_chat"
+        || kind === "list_pending" || kind === "list_fixture_read_challenges"
         || kind === "list_fixture_prepared_reviews" || kind === "approve_fixture_review"
         || kind === "list_fixture_fill_reviews" || kind === "approve_fixture_fill_review"
         || kind === "list_fixture_send_reviews" || kind === "approve_fixture_send_review"
@@ -591,6 +607,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
     return {
       role,
       get closed() { return socket.destroyed; },
+      listChatAgents: (target: ApprovedTarget) => request("list_chat_agents", { target }),
+      removeChatAgent: (target: ApprovedTarget, agentId: string) => request("remove_chat_agent", { target, agentId }),
+      disconnectChat: (target: ApprovedTarget) => request("disconnect_chat", { target }),
       requestConnection: () => request("request_connection", {}),
       getConnection: (requestId: string) => request("get_connection", { requestId }),
       readFixtureSnapshot: (connectionId: string, limit?: number) =>

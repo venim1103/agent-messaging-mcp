@@ -36,6 +36,15 @@ const geminiMessage = z.strictObject({
 
 const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("keep_alive"), payload: z.strictObject({}) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_chat_agents"), payload: z.strictObject({
+    target: z.union([fixtureTarget, geminiTarget])
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("disconnect_chat"), payload: z.strictObject({
+    target: z.union([fixtureTarget, geminiTarget])
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("remove_chat_agent"), payload: z.strictObject({
+    target: z.union([fixtureTarget, geminiTarget]), agentId: z.uuid()
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("request_connection"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("get_connection"), payload: z.strictObject({ requestId: z.uuid() }) }),
   z.strictObject({ ...envelope, kind: z.literal("read_fixture_snapshot"), payload: z.strictObject({
@@ -194,6 +203,18 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return role === "relay"
       ? { ...response, kind: "pending_list" as const, payload: { requests: requests.listPending(now) } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "list_chat_agents") {
+    return role === "relay"
+      ? { ...response, kind: "chat_agents" as const, payload: { agents: requests.listChatAgents(request.payload.target, now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "remove_chat_agent" || request.kind === "disconnect_chat") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    const revoked = request.kind === "disconnect_chat" ? requests.disconnectChat(request.payload.target, now)
+      : requests.removeChatAgent(request.payload.agentId, request.payload.target, now);
+    const remainingAgents = requests.listChatAgents(request.payload.target, now).filter(agent => agent.connectionCount > 0).length;
+    return { ...response, kind: "chat_agent_removed" as const, payload: { revoked, remainingAgents } };
   }
   if (request.kind === "list_fixture_read_challenges") {
     return role === "relay"

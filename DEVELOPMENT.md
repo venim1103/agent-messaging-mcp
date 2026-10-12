@@ -10,7 +10,7 @@ Dated test reports that used to fill this file were removed in the 2026-10-09 re
 
 > **Experimental.** The local fixture supports reads, events and supervised fill and send. A selected saved Gemini chat supports reads and events; Gemini writing is private, incomplete and refused by the public tools. Never connect personal conversations.
 
-The decided target is different: one **Connect this chat** approval per agent in the popup, after which each approved agent chats on its own until its connection ends. Several agents may share a chat, with a visible roster and individual removal (DESIGN.md sections 2 and 17). Those connection controls are not implemented yet; this file describes the tools as they work today.
+The decided target is different: one **Connect this chat** approval per agent in the popup, after which each approved agent chats on its own until its connection ends. Several agents may share a chat (DESIGN.md sections 2 and 17). The trusted roster and removal controls are synthetic-tested; popup-first autonomous admission/pickup and no-expiry lifetime are not implemented yet. This file describes the tools as they work today.
 
 ## Architecture in Brief
 
@@ -152,6 +152,14 @@ Review lists show at most eight exact previews and clear when the tab, document,
 - Reads parse `user-query` and `model-response` rows inside one visible `infinite-scroller` in one `main` region. Fill and submit also need the tab active and visible, one prompt editor labeled `Enter a prompt for Gemini` (empty before filling) and one visible `Send message` submit button.
 - These selectors reflect one observed UI variant and can break whenever Gemini changes its page.
 
+## Agent Roster
+
+The selected eligible chat's popup lists all currently authenticated MCP facade instances and how many have live grants for that exact chat. Each row has a broker-minted instance UUID and a display label, plus **Remove access** when connected. **Disconnect all** removes all owners from that exact target; it does not close the tab or affect another chat. Refresh rereads the roster. Existing host permission is required for the worker's fixed identity check.
+
+The label defaults to the MCP client's reported name (sanitized/truncated to at most 80 printable ASCII characters), or `MCP agent`. Set `BROWSER_CHAT_AGENT_LABEL` in the MCP process environment to a nonempty, unpadded printable ASCII label of at most 80 characters. Invalid overrides are rejected. Labels are not verified model identities; two threads sharing one facade appear as one instance. Duplicate labels are distinguished by instance UUID. Restarting a facade creates a new instance, without inherited grants.
+
+Removal revokes matching grants and cancels pending reads. It does not undo an already activated send or restore consumed authority. A removed instance remains available but needs a fresh request and trusted approval; it is not silently readmitted. Current grants remain `ready_readonly` with five-minute expiry and per-message supervised write consent.
+
 ## Limits and Timers
 
 | Item | Value | Defined in |
@@ -169,6 +177,7 @@ Review lists show at most eight exact previews and clear when the tab, document,
 | Browser leases | Fill, proof and submit 4 s; one pending fill shared by providers; one pending submit; 16 proofs or preflights | `message-operations.ts` |
 | Facade requests | 5 s budget; keepalive every 60 s when idle; the broker drops idle sockets after 150 s | `broker-client.ts`, `broker-ipc.ts` |
 | Broker capacity | 16 sockets; 16 queued requests per socket | `broker-ipc.ts`, `broker-roles.ts` |
+| Agent registry | At most 16 authenticated facade instances, within the shared socket cap; labels 1-80 printable ASCII characters | `pending-connections.ts`, `broker-roles.ts` |
 | Native frames | 256 KiB; relay queue 16 | `native-framing.ts`, `native-relay.ts` |
 | Browser submit markers | 10,000 operation IDs, no eviction | `fixture-observation.ts` |
 
@@ -176,6 +185,7 @@ Review lists show at most eight exact previews and clear when the tab, document,
 
 - Broker sockets and Native Messaging use the same framing: UTF-8 JSON with a native-endian 32-bit length prefix, at most 256 KiB, in the envelope `{ kind, protocolVersion: 1, requestId, connectionGeneration: 0, deadlineMs, payload }`. Every schema is strict. Deadlines are absolute and only ever clipped, never extended.
 - Each broker socket authenticates once as `facade` (the MCP owner of grants and operations) or `relay` (the native host). Facade-only requests query state and start reads, preparation, fills, proofs and commits. Relay-only requests list and approve pending requests and reviews, list and complete browser challenges and jobs, publish snapshots, mark gaps and revoke grants. Facades cannot approve or complete browser work, and relays cannot read, prepare, fill or commit for an owner.
+- A facade hello may carry an optional `agentLabel` in its strict payload; relay hellos may not. The broker, never the client, creates `agentId`. Provider-neutral relay-only `list_chat_agents { target }` returns `chat_agents { agents: [{ agentId, label, connectionCount }] }`; IDs/labels are owner descriptors, not connection handles. `remove_chat_agent { target, agentId }` and `disconnect_chat { target }` return `chat_agent_removed { revoked, remainingAgents }`. Targets use the existing strict fixture/Gemini schema, with exact document and Gemini URL; the trusted worker pins the selected tab/document before and after each request. Removal replies describe the state at broker execution, not a promise that no later human approval occurred.
 - Write jobs (Gemini fill, Gemini proof and every submit job) are offered once and never re-offered. Read challenges and fixture fill and proof checks are listed until answered or expired; one-shot attempt IDs in the page stop a second fixture fill. Lost or late results become uncertainty, never retries.
 - A command spans `broker-requests.ts` (schema and role check), `broker-ipc.ts` (asynchronous orchestration), `broker-client.ts` (client method and reply schema), `native-protocol.ts` (relay parser), `native-relay.ts` (forwarding) and `entrypoints/background.ts` (hand-written extension validation). Change them together, and read DESIGN.md sections 8 and 17 before adding a command family.
 

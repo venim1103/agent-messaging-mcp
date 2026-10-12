@@ -1057,6 +1057,196 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
   }
 });
 
+for (const provider of ["fixture", "gemini"]) {
+  test(`${provider} popup roster removes one agent and preserves a newer approval`, { timeout: 20000 }, async (testContext) => {
+    const profile = await mkdtemp(join(tmpdir(), "agent-messaging-roster-test-"));
+    const unpacked = join(profile, "unpacked-extension");
+    await cp(extensionDirectory, unpacked, { recursive: true });
+    const manifestPath = join(unpacked, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.host_permissions = ["http://127.0.0.1:8787/*", "https://gemini.google.com/*"];
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const directory = join(profile, ".config/agent-messaging-mcp/broker");
+    const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
+    const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
+    const firstLabel = `Synthetic ${"W".repeat(70)}`;
+    const secondLabel = "Synthetic host two";
+    const clients = [new Client({ name: firstLabel, version: "0.0.1" }), new Client({ name: secondLabel, version: "0.0.1" })];
+    let context;
+    let broker;
+    let brokerExit;
+    try {
+      testContext.signal.throwIfAborted();
+      context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
+        executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+        args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
+      const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+      const extensionId = new URL(worker.url()).hostname;
+      await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+      broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+      brokerExit = once(broker, "exit");
+      let ready = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        ready = await brokerSocketReady(join(directory, "broker.sock"));
+        if (ready) break;
+        await setTimeout(25);
+      }
+      assert.equal(ready, true, "Roster broker did not start");
+      const options = { command: process.execPath, args: [mcpEntry],
+        env: { ...process.env, HOME: profile, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
+      delete options.env.BROWSER_CHAT_AGENT_LABEL;
+      await Promise.all(clients.map(client => client.connect(new StdioClientTransport(options))));
+      const requested = await Promise.all(clients.map(client => client.callTool({ name: "chat_request_connection", arguments: {} })));
+      assert.ok(requested.every(reply => reply.isError === undefined));
+      const page = await context.newPage();
+      const url = provider === "fixture" ? "http://127.0.0.1:8787/" : "https://gemini.google.com/app/synthetic-roster";
+      const html = provider === "fixture" ? await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8")
+        : `<!doctype html><main><infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic user row</p></user-query-content></user-query>
+          <model-response><model-response-content>Synthetic reply</model-response-content></model-response></infinite-scroller>
+          <div contenteditable="true" aria-label="Enter a prompt for Gemini"></div><button type="submit" aria-label="Send message">Send</button></main>`;
+      await page.route(url, route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
+      await page.goto(url);
+      const selected = await worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        return { tabId: tab.id, url: tab.url };
+      });
+      const popup = await context.newPage();
+      await page.bringToFront();
+      await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+      const waitCount = async count => popup.waitForFunction(expected =>
+        document.querySelector("#agent-count")?.textContent === `${expected} connected / 2 available`, count, { timeout: 4000 });
+      await waitCount(0);
+      const approve = async requestId => {
+        const result = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+          kind: provider === "fixture" ? "approve_fixture" : "approve_gemini",
+          tabId: selected.tabId, expectedUrl: url, pendingRequestId: requestId
+        });
+        assert.equal(result.ok, true, JSON.stringify(result));
+      };
+      for (const reply of requested) await approve(reply.structuredContent.requestId);
+      await waitCount(2);
+      const firstRow = popup.locator("#agent-list li").filter({ hasText: firstLabel });
+      const secondRow = popup.locator("#agent-list li").filter({ hasText: secondLabel });
+      assert.equal(await firstRow.count(), 1);
+      assert.notEqual(await firstRow.getAttribute("data-agent-id"), await secondRow.getAttribute("data-agent-id"));
+      assert.equal(await popup.locator("#agent-list").evaluate(list => [...list.querySelectorAll("p, strong")]
+        .every(element => element.scrollWidth <= element.clientWidth)), true);
+      await popup.locator("main").screenshot({ path: join(tmpdir(), `agent-messaging-${provider}-roster.png`) });
+      const connections = await Promise.all(clients.map((client, index) => client.callTool({ name: "chat_get_connection",
+        arguments: { requestId: requested[index].structuredContent.requestId } })));
+      const snapshots = await Promise.all(clients.map((client, index) => client.callTool({ name: "chat_read_messages",
+        arguments: { connectionId: connections[index].structuredContent.connectionId } })));
+      assert.ok(snapshots.every(reply => reply.isError === undefined));
+      assert.notDeepEqual(snapshots[0].structuredContent.cursor, snapshots[1].structuredContent.cursor);
+      const forged = await worker.evaluate(async ({ tabId, expectedUrl }) => {
+        const [reply] = await chrome.scripting.executeScript({ target: { tabId }, args: [tabId, expectedUrl],
+          func: async (selectedTab, selectedUrl) => chrome.runtime.sendMessage({ kind: "list_chat_agents",
+            tabId: selectedTab, expectedUrl: selectedUrl }).catch(() => null) });
+        return reply.result ?? null;
+      }, { tabId: selected.tabId, expectedUrl: url });
+      assert.equal(forged?.ok === true, false);
+      await firstRow.getByRole("button", { name: "Remove access" }).click();
+      await waitCount(1);
+      assert.equal((await clients[0].callTool({ name: "chat_read_messages",
+        arguments: { connectionId: connections[0].structuredContent.connectionId } })).isError, true);
+      const survivor = await clients[1].callTool({ name: "chat_read_messages",
+        arguments: { connectionId: connections[1].structuredContent.connectionId } });
+      assert.equal(survivor.isError, undefined);
+      assert.deepEqual(survivor.structuredContent.cursor, snapshots[1].structuredContent.cursor);
+      const fresh = await clients[0].callTool({ name: "chat_request_connection", arguments: {} });
+      assert.equal(fresh.structuredContent.state, "pending");
+      await worker.evaluate(() => {
+        globalThis.holdNextAgentRemoval = true;
+        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+        chrome.runtime.connectNative = (...args) => {
+          const port = connect(...args);
+          const listen = port.onMessage.addListener.bind(port.onMessage);
+          port.onMessage.addListener = listener => listen(reply => {
+            if (globalThis.holdNextAgentRemoval && reply.kind === "chat_agent_removed" && reply.payload.remainingAgents === 0) {
+              globalThis.holdNextAgentRemoval = false;
+              globalThis.releaseAgentRemoval = () => listener(reply);
+              globalThis.agentRemovalHeld = true;
+            } else listener(reply);
+          });
+          return port;
+        };
+      });
+      await secondRow.getByRole("button", { name: "Remove access" }).click();
+      let held = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        testContext.signal.throwIfAborted();
+        held = await worker.evaluate(() => globalThis.agentRemovalHeld === true);
+        if (held) break;
+        await setTimeout(25);
+      }
+      assert.equal(held, true, "Last-agent removal reply was not held");
+      await approve(fresh.structuredContent.requestId);
+      const key = `${provider}-grant-${selected.tabId}`;
+      const newRevision = await worker.evaluate(async key => (await chrome.storage.session.get(key))[key].revision, key);
+      assert.equal(typeof newRevision, "string");
+      await worker.evaluate(() => globalThis.releaseAgentRemoval());
+      await waitCount(1);
+      assert.equal(await worker.evaluate(async key => (await chrome.storage.session.get(key))[key]?.revision, key), newRevision);
+      const reconnected = await clients[0].callTool({ name: "chat_get_connection", arguments: { requestId: fresh.structuredContent.requestId } });
+      assert.equal((await clients[0].callTool({ name: "chat_read_messages",
+        arguments: { connectionId: reconnected.structuredContent.connectionId } })).isError, undefined);
+      const otherFresh = await clients[1].callTool({ name: "chat_request_connection", arguments: {} });
+      await approve(otherFresh.structuredContent.requestId);
+      await waitCount(2);
+      await worker.evaluate(key => {
+        const remove = chrome.storage.session.remove.bind(chrome.storage.session);
+        chrome.storage.session.remove = keys => {
+          if (keys === key && !globalThis.agentStorageRemovalHeld) {
+            globalThis.agentStorageRemovalHeld = true;
+            return new Promise((resolve, reject) => {
+              globalThis.releaseAgentStorageRemoval = () => remove(keys).then(resolve, reject);
+            });
+          }
+          return remove(keys);
+        };
+      }, key);
+      await popup.getByRole("button", { name: "Disconnect all" }).click();
+      let storageHeld = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        testContext.signal.throwIfAborted();
+        storageHeld = await worker.evaluate(() => globalThis.agentStorageRemovalHeld === true);
+        if (storageHeld) break;
+        await setTimeout(25);
+      }
+      assert.equal(storageHeld, true, "Grant deletion was not held");
+      const newest = await clients[0].callTool({ name: "chat_request_connection", arguments: {} });
+      const approving = approve(newest.structuredContent.requestId);
+      let newestConnection;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        testContext.signal.throwIfAborted();
+        const result = await clients[0].callTool({ name: "chat_get_connection", arguments: { requestId: newest.structuredContent.requestId } });
+        if (result.structuredContent.state === "ready_readonly") { newestConnection = result.structuredContent; break; }
+        await setTimeout(25);
+      }
+      assert.ok(newestConnection, "New approval did not reach the broker while deletion was held");
+      await worker.evaluate(() => globalThis.releaseAgentStorageRemoval());
+      await approving;
+      await waitCount(1);
+      assert.equal(typeof await worker.evaluate(async key => (await chrome.storage.session.get(key))[key]?.revision, key), "string");
+      assert.equal((await clients[0].callTool({ name: "chat_read_messages",
+        arguments: { connectionId: newestConnection.connectionId } })).isError, undefined);
+      await popup.getByRole("button", { name: "Disconnect all" }).click();
+      await waitCount(0);
+      assert.equal(await worker.evaluate(async key => (await chrome.storage.session.get(key))[key], key), undefined);
+      assert.equal((await clients[0].callTool({ name: "chat_read_messages",
+        arguments: { connectionId: reconnected.structuredContent.connectionId } })).isError, true);
+      assert.equal((await clients[0].callTool({ name: "chat_read_messages",
+        arguments: { connectionId: newestConnection.connectionId } })).isError, true);
+    } finally {
+      await Promise.all(clients.map(client => client.close().catch(() => {})));
+      await context?.close();
+      broker?.kill("SIGTERM");
+      if (brokerExit) await brokerExit;
+      await rm(profile, { recursive: true, force: true });
+    }
+  });
+}
+
 async function exerciseFixtureDispatch(outcome) {
   let mcpClient;
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-dispatch-test-"));

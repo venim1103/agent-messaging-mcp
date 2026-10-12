@@ -16,6 +16,11 @@ type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: s
 type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
 type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: number }[] }
   | { ok: false; error: string };
+type ChatAgent = { agentId: string; label: string; connectionCount: number };
+type ChatAgentsResult = { ok: true; agents: ChatAgent[] } | { ok: true; revoked: number; remainingAgents: number }
+  | { ok: false; error: string };
+type ChatTarget = { origin: "http://127.0.0.1:8787"; conversationId: "fixture-alpha"; tabId: number; documentId: string }
+  | { origin: "https://gemini.google.com"; conversationId: string; url: string; tabId: number; documentId: string };
 type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
 type FixtureReviewsResult = { ok: true; reviews: { operationId: string; expiresAt: number;
@@ -43,8 +48,8 @@ const fixtureResetKey = "fixture-reset-done";
 const fixtureGrantKey = (tabId: number) => `fixture-grant-${tabId}`;
 const geminiGrantKey = (tabId: number) => `gemini-grant-${tabId}`;
 const geminiStatusKey = (tabId: number) => `gemini-grant-status-${tabId}`;
-type StoredFixtureGrant = { documentId: string; expiresAt: number; url?: string };
-type StoredGeminiGrant = { documentId: string; url: string; expiresAt: number };
+type StoredFixtureGrant = { documentId: string; expiresAt: number; url?: string; revision?: string };
+type StoredGeminiGrant = { documentId: string; url: string; expiresAt: number; revision?: string };
 type GeminiGrantStatus = { code: "target_changed" | "observation_unavailable"; recordedAt: number };
 type GrantCountRequest = { kind: "revoke_fixture"; payload: {
   tabId: number; observed: { documentId: string; conversationId: string } | null
@@ -59,11 +64,23 @@ type GrantCountRequest = { kind: "revoke_fixture"; payload: {
 let fixtureResetPromise: Promise<boolean> | undefined;
 const fixtureSnapshotJobs = new Map<number, Promise<boolean>>();
 const geminiSnapshotJobs = new Map<number, Promise<boolean>>();
+const grantStorageMutations = new Map<string, Promise<void>>();
 let fixtureReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 let geminiReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
 type ReadWatchRestart = { timer?: ReturnType<typeof setTimeout>; delayMs: number };
 const fixtureWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
 const geminiWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
+
+function mutateStoredGrant(key: string, action: () => Promise<void>): Promise<void> {
+  const previous = grantStorageMutations.get(key) ?? Promise.resolve();
+  const mutation = previous.catch(() => {}).then(action);
+  grantStorageMutations.set(key, mutation);
+  const release = () => {
+    if (grantStorageMutations.get(key) === mutation) grantStorageMutations.delete(key);
+  };
+  void mutation.then(release, release);
+  return mutation;
+}
 
 function scheduleReadWatchRestart(state: ReadWatchRestart, hasGrant: () => Promise<boolean>,
   start: () => boolean): void {
@@ -1254,9 +1271,12 @@ async function approveFixture(tabId: number, expectedUrl: string, pendingRequest
           const currentTab = await browser.tabs.get(tabId);
           if (current?.documentId !== documentId || current.result !== "fixture-alpha"
             || !currentTab.active || currentTab.url !== expectedUrl) throw new Error();
-          await browser.storage.session.set({ [fixtureGrantKey(tabId)]: {
-            documentId, expiresAt: payload.expiresAt, url: expectedUrl
-          } satisfies StoredFixtureGrant });
+          await mutateStoredGrant(fixtureGrantKey(tabId), async () => {
+            if (settled || Date.now() >= deadlineMs) throw new Error();
+            await browser.storage.session.set({ [fixtureGrantKey(tabId)]: {
+              documentId, expiresAt: payload.expiresAt as number, url: expectedUrl, revision: crypto.randomUUID()
+            } satisfies StoredFixtureGrant });
+          });
           const [stillCurrent] = await browser.scripting.executeScript({
             target: { tabId, documentIds: [documentId] }, func: readFixtureIdentity
           });
@@ -1371,9 +1391,12 @@ async function approveGemini(tabId: number, expectedUrl: string, pendingRequestI
           if (current?.frameId !== 0 || current.documentId !== documentId
             || current.result?.url !== expectedUrl || current.result.conversationId !== conversationId
             || !currentTab.active || currentTab.url !== expectedUrl) throw new Error();
-          await browser.storage.session.set({ [geminiGrantKey(tabId)]: {
-            documentId, url: expectedUrl, expiresAt: payload.expiresAt
-          } satisfies StoredGeminiGrant });
+          await mutateStoredGrant(geminiGrantKey(tabId), async () => {
+            if (settled || Date.now() >= deadlineMs) throw new Error();
+            await browser.storage.session.set({ [geminiGrantKey(tabId)]: {
+              documentId, url: expectedUrl, expiresAt: payload.expiresAt as number, revision: crypto.randomUUID()
+            } satisfies StoredGeminiGrant });
+          });
           await browser.storage.session.remove(geminiStatusKey(tabId));
           const [stillCurrent] = await browser.scripting.executeScript({
             target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation
@@ -1411,6 +1434,100 @@ async function approveGemini(tabId: number, expectedUrl: string, pendingRequestI
     });
   } catch {
     return { ok: false, error: "Selected Gemini chat changed or approval unavailable; reconnect" };
+  }
+}
+
+async function selectedChatTarget(tabId: number, expectedUrl: string, documentId?: string): Promise<ChatTarget | null> {
+  const [active] = await browser.tabs.query({ active: true, currentWindow: true });
+  if (active?.id !== tabId || active.url !== expectedUrl) return null;
+  const scriptTarget = { tabId, ...(documentId ? { documentIds: [documentId] } : {}) };
+  let target: ChatTarget;
+  if (isEligibleGeminiUrl(expectedUrl)) {
+    const [identity] = await browser.scripting.executeScript({ target: scriptTarget, func: identifyGeminiConversation });
+    if (identity?.frameId !== 0 || identity.result?.url !== expectedUrl) return null;
+    target = { origin: "https://gemini.google.com", conversationId: identity.result.conversationId,
+      url: expectedUrl, tabId, documentId: identity.documentId };
+  } else if (new URL(expectedUrl).origin === "http://127.0.0.1:8787") {
+    const [identity] = await browser.scripting.executeScript({ target: scriptTarget, func: readFixtureIdentity });
+    if (identity?.frameId !== 0 || identity.result !== "fixture-alpha") return null;
+    target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId, documentId: identity.documentId };
+  } else return null;
+  if (!/^[!-~]{1,128}$/.test(target.documentId) || (documentId && target.documentId !== documentId)) return null;
+  const [current] = await browser.tabs.query({ active: true, currentWindow: true });
+  return current?.id === tabId && current.url === expectedUrl ? target : null;
+}
+
+async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agentId?: string,
+  disconnectAll = false): Promise<ChatAgentsResult> {
+  try {
+    if (!await ensureFixtureReset()) return { ok: false, error: "Chat reset unavailable" };
+    const target = await selectedChatTarget(tabId, expectedUrl);
+    if (!target) return { ok: false, error: "Selected chat unavailable or changed" };
+    const grantKey = target.origin === geminiOrigin ? geminiGrantKey(tabId) : fixtureGrantKey(tabId);
+    const stored = (await browser.storage.session.get(grantKey))[grantKey] as StoredFixtureGrant | StoredGeminiGrant | undefined;
+    const verified = await selectedChatTarget(tabId, expectedUrl, target.documentId);
+    if (!verified || verified.conversationId !== target.conversationId) return { ok: false, error: "Selected chat changed" };
+    return await new Promise<ChatAgentsResult>((resolve) => {
+      const requestId = crypto.randomUUID();
+      const deadlineMs = Date.now() + 10_000;
+      const port = browser.runtime.connectNative(nativeHostName);
+      let settled = false;
+      const finish = (result: ChatAgentsResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+        port.disconnect();
+      };
+      const timer = setTimeout(() => finish({ ok: false, error: "Agent management timed out" }), 10_000);
+      port.onDisconnect.addListener(() => {
+        void browser.runtime.lastError;
+        finish({ ok: false, error: "Agent management unavailable" });
+      });
+      port.onMessage.addListener((value: unknown) => {
+        void (async () => {
+          if (settled || Date.now() >= deadlineMs || typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+          const reply = value as Record<string, unknown>;
+          if (Object.keys(reply).length !== 6 || reply.protocolVersion !== protocolVersion || reply.requestId !== requestId
+            || reply.connectionGeneration !== 0 || reply.deadlineMs !== deadlineMs
+            || typeof reply.payload !== "object" || reply.payload === null || Array.isArray(reply.payload)) throw new Error();
+          const payload = reply.payload as Record<string, unknown>;
+          const current = await selectedChatTarget(tabId, expectedUrl, target.documentId);
+          if (settled || Date.now() >= deadlineMs || !current || current.conversationId !== target.conversationId) throw new Error();
+          if (agentId === undefined && !disconnectAll) {
+            const agents = payload.agents;
+            if (reply.kind !== "chat_agents" || Object.keys(payload).length !== 1 || !Array.isArray(agents) || agents.length > 16
+              || !agents.every((item: unknown) => {
+                if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
+                const agent = item as Record<string, unknown>;
+                return Object.keys(agent).length === 3 && typeof agent.agentId === "string" && /^[0-9a-f-]{36}$/.test(agent.agentId)
+                  && typeof agent.label === "string" && /^[ -~]{1,80}$/.test(agent.label) && agent.label.trim() === agent.label
+                  && typeof agent.connectionCount === "number" && Number.isSafeInteger(agent.connectionCount) && agent.connectionCount >= 0;
+              }) || new Set(agents.map(item => item.agentId)).size !== agents.length) throw new Error();
+            finish({ ok: true, agents: agents as ChatAgent[] });
+          } else {
+            if (reply.kind !== "chat_agent_removed" || Object.keys(payload).length !== 2
+              || typeof payload.revoked !== "number" || !Number.isSafeInteger(payload.revoked) || payload.revoked < 0
+              || typeof payload.remainingAgents !== "number" || !Number.isSafeInteger(payload.remainingAgents)
+              || payload.remainingAgents < 0 || payload.remainingAgents > 16) throw new Error();
+            if (payload.remainingAgents === 0 && stored) {
+              await mutateStoredGrant(grantKey, async () => {
+                const latest = (await browser.storage.session.get(grantKey))[grantKey] as StoredFixtureGrant | StoredGeminiGrant | undefined;
+                if (settled || Date.now() >= deadlineMs) throw new Error();
+                if (latest?.documentId === stored.documentId && latest.expiresAt === stored.expiresAt && latest.revision === stored.revision) {
+                  await browser.storage.session.remove(grantKey);
+                }
+              });
+            }
+            finish({ ok: true, revoked: payload.revoked, remainingAgents: payload.remainingAgents });
+          }
+        })().catch(() => finish({ ok: false, error: "Agent management invalid or selected chat changed" }));
+      });
+      port.postMessage({ kind: disconnectAll ? "disconnect_chat" : agentId === undefined ? "list_chat_agents" : "remove_chat_agent", protocolVersion,
+        requestId, connectionGeneration: 0, deadlineMs, payload: { target, ...(agentId ? { agentId } : {}) } });
+    });
+  } catch {
+    return { ok: false, error: "Agent management unavailable" };
   }
 }
 
@@ -1992,6 +2109,14 @@ export default defineBackground(() => {
       || typeof message !== "object" || message === null || Array.isArray(message)) return;
 
     const request = message as Record<string, unknown>;
+    if ((request.kind === "list_chat_agents" || request.kind === "remove_chat_agent" || request.kind === "disconnect_chat")
+      && Object.keys(request).length === (request.kind === "remove_chat_agent" ? 4 : 3)
+      && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
+      && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512
+      && (request.kind !== "remove_chat_agent" || (typeof request.agentId === "string" && /^[0-9a-f-]{36}$/.test(request.agentId)))) {
+      return manageSelectedChatAgents(request.tabId, request.expectedUrl,
+        request.kind === "remove_chat_agent" ? request.agentId as string : undefined, request.kind === "disconnect_chat");
+    }
     if (request.kind === "list_fixture_pending" && Object.keys(request).length === 2
       && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0) {
       return listPendingForSelectedTab(request.tabId);

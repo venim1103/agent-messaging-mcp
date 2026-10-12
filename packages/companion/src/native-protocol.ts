@@ -247,6 +247,22 @@ function isValidGeminiTarget(target: z.infer<typeof geminiTargetSchema>): boolea
   }
 }
 
+const chatAgentTargetSchema = z.union([fixtureTargetSchema, geminiTargetSchema.refine(isValidGeminiTarget)]);
+const chatAgentRequestSchema = z.discriminatedUnion("kind", [
+  pendingListSchema.extend({ kind: z.literal("list_chat_agents"), payload: z.strictObject({ target: chatAgentTargetSchema }) }),
+  pendingListSchema.extend({ kind: z.literal("disconnect_chat"), payload: z.strictObject({ target: chatAgentTargetSchema }) }),
+  pendingListSchema.extend({ kind: z.literal("remove_chat_agent"),
+    payload: z.strictObject({ target: chatAgentTargetSchema, agentId: z.uuid() }) })
+]);
+
+export function parseNativeChatAgentRequest(message: unknown, now = Date.now()) {
+  const result = chatAgentRequestSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native chat agent request");
+  }
+  return result.data;
+}
+
 const geminiFillChallengesSchema = geminiReadChallengesSchema.extend({ kind: z.literal("list_gemini_fill_challenges") });
 
 export function parseNativeGeminiFillChallenges(message: unknown, now = Date.now()) {

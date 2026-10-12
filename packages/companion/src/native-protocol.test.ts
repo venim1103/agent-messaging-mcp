@@ -13,6 +13,7 @@ import { connectBroker } from "./broker-client.js";
 import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
+  parseNativeChatAgentRequest,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
@@ -41,6 +42,29 @@ const request = {
   deadlineMs: now + 10_000,
   payload: {}
 };
+
+test("native agent roster and removal accept only bounded exact-target envelopes", () => {
+  for (const target of [
+    { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
+    { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
+      documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat?hl=en" }
+  ]) {
+    for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat"]) {
+      const payload = { target, ...(kind === "remove_chat_agent" ? { agentId: request.requestId } : {}) };
+      const message = { ...request, kind, payload };
+      assert.deepEqual(parseNativeChatAgentRequest(message, now), message);
+      for (const invalid of [
+        { ...message, deadlineMs: now }, { ...message, deadlineMs: now + 30_001 },
+        { ...message, connectionGeneration: 1 },
+        { ...message, payload: { ...payload, selector: "input" } },
+        { ...message, payload: { ...payload, approved: true } },
+        { ...message, payload: { ...payload, agentId: "invalid" } },
+        { ...message, payload: { ...payload, target: { ...target, documentId: "" } } },
+        { ...message, payload: { ...payload, target: { ...target, origin: "https://other.invalid" } } }
+      ]) assert.throws(() => parseNativeChatAgentRequest(invalid, now), /Invalid native chat agent request/);
+    }
+  }
+});
 
 test("native Gemini fill transport accepts only empty listing and fixed exact-target completion", () => {
   const listing = { ...request, kind: "list_gemini_fill_challenges" };

@@ -1,9 +1,84 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FIXTURE_READ_TIMEOUT_MS, GEMINI_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_GEMINI_SNAPSHOT_AGE_MS,
-  MAX_PENDING_REQUESTS, PendingConnectionRequests,
-  PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS }
+  MAX_CONNECTED_AGENTS, MAX_PENDING_REQUESTS, PendingConnectionRequests,
+  PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS, type ApprovedTarget }
   from "./pending-connections.js";
+
+for (const target of [
+  { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
+  { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
+    documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" }
+] as const) {
+  test(`${target.origin} agent roster and removal preserve other owners and targets`, async () => {
+    const requests = new PendingConnectionRequests();
+    const first = Symbol("first agent");
+    const second = Symbol("second agent");
+    const firstAgent = requests.registerAgent(first, "Same reported name");
+    const secondAgent = requests.registerAgent(second, "Same reported name");
+    assert.notEqual(firstAgent.agentId, secondAgent.agentId);
+    const firstPending = requests.create(first, 1000);
+    const secondPending = requests.create(second, 1000);
+    const otherPending = requests.create(first, 1000);
+    const approve = (requestId: string, selected: ApprovedTarget, now: number) => selected.origin === "https://gemini.google.com"
+      ? requests.approveGemini(requestId, selected, now) : requests.approve(requestId, selected, now);
+    const firstGrant = approve(firstPending.requestId, target, 1000);
+    const secondGrant = approve(secondPending.requestId, target, 1000);
+    const otherGrant = approve(otherPending.requestId, { ...target, tabId: 4 }, 1000);
+    assert.ok(firstGrant && secondGrant && otherGrant);
+    assert.deepEqual(requests.listChatAgents(target, 1000), [
+      { ...firstAgent, connectionCount: 1 }, { ...secondAgent, connectionCount: 1 }
+    ]);
+    const read = target.origin === "https://gemini.google.com"
+      ? requests.requestFreshGeminiRead(first, firstGrant.connectionId, 1000)
+      : requests.requestFreshFixtureRead(first, firstGrant.connectionId, 1000);
+    assert.ok(read && read !== "busy");
+    assert.equal(requests.removeChatAgent(firstAgent.agentId, { ...target, documentId: "wrong-document" }, 1000), 0);
+    assert.equal(requests.removeChatAgent("unknown-agent", target, 1000), 0);
+    assert.equal(requests.removeChatAgent(firstAgent.agentId, target, 1000), 1);
+    assert.equal(await read.result, null);
+    assert.equal(requests.get(first, firstPending.requestId, 1000)?.state, "stale");
+    assert.equal(requests.get(second, secondPending.requestId, 1000)?.state, "ready_readonly");
+    assert.equal(requests.get(first, otherPending.requestId, 1000)?.state, "ready_readonly");
+    assert.equal(requests.removeChatAgent(firstAgent.agentId, target, 1000), 0);
+    assert.equal(approve(firstPending.requestId, target, 1000), null);
+    assert.deepEqual(requests.listChatAgents(target, 1000), [
+      { ...firstAgent, connectionCount: 0 }, { ...secondAgent, connectionCount: 1 }
+    ]);
+    assert.equal(JSON.stringify(requests.listChatAgents(target, 1000)).includes(firstGrant.connectionId), false);
+    const secondRead = target.origin === "https://gemini.google.com"
+      ? requests.requestFreshGeminiRead(second, secondGrant.connectionId, 1000)
+      : requests.requestFreshFixtureRead(second, secondGrant.connectionId, 1000);
+    assert.ok(secondRead && secondRead !== "busy");
+    assert.equal(requests.disconnectChat({ ...target, documentId: "wrong-document" }, 1000), 0);
+    assert.equal(requests.disconnectChat(target, 1000), 1);
+    assert.equal(await secondRead.result, null);
+    assert.equal(requests.get(second, secondPending.requestId, 1000)?.state, "stale");
+    assert.equal(requests.get(first, otherPending.requestId, 1000)?.state, "ready_readonly");
+    requests.disconnect(first);
+    assert.deepEqual(requests.listChatAgents(target, 1000), [{ ...secondAgent, connectionCount: 0 }]);
+    const restarted = requests.registerAgent(first, "Same reported name");
+    assert.notEqual(restarted.agentId, firstAgent.agentId);
+    assert.equal(requests.listChatAgents(target, 1000)[1]?.connectionCount, 0);
+    requests.disconnect(second);
+    requests.disconnect(first);
+  });
+}
+
+test("agent identity registration has bounded immutable labels and capacity", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("agent owner");
+  for (const label of ["", " padded", "padded ", "line\nbreak", "x".repeat(81), "\u202eHidden"]) {
+    assert.throws(() => requests.registerAgent(owner, label), /Invalid broker-owned/);
+  }
+  const agent = requests.registerAgent(owner);
+  assert.ok(Object.isFrozen(agent));
+  assert.throws(() => requests.registerAgent(owner), /already registered/);
+  for (let index = 1; index < MAX_CONNECTED_AGENTS; index++) requests.registerAgent(Symbol("other agent"));
+  assert.throws(() => requests.registerAgent(Symbol("over capacity")), /Too many connected agents/);
+  requests.disconnect(owner);
+  assert.ok(requests.registerAgent(owner));
+});
 
 test("pending requests remain private to their broker-owned client", () => {
   const requests = new PendingConnectionRequests();

@@ -191,6 +191,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
             return;
           }
           role = hello.role;
+          if (role === "facade") requests.registerAgent(owner, hello.agentLabel);
           clearTimeout(timeout);
           responses = writeBrokerResponse(socket, {
             kind: "hello_result",

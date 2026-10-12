@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-12 (T1 and T2a complete; D13a/D13b decided; remaining T2 connection work pending).
+Updated: 2026-10-12 (T1, T2a startup and T2b roster/removal complete; remaining T2 approval/pickup/lifetime work pending).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,7 +16,7 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest source checkpoint: T2a broker auto-start/startup facade connection (2026-10-12 entry below), after T1b `11d2bd1` and T1a `75ad536`. Its repaired exact gate passed build, both typechecks, **176/176 units and 20/20 e2e checks**. T1 and T2a are complete. Remaining T2 roster, per-agent approval/pickup/revocation and lifetime work is not implemented.
+- Latest source checkpoint: T2b broker-owned agent identities and trusted exact-chat roster/removal (entry below), after T2a `5b71471`, T1b `11d2bd1` and T1a `75ad536`. Its exact gate passed build, both typechecks, **182/182 units and 22/22 e2e checks**. T1, T2a and T2b are complete. Popup-first autonomous approval/pickup and no-expiry/reload lifetime remain unimplemented.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
 ### Capability matrix
@@ -32,6 +32,8 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 | `chat_get_operation` | Works | Only for privately prepared operations |
 
 The trusted popup already offers Gemini pending-request approval, ordinary review, fill consent and Send consent. These are today's supervised tools; the decided target replaces the per-message approvals with one connection approval (T2, T3).
+
+The popup now shows authenticated facade instance labels/IDs and the selected chat's connected count, with individual **Remove access** and exact-chat **Disconnect all**. Fixture and synthetic Gemini browser checks cover these controls; no new installed or live acceptance. Labels identify reported/configured MCP clients, not verified models or separate threads sharing a facade. Existing grants still use the read-only five-minute model.
 
 ### Gemini send chain
 
@@ -58,7 +60,7 @@ This supervised chain stays for tests. The autonomous path (T3) reuses its fill,
 Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). Steps T1-T6 replace the earlier G2-G6 plan. The exact changes, tests, completion criteria and ask-points for each step are in **Implementation Plan T1-T6** below the dashboard.
 
 1. **T1 Read robustness: done.** Stopped native watches restart with bounded backoff (R2). D8 captures the newest 32 visible rows with `omittedBefore`, per-message truncation at 16,000 UTF-16 units and a 96 KiB capture cap. Identity-preserving failures skip publication; changed targets still revoke (R1). Synthetic evidence only for these changes.
-2. **T2 Connection model: in progress.** Startup connection and detached broker auto-start (D4) are gated in T2a. Still pending: popup-first **Connect this chat**, agent-bound pickup, count/roster and individual access removal (D13a), one popup approval per agent with no automatic admission/re-admission (D13b), autonomous read/send authority (D1) and no-expiry/same-chat reload lifetime (D2). Individual disconnect/restart ends that owner's grant; target/browser changes end all grants for that chat.
+2. **T2 Connection model: in progress.** Startup/auto-start (D4) and trusted multi-agent roster, individual removal and whole-chat disconnect (D13a) are gated in T2a/T2b. Still pending: popup-first **Connect this chat**, agent-bound pickup, one approval per agent with no automatic admission/re-admission (D13b), autonomous read/send authority (D1) and no-expiry/same-chat reload lifetime (D2). Individual disconnect/restart ends that owner's grant; target/browser changes end all grants for that chat.
 3. **T3 Autonomous send.** A provider-neutral `chat_send_message` runs fill, fresh proof, durable intent, the one-offer job, browser reservation and one guarded activation, reusing today's pieces (D5). Add the append-only evidence rule (D9) with a settle window, per-connection resolution of unconfirmed sends with a one-click popup fallback (D10, R8), and the runaway guard: one message at a time and a configurable hourly cap. Relax "active tab of the current window" to "visible tab" (D11). Sandboxed synthetic tests cover the loop and its loss and crash cases.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
 5. **T5 Live acceptance.** Coordinated reload, then one human-authorized session on a disposable chat: connect once, the agent sends a few neutral messages and reads the complete replies without further clicks, then the tab is closed.
@@ -77,9 +79,9 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 ### Findings: architecture and maintainability
 
-- **A1 Provider duplication.** There are 52 private broker request kinds and parallel ledger, client, native, worker and popup families per provider, while DESIGN.md section 8 expects one policy pipeline with adapters. Several fixture-named items are provider-generic (`disconnect_fixture`, `revoke_all_fixture`, `revokeTrackedFixture`, `completeFixtureBrowserCheck`, the shared `MAX_PENDING_FIXTURE_DISPATCHES` cap). Do not add a provider by copying (D5).
+- **A1 Provider duplication.** Parallel ledger, client, native, worker and popup families per provider remain, while DESIGN.md section 8 expects one policy pipeline with adapters. T2b's roster/removal/disconnect commands are provider-neutral. Several fixture-named items are provider-generic (`disconnect_fixture`, `revoke_all_fixture`, `revokeTrackedFixture`, `completeFixtureBrowserCheck`, the shared `MAX_PENDING_FIXTURE_DISPATCHES` cap). Do not add a provider by copying (D5).
 - **A2 Input mechanism drift.** Connected writers use `document.execCommand("insertText")` and a script-initiated `click()`, not `chrome.debugger`. `debugger` serves only two legacy popup probes, and the Gemini **Fill test draft** probe types a fixed sentence outside the operation ledger (D6). Whether live Gemini accepts the script-initiated Send click is unverified.
-- **A3 Model gaps.** `generation` is always 1, every connection is `ready_readonly` and write authority is per operation; there is no write mode or pause state. The popup lacks the data-boundary disclosure and multi-agent roster/removal controls. Broker owners are facade sockets, not automatically distinct models or VS Code chat sessions; the new roster needs broker instance IDs and clearly labeled display names (DESIGN.md section 7). The extension mirrors broker schemas by hand, so protocol changes must be made in both places.
+- **A3 Model gaps.** `generation` is always 1, every connection is `ready_readonly` and write authority is per operation; there is no write mode or pause state. The popup now has broker instance IDs, display labels and multi-agent roster/removal, but still lacks autonomous admission and its data-boundary disclosure. Owners are facade sockets, not automatically distinct models or VS Code chat sessions (DESIGN.md section 7). The extension mirrors broker schemas by hand, so protocol changes must be made in both places.
 - **A4 Port churn.** Each snapshot publication and each worker completion opens a new native port and relay process. This is fine locally; measure before raising event rates.
 
 ### Findings: process and documentation
@@ -93,7 +95,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-Continue T2 with the multi-agent roster and individually approved connection/pickup/revocation path (D13a, D13b), then no-expiry grants and same-chat reload re-attachment (D2). No automatic admission or exclusive-pickup/refusal rule. Use the revised T2 tests below. D10a remains the user ask-point before T3; no live access or real-chat approval has occurred.
+Continue T2 with individually approved autonomous grants and owner-bound pickup (D1, D13b), including no-expiry deadline handling and same-chat reload re-attachment (D2). The roster/removal boundary is complete. No automatic admission or exclusive-pickup/refusal rule. Use the revised T2 tests below. D10a remains the user ask-point before T3; no live access or real-chat approval has occurred.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -159,6 +161,15 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T2b Agent Roster And Revocation (2026-10-12)
+
+- Authenticated facade sockets register immutable broker-minted instance UUIDs and bounded display labels. MCP initialization supplies the reported host name, sanitized/truncated to printable ASCII; `BROWSER_CHAT_AGENT_LABEL` overrides it with a strictly validated configured label. A relay cannot report an agent label or become a roster member. Owners remain facade processes/sockets, not verified model identities.
+- New provider-neutral relay-only `list_chat_agents`, `remove_chat_agent` and `disconnect_chat` use the original bounded native envelope and exact origin/conversation/tab/document (plus exact Gemini URL). Replies disclose only instance ID, display label and connection count. Individual removal cancels that owner's pending reads and revokes only matching grants; whole-chat disconnect revokes every matching owner. Another tab and other owners' independent cursors remain intact. Reapproval requires a fresh pending request; reconnecting owners get new IDs without inherited access.
+- Trusted popup controls show counts, labels/IDs, status, Refresh, Remove access and Disconnect all. The worker rechecks the originally selected document before forwarding and after reply, rejects content-page requests and strictly validates bounded replies. Last-owner cleanup uses per-grant storage revisions and serialized compare/delete versus approval writes, so delayed native replies or delayed storage deletion cannot erase a newer approval. No clock, deadline, polling, sandbox or authority limits changed.
+- First focused companion build rejected a test helper's union of bound provider methods; a discriminated target helper repaired the same slice and the registry checks passed 3/3. Authentication, real-socket roster/role tests, strict native parsing and actual SDK startup-label checks passed. Diff review repaired host-name truncation ending on a space; the startup/registry subset passed 5/5.
+- Two disposable Chromium tests use real SDK owners, popup/worker, native host and isolated broker for fixture and routed synthetic Gemini. They cover display width/IDs, independent reads/cursors, individual removal, content-page denial, fresh reapproval, held last-removal replies, delayed storage deletion concurrent with a newer approval, and whole-chat disconnect. Focused browser checks passed 2/2 after each local change; synthetic screenshots outside Git were inspected. The exact source gate passed build, both typechecks, **182/182 units and 22/22 e2e checks**; no failed full gate for this checkpoint.
+- This checkpoint manages existing five-minute read-only grants only. Autonomous popup-first approval/pickup, no-expiry/reload lifetime and public Gemini sending remain pending. No installed-profile or live-site access, real-chat approval, draft fill or submission occurred; see AGENTS.md Safety Boundaries.
 
 ## T2a Broker Startup (2026-10-12)
 

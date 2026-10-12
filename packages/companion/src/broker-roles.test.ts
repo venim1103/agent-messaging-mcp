@@ -24,8 +24,16 @@ test("facade and relay roles require distinct validated credentials", () => {
   assert.equal(authenticateBrokerRole({ ...facadeHello, deadlineMs: 1000 }, credentials, 1000), null);
   assert.equal(authenticateBrokerRole({ ...facadeHello, deadlineMs: 31_001 }, credentials, 1000), null);
   assert.equal(authenticateBrokerRole({ ...facadeHello, arbitraryCommand: "evaluate" }, credentials, 1000), null);
+  assert.deepEqual(authenticateBrokerRole({ ...facadeHello, payload: { agentLabel: "Synthetic MCP host" } }, credentials, 1000), {
+    role: "facade", requestId: facadeHello.requestId, deadlineMs: facadeHello.deadlineMs, agentLabel: "Synthetic MCP host"
+  });
+  for (const payload of [{ agentLabel: " padded" }, { agentLabel: "x".repeat(81) }, { agentLabel: "line\nbreak" },
+    { agentId: facadeHello.requestId }, { agentLabel: "Synthetic", approved: true }]) {
+    assert.equal(authenticateBrokerRole({ ...facadeHello, payload }, credentials, 1000), null);
+  }
 
   const relayHello = { ...facadeHello, role: "relay", credential: credentials.relay };
+  assert.equal(authenticateBrokerRole({ ...relayHello, payload: { agentLabel: "Fake facade" } }, credentials, 1000), null);
   assert.deepEqual(authenticateBrokerRole(relayHello, credentials, 1000), {
     role: "relay", requestId: relayHello.requestId, deadlineMs: relayHello.deadlineMs
   });

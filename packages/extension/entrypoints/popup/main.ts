@@ -17,6 +17,9 @@ type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: s
 type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
 type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: number }[] }
   | { ok: false; error: string };
+type ChatAgent = { agentId: string; label: string; connectionCount: number };
+type ChatAgentsResult = { ok: true; agents: ChatAgent[] } | { ok: false; error: string };
+type ChatAgentRemovalResult = { ok: true; revoked: number; remainingAgents: number } | { ok: false; error: string };
 type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
 type FixtureReviewsResult = { ok: true; reviews: { operationId: string; expiresAt: number;
@@ -29,6 +32,11 @@ const fixtureOrigin = "http://127.0.0.1:8787";
 const richFixtureUrl = `${fixtureOrigin}/?editor=rich`;
 const geminiOrigin = "https://gemini.google.com";
 const inspectButton = document.querySelector<HTMLButtonElement>("#inspect");
+const agentPanel = document.querySelector<HTMLElement>("#agent-panel");
+const agentCount = document.querySelector<HTMLElement>("#agent-count");
+const agentList = document.querySelector<HTMLOListElement>("#agent-list");
+const refreshAgentsButton = document.querySelector<HTMLButtonElement>("#refresh-agents");
+const disconnectChatButton = document.querySelector<HTMLButtonElement>("#disconnect-chat");
 const pendingButton = document.querySelector<HTMLButtonElement>("#view-pending");
 const fixtureReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-reviews");
 const fixtureFillReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-fill-reviews");
@@ -101,7 +109,8 @@ function inspectGeminiStructure(): GeminiPreview | null {
   };
 }
 
-if (!inspectButton || !pendingButton || !fixtureReviewButton || !fixtureFillReviewButton || !fixtureSendReviewButton || !fixtureInputButton || !geminiDraftReview
+if (!inspectButton || !agentPanel || !agentCount || !agentList || !refreshAgentsButton || !disconnectChatButton
+  || !pendingButton || !fixtureReviewButton || !fixtureFillReviewButton || !fixtureSendReviewButton || !fixtureInputButton || !geminiDraftReview
   || !geminiDraftPreview || !geminiDraftButton || !status || !result || !fixtureDocumentStatus || !pendingResult
   || !pendingTarget || !pendingRequests || !fixtureReviewResult || !fixtureReviewHeading || !fixtureReviews || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
@@ -111,6 +120,93 @@ let selectedFixtureTab: { id: number; url: string } | null = null;
 let selectedGeminiTab: { id: number; url: string } | null = null;
 let fixtureReviewExpiry: ReturnType<typeof setTimeout> | undefined;
 let fixtureReviewGeneration = 0;
+let agentRosterGeneration = 0;
+
+function clearChatAgents() {
+  agentRosterGeneration++;
+  agentList?.replaceChildren();
+  if (agentCount) agentCount.textContent = "Unavailable";
+  if (disconnectChatButton) disconnectChatButton.disabled = true;
+}
+
+async function refreshChatAgents(): Promise<void> {
+  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  if (!selected || !agentPanel || !agentCount || !agentList || !refreshAgentsButton || !disconnectChatButton || !status) return;
+  const generation = ++agentRosterGeneration;
+  refreshAgentsButton.disabled = true;
+  disconnectChatButton.disabled = true;
+  agentList.replaceChildren();
+  agentCount.textContent = "Checking...";
+  try {
+    const response = await browser.runtime.sendMessage({ kind: "list_chat_agents", tabId: selected.id,
+      expectedUrl: selected.url }) as ChatAgentsResult;
+    if (generation !== agentRosterGeneration) return;
+    if (!response?.ok) {
+      agentCount.textContent = "Unavailable";
+      return;
+    }
+    const connected = response.agents.filter(agent => agent.connectionCount > 0).length;
+    agentCount.textContent = `${connected} connected / ${response.agents.length} available`;
+    disconnectChatButton.disabled = connected === 0;
+    for (const agent of response.agents) {
+      const row = document.createElement("li");
+      row.dataset.agentId = agent.agentId;
+      const label = document.createElement("strong");
+      label.textContent = agent.label;
+      label.title = "Client display label, not a verified model identity";
+      const identity = document.createElement("p");
+      identity.className = "agent-instance";
+      identity.textContent = agent.agentId;
+      const state = document.createElement("p");
+      state.textContent = agent.connectionCount ? "Connected" : "Not connected";
+      row.append(label, identity, state);
+      if (agent.connectionCount > 0) {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "Remove access";
+        remove.addEventListener("click", async () => {
+          remove.disabled = true;
+          try {
+            const removal = await browser.runtime.sendMessage({ kind: "remove_chat_agent", tabId: selected.id,
+              expectedUrl: selected.url, agentId: agent.agentId }) as ChatAgentRemovalResult;
+            if (!removal?.ok) {
+              status.textContent = removal?.error ?? "Agent removal unavailable; refresh status.";
+              return;
+            }
+            status.textContent = removal.revoked > 0 ? "Agent access removed." : "No active access remains for this agent.";
+            await refreshChatAgents();
+          } catch {
+            status.textContent = "Agent removal unavailable; refresh status.";
+          } finally {
+            remove.disabled = false;
+          }
+        });
+        row.append(remove);
+      }
+      agentList.append(row);
+    }
+  } catch {
+    if (generation === agentRosterGeneration) agentCount.textContent = "Unavailable";
+  } finally {
+    refreshAgentsButton.disabled = false;
+  }
+}
+
+refreshAgentsButton.addEventListener("click", () => { void refreshChatAgents(); });
+disconnectChatButton.addEventListener("click", async () => {
+  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  if (!selected) return;
+  disconnectChatButton.disabled = true;
+  try {
+    const response = await browser.runtime.sendMessage({ kind: "disconnect_chat", tabId: selected.id,
+      expectedUrl: selected.url }) as ChatAgentRemovalResult;
+    status.textContent = response?.ok ? "Chat disconnected." : response?.error ?? "Disconnect unavailable; refresh status.";
+  } catch {
+    status.textContent = "Disconnect unavailable; refresh status.";
+  } finally {
+    await refreshChatAgents();
+  }
+});
 
 function clearFixtureReviews() {
   fixtureReviewGeneration++;
@@ -125,6 +221,8 @@ browser.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === "session" && selected
     && Object.hasOwn(changes, `${selectedGeminiTab ? "gemini" : "fixture"}-grant-${selected.id}`)) {
     clearFixtureReviews();
+    clearChatAgents();
+    void refreshChatAgents();
     status.textContent = selectedGeminiTab ? "Gemini approval changed. Draft review cleared."
       : "Fixture approval changed. Draft review cleared.";
   }
@@ -133,6 +231,7 @@ browser.tabs.onActivated.addListener(({ tabId }) => {
   const selected = selectedGeminiTab ?? selectedFixtureTab;
   if (selected && tabId !== selected.id) {
     clearFixtureReviews();
+    clearChatAgents();
     status.textContent = selectedGeminiTab ? "Selected Gemini changed. Draft review cleared."
       : "Selected fixture changed. Draft review cleared.";
   }
@@ -141,6 +240,7 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
   const selected = selectedGeminiTab ?? selectedFixtureTab;
   if (selected?.id === tabId && (changeInfo.status === "loading" || changeInfo.url)) {
     clearFixtureReviews();
+    clearChatAgents();
     status.textContent = selectedGeminiTab ? "Gemini document changed. Draft review cleared."
       : "Fixture document changed. Draft review cleared.";
   }
@@ -169,6 +269,8 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
     geminiDraftPreview.textContent = geminiDraftText;
     geminiDraftReview.hidden = false;
   }
+  agentPanel.hidden = !selectedFixtureTab && !selectedGeminiTab;
+  if (!agentPanel.hidden) void refreshChatAgents();
 });
 
 const fixtureReviewCommands = {

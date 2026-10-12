@@ -19,8 +19,10 @@ let brokerStartAttempted = false;
 
 async function connectFacadeBroker() {
   const deadlineMs = Date.now() + 5000;
+  const reportedLabel = server.server.getClientVersion()?.name.replace(/[^ -~]/g, "?").slice(0, 80).trim();
+  const agentLabel = process.env.BROWSER_CHAT_AGENT_LABEL ?? (reportedLabel || "MCP agent");
   try {
-    return await connectBroker("facade", runtimeDirectory, undefined, deadlineMs);
+    return await connectBroker("facade", runtimeDirectory, undefined, deadlineMs, agentLabel);
   } catch (error) {
     if (facadeClosed || brokerStartAttempted || process.env.BROWSER_CHAT_AUTO_START_BROKER === "0"
       || !(error instanceof Error && "code" in error
@@ -38,7 +40,7 @@ async function connectFacadeBroker() {
       if (!socket.isSocket() || socket.uid !== process.getuid?.() || (socket.mode & 0o077) !== 0) {
         throw new Error("Broker socket has unsafe ownership or permissions");
       }
-      return await connectBroker("facade", runtimeDirectory, undefined, deadlineMs);
+      return await connectBroker("facade", runtimeDirectory, undefined, deadlineMs, agentLabel);
     } catch (error) {
       if (!(error instanceof Error && "code" in error
         && (error.code === "ENOENT" || error.code === "ECONNREFUSED"))) throw error;
@@ -284,7 +286,9 @@ server.registerTool("chat_disconnect", {
   }
 });
 
-if (process.env.BROWSER_CHAT_AUTO_START_BROKER !== "0") void pendingBroker().catch(() => {});
+server.server.oninitialized = () => {
+  if (process.env.BROWSER_CHAT_AUTO_START_BROKER !== "0") void pendingBroker().catch(() => {});
+};
 
 server.connect(new StdioServerTransport()).catch((error: unknown) => {
   process.stderr.write(`${error instanceof Error ? error.message : "MCP stdio connection failed"}\n`);

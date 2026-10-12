@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { on, once } from "node:events";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { connect, Socket } from "node:net";
@@ -40,6 +41,90 @@ async function exchange(socket: Socket, message: unknown): Promise<unknown> {
     socket.once("error", onError);
     socket.once("close", onClose);
     socket.write(encodeNativeFrame(message));
+  });
+}
+
+for (const target of [
+  { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
+  { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
+    documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" }
+] as const) {
+  test(`${target.origin} roster IPC is relay-only and removes one approved agent`, { timeout: 5000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-agent-roster-"));
+    const directory = join(home, "broker");
+    const credentials = createBrokerCredentials();
+    const broker = await startBrokerSocket(directory, credentials);
+    let first: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let second: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let rawFacade: Socket | undefined;
+    try {
+      first = await connectBroker("facade", directory, undefined, undefined, "Synthetic agent one");
+      second = await connectBroker("facade", directory, undefined, undefined, "Synthetic agent two");
+      relay = await connectBroker("relay", directory);
+      const roster = await relay.listChatAgents(target);
+      if (roster.kind !== "chat_agents") throw new Error("Expected agent roster");
+      assert.equal(roster.payload.agents.length, 2);
+      const firstAgent = roster.payload.agents.find(agent => agent.label === "Synthetic agent one");
+      const secondAgent = roster.payload.agents.find(agent => agent.label === "Synthetic agent two");
+      assert.ok(firstAgent && secondAgent);
+      assert.notEqual(firstAgent.agentId, secondAgent.agentId);
+      const untrusted = first;
+      assert.throws(() => untrusted.listChatAgents(target), /Broker role cannot perform/);
+      assert.throws(() => untrusted.removeChatAgent(target, secondAgent.agentId), /Broker role cannot perform/);
+      assert.throws(() => untrusted.disconnectChat(target), /Broker role cannot perform/);
+      const firstRequest = await first.requestConnection();
+      const secondRequest = await second.requestConnection();
+      if (firstRequest.kind !== "connection_requested" || secondRequest.kind !== "connection_requested") {
+        throw new Error("Expected two owned requests");
+      }
+      if (target.origin === "https://gemini.google.com") {
+        assert.equal((await relay.approveGemini(firstRequest.payload.requestId, target)).kind, "gemini_approved");
+        assert.equal((await relay.approveGemini(secondRequest.payload.requestId, target)).kind, "gemini_approved");
+      } else {
+        assert.equal((await relay.approveFixture(firstRequest.payload.requestId, target)).kind, "fixture_approved");
+        assert.equal((await relay.approveFixture(secondRequest.payload.requestId, target)).kind, "fixture_approved");
+      }
+      const connected = await relay.listChatAgents(target);
+      if (connected.kind !== "chat_agents") throw new Error("Expected connected roster");
+      assert.deepEqual(connected.payload.agents.map(agent => agent.connectionCount), [1, 1]);
+      assert.equal(JSON.stringify(connected.payload).includes(target.conversationId), false);
+      assert.deepEqual((await second.getConnection(firstRequest.payload.requestId)).payload, { state: "unknown" });
+      rawFacade = connect(join(directory, "broker.sock"));
+      await once(rawFacade, "connect");
+      const envelope = { protocolVersion: PROTOCOL_VERSION, connectionGeneration: 0, deadlineMs: Date.now() + 4000 };
+      await exchange(rawFacade, { ...envelope, kind: "hello", requestId: randomUUID(), role: "facade",
+        credential: credentials.facade, payload: {} });
+      for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat"]) {
+        const denied = await exchange(rawFacade, { ...envelope, kind, requestId: randomUUID(),
+          payload: { target, ...(kind === "remove_chat_agent" ? { agentId: secondAgent.agentId } : {}) } });
+        assert.ok(typeof denied === "object" && denied !== null && "payload" in denied);
+        assert.deepEqual(denied.payload, { code: "PERMISSION_DENIED" });
+      }
+      assert.deepEqual((await relay.removeChatAgent({ ...target, documentId: "wrong-document" }, firstAgent.agentId)).payload,
+        { revoked: 0, remainingAgents: 0 });
+      assert.deepEqual((await relay.removeChatAgent(target, firstAgent.agentId)).payload, { revoked: 1, remainingAgents: 1 });
+      const firstState = await first.getConnection(firstRequest.payload.requestId);
+      const secondState = await second.getConnection(secondRequest.payload.requestId);
+      assert.equal(firstState.kind === "connection_state" && firstState.payload.state, "stale");
+      assert.equal(secondState.kind === "connection_state" && secondState.payload.state, "ready_readonly");
+      const fresh = await first.requestConnection();
+      assert.equal(fresh.kind === "connection_requested" && fresh.payload.state, "pending");
+      const removed = await relay.listChatAgents(target);
+      if (removed.kind !== "chat_agents") throw new Error("Expected updated agent roster");
+      assert.equal(removed.payload.agents.find(agent => agent.agentId === firstAgent.agentId)?.connectionCount, 0);
+      assert.deepEqual((await relay.removeChatAgent(target, firstAgent.agentId)).payload, { revoked: 0, remainingAgents: 1 });
+      assert.deepEqual((await relay.disconnectChat(target)).payload, { revoked: 1, remainingAgents: 0 });
+      const disconnected = await second.getConnection(secondRequest.payload.requestId);
+      assert.equal(disconnected.kind === "connection_state" && disconnected.payload.state, "stale");
+    } finally {
+      rawFacade?.destroy();
+      first?.close();
+      second?.close();
+      relay?.close();
+      await broker.close();
+      await rm(home, { recursive: true, force: true });
+    }
   });
 }
 

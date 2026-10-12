@@ -96,7 +96,7 @@ test("two MCP facades auto-start one private broker before any tool call", { tim
     args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
     env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "1",
       NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(brokerStartupObserver)}` } };
-  const clients = [new Client({ name: "auto-start-one", version: "0.0.1" }),
+  const clients = [new Client({ name: `${"A".repeat(79)} B`, version: "0.0.1" }),
     new Client({ name: "auto-start-two", version: "0.0.1" })] as const;
   try {
     await Promise.all(clients.map((client) => client.connect(new StdioClientTransport(options))));
@@ -122,6 +122,17 @@ test("two MCP facades auto-start one private broker before any tool call", { tim
       arguments: { requestId: handles[0]!.requestId } });
     assert.deepEqual(foreign.structuredContent, { state: "unknown" });
     assert.equal(await readFile(join(runtimeDirectory, "facade.key"), "utf8"), credential);
+    const relay = await connectBroker("relay", runtimeDirectory);
+    try {
+      const roster = await relay.listChatAgents({ origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+        tabId: 3, documentId: "synthetic-document" });
+      assert.equal(roster.kind, "chat_agents");
+      if (roster.kind !== "chat_agents") throw new Error("Expected agent roster");
+      assert.deepEqual(roster.payload.agents.map(agent => agent.label).sort(), ["A".repeat(79), "auto-start-two"]);
+      assert.ok(roster.payload.agents.every(agent => agent.connectionCount === 0));
+    } finally {
+      relay.close();
+    }
   } finally {
     await Promise.all(clients.map((client) => client.close()));
     const recorded = await readFile(join(home, "broker-pids"), "utf8").catch(() => "");

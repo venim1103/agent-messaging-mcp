@@ -3,7 +3,9 @@ import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { NativeFrameDecoder, writeNativeFrame } from "./native-framing.js";
+import type { ChatAgent } from "./pending-connections.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
+  parseNativeChatAgentRequest,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
@@ -79,6 +81,9 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           continue;
         }
         const request = typeof message === "object" && message !== null && "kind" in message
+          && (message.kind === "list_chat_agents" || message.kind === "remove_chat_agent" || message.kind === "disconnect_chat")
+          ? parseNativeChatAgentRequest(message)
+          : typeof message === "object" && message !== null && "kind" in message
           && message.kind === "approve_fixture" ? parseNativeFixtureApproval(message)
           : typeof message === "object" && message !== null && "kind" in message
             && message.kind === "approve_gemini" ? parseNativeGeminiApproval(message)
@@ -145,7 +150,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               : parseNativePendingList(message);
               queueNativeReply(async () => {
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
-          let kind: "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
+          let kind: "chat_agents" | "chat_agent_removed" | "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
             | "fixture_approved" | "fixture_review_approved" | "gemini_approved" | "fixture_revoked"
             | "fixture_fill_reviews" | "fixture_fill_review_approved"
             | "gemini_prepared_reviews" | "gemini_review_approved" | "gemini_fill_reviews" | "gemini_fill_review_approved"
@@ -159,6 +164,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
+            | { agents: ReadonlyArray<ChatAgent> } | { revoked: number; remainingAgents: number }
             | { fills: ReadonlyArray<{ operationId: string; attemptId: string; target: {
               origin: string; conversationId: string; url: string; tabId: number; documentId: string
             }; text: string; expiresAt: number }> }
@@ -187,7 +193,22 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"), request.deadlineMs);
-            if (request.kind === "list_pending") {
+            if (request.kind === "list_chat_agents") {
+              const result = await client.listChatAgents(request.payload.target);
+              if (result.kind !== "chat_agents") throw new Error("Broker refused chat agent list");
+              kind = "chat_agents";
+              payload = result.payload;
+            } else if (request.kind === "remove_chat_agent") {
+              const result = await client.removeChatAgent(request.payload.target, request.payload.agentId);
+              if (result.kind !== "chat_agent_removed") throw new Error("Broker refused chat agent removal");
+              kind = "chat_agent_removed";
+              payload = result.payload;
+            } else if (request.kind === "disconnect_chat") {
+              const result = await client.disconnectChat(request.payload.target);
+              if (result.kind !== "chat_agent_removed") throw new Error("Broker refused chat disconnect");
+              kind = "chat_agent_removed";
+              payload = result.payload;
+            } else if (request.kind === "list_pending") {
               const result = await client.listPending();
               if (result.kind !== "pending_list") throw new Error("Broker refused pending list");
               kind = "pending_list";

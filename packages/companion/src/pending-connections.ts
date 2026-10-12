@@ -3,6 +3,7 @@ import { ObservationBuffer } from "./observation-buffer.js";
 
 export const PENDING_REQUEST_TTL_MS = 60_000;
 export const MAX_PENDING_REQUESTS = 100;
+export const MAX_CONNECTED_AGENTS = 16;
 export const READONLY_CONNECTION_TTL_MS = 5 * 60_000;
 export const MAX_FIXTURE_SNAPSHOT_MESSAGES = 32;
 export const MAX_FIXTURE_SNAPSHOT_BYTES = 96 * 1024;
@@ -38,6 +39,9 @@ export type GeminiTarget = Readonly<{
   documentId: string;
 }>;
 export type ApprovedTarget = FixtureTarget | GeminiTarget;
+
+export type ConnectedAgent = Readonly<{ agentId: string; label: string }>;
+export type ChatAgent = ConnectedAgent & Readonly<{ connectionCount: number }>;
 
 export type ReadonlyConnection = Readonly<{
   requestId: string;
@@ -101,9 +105,67 @@ type PendingGeminiRead = {
 };
 
 export class PendingConnectionRequests {
+  private readonly agents = new Map<symbol, ConnectedAgent>();
   private readonly requests = new Map<string, RequestRecord>();
   private readonly fixtureReads = new Map<string, PendingFixtureRead>();
   private readonly geminiReads = new Map<string, PendingGeminiRead>();
+
+  registerAgent(owner: symbol, label = "MCP agent"): ConnectedAgent {
+    if (typeof owner !== "symbol" || !/^[ -~]{1,80}$/.test(label) || label.trim() !== label) {
+      throw new TypeError("Invalid broker-owned agent identity or display label");
+    }
+    if (this.agents.has(owner)) throw new Error("Agent is already registered");
+    if (this.agents.size >= MAX_CONNECTED_AGENTS) throw new Error("Too many connected agents");
+    const agent = Object.freeze({ agentId: randomUUID(), label });
+    this.agents.set(owner, agent);
+    return agent;
+  }
+
+  private matchesTarget(first: ApprovedTarget, second: ApprovedTarget): boolean {
+    return first.origin === second.origin && first.conversationId === second.conversationId
+      && first.tabId === second.tabId && first.documentId === second.documentId
+      && (first.origin !== "https://gemini.google.com"
+        || (second.origin === "https://gemini.google.com" && first.url === second.url));
+  }
+
+  listChatAgents(target: ApprovedTarget, now = Date.now()): ReadonlyArray<ChatAgent> {
+    return Object.freeze([...this.agents].map(([owner, agent]) => {
+      let connectionCount = 0;
+      for (const request of this.requests.values()) {
+        const grant = request.grant;
+        if (request.owner === owner && grant && !grant.stale && now < grant.connection.expiresAt
+          && this.matchesTarget(grant.target, target)) connectionCount++;
+      }
+      return Object.freeze({ ...agent, connectionCount });
+    }));
+  }
+
+  removeChatAgent(agentId: string, target: ApprovedTarget, now = Date.now()): number {
+    const entry = [...this.agents].find(([, agent]) => agent.agentId === agentId);
+    if (!entry) return 0;
+    let revoked = 0;
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (request.owner === entry[0] && grant && !grant.stale && now < grant.connection.expiresAt
+        && this.matchesTarget(grant.target, target)) {
+        this.revokeGrant(grant);
+        revoked++;
+      }
+    }
+    return revoked;
+  }
+
+  disconnectChat(target: ApprovedTarget, now = Date.now()): number {
+    let revoked = 0;
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (grant && !grant.stale && now < grant.connection.expiresAt && this.matchesTarget(grant.target, target)) {
+        this.revokeGrant(grant);
+        revoked++;
+      }
+    }
+    return revoked;
+  }
 
   private finishFixtureRead(challengeId: string, result: FixtureSnapshot | "not_ready" | null): void {
     const pending = this.fixtureReads.get(challengeId);
@@ -503,6 +565,7 @@ export class PendingConnectionRequests {
   }
 
   disconnect(owner: symbol): void {
+    this.agents.delete(owner);
     for (const [challengeId, pending] of this.fixtureReads) {
       if (pending.owner === owner) this.finishFixtureRead(challengeId, null);
     }
