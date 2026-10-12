@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-12 (T1 complete; awaiting D13a before T2).
+Updated: 2026-10-12 (T1 complete; D13a exclusivity confirmed, selection pending).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -87,11 +87,11 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 ### Decisions
 
-Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Still open: D6, the debugger permission, decided after the first live test (T5); D10a, whether the system may clear a leftover draft that exactly equals the agent's own not-sent text (ask before T3); D13a, the rule for which agent receives a popup connection (proposal in DESIGN.md D13, confirm before T2); and which second chat site to support.
+Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). D13a exclusivity was confirmed on 2026-10-12: only one agent may receive a chat. Still open: D6, the debugger permission, decided after the first live test (T5); D10a, whether the system may clear a leftover draft that exactly equals the agent's own not-sent text (ask before T3); D13a recipient selection when several agents are connected (confirm before T2); and which second chat site to support.
 
 ### Next step
 
-Await the user's D13a confirmation before T2: exactly one connected facade receives a popup connection; with none, the offer waits for pickup or tab close; with several, the popup refuses. T1a is `75ad536`; T1b is the newest checkpoint below. No T2 implementation or live access has started.
+Await the remaining D13a selection decision before T2. One recipient per chat is confirmed; clarify whether several connected agents cause popup refusal (the existing proposal) or allow one exclusive pickup. The proposal still waits for pickup or tab close when no agent is connected. T1a is `75ad536`; T1b is `11d2bd1`. No T2 implementation or live access has started.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -118,7 +118,7 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 
 - **Broker start (D4):** `packages/companion/src/mcp-stdio.ts` connects at startup. If the socket is missing or refuses, it spawns `broker-process.js` detached with `stdio: "ignore"` (never the MCP stdout), waits within a bounded loop for the owner-only private socket and connects. Racing facades are safe because the broker refuses a second instance. `mcp-stdio.test.ts` currently expects `BROKER_UNAVAILABLE` without a broker (around line 161); keep a way to disable auto-start in tests.
 - **Connect this chat (D13, D1):** add the popup action for an eligible fixture or Gemini tab. Its text states that the agent may read and send in this chat on its own until the tab closes, and that chat content can influence what it sends. The click requests optional host permission for that origin (`optional_host_permissions` in `packages/extension/wxt.config.ts`; `permissions.request` must run inside the click handler), then a new relay-only command creates an autonomous grant.
-- **Proposed D13a rule:** exactly one connected facade receives the chat; with none, the offer waits until an agent picks it up or the tab closes; with several, the popup refuses.
+- **D13a:** one recipient per chat is confirmed (2026-10-12). Selection remains open. The existing proposal binds the sole connected facade; with none, the offer waits until an agent picks it up or the tab closes; with several, the popup refuses. Do not treat exclusivity as confirmation of the several-facade refusal policy.
 - **Pickup tool:** `chat_wait_for_connection { timeoutMs }` (at most 20 s) returns connections offered to this agent. `chat_request_connection` stays for tests.
 - **Grant model:** autonomous grants report state `ready` with read and send capability and no expiry (`expiresAt: null`). Keep clipping correct wherever expiry feeds deadlines: `liveGrant`, read challenges, `getConnectionExpiresAt` and the extension's stored grants. Legacy read-only grants keep the five-minute TTL.
 - **Lifetime (D2):** tab close, chat switch, extension reload, browser restart (`ensureFixtureReset`) and owner disconnect already revoke. Change the `tabs.onUpdated` handler near the end of `background.ts` so a reload of the same exact URL re-attaches: after load, confirm identity in the new document, rebind the broker target through a new relay-only command, mark an observation gap and reinstall observers. Any other URL change still revokes.
@@ -155,6 +155,11 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## D13a Exclusive Recipient Confirmation (2026-10-12)
+
+- The user confirmed: only one agent can receive a chat. DESIGN.md section 17 records this exclusive-recipient constraint without marking the remaining selection policy resolved.
+- Before T2, clarify the several-agent case: refuse connection as proposed, or permit one exclusive pickup. No source, service, grant or live browser access changed. Documentation-only validation applies; the latest source gate remains T1b's 173/173 units and 20/20 e2e checks.
 
 ## T1b Observation Window And Failure Policy (2026-10-12)
 
