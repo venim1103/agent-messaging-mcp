@@ -118,7 +118,7 @@ These controls still require the legacy finite read-only grant. Popup-first auto
 1. `chat_prepare_message { connectionId, expectedGeneration: 1, text, idempotencyKey }` with a new UUID key returns `operationId`, `awaiting_approval`, `expiresAt` (three minutes), the exact `preview` and a private `recoveryToken`.
 2. Human: **Review fixture drafts**, then **Approve draft (no send)**.
 3. Human: **Review fixture draft fill**, then **Allow draft fill (no send)**.
-4. `chat_fill_draft { operationId }`, once, while the same fixture document is selected and its editor is empty.
+4. Check `chat_get_operation` reports `approved` and `draftFill.state` as `fill_approved`; ordinary review alone is insufficient. Then call `chat_fill_draft { operationId }` once, while the same fixture document is selected and its editor is empty.
 5. Human: check the draft, then **Review fixture sending** and **Approve fixture send**.
 6. `chat_commit_message { operationId }`, once.
 7. `chat_get_operation { operationId, recoveryToken? }` reports status only.
@@ -150,6 +150,8 @@ Most refusals are text of the form `CODE: No chat was accessed.` Codes include `
 ## Trusted Popup
 
 The toolbar popup is the only approval surface; page scripts and MCP calls cannot approve anything. On the fixture or an eligible saved Gemini chat it offers:
+
+Open this small panel from the extension icon in container Chromium's toolbar, using the Extensions puzzle-piece menu if necessary, while the chat tab remains selected underneath. Do not open the extension UI as a full browser tab or confuse it with the `chrome://extensions` management page. After an approval click, report its actual confirmation or error; clicking alone is not evidence that consent was granted.
 
 - **Inspect this chat**: a read-only diagnostic. On the fixture it lists rows and checks the native bridge. On Gemini it shows only structure metadata (regions, editors, row lengths, **Send controls**, **Prompt state** and **Nearby prompt controls**), never chat text.
 - **View pending requests**, then **Approve read-only fixture** or **Approve read-only Gemini chat**.

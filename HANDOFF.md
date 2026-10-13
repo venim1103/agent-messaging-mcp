@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-13 (installed Gemini approval/read/events/removal passed; T3e retained-composer fill coordination gated; provider-neutral autonomous orchestration/page evidence next).
+Updated: 2026-10-13 (installed supervised fixture fill/send passed with visual confirmation; installed Gemini reads/events/removal passed; autonomous orchestration/page evidence next).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -18,7 +18,8 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 - Latest source checkpoint: T3e retained-composer fill coordination (entry below), after T3d `f8dc3f1`, T3c `077094a`, T3b `9bdb622`, T3a `3fcf811` and T2d `7de5862`. Its third exact gate passed build, both typechecks, **203/203 units and 36/36 e2e checks** after the documented failures and substantive repairs. T3d connects trusted relay-only resolution; T3e blocks a new fill while another live operation retains that exact composer. Page resolution and provider-neutral autonomous orchestration remain missing.
 - T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Installed Gemini single-owner approval/pickup, fresh reads, same-chat events and removal now passed (entry below). Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3d's installed fixture empty-status check passed after coordinated reload; installed outcome buttons remain untested.
-- Current coordination: the person pushed through `17d9599`; the worktree was clean before this read-only user test. Existing fixture HTTP 200, broker/facade processes and the no-data MCP diagnostic were verified; no service restart occurred. The person approved two disposable Gemini chats sequentially and manually sent the prompts. The agent read only; the final grant was removed through the popup, pickup became empty and the old read handle was refused without chat access. Do not assume any current approval.
+- Latest installed write evidence: one supervised fixture textarea message passed separate trusted draft, fill and Send approvals, one MCP fill and one submit, `observed_in_ui`, fresh read/status and the person's visual confirmation of one outgoing row with an empty editor. An earlier fill refusal/expiry is preserved below. This is not autonomous sending, Gemini writing or installed T3e coordination evidence.
+- Current coordination: the worktree was clean before the fixture user test, with source `17d9599` pushed and documentation `b75649e` local. Existing fixture HTTP 200 was verified; no build, restart or extension reload occurred. The earlier Gemini grants were removed. The refused fixture preparation expired; after an explicitly requested fresh attempt, the successful fixture grant was disconnected through MCP (`disconnected: true`). Do not assume any current approval.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 - Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e has synthetic/source-gate evidence only. A future reload ends current grants; do not assume the running broker already loaded this newer guard.
 
@@ -105,7 +106,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-Continue provider-neutral autonomous send orchestration with bounded owner-specific waiting, original request deadlines and the retained-composer guard, then page evidence. T3a-T3e are gated; installed fixture pickup/read/reload/removal, fixture empty resolution status and Gemini single-owner approval/read/events/removal passed. D10a is decided. The user test ended with no picked-up grants; obtain fresh approval for any further live access. Do not fabricate uncertain work in the person's profile or infer fill/send permission. Keep earlier runtime failures and the limited read-only diagnostic evidence; no clock/host settings were changed. Do not weaken limits or rerun an unchanged successful gate.
+Continue provider-neutral autonomous send orchestration with bounded owner-specific waiting, original request deadlines and the retained-composer guard, then page evidence. T3a-T3e are gated; installed fixture pickup/read/reload/removal, supervised textarea fill/send, fixture empty resolution status and Gemini single-owner approval/read/events/removal passed. D10a is decided. The test grants are ended; obtain fresh approval for further live access or writes. Do not fabricate uncertain work in the person's profile or infer fill/send permission. Keep earlier refusals/runtime failures and the limited read-only diagnostic evidence; no clock/host settings were changed. Do not weaken limits or rerun an unchanged successful gate.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -172,6 +173,16 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## Installed Supervised Fixture Fill And Send (2026-10-13)
+
+- The person requested agent sending on the local fixture after the Gemini read-only test. Fixture HTTP 200 and the clean worktree were verified. Public supervised fixture tools were used; Gemini and the logged-in browser profile were not automated. No source edit, build, service restart or extension reload occurred, so this tests the previously installed runtime, not the newer T3e guard.
+- The first pending request was no longer available after the person reported waiting too long. A fresh pending request was explicitly approved read-only. The first preparation had ordinary `approved` status but no `draftFill` approval metadata; its one fill call returned `FILL_UNAVAILABLE`, `retryAllowed: false`. It was not retried or submitted. The person clarified they had been opening the extension UI as a full tab, rather than the toolbar panel. Waiting versus UI context as the cause was not conclusively established.
+- The old operation then reported `expired` and its request `unknown`. After opening the real toolbar panel over the selected fixture, the person confirmed the editor was empty and explicitly requested a fresh attempt. A new read-only request, preparation and idempotency key were used; no old consent, authority or job was restored.
+- On the fresh operation, the person separately approved ordinary draft review and fill consent. Status showed `approved` with `draftFill.state: fill_approved`. One MCP fill returned `ok: true`, `editor: textarea`, `retryAllowed: false`. The person confirmed the exact draft was present and unsent, then separately clicked **Approve fixture send**. Status showed the past fill readback; one commit returned `observed_in_ui`, `ok: true`, `retryAllowed: false`.
+- A fresh read showed the new outgoing row without omissions and a separate status query retained `observed_in_ui`. The person visually confirmed exactly one new outgoing test message and an empty editor. Only the fresh operation had a submit call; no fill/submit retry or page Send click was requested. This is UI evidence, not provider acceptance or external delivery, and the fixture has no Gemini AI behind it.
+- MCP disconnect returned `disconnected: true` for the successful test grant, leaving the tab and message untouched. The reusable toolbar-opening instructions and pre-fill approval-state check are clarified in DEVELOPMENT.md. No private text, URLs, IDs or recovery tokens are recorded here. See AGENTS.md Safety Boundaries.
+- Documentation-only checkpoint: scoped content/link/line-length/whitespace and editor checks apply; the unchanged successful application gate is not rerun. Next implementation remains autonomous orchestration/page evidence; future installed tests need fresh approvals.
 
 ## Installed Gemini Approval, Reads, Events And Removal (2026-10-13)
 
