@@ -91,6 +91,7 @@ type FixtureGrant = {
   connection: ApprovedConnection;
   target: ApprovedTarget;
   stale: boolean;
+  reloadPending?: boolean;
   revokedAt?: number;
   observations?: ObservationBuffer;
   snapshot?: FixtureSnapshot;
@@ -145,8 +146,12 @@ export class PendingConnectionRequests {
         || (second.origin === "https://gemini.google.com" && first.url === second.url));
   }
 
-  private isLiveGrant(grant: FixtureGrant, now: number): boolean {
+  private isAuthorizedGrant(grant: FixtureGrant, now: number): boolean {
     return !grant.stale && now < (grant.connection.expiresAt ?? Infinity);
+  }
+
+  private isLiveGrant(grant: FixtureGrant, now: number): boolean {
+    return this.isAuthorizedGrant(grant, now) && !grant.reloadPending;
   }
 
   private recordExpiresAt(request: RequestRecord): number {
@@ -195,7 +200,7 @@ export class PendingConnectionRequests {
       let autonomous = false;
       for (const request of this.requests.values()) {
         const grant = request.grant;
-        if (target && request.owner === owner && grant && this.isLiveGrant(grant, now)
+        if (target && request.owner === owner && grant && this.isAuthorizedGrant(grant, now)
           && this.matchesTarget(grant.target, target)) {
           connectionCount++;
           autonomous ||= grant.connection.state === "ready";
@@ -211,7 +216,7 @@ export class PendingConnectionRequests {
     let revoked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (request.owner === entry[0] && grant && this.isLiveGrant(grant, now)
+      if (request.owner === entry[0] && grant && this.isAuthorizedGrant(grant, now)
         && this.matchesTarget(grant.target, target)) {
         this.revokeGrant(grant, now);
         revoked++;
@@ -224,12 +229,58 @@ export class PendingConnectionRequests {
     let revoked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (grant && this.isLiveGrant(grant, now) && this.matchesTarget(grant.target, target)) {
+      if (grant && this.isAuthorizedGrant(grant, now) && this.matchesTarget(grant.target, target)) {
         this.revokeGrant(grant, now);
         revoked++;
       }
     }
     return revoked;
+  }
+
+  beginChatReload(target: ApprovedTarget, now = Date.now()): number {
+    if (!this.validTarget(target)) return 0;
+    let preserved = 0;
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (!grant || !this.isAuthorizedGrant(grant, now) || !this.matchesTarget(grant.target, target)) continue;
+      if (grant.connection.state !== "ready") {
+        this.revokeGrant(grant, now);
+        continue;
+      }
+      grant.reloadPending = true;
+      grant.snapshot = undefined;
+      grant.geminiSnapshot = undefined;
+      if (target.origin === "http://127.0.0.1:8787") grant.observations = new ObservationBuffer(observationLimits);
+      else grant.geminiObservations = new ObservationBuffer(observationLimits);
+      for (const [challengeId, pending] of this.fixtureReads) {
+        if (pending.connectionId === grant.connection.connectionId) this.finishFixtureRead(challengeId, "not_ready");
+      }
+      for (const [challengeId, pending] of this.geminiReads) {
+        if (pending.connectionId === grant.connection.connectionId) this.finishGeminiRead(challengeId, "not_ready");
+      }
+      preserved++;
+    }
+    return preserved;
+  }
+
+  rebindChat(previous: ApprovedTarget, target: ApprovedTarget, now = Date.now()): number {
+    if (!this.validTarget(previous) || !this.validTarget(target) || previous.documentId === target.documentId
+      || !this.matchesTarget(previous, { ...target, documentId: previous.documentId })) return 0;
+    let rebound = 0;
+    const owners = new Set<symbol>();
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (!grant || grant.connection.state !== "ready" || !grant.reloadPending || !this.isAuthorizedGrant(grant, now)
+        || !this.matchesTarget(grant.target, previous)) continue;
+      grant.target = Object.freeze({ ...target });
+      grant.reloadPending = false;
+      owners.add(request.owner);
+      rebound++;
+    }
+    for (const owner of owners) {
+      this.finishConnectionWait(owner, { connections: this.ownedAutonomousConnections(owner, now), timedOut: false }, now);
+    }
+    return rebound;
   }
 
   private finishFixtureRead(challengeId: string, result: FixtureSnapshot | "not_ready" | null): void {
@@ -263,11 +314,11 @@ export class PendingConnectionRequests {
     }
   }
 
-  private liveGrant(owner: symbol, connectionId: string, now: number): FixtureGrant | null {
+  private liveGrant(owner: symbol, connectionId: string, now: number, allowReload = false): FixtureGrant | null {
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (request.owner === owner && grant?.connection.connectionId === connectionId) {
-        return this.isLiveGrant(grant, now) ? grant : null;
+        return this.isAuthorizedGrant(grant, now) && (allowReload || !grant.reloadPending) ? grant : null;
       }
     }
     return null;
@@ -367,7 +418,7 @@ export class PendingConnectionRequests {
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (grant?.target.origin === "https://gemini.google.com"
-        && this.isLiveGrant(grant, now)) tabs.add(grant.target.tabId);
+        && this.isAuthorizedGrant(grant, now)) tabs.add(grant.target.tabId);
     }
     return [...tabs].sort((first, second) => first - second);
   }
@@ -459,13 +510,13 @@ export class PendingConnectionRequests {
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (grant?.target.origin === "http://127.0.0.1:8787"
-        && this.isLiveGrant(grant, now)) tabs.add(grant.target.tabId);
+        && this.isAuthorizedGrant(grant, now)) tabs.add(grant.target.tabId);
     }
     return [...tabs].sort((first, second) => first - second);
   }
 
   disconnectFixture(owner: symbol, connectionId: string, now = Date.now()): boolean {
-    const grant = this.liveGrant(owner, connectionId, now);
+    const grant = this.liveGrant(owner, connectionId, now, true);
     if (!grant) return false;
     this.revokeGrant(grant, now);
     return true;
@@ -572,7 +623,7 @@ export class PendingConnectionRequests {
     this.pruneExpiredRecords(now);
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (request.owner === owner && grant?.connection.state === "ready" && this.isLiveGrant(grant, now)
+      if (request.owner === owner && grant?.connection.state === "ready" && this.isAuthorizedGrant(grant, now)
         && this.matchesTarget(grant.target, target)) return grant.connection;
     }
     if ([...this.requests.values()].filter(request => request.grant?.connection.state === "ready").length

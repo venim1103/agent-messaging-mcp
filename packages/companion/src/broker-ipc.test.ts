@@ -128,6 +128,63 @@ for (const target of [
   });
 }
 
+for (const target of [
+  { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
+  { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
+    documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" }
+] as const) {
+  test(`${target.origin} reload IPC cannot approve, revive or retarget agent authority`, { timeout: 5000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-reload-ipc-"));
+    const directory = join(home, "broker");
+    const credentials = createBrokerCredentials();
+    const broker = await startBrokerSocket(directory, credentials);
+    let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let raw: Socket | undefined;
+    try {
+      facade = await connectBroker("facade", directory);
+      relay = await connectBroker("relay", directory);
+      const untrusted = facade;
+      assert.throws(() => untrusted.beginChatReload(target), /Broker role cannot perform/);
+      assert.throws(() => untrusted.rebindChat(target, target), /Broker role cannot perform/);
+      raw = connect(join(directory, "broker.sock"));
+      await once(raw, "connect");
+      const envelope = { protocolVersion: PROTOCOL_VERSION, connectionGeneration: 0, deadlineMs: Date.now() + 4000 };
+      await exchange(raw, { ...envelope, kind: "hello", requestId: randomUUID(), role: "facade", credential: credentials.facade, payload: {} });
+      for (const kind of ["begin_chat_reload", "rebind_chat"]) {
+        const denied = await exchange(raw, { ...envelope, kind, requestId: randomUUID(),
+          payload: { target, ...(kind === "rebind_chat" ? { previous: target } : {}) } });
+        assert.ok(typeof denied === "object" && denied !== null && "payload" in denied);
+        assert.deepEqual(denied.payload, { code: "PERMISSION_DENIED" });
+      }
+      const roster = await relay.listChatAgents(target);
+      assert.ok(roster.kind === "chat_agents");
+      const agent = roster.payload.agents.find(candidate => candidate.agentId);
+      assert.ok(agent);
+      const updated = { ...target, documentId: "new-document" };
+      assert.deepEqual((await relay.rebindChat(target, updated)).payload, { rebound: 0 });
+      await relay.approveChatAgent(target, agent.agentId);
+      const pickup = await facade.waitForConnection(0);
+      assert.ok(pickup.kind === "connection_pickup" && pickup.payload.connections[0]);
+      const connection = pickup.payload.connections[0];
+      assert.deepEqual((await relay.beginChatReload(target)).payload, { preserved: 1 });
+      assert.deepEqual((await facade.waitForConnection(0)).payload, { connections: [], timedOut: true });
+      assert.deepEqual((await relay.rebindChat(target, { ...updated, tabId: 4 })).payload, { rebound: 0 });
+      assert.deepEqual((await relay.rebindChat(target, updated)).payload, { rebound: 1 });
+      assert.deepEqual((await facade.waitForConnection(0)).payload, { connections: [connection], timedOut: false });
+      assert.deepEqual((await relay.removeChatAgent(updated, agent.agentId)).payload, { revoked: 1, remainingAgents: 0 });
+      assert.deepEqual((await relay.beginChatReload(updated)).payload, { preserved: 0 });
+      assert.deepEqual((await relay.rebindChat(updated, { ...updated, documentId: "third-document" })).payload, { rebound: 0 });
+    } finally {
+      raw?.destroy();
+      facade?.close();
+      relay?.close();
+      await broker.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}
+
 test("autonomous pickup has its own bounded wait budget without relaxing ordinary requests", { timeout: 8000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-pickup-budget-"));
   const directory = join(home, "broker");

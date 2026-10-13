@@ -1248,7 +1248,7 @@ for (const provider of ["fixture", "gemini"]) {
 }
 
 for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
-  ["failure", "lifetime"].map(scenario => ({ provider, scenario })))) {
+  ["failure", "lifetime", "reload", "reload-failure"].map(scenario => ({ provider, scenario })))) {
   test(`${provider} popup autonomous admission (${scenario}) is per agent and preserves other owners`, { timeout: 20000 }, async (testContext) => {
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-autonomous-test-"));
     const unpacked = join(profile, "unpacked-extension");
@@ -1374,6 +1374,75 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
         await popup.locator("#agent-panel").screenshot({ path: join(tmpdir(), `agent-messaging-${provider}-autonomous.png`) });
       }
       const firstAgentId = await row("Autonomous one").getAttribute("data-agent-id");
+      if (scenario === "reload" || scenario === "reload-failure") {
+        const originalDocument = await worker.evaluate(async key => (await chrome.storage.session.get(key))[key].documentId, key);
+        let oldRead;
+        if (scenario === "reload-failure") {
+          await worker.evaluate(() => {
+            const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+            chrome.runtime.connectNative = (...args) => {
+              const port = connect(...args);
+              const listen = port.onMessage.addListener.bind(port.onMessage);
+              port.onMessage.addListener = listener => listen(reply => listener(reply.kind === "chat_rebound"
+                ? { ...reply, payload: { ...reply.payload, renewed: true } } : reply));
+              return port;
+            };
+          });
+        } else {
+          await worker.evaluate(documentId => {
+            const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+            chrome.scripting.executeScript = async options => {
+              const result = await execute(options);
+              if (options.target.documentIds?.[0] === documentId && options.func.toString().includes("omittedBefore")) {
+                chrome.scripting.executeScript = execute;
+                return new Promise(resolve => { globalThis.releaseOldCapture = () => resolve(result); });
+              }
+              return result;
+            };
+          }, originalDocument);
+          oldRead = clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: first.connectionId } });
+          let captureHeld = false;
+          for (let attempt = 0; attempt < 80; attempt++) {
+            testContext.signal.throwIfAborted();
+            captureHeld = await worker.evaluate(() => typeof globalThis.releaseOldCapture === "function");
+            if (captureHeld) break;
+            await setTimeout(25);
+          }
+          assert.equal(captureHeld, true, "Old-document capture was not held before reload");
+        }
+        await page.reload();
+        let reloaded = false;
+        for (let attempt = 0; attempt < 80; attempt++) {
+          testContext.signal.throwIfAborted();
+          reloaded = await worker.evaluate(async ({ key, originalDocument, failed }) => {
+            const grant = (await chrome.storage.session.get(key))[key];
+            return failed ? !grant : grant?.documentId !== originalDocument && grant?.expiresAt === null && !grant.reloadPending;
+          }, { key, originalDocument, failed: scenario === "reload-failure" });
+          if (reloaded) break;
+          await setTimeout(25);
+        }
+        assert.equal(reloaded, true, "Reload did not settle the tracked grant");
+        if (scenario === "reload-failure") {
+          for (const client of clients) {
+            assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+              { connections: [], timedOut: true });
+          }
+          return;
+        }
+        await worker.evaluate(() => globalThis.releaseOldCapture());
+        assert.equal((await oldRead).isError, true, "Old capture must not satisfy a post-reload read");
+        for (const [client, connection, before] of [[clients[0], first, firstRead], [clients[1], second, otherRead]]) {
+          assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+            { connections: [connection], timedOut: false });
+          const after = await client.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+          assert.equal(after.isError, undefined);
+          assert.notEqual(after.structuredContent.cursor.epoch, before.structuredContent.cursor.epoch);
+          const gap = await client.callTool({ name: "chat_wait_for_events", arguments: {
+            connectionId: connection.connectionId, cursor: before.structuredContent.cursor, timeoutMs: 0
+          } });
+          assert.deepEqual(gap.structuredContent, { code: "CURSOR_EXPIRED", resnapshot: true });
+        }
+      }
       for (const extra of [{ approved: true }, { connectionId: first.connectionId }]) {
         assert.equal(await popup.evaluate(args => chrome.runtime.sendMessage(args), {
           kind: "approve_chat_agent", tabId: selected.tabId, expectedUrl: url, agentId: firstAgentId, ...extra
@@ -1384,7 +1453,17 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
       assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
         { connections: [], timedOut: true });
       let later;
-      if (scenario === "failure") {
+      if (scenario === "reload") {
+        await page.reload();
+        await popup.getByRole("button", { name: "Refresh agents" }).click();
+        await waitCount(1);
+        assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+          { connections: [], timedOut: true });
+        assert.deepEqual((await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+          { connections: [second], timedOut: false });
+        await page.route(`${url}?changed`, route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
+        await page.goto(`${url}?changed`);
+      } else if (scenario === "failure") {
         await worker.evaluate(agentId => {
           const connect = chrome.runtime.connectNative.bind(chrome.runtime);
           chrome.runtime.connectNative = (...args) => {

@@ -63,6 +63,12 @@ const autonomousConnection = z.strictObject({ requestId: z.uuid(), state: z.lite
 }).refine(connection => connection.origin !== "http://127.0.0.1:8787" || connection.conversationId === "fixture-alpha");
 
 const replySchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("chat_reload_started"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ preserved: z.number().int().min(0).max(MAX_AUTONOMOUS_CONNECTIONS) }) }),
+  z.strictObject({ kind: z.literal("chat_rebound"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ rebound: z.number().int().min(0).max(MAX_AUTONOMOUS_CONNECTIONS) }) }),
   z.strictObject({ kind: z.literal("chat_agent_approved"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ agentId: z.uuid(), expiresAt: z.null() }) }),
@@ -515,7 +521,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
     let nextRequest: Promise<void> = Promise.resolve();
     let pendingRequests = 0;
     const request = (kind: "keep_alive" | "list_chat_agents" | "remove_chat_agent" | "disconnect_chat"
-      | "approve_chat_agent" | "wait_for_connection" | "list_available_agents"
+      | "approve_chat_agent" | "wait_for_connection" | "list_available_agents" | "begin_chat_reload" | "rebind_chat"
       | "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
@@ -540,7 +546,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap"
       | "mark_gemini_observation_gap", payload: object) => {
       if (kind === "list_chat_agents" || kind === "remove_chat_agent" || kind === "disconnect_chat" || kind === "approve_chat_agent"
-        || kind === "list_available_agents"
+        || kind === "list_available_agents" || kind === "begin_chat_reload" || kind === "rebind_chat"
         || kind === "list_pending" || kind === "list_fixture_read_challenges"
         || kind === "list_fixture_prepared_reviews" || kind === "approve_fixture_review"
         || kind === "list_fixture_fill_reviews" || kind === "approve_fixture_fill_review"
@@ -632,6 +638,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       listAvailableAgents: () => request("list_available_agents", {}),
       removeChatAgent: (target: ApprovedTarget, agentId: string) => request("remove_chat_agent", { target, agentId }),
       disconnectChat: (target: ApprovedTarget) => request("disconnect_chat", { target }),
+      beginChatReload: (target: ApprovedTarget) => request("begin_chat_reload", { target }),
+      rebindChat: (previous: ApprovedTarget, target: ApprovedTarget) => request("rebind_chat", { previous, target }),
       approveChatAgent: (target: ApprovedTarget, agentId: string) => request("approve_chat_agent", { target, agentId }),
       waitForConnection: (timeoutMs = MAX_CONNECTION_WAIT_MS) => request("wait_for_connection", { timeoutMs }),
       requestConnection: () => request("request_connection", {}),

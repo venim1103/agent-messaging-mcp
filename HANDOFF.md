@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-12 (paused after T2c popup-first admission/pickup; same-chat reload and autonomous sending remain pending).
+Updated: 2026-10-13 (T2d same-chat reload/rebind gated; installed acceptance and D10a precede T3 autonomous sending).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,7 +16,7 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest source checkpoint: T2c popup-first per-agent approval, owner-bound pickup and no-expiry grants (entry below), after T2b `c032ee7`, T2a `5b71471`, T1b `11d2bd1` and T1a `75ad536`. Its exact gate passed build, both typechecks, **189/189 units and 26/26 e2e checks**. Same-chat reload/rebind remains T2 work; autonomous sending remains T3. Paused at the user's request after this checkpoint.
+- Latest source checkpoint: T2d exact same-chat reload/rebind (entry below), after T2c `8960a0a`, T2b `c032ee7` and T2a `5b71471`. Its exact gate passed build, both typechecks, **193/193 units and 30/30 e2e checks**. T2's connection model is complete synthetically; installed optional-permission/reload acceptance and autonomous sending remain. The user resumed development and offered testing help on 2026-10-13.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
 ### Capability matrix
@@ -35,6 +35,8 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 The trusted popup retains Gemini pending-request approval, ordinary review, fill consent and Send consent for the supervised path. Popup-first grants authorize read/send and support public reads/events, but autonomous sending is not implemented. Supervised write controls still require the legacy finite grant; the new connection approval does not bypass them.
 
 The popup shows facade labels/IDs, exact-chat connected counts, per-agent **Connect this chat**, **Remove access** and **Disconnect all**. It requests optional origin permission from the trusted click; before script access, it shows available owners with chat status unknown, not a proven zero count. New grants are `ready`, read/send-capable and `expiresAt: null`; legacy grants remain five-minute `ready_readonly`. Labels are reported/configured client names, not verified models. Evidence is synthetic only; fresh installed optional-permission acceptance and live Gemini admission are unverified.
+
+Autonomous same-chat reload preserves existing handles after fresh new-document identity verification, invalidates observation cursors and reinstalls observers. Old-document reads/publications are blocked during suspension; removal/disconnect still work. Only the exact URL/chat/tab may rebind; legacy reload still revokes. Failure or uncertainty disconnects pinned targets, without new approval, automatic readmission or job replay. This lifecycle evidence is synthetic only.
 
 ### Gemini send chain
 
@@ -61,7 +63,7 @@ This supervised chain stays for tests. The autonomous path (T3) reuses its fill,
 Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). Steps T1-T6 replace the earlier G2-G6 plan. The exact changes, tests, completion criteria and ask-points for each step are in **Implementation Plan T1-T6** below the dashboard.
 
 1. **T1 Read robustness: done.** Stopped native watches restart with bounded backoff (R2). D8 captures the newest 32 visible rows with `omittedBefore`, per-message truncation at 16,000 UTF-16 units and a 96 KiB capture cap. Identity-preserving failures skip publication; changed targets still revoke (R1). Synthetic evidence only for these changes.
-2. **T2 Connection model: in progress.** Startup (T2a), roster/removal (T2b), and per-agent popup-first approval, owned pickup and no-expiry grants (T2c) are gated. No automatic admission/re-admission (D13b). Still pending: same-chat reload/rebind, observation gaps and observer reattachment (D2); reload currently revokes. Individual disconnect/restart ends that owner's grant, and tab/chat/browser changes end matching grants. Read/send authority is represented, not a working autonomous send pipeline (T3).
+2. **T2 Connection model: synthetic implementation done.** Startup (T2a), roster/removal (T2b), popup-first per-agent admission/pickup/no-expiry grants (T2c) and same-chat reload/rebind/gaps/observer reattachment (T2d) are gated. No automatic admission/re-admission (D13b). Individual disconnect/restart ends that owner's grant; tab/chat/browser changes end matching grants. Installed optional-permission/reload acceptance remains unverified. Read/send authority is represented, not a working autonomous send pipeline (T3).
 3. **T3 Autonomous send.** A provider-neutral `chat_send_message` runs fill, fresh proof, durable intent, the one-offer job, browser reservation and one guarded activation, reusing today's pieces (D5). Add the append-only evidence rule (D9) with a settle window, per-connection resolution of unconfirmed sends with a one-click popup fallback (D10, R8), and the runaway guard: one message at a time and a configurable hourly cap. Relax "active tab of the current window" to "visible tab" (D11). Sandboxed synthetic tests cover the loop and its loss and crash cases.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
 5. **T5 Live acceptance.** Coordinated reload, then one human-authorized session on a disposable chat: connect once, the agent sends a few neutral messages and reads the complete replies without further clicks, then the tab is closed.
@@ -71,7 +73,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 - **R1 Fixed (T1b, D8).** Both providers capture a newest-32-visible-row window, explicitly flag omitted rows and truncated text, and stay within 96 KiB. Missing or ambiguous row structure still fails capture, but unchanged exact targets retain their grants; challenged reads then return `OBSERVATION_UNAVAILABLE`, and later captures can recover. URL/document/conversation changes still revoke. The earlier live failure's cause remains unproven; this fix is synthetic-tested, not newly live-verified.
 - **R2 Fixed (T1a).** Both native watches schedule at most one restart timer after timeout, parse failure or port disconnect: 1 s doubling to 10 s, reset after a valid reply. The timer rechecks tracked unexpired grants before connecting. Disposable-browser checks verify fixture and Gemini reads recover without reapproval and a consumed Gemini fill job is not re-offered.
-- **R3 Partly fixed (T2c).** Popup-first grants have no expiry; legacy read-only grants retain the five-minute TTL without renewal. Same-chat reload still revokes both modes; preserving autonomous approval across reload remains D2/T2 work.
+- **R3 Fixed synthetically (T2c/T2d).** Popup-first grants have no expiry and preserve existing approval on exact same-chat reload after fresh identity verification. Legacy read-only grants retain the five-minute TTL without renewal and still revoke on reload. Installed/live reload acceptance remains unverified.
 - **R4 Three popup clicks per message**, plus the prepare, fill and commit calls. Decided fix: one connection approval, D1 (T2, T3).
 - **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer now holds 128 events or 4 MiB (T1b), so streaming can still expire cursors. Agents should treat events as change hints and re-read (D3, T4).
 - **R6 Gemini commits would end uncertain.** Fixture evidence uses stable row IDs; Gemini rows have none (D9).
@@ -82,7 +84,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 - **A1 Provider duplication.** Parallel ledger, client, native, worker and popup families per provider remain, while DESIGN.md section 8 expects one policy pipeline with adapters. T2b's roster/removal/disconnect commands are provider-neutral. Several fixture-named items are provider-generic (`disconnect_fixture`, `revoke_all_fixture`, `revokeTrackedFixture`, `completeFixtureBrowserCheck`, the shared `MAX_PENDING_FIXTURE_DISPATCHES` cap). Do not add a provider by copying (D5).
 - **A2 Input mechanism drift.** Connected writers use `document.execCommand("insertText")` and a script-initiated `click()`, not `chrome.debugger`. `debugger` serves only two legacy popup probes, and the Gemini **Fill test draft** probe types a fixed sentence outside the operation ledger (D6). Whether live Gemini accepts the script-initiated Send click is unverified.
-- **A3 Model gaps.** `generation` is always 1. Popup-first grants now report `ready`, read/send capabilities and no expiry; legacy grants remain `ready_readonly` with per-operation write consent. Autonomous sends, pause state and reload/rebind are missing. The popup has IDs, labels, per-agent admission/removal and the data-boundary disclosure. Owners are facade sockets, not automatically distinct models or VS Code chat sessions (DESIGN.md section 7). The extension mirrors broker schemas by hand, so protocol changes must be made in both places.
+- **A3 Model gaps.** `generation` is always 1; reload replaces observation epochs rather than handles. Popup-first grants report `ready`, read/send capabilities and no expiry; legacy grants remain `ready_readonly` with per-operation write consent. Autonomous sends and pause state are missing. The popup has IDs, labels, per-agent admission/removal and the data-boundary disclosure. Owners are facade sockets, not automatically distinct models or VS Code chat sessions (DESIGN.md section 7). The extension mirrors broker schemas by hand, so protocol changes must be made in both places.
 - **A4 Port churn.** Each snapshot publication and each worker completion opens a new native port and relay process. This is fine locally; measure before raising event rates.
 
 ### Findings: process and documentation
@@ -96,7 +98,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-Paused at the user's request. When resumed, finish T2 with exact same-chat reload/rebind, observation-gap invalidation and observer reattachment (D2), preserving legacy reload revocation and ending all matching grants on chat/browser changes. Admission/pickup is complete; do not reopen exclusive pickup or add automatic admission. D10a remains the user ask-point before T3. No live access or real-chat approval occurred at this checkpoint.
+Coordinate a bounded installed local-fixture test of optional permission, per-agent approval, reload, individual removal and tab closure. Check processes and prepare prerequisites before asking for human gestures/restarts. Ask D10a before T3; do not infer its answer from testing availability. T2 is gated; do not reopen exclusive pickup or add automatic admission. No installed-profile activity, live access or real-chat approval occurred at T2d.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -162,6 +164,14 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T2d Same-Chat Reload/Rebind (2026-10-13)
+
+- Provider-neutral relay-only `begin_chat_reload` suspends exact-document autonomous grants, revokes legacy grants, cancels pending reads and replaces observation epochs. `rebind_chat` changes only the document of already suspended, still authorized grants for the same origin/conversation/tab/exact Gemini URL. Handles, owners and approval remain unchanged; removed/disconnected owners cannot return.
+- The worker serializes tab updates and storage mutations, pins the fixture's full URL too, verifies new-document identity and reinstalls observers. Pending reload blocks old-document snapshots, jobs and identity callbacks. Failed/uncertain setup attempts exact-target disconnect, never new approval or job replay. Capture-failure cleanup targets the original document and compare-deletes its storage revision, so late old results cannot revoke a rebound document.
+- Focused model compilation first exposed test-only union-narrowing errors; those were repaired and the authority subset passed 6/6. Private IPC/native reload checks passed 5/5. Worker typecheck passed; four disposable Chromium cases passed. Cleanup tightening then exposed missing explicit grant guards in two callbacks; repair passed typecheck and the reload plus legacy-wake subset 5/5.
+- The exact source gate passed on its first run: `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e`, **193/193 units and 30/30 e2e checks**. Synthetic fixture/routed Gemini coverage includes two retained owners, independent cursor gaps, held old-document capture, malformed rebind reply, removed-owner non-readmission, exact-URL change and closure. Legacy reload revocation remains covered; deadlines, assertions, sandbox and ownership checks were not weakened.
+- Scoped documentation validation caught an indented protocol bullet; it was corrected. No installed-profile or live-site access, real chat text, fill or send occurred. User testing is now available but is not a grant. Next: installed local-fixture permission/reload acceptance, D10a choice, then T3. See AGENTS.md Safety Boundaries.
 
 ## T2c Popup-First Admission And Stop Checkpoint (2026-10-12)
 

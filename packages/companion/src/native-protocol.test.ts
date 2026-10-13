@@ -52,8 +52,9 @@ test("native agent roster and removal accept only bounded exact-target envelopes
     { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
       documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat?hl=en" }
   ]) {
-    for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat", "approve_chat_agent"]) {
-      const payload = { target, ...(["remove_chat_agent", "approve_chat_agent"].includes(kind) ? { agentId: request.requestId } : {}) };
+    for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat", "approve_chat_agent", "begin_chat_reload", "rebind_chat"]) {
+      const payload = { target, ...(["remove_chat_agent", "approve_chat_agent"].includes(kind) ? { agentId: request.requestId } : {}),
+        ...(kind === "rebind_chat" ? { previous: target } : {}) };
       const message = { ...request, kind, payload };
       assert.deepEqual(parseNativeChatAgentRequest(message, now), message);
       for (const invalid of [
@@ -62,6 +63,7 @@ test("native agent roster and removal accept only bounded exact-target envelopes
         { ...message, payload: { ...payload, selector: "input" } },
         { ...message, payload: { ...payload, approved: true } },
         { ...message, payload: { ...payload, agentId: "invalid" } },
+        { ...message, payload: { ...payload, previous: { ...target, documentId: "" } } },
         { ...message, payload: { ...payload, target: { ...target, documentId: "" } } },
         { ...message, payload: { ...payload, target: { ...target, origin: "https://other.invalid" } } }
       ]) assert.throws(() => parseNativeChatAgentRequest(invalid, now), /Invalid native chat agent request/);

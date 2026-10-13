@@ -82,7 +82,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
         }
         const request = typeof message === "object" && message !== null && "kind" in message
           && (message.kind === "list_chat_agents" || message.kind === "remove_chat_agent" || message.kind === "disconnect_chat"
-            || message.kind === "approve_chat_agent" || message.kind === "list_available_agents")
+            || message.kind === "approve_chat_agent" || message.kind === "list_available_agents"
+            || message.kind === "begin_chat_reload" || message.kind === "rebind_chat")
           ? parseNativeChatAgentRequest(message)
           : typeof message === "object" && message !== null && "kind" in message
           && message.kind === "approve_fixture" ? parseNativeFixtureApproval(message)
@@ -152,6 +153,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               queueNativeReply(async () => {
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
           let kind: "chat_agents" | "chat_agent_removed" | "chat_agent_approved" | "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
+            | "chat_reload_started" | "chat_rebound"
             | "fixture_approved" | "fixture_review_approved" | "gemini_approved" | "fixture_revoked"
             | "fixture_fill_reviews" | "fixture_fill_review_approved"
             | "gemini_prepared_reviews" | "gemini_review_approved" | "gemini_fill_reviews" | "gemini_fill_review_approved"
@@ -190,7 +192,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | { reviews: ReadonlyArray<{ operationId: string; reviewId: string; expiresAt: number;
               preview: { target: "fixture-alpha" | "gemini"; text: string } }>; hasMore: boolean }
             | { operationId: string; state: "approved" | "fill_approved" | "send_approved"; approvedAt: number; expiresAt: number }
-            | { accepted: boolean }
+            | { accepted: boolean } | { preserved: number } | { rebound: number }
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"), request.deadlineMs);
@@ -213,6 +215,16 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               const result = await client.approveChatAgent(request.payload.target, request.payload.agentId);
               if (result.kind !== "chat_agent_approved") throw new Error("Broker refused agent approval");
               kind = "chat_agent_approved";
+              payload = result.payload;
+            } else if (request.kind === "begin_chat_reload") {
+              const result = await client.beginChatReload(request.payload.target);
+              if (result.kind !== "chat_reload_started") throw new Error("Broker refused reload suspension");
+              kind = "chat_reload_started";
+              payload = result.payload;
+            } else if (request.kind === "rebind_chat") {
+              const result = await client.rebindChat(request.payload.previous, request.payload.target);
+              if (result.kind !== "chat_rebound") throw new Error("Broker refused chat rebind");
+              kind = "chat_rebound";
               payload = result.payload;
             } else if (request.kind === "disconnect_chat") {
               const result = await client.disconnectChat(request.payload.target);

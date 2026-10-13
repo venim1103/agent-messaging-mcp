@@ -46,6 +46,12 @@ const requestSchema = z.discriminatedUnion("kind", [
     target: z.union([fixtureTarget, geminiTarget])
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_available_agents"), payload: z.strictObject({}) }),
+  z.strictObject({ ...envelope, kind: z.literal("begin_chat_reload"), payload: z.strictObject({
+    target: z.union([fixtureTarget, geminiTarget])
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("rebind_chat"), payload: z.strictObject({
+    previous: z.union([fixtureTarget, geminiTarget]), target: z.union([fixtureTarget, geminiTarget])
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("disconnect_chat"), payload: z.strictObject({
     target: z.union([fixtureTarget, geminiTarget])
   }) }),
@@ -221,6 +227,12 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return role === "facade"
       ? { ...response, kind: "connection_wait_authorized" as const, payload: request.payload }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "begin_chat_reload" || request.kind === "rebind_chat") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    return request.kind === "begin_chat_reload"
+      ? { ...response, kind: "chat_reload_started" as const, payload: { preserved: requests.beginChatReload(request.payload.target, now) } }
+      : { ...response, kind: "chat_rebound" as const, payload: { rebound: requests.rebindChat(request.payload.previous, request.payload.target, now) } };
   }
   if (request.kind === "approve_chat_agent") {
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };

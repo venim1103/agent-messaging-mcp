@@ -126,6 +126,73 @@ for (const target of [
   });
 }
 
+for (const target of [
+  { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
+  { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
+    documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" }
+] as const) {
+  test(`${target.origin} reload rebind preserves only existing autonomous owners and invalidates observations`, async () => {
+    const requests = new PendingConnectionRequests();
+    const first = Symbol("first owner");
+    const second = Symbol("second owner");
+    const legacy = Symbol("legacy owner");
+    const firstAgent = requests.registerAgent(first);
+    const secondAgent = requests.registerAgent(second);
+    const firstGrant = requests.approveAgent(firstAgent.agentId, target, 1000);
+    const secondGrant = requests.approveAgent(secondAgent.agentId, target, 1000);
+    const pending = requests.create(legacy, 1000);
+    const legacyGrant = target.origin === "https://gemini.google.com"
+      ? requests.approveGemini(pending.requestId, target, 1000) : requests.approve(pending.requestId, target, 1000);
+    assert.ok(firstGrant && secondGrant && legacyGrant);
+    const updated = { ...target, documentId: "reloaded-document" };
+    assert.equal(requests.rebindChat(target, updated, 1000), 0);
+    const publish = (selected: ApprovedTarget, now: number) => selected.origin === "https://gemini.google.com"
+      ? requests.publishGeminiSnapshot(selected, [{ direction: "incoming", text: "Synthetic reply" }], now)
+      : requests.publishFixtureSnapshot(selected, [{ id: "row", direction: "incoming", text: "Synthetic reply" }], now);
+    assert.equal(publish(target, 1000), 3);
+    const snapshot = target.origin === "https://gemini.google.com"
+      ? requests.getGeminiSnapshot(first, firstGrant.connectionId, 1000)
+      : requests.getFixtureSnapshot(first, firstGrant.connectionId, 1000);
+    assert.ok(snapshot && snapshot !== "not_ready");
+    const read = target.origin === "https://gemini.google.com"
+      ? requests.requestFreshGeminiRead(first, firstGrant.connectionId, 1000)
+      : requests.requestFreshFixtureRead(first, firstGrant.connectionId, 1000);
+    assert.ok(read && read !== "busy");
+    assert.equal(requests.beginChatReload(target, 1001), 2);
+    assert.equal(await read.result, "not_ready");
+    assert.equal(requests.get(legacy, pending.requestId, 1001)?.state, "stale");
+    assert.equal(requests.getConnectionExpiresAt(first, firstGrant.connectionId, 1001), null);
+    assert.equal(publish(target, 1001), 0);
+    assert.equal(requests.rebindChat(target, { ...updated, tabId: 4 }, 1001), 0);
+    assert.equal(requests.rebindChat(target, target, 1001), 0);
+    if (target.origin === "https://gemini.google.com") {
+      assert.equal(requests.rebindChat(target, { ...target, documentId: updated.documentId, url: `${target.url}?other` }, 1001), 0);
+    }
+    assert.equal(requests.approveAgent(firstAgent.agentId, target, 1001), firstGrant);
+    assert.equal(requests.removeChatAgent(secondAgent.agentId, target, 1001), 1);
+    assert.equal(requests.rebindChat(target, updated, 1002), 1);
+    assert.equal(requests.rebindChat(target, updated, 1002), 0);
+    assert.equal(requests.get(first, firstGrant.requestId, 1002)?.state, "ready");
+    assert.equal(requests.get(second, secondGrant.requestId, 1002)?.state, "stale");
+    assert.equal(publish(target, 1002), 0);
+    assert.equal(publish(updated, 1002), 1);
+    const events = target.origin === "https://gemini.google.com"
+      ? requests.readGeminiEvents(first, firstGrant.connectionId, snapshot.cursor, 2, 1002)
+      : requests.readFixtureEvents(first, firstGrant.connectionId, snapshot.cursor, 2, 1002);
+    assert.ok(events && typeof events === "object");
+    assert.equal(events.state, "expired");
+    const rebound = requests.get(first, firstGrant.requestId, 1002);
+    assert.ok(rebound?.state === "ready");
+    assert.equal(rebound.connectionId, firstGrant.connectionId);
+    assert.equal(requests.beginChatReload(updated, 1003), 1);
+    assert.equal(requests.disconnectFixture(first, firstGrant.connectionId, 1003), true);
+    assert.equal(requests.rebindChat(updated, { ...updated, documentId: "another-document" }, 1003), 0);
+    requests.disconnect(first);
+    requests.disconnect(second);
+    requests.disconnect(legacy);
+  });
+}
+
 test("connection pickup waits for only its approved registered owner and cancels without authority", async () => {
   const requests = new PendingConnectionRequests();
   const first = Symbol("first owner");
