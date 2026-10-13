@@ -286,12 +286,12 @@ Sending has external effects. A successful DOM click is not sufficient evidence 
 
 1. **Prepare:** validate the connection, text limits, idempotency key, and target identity. Create an operation bound to the exact text and connection generation. Do not modify the website yet.
 2. **Authorize:** display the exact message and target in trusted extension UI. Human approval is bound to the operation, expires quickly, and cannot be supplied as an agent-controlled `approved: true` argument.
-3. **Preflight:** acquire the connection's writer lock; recheck the current document/conversation and ensure the composer has no unrelated draft. Confirm the send control is available and unobstructed.
+3. **Preflight:** acquire writer coordination for the shared composer across owners; recheck the current document/conversation and ensure the composer has no unrelated draft. Confirm the send control is available and unobstructed.
 4. **Fill:** enter text using the verified editor strategy. Read it back and compare against the approved content, allowing only explicitly documented editor normalization. Abort on unexpected user edits or identity changes.
 5. **Commit:** durably record that dispatch is starting, recheck the target and approval, then activate the send control once. The browser side rejects duplicate operation dispatches within its current generation.
 6. **Reconcile:** inspect newly observed outgoing-message evidence and application status. Correlate native message ID, direction, content, and observation ordering when available. Composer clearing alone is not confirmation.
 
-Default policy is approval for each send. A later explicitly granted autonomous mode can be limited to one conversation, a short lifetime, and a small message/rate budget. The agent must not be able to widen that grant itself.
+The steps above describe supervised mode with per-message approval. The product default is the decided autonomous mode below: trusted exact-chat connection approval, no agent-created or widened authority, and all machine-side guards retained.
 
 **Decision (2026-10-09, D1):** Autonomous mode is the product default. The single **Connect this chat** approval allows the agent to send in that chat until the connection ends; the agent cannot create, widen or renew it. A runaway guard allows one message at a time and a generous, configurable hourly cap. Every machine-side guard still applies to each message. Because no person reviews individual messages, chat content can steer what the agent sends into that chat (prompt injection), and the approval text must say so. The supervised three-consent flow remains for tests and as an optional stricter mode.
 
@@ -331,7 +331,7 @@ D10a (decided 2026-10-13): the system may clear only its own exactly matching le
 | State | What the caller may infer |
 | --- | --- |
 | `prepared` / `awaiting_approval` | No submission has occurred |
-| `approved` | Permission exists for this exact operation, subject to fresh preflight checks |
+| `approved` | Ordinary no-send review only in supervised mode; not fill or Send consent |
 | `dispatching` | Submission may be in progress; do not create a replacement operation |
 | `observed_in_ui` | Matching outgoing evidence appeared; this may still be a local optimistic echo |
 | `accepted_by_service` | The adapter observed a documented UI indicator of service acceptance |
@@ -539,7 +539,7 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D7 Checkpoint size: decided.** One checkpoint per authority boundary when it follows an established pattern, with shorter handoff entries.
 - **D8 Observation window and failure policy: decided.** Publish the newest rows with `omittedBefore`, mark per-message truncation explicitly within the frame limit, and when URL, document and conversation are unchanged skip a failed capture instead of revoking; challenged reads then return `OBSERVATION_UNAVAILABLE`. Identity changes still revoke.
 - **D9 Gemini outcome evidence: decided.** The append-only rule in section 10.
-- **D10 Unconfirmed sends: decided.** Resolve from page evidence and pause only the affected chat when still unclear, with a one-click popup resolution; the barrier becomes per connection (section 10).
+- **D10 Unconfirmed sends: decided.** Resolve from page evidence and pause only the affected conversation across all owners when still unclear, with a one-click popup resolution. New keyed attempts use the shared conversation barrier; legacy unkeyed attempts remain globally blocking (section 10, D13a).
 - **D10a Leftover draft: decided (2026-10-13).** The user permits clearing only the agent's own exactly matching unsent leftover draft, never a person's draft. Require fresh target/ownership evidence and resolve uncertainty first; no retry or restored authority. See section 10. This policy is not a live-test grant.
 - **D11 Hidden tab: decided, phased.** First the chat tab must stay visible; its own window is fine, so "active tab of the current window" relaxes to "visible tab". Later a hidden tab must work too, so that only closing the tab or the browser disconnects.
 - **D12 Target platform: decided.** Keep the devcontainer: container Chromium, native host, broker and MCP server in one container (section 12).

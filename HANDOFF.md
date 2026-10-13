@@ -16,10 +16,11 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest source checkpoint: T3e retained-composer fill coordination (entry below), after T3d `f8dc3f1`, T3c `077094a`, T3b `9bdb622`, T3a `3fcf811` and T2d `7de5862`. Its third exact gate passed build, both typechecks, **203/203 units and 36/36 e2e checks** after the documented failures and substantive repairs. T3d connects trusted relay-only resolution; T3e blocks a new fill while another live operation retains that exact composer. Page resolution and provider-neutral autonomous orchestration remain missing.
+- Latest source checkpoint: T3e `17d9599` retained-composer fill coordination (entry below), after T3d `f8dc3f1`, T3c `077094a`, T3b `9bdb622`, T3a `3fcf811` and T2d `7de5862`. Its third exact gate passed build, both typechecks, **203/203 units and 36/36 e2e checks** after the documented failures and substantive repairs. T3d connects trusted relay-only resolution; T3e blocks a new fill while another live operation retains that exact composer. Page resolution and provider-neutral autonomous orchestration remain missing.
 - T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Installed Gemini single-owner approval/pickup, fresh reads, same-chat events and removal now passed (entry below). Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3d's installed fixture empty-status check passed after coordinated reload; installed outcome buttons remain untested.
 - Latest installed write evidence: one supervised fixture textarea message passed separate trusted draft, fill and Send approvals, one MCP fill and one submit, `observed_in_ui`, fresh read/status and the person's visual confirmation of one outgoing row with an empty editor. An earlier fill refusal/expiry is preserved below. This is not autonomous sending, Gemini writing or installed T3e coordination evidence.
-- Current coordination: the worktree was clean before the fixture user test, with source `17d9599` pushed and documentation `b75649e` local. Existing fixture HTTP 200 was verified; no build, restart or extension reload occurred. The earlier Gemini grants were removed. The refused fixture preparation expired; after an explicitly requested fresh attempt, the successful fixture grant was disconnected through MCP (`disconnected: true`). Do not assume any current approval.
+- Handover baseline before this documentation review: clean checkout `fedd15b`, two local documentation commits (`b75649e`, `fedd15b`) ahead of tracked `origin/main` at source `17d9599`. Recheck Git state on arrival; this review adds a documentation checkpoint only.
+- Current coordination: local process metadata confirms the existing broker, MCP facade and fixture server at handover review. No build, restart or extension reload occurred. The earlier Gemini grants were removed; the refused fixture preparation expired and the successful fixture grant was disconnected (`disconnected: true`). Do not assume any current approval, transfer old handles to a new owner or treat a previous test as fresh permission.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 - Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e has synthetic/source-gate evidence only. A future reload ends current grants; do not assume the running broker already loaded this newer guard.
 
@@ -97,7 +98,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 ### Findings: process and documentation
 
-- The project has 139 commits in 15 days. Each boundary (ledger, private transport, trusted UI, worker, public tool) was a separate gated checkpoint with a long handoff entry (D7).
+- Earlier review snapshot, not a current repository count: 139 commits in 15 days. Each boundary (ledger, private transport, trusted UI, worker, public tool) was a separate gated checkpoint with a long handoff entry (D7).
 - This file is about 260 KB. Before the review, two documentation lines exceeded the 2,000-character limit of agent file readers, and DEVELOPMENT.md was mostly dated history. The review added this dashboard, split those lines, rewrote DEVELOPMENT.md as a reference and added readability rules to AGENTS.md.
 
 ### Decisions
@@ -173,6 +174,15 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## Next-Session Documentation Review (2026-10-13)
+
+- Reviewed the dashboard/newest acceptance entries, README.md, DEVELOPMENT.md, AGENTS.md and DESIGN.md sections 8, 10 and 17 against the actual checkout. Baseline Git commands showed clean `fedd15b`, tracked remote at `17d9599` and two local documentation commits. No implementation changes or live browser/MCP operations were performed for this review.
+- Corrected stale DESIGN.md wording: D10 is conversation-scoped across owners, preflight coordination covers the shared composer, and supervised `approved` is ordinary no-send review only. The old default-policy paragraph now defers to decided D1. No new product decision, consent type or security relaxation was introduced; the public README already accurately describes present limitations.
+- Continue T3, not another user-testing session: one provider-neutral autonomous broker pipeline, bounded owner-specific waiting and whole-loop composer coordination, then the missing Gemini relay/worker submit and D9 page evidence. Preserve one absolute send deadline, inner leases at most four seconds, one-offer jobs, durable intent, browser reservation and one activation. The existing retained-composer guard is not a completed scheduler or public `chat_send_message`.
+- Start locally with the operation ledger and neighboring tests, then the owning broker orchestration path. Reuse existing fixture commit/fill/proof primitives rather than copying provider command families. T4 completion and T5 live acceptance follow the working synthetic pipeline. D10a own-leftover clearing is decided but unimplemented; text equality alone is not ownership. See DESIGN.md sections 8, 10 and 17 and AGENTS.md Safety Boundaries.
+- Installed services were last reloaded at `f8dc3f1`, not the latest source. Prior human-approved grants are ended; a new facade is a new owner. User gestures and fresh bounded authorization remain necessary for live reads, fills or sends. Open the real toolbar panel over the selected chat, not the extension UI as a full tab. Earlier refused/expired attempts and timing failures remain in their entries; a clean diagnostic sample is not a global timing fix.
+- Documentation-only content/link/line-length/whitespace and editor validation apply. Do not rerun the unchanged successful source gate, restart services, push or resume implementation as part of this handover task. The continuation prompt is delivered to the person; the next AI should implement autonomously within agreed scope, without subagents, until a tested checkpoint or genuine blocker.
 
 ## Installed Supervised Fixture Fill And Send (2026-10-13)
 
