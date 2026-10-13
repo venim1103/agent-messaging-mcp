@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-13 (T3d trusted person-resolution transport/UI gated; installed fixture T2 pickup/read/reload/removal remains verified; page evidence and shared-composer send orchestration next).
+Updated: 2026-10-13 (T3d trusted resolution transport/UI gated and installed fixture empty-status check observed; page evidence and shared-composer send orchestration next).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,9 +16,9 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest source checkpoint: T3d trusted person-resolution transport/UI (entry below), after T3c `077094a`, T3b `9bdb622`, T3a `3fcf811` and T2d `7de5862`. Its fourth exact gate passed build, both typechecks, **201/201 units and 36/36 e2e checks** after the documented failed gates and substantive repairs. It connects relay-only resolution commands and trusted selected-chat controls. Page resolution, shared-composer serialization and autonomous send orchestration remain missing.
-- T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and live Gemini admission remain unverified. No installed acceptance of T3d controls occurred.
-- Current coordination: local fixture HTTP 200 and Chromium process checked; no-data MCP diagnostic passed. The person confirmed the fixture visible and approved this MCP client through the popup. Pickup and fresh reads worked; same-tab reload retained the original handle with a new cursor epoch. The person then removed access; pickup returned no connections and the former handle returned `CONNECTION_NOT_FOUND` without page access. No current approval should be assumed; no live-site access, draft fill or send occurred.
+- Latest source checkpoint: T3d trusted person-resolution transport/UI `f8dc3f1` (entry below), after T3c `077094a`, T3b `9bdb622`, T3a `3fcf811` and T2d `7de5862`. Its fourth exact gate passed build, both typechecks, **201/201 units and 36/36 e2e checks** after the documented failed gates and substantive repairs. It connects relay-only resolution commands and trusted selected-chat controls. Page resolution, shared-composer serialization and autonomous send orchestration remain missing.
+- T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and live Gemini admission remain unverified. T3d's installed fixture empty-status check passed after coordinated reload; installed outcome buttons remain untested.
+- Current coordination: fixture HTTP 200 and a private owned broker socket verified. With explicit permission, the verified workspace broker was stopped and the compiled `f8dc3f1` broker started; this ended existing grants. The person confirmed MCP restart and installed extension reload, then reported the fixture popup's empty resolution status after **Refresh status**. The no-data MCP diagnostic passed. No Connect/fill/Send was requested; no connector reads/writes or live-site access occurred. T2's earlier installed pickup/read/reload/removal evidence remains in its dated entry. No current approval should be assumed.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
 ### Capability matrix
@@ -38,7 +38,7 @@ The trusted popup retains Gemini pending-request approval, ordinary review, fill
 
 The popup shows facade labels/IDs, exact-chat connected counts, per-agent **Connect this chat**, **Remove access** and **Disconnect all**. It requests optional origin permission from the trusted click; before script access, it shows available owners with chat status unknown, not a proven zero count. New grants are `ready`, read/send-capable and `expiresAt: null`; legacy grants remain five-minute `ready_readonly`. Labels are reported/configured client names, not verified models. Installed single-owner fixture admission/removal is verified; fresh optional-permission prompt appearance, installed multi-owner behavior and live Gemini admission are unverified.
 
-T3d adds **Unconfirmed Sends** with on-demand **Refresh status** and per-attempt **Sent** / **Not sent** choices. It lists at most eight eligible exact-chat operation IDs/timestamps, never message text. Choices record immutable person assessments only; they do not refill, resend, clear a draft or change grants. Isolated fixture/routed-Gemini checks pass, including stale/malformed replies and content-page refusal. The empty state means nothing is currently eligible to resolve, not proof that no uncertainty exists. Installed acceptance and page-attributed resolution remain unverified/unimplemented respectively.
+T3d adds **Unconfirmed Sends** with on-demand **Refresh status** and per-attempt **Sent** / **Not sent** choices. It lists at most eight eligible exact-chat operation IDs/timestamps, never message text. Choices record immutable person assessments only; they do not refill, resend, clear a draft or change grants. Isolated fixture/routed-Gemini checks pass, including stale/malformed replies and content-page refusal. The empty state means nothing is currently eligible to resolve, not proof that no uncertainty exists. Installed fixture empty-status acceptance passed; installed outcome choices remain untested and page-attributed resolution is unimplemented.
 
 Autonomous same-chat reload preserves existing handles after fresh new-document identity verification, invalidates observation cursors and reinstalls observers. Old-document reads/publications are blocked during suspension; removal/disconnect still work. Only the exact URL/chat/tab may rebind; legacy reload still revokes. Failure or uncertainty disconnects pinned targets, without new approval, automatic readmission or job replay. Installed fixture reload retained the same handle and produced a fresh cursor epoch; failure/race coverage and Gemini reload evidence remain synthetic.
 
@@ -82,7 +82,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 - **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer now holds 128 events or 4 MiB (T1b), so streaming can still expire cursors. Agents should treat events as change hints and re-read (D3, T4).
 - **R6 Gemini commits would end uncertain.** Fixture evidence uses stable row IDs; Gemini rows have none (D9).
 - **R7 Setup and target limits.** Automatic broker start/startup facade connection is gated in T2a (D4); manual start is optional debugging. Only saved chats with exactly two path segments, such as `https://gemini.google.com/app/<id>`, qualify; new unsaved chats and multi-account paths such as `/u/<n>/app/<id>` do not. Fill and submit need the chat tab to be the active tab of the current window and visible (D11 relaxes this to visible).
-- **R8 Partially fixed (T3a/T3c/T3d).** New attempts pause only their conversation across owners/tabs/restarts; fill admission and pending Gemini fills share the scope. Old unkeyed attempts block globally. T3c/T3d connect immutable person-attributed ledger outcomes to relay-only actions and trusted exact-chat popup controls after the old activation lease, without restoring authority or dropping hourly counts. The full gate passes; page resolution remains missing and installed services have not been restarted to load this work.
+- **R8 Partially fixed (T3a/T3c/T3d).** New attempts pause only their conversation across owners/tabs/restarts; fill admission and pending Gemini fills share the scope. Old unkeyed attempts block globally. T3c/T3d connect immutable person-attributed ledger outcomes to relay-only actions and trusted exact-chat popup controls after the old activation lease, without restoring authority or dropping hourly counts. The full gate passes; installed services were reloaded and fixture empty status observed. Installed resolution choices remain untested; page resolution remains missing.
 
 ### Findings: architecture and maintainability
 
@@ -102,7 +102,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-Continue shared-composer serialization and provider-neutral send orchestration/page evidence. T3a-T3d are gated; installed T2 fixture pickup/read/reload/removal passed and D10a is decided. T3d installed visual/status acceptance needs coordinated broker/MCP/extension reload and a person's trusted popup gesture, not fabricated uncertain work in their profile. The fixture grant was removed; no live-site inspection, fill or send is authorized by this work. Keep the earlier native/broker startup and timing failures as unresolved diagnostic history; do not weaken limits or rerun an unchanged successful gate.
+Continue shared-composer serialization and provider-neutral send orchestration/page evidence. T3a-T3d are gated; installed T2 fixture pickup/read/reload/removal and T3d fixture empty-status checks passed, and D10a is decided. Do not fabricate uncertain work in the person's profile to test outcome choices. No live-site inspection, fill or send is authorized by this status check. Keep the earlier native/broker startup and timing failures as unresolved diagnostic history; do not weaken limits or rerun an unchanged successful gate.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -169,6 +169,13 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## Installed Fixture Resolution Empty Status (2026-10-13)
+
+- Source `f8dc3f1` was committed after the exact 201/36 gate; the worktree was clean and nothing pushed. Fixture HTTP 200 and private socket metadata were verified without browser data. The person explicitly authorized broker restart for a fixture-only popup status check; before SIGTERM, verify the broker's PID, UID, exact workspace executable/cwd and expected HOME. The rebuilt broker was started and its private socket checked; all old grants ended.
+- The person reported the **Unconfirmed Sends** empty state after **Refresh status**, then explicitly confirmed restarting `browserChatFeasibility` and reloading the installed extension in container Chromium. The no-data MCP diagnostic returned success. This establishes installed empty-state/status connectivity, not either outcome button, delivery, a connection grant or live Gemini behavior.
+- No Connect approval, fill or Send was requested, and no connector chat read/write was invoked. The actual profile was not automated or seeded with synthetic intents. The fixture and broker remain intentionally available; do not assume a grant exists. Installed **Sent** / **Not sent** action acceptance remains synthetic-only until a separately authorized bounded scenario can establish it safely.
+- This is a documentation-only acceptance checkpoint. Scoped content/link/line-length/whitespace and editor checks apply; the unchanged successful application gate is not rerun. Next: shared-composer coordination and provider-neutral send orchestration/page evidence. See AGENTS.md Safety Boundaries.
 
 ## T3d Trusted Person-Resolution Transport And Popup (2026-10-13)
 
