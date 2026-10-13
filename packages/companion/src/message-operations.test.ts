@@ -578,10 +578,21 @@ test("staged Gemini and fixture durable jobs share one slot without consuming th
         assert.equal(ledger.completeFixtureDispatch(fixtureTarget, fixture.operationId, fixture.operationId, refused, 2008), true);
       }
       assert.equal((await first.result).state, "dispatch_uncertain");
-      assert.throws(() => requestSecond(2009), /DISPATCH_UNCERTAIN/);
-      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
-      assert.deepEqual(ledger.listGeminiDispatchAttempts(2009), []);
-      assert.deepEqual(ledger.listFixtureDispatchAttempts(2009), []);
+      const second = requestSecond(2009);
+      assert.equal(second.operationId, waiting.operationId);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 2);
+      if (firstProvider === "gemini") {
+        assert.deepEqual(ledger.listGeminiDispatchAttempts(2009), []);
+        assert.equal(ledger.listFixtureDispatchAttempts(2009)[0]?.operationId, waiting.operationId);
+        assert.equal(ledger.completeFixtureDispatch(fixtureTarget, fixture.operationId, fixture.operationId, refused, 2010), true);
+      } else {
+        assert.deepEqual(ledger.listFixtureDispatchAttempts(2009), []);
+        assert.equal(ledger.listGeminiDispatchAttempts(2009)[0]?.operationId, waiting.operationId);
+        assert.equal(ledger.completeGeminiDispatch(geminiTarget, gemini.operationId, gemini.operationId, refused, 2010), true);
+      }
+      assert.equal((await second.result).state, "dispatch_uncertain");
+      assert.deepEqual(ledger.listGeminiDispatchAttempts(2010), []);
+      assert.deepEqual(ledger.listFixtureDispatchAttempts(2010), []);
     } finally {
       ledger.disconnect(owner);
       database.close();
@@ -662,6 +673,175 @@ test("staged Gemini durable intent requires separate owned receipt, Send consent
   } finally {
     ledger.disconnect(owner);
     database.close();
+  }
+});
+
+test("conversation-scoped dispatch intent shares uncertainty across owners without blocking unrelated chats", async () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  const ledger = new PreparedMessageOperations(requests, database);
+  const firstOwner = Symbol("first shared-chat owner");
+  const secondOwner = Symbol("second shared-chat owner");
+  const thirdOwner = Symbol("owner after ledger restart");
+  let restarted: PreparedMessageOperations | undefined;
+  const operations: { owner: symbol; operationId: string; checkId: string }[] = [];
+  try {
+    const cases = [
+      [firstOwner, "synthetic-shared", 3],
+      [secondOwner, "synthetic-shared", 4],
+      [secondOwner, "fixture-alpha", 5]
+    ] as const;
+    for (const [owner, conversationId, tabId] of cases) {
+      const target = { origin: "https://gemini.google.com" as const, conversationId,
+        url: `https://gemini.google.com/app/${conversationId}`, tabId, documentId: `synthetic-document-${tabId}` };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+      const text = `Synthetic shared journal operation ${tabId}`;
+      const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, text,
+        `a66b3997-9d43-4554-8399-267d1fe9f75${tabId}`, 2001);
+      const review = ledger.listGeminiReviews(target, 2002).reviews[0]!;
+      ledger.approveGeminiReview(target, prepared.operationId, review.reviewId, 2002);
+      await approveSyntheticGeminiSend(ledger, owner, prepared.operationId, target, 2003);
+      ledger.createGeminiRecoveryReceipt(owner, prepared.operationId, 2003);
+      requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic journal baseline" }], 2004);
+      const checkId = await checkSyntheticGeminiDispatch(ledger, owner, prepared.operationId, target, text, 2005);
+      operations.push({ owner, operationId: prepared.operationId, checkId });
+    }
+    const [first, shared, unrelated] = operations;
+    assert.ok(first && shared && unrelated);
+    ledger.recordGeminiDispatchStart(first.owner, first.operationId, 2006, first.checkId);
+    assert.throws(() => ledger.recordGeminiDispatchStart(shared.owner, shared.operationId, 2006, shared.checkId),
+      /DISPATCH_UNCERTAIN/);
+    assert.ok(ledger.getGeminiSendAuthorization(shared.owner, shared.operationId, 2006));
+    assert.ok(ledger.getGeminiDispatchProof(shared.owner, shared.operationId, shared.checkId, 2006));
+    assert.equal(ledger.recordGeminiDispatchStart(unrelated.owner, unrelated.operationId, 2006, unrelated.checkId).state,
+      "dispatching");
+    const attempts = database.prepare("SELECT conversation_key FROM message_dispatch_attempts").all();
+    assert.equal(attempts.length, 2);
+    assert.notEqual(attempts[0]?.conversation_key, attempts[1]?.conversation_key);
+    assert(attempts.every(attempt => typeof attempt.conversation_key === "string" && /^[a-f0-9]{64}$/.test(attempt.conversation_key)));
+    assert(!JSON.stringify(attempts).includes("synthetic-shared"));
+    assert(!JSON.stringify(attempts).includes("gemini.google.com"));
+    const keyBefore = database.prepare("SELECT key FROM message_conversation_key WHERE singleton = 1").get()?.key;
+    restarted = new PreparedMessageOperations(requests, database);
+    const keyAfter = database.prepare("SELECT key FROM message_conversation_key WHERE singleton = 1").get()?.key;
+    assert.ok(keyBefore instanceof Uint8Array && keyAfter instanceof Uint8Array);
+    assert.equal(Buffer.from(keyBefore).equals(Buffer.from(keyAfter)), true);
+    assert.equal(restarted.getGeminiSendAuthorization(shared.owner, shared.operationId, 2010), null);
+    for (const [conversationId, tabId] of [["synthetic-shared", 6], ["synthetic-after-restart", 7]] as const) {
+      const target = { origin: "https://gemini.google.com" as const, conversationId,
+        url: `https://gemini.google.com/app/${conversationId}`, tabId, documentId: `synthetic-reloaded-document-${tabId}` };
+      const pending = requests.create(thirdOwner, 2010);
+      const grant = requests.approveGemini(pending.requestId, target, 2010)!;
+      const prepared = restarted.prepareGemini(thirdOwner, grant.connectionId, 1, "Synthetic restart fill",
+        `a66b3997-9d43-4554-8399-267d1fe9f75${tabId}`, 2010);
+      const review = restarted.listGeminiReviews(target, 2011).reviews[0]!;
+      restarted.approveGeminiReview(target, prepared.operationId, review.reviewId, 2011);
+      const fill = restarted.listGeminiFillReviews(target, 2011).reviews[0]!;
+      restarted.approveGeminiFillReview(target, prepared.operationId, fill.reviewId, 2011);
+      const filling = restarted.requestGeminiFill(thirdOwner, prepared.operationId, 2012);
+      if (conversationId === "synthetic-shared") {
+        assert.equal(filling, null);
+        assert.ok(restarted.getGeminiFillAuthorization(thirdOwner, prepared.operationId, 2013));
+      } else {
+        assert.ok(filling && filling !== "busy");
+        assert.equal(restarted.listGeminiFillChallenges(2013)[0]?.attemptId, filling.attemptId);
+        assert.equal(restarted.completeGeminiFill(target, filling.attemptId, { ok: true, editor: "contenteditable" }, 2014), true);
+        assert.equal((await filling.result)?.ok, true);
+      }
+    }
+    const fixtureTarget = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 8, documentId: "synthetic-other-provider-document" };
+    const fixturePending = requests.create(thirdOwner, 2010);
+    const fixtureGrant = requests.approve(fixturePending.requestId, fixtureTarget, 2010)!;
+    const fixture = restarted.prepare(thirdOwner, fixtureGrant.connectionId, 1, "Synthetic other-provider fill",
+      "a66b3997-9d43-4554-8399-267d1fe9f758", 2010);
+    const review = restarted.listFixtureReviews(fixtureTarget, 2011).reviews[0]!;
+    restarted.approveFixtureReview(fixtureTarget, fixture.operationId, review.reviewId, 2011);
+    const fill = restarted.listFixtureFillReviews(fixtureTarget, 2012).reviews[0]!;
+    restarted.approveFixtureFillReview(fixtureTarget, fixture.operationId, fill.reviewId, 2012);
+    assert.ok(restarted.consumeFixtureFillApproval(thirdOwner, fixture.operationId, 2013));
+  } finally {
+    restarted?.disconnect(thirdOwner);
+    ledger.disconnect(firstOwner);
+    ledger.disconnect(secondOwner);
+    database.close();
+  }
+});
+
+test("conversation-scoped journal migration leaves legacy unresolved attempts globally blocking", () => {
+  const database = new DatabaseSync(":memory:");
+  const requests = new PendingConnectionRequests();
+  const ledger = new PreparedMessageOperations(requests, database);
+  const owner = Symbol("legacy journal owner");
+  const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-legacy",
+    url: "https://gemini.google.com/app/synthetic-legacy", tabId: 3, documentId: "synthetic-legacy-document" };
+  const pending = requests.create(owner, 1000);
+  const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+  let migrated: PreparedMessageOperations | undefined;
+  try {
+    const legacy = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic legacy journal operation",
+      "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+    database.exec("ALTER TABLE message_dispatch_attempts DROP COLUMN conversation_key; DROP TABLE message_conversation_key");
+    database.prepare("INSERT INTO message_dispatch_attempts (operation_id, started_at, state) VALUES (?, ?, 'dispatching')")
+      .run(legacy.operationId, 2002);
+    migrated = new PreparedMessageOperations(requests, database);
+    assert.equal(database.prepare("SELECT conversation_key FROM message_dispatch_attempts").get()?.conversation_key, null);
+    assert.equal(database.prepare("SELECT state FROM message_dispatch_attempts").get()?.state, "unknown");
+    const keys = database.prepare("SELECT key FROM message_conversation_key").all();
+    assert.equal(keys.length, 1);
+    assert.ok(keys[0]?.key instanceof Uint8Array && keys[0].key.length === 32);
+    const otherTarget = { ...target, conversationId: "synthetic-other-chat", url: "https://gemini.google.com/app/synthetic-other-chat",
+      tabId: 4, documentId: "synthetic-other-document" };
+    const otherPending = requests.create(owner, 2003);
+    const otherGrant = requests.approveGemini(otherPending.requestId, otherTarget, 2003)!;
+    const prepared = migrated.prepareGemini(owner, otherGrant.connectionId, 1, "Synthetic legacy-blocked fill",
+      "b66b3997-9d43-4554-8399-267d1fe9f75c", 2004);
+    const review = migrated.listGeminiReviews(otherTarget, 2005).reviews[0]!;
+    migrated.approveGeminiReview(otherTarget, prepared.operationId, review.reviewId, 2005);
+    const fill = migrated.listGeminiFillReviews(otherTarget, 2006).reviews[0]!;
+    migrated.approveGeminiFillReview(otherTarget, prepared.operationId, fill.reviewId, 2006);
+    assert.equal(migrated.consumeGeminiFillApproval(owner, prepared.operationId, 2007), null);
+    assert.ok(migrated.getGeminiFillAuthorization(owner, prepared.operationId, 2007));
+    database.prepare("INSERT INTO message_dispatch_evidence (operation_id, observed_at, message_id) VALUES (?, ?, ?)")
+      .run(legacy.operationId, 2007, "synthetic-legacy-ui-row");
+    assert.ok(migrated.consumeGeminiFillApproval(owner, prepared.operationId, 2008));
+    assert.equal(migrated.consumeGeminiFillApproval(owner, prepared.operationId, 2009), null);
+  } finally {
+    migrated?.disconnect(owner);
+    ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("conversation-scoped journal never replaces a malformed or lost persistent key", () => {
+  for (const fault of ["malformed", "missing-row", "missing-table"]) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("key-loss boundary");
+    try {
+      const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-key-loss",
+        url: "https://gemini.google.com/app/synthetic-key-loss", tabId: 3, documentId: "synthetic-key-loss-document" };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+      const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic keyed journal marker",
+        "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
+      database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
+        VALUES (?, ?, ?, 'dispatching')`).run(prepared.operationId, 2002, "a".repeat(64));
+      if (fault === "malformed") database.prepare("UPDATE message_conversation_key SET key = ?").run("x".repeat(32));
+      else if (fault === "missing-row") database.exec("DELETE FROM message_conversation_key");
+      else database.exec("DROP TABLE message_conversation_key");
+      assert.throws(() => new PreparedMessageOperations(requests, database), /DISPATCH_UNAVAILABLE/, fault);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      assert.equal(database.prepare("SELECT state FROM message_dispatch_attempts").get()?.state, "dispatching");
+      const key = database.prepare("SELECT key FROM message_conversation_key WHERE singleton = 1").get();
+      if (fault === "malformed") assert.equal(key?.key, "x".repeat(32));
+      else assert.equal(key, undefined);
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
   }
 });
 
@@ -2125,8 +2305,11 @@ test("private dispatch intent persists before any submit and restart refuses reu
     const checkId = checkSyntheticDispatch(ledger, owner, prepared.operationId, target, text, 2003);
     const started = ledger.recordFixtureDispatchStart(owner, prepared.operationId, 2004, checkId);
     assert.deepEqual(started, { operationId: prepared.operationId, state: "dispatching", startedAt: 2004 });
+    const conversationKey = database.prepare("SELECT conversation_key FROM message_dispatch_attempts").get()?.conversation_key;
+    assert.ok(typeof conversationKey === "string");
+    assert.match(conversationKey, /^[a-f0-9]{64}$/);
     assert.deepEqual(database.prepare("SELECT * FROM message_dispatch_attempts").all().map((row) => ({ ...row })), [
-      { operation_id: prepared.operationId, started_at: 2004, state: "dispatching" }
+      { operation_id: prepared.operationId, started_at: 2004, conversation_key: conversationKey, state: "dispatching" }
     ]);
     assert.deepEqual(ledger.getOperation(owner, prepared.operationId, 2005), {
       operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2004
@@ -2154,7 +2337,7 @@ test("private dispatch intent persists before any submit and restart refuses reu
     });
     assert.deepEqual(restarted.recoverOperationStatus(prepared.operationId, "invalid"), { state: "unknown" });
     assert.deepEqual(database.prepare("SELECT * FROM message_dispatch_attempts").all().map((row) => ({ ...row })), [
-      { operation_id: prepared.operationId, started_at: 2004, state: "unknown" }
+      { operation_id: prepared.operationId, started_at: 2004, conversation_key: conversationKey, state: "unknown" }
     ]);
     assert.equal(database.prepare("PRAGMA foreign_keys").get()?.foreign_keys, 1);
     const nextOwner = Symbol("new broker owner");

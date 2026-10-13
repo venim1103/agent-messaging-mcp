@@ -34,6 +34,8 @@ Private state, never committed:
 - `~/.config/agent-messaging-mcp/native-host` is the native launcher script.
 - `~/.local/share/agent-messaging-mcp/chromium-dev` is the Chromium profile (a Podman volume) with logins and the native host manifest. Treat it as sensitive.
 
+New dispatch attempts carry a conversation HMAC under a persistent 32-byte key in the private database. Unresolved attempts block new intents and fills in that chat for every owner, including after restart, not unrelated chats. Old unkeyed attempts retain global blocking. Missing/corrupt keys with keyed attempts fail startup; do not delete or regenerate the key/database to bypass uncertainty. Only existing UI evidence clears the pause today; resolution and autonomous sending remain unconnected.
+
 ## Setup
 
 Everything runs inside the Podman devcontainer ([devcontainer.json](.devcontainer/devcontainer.json)): Chromium, the extension, the native host, the broker and the MCP facade. Browsers on the Windows or WSL host cannot be used, and their tabs and logins are not reachable. Port 8787 is forwarded only for optional viewing of the fixture.

@@ -206,9 +206,27 @@ export class PreparedMessageOperations {
   private readonly fillChecks = new Map<string, PendingFixtureFill>();
   private readonly geminiFillChecks = new Map<string, PendingGeminiFill>();
   private readonly digestKey = randomBytes(32);
+  private readonly conversationDigestKey: Uint8Array;
 
   constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync) {
     database.exec("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL");
+    database.exec(`CREATE TABLE IF NOT EXISTS message_conversation_key (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      key BLOB NOT NULL CHECK (length(key) = 32)
+    )`);
+    let key = database.prepare("SELECT key FROM message_conversation_key WHERE singleton = 1").get();
+    if (!key) {
+      if (database.prepare("PRAGMA table_info(message_dispatch_attempts)").all()
+        .some(column => column.name === "conversation_key")
+        && database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE conversation_key IS NOT NULL LIMIT 1").get()) {
+        throw new Error("DISPATCH_UNAVAILABLE");
+      }
+      database.prepare("INSERT OR IGNORE INTO message_conversation_key (singleton, key) VALUES (1, ?)")
+        .run(randomBytes(32));
+      key = database.prepare("SELECT key FROM message_conversation_key WHERE singleton = 1").get();
+    }
+    if (!(key?.key instanceof Uint8Array) || key.key.length !== 32) throw new Error("DISPATCH_UNAVAILABLE");
+    this.conversationDigestKey = Buffer.from(key.key);
     database.exec(`CREATE TABLE IF NOT EXISTS prepared_message_operations (
       operation_id TEXT PRIMARY KEY,
       owner_id TEXT NOT NULL,
@@ -227,8 +245,13 @@ export class PreparedMessageOperations {
     database.exec(`CREATE TABLE IF NOT EXISTS message_dispatch_attempts (
       operation_id TEXT PRIMARY KEY REFERENCES prepared_message_operations(operation_id) ON DELETE RESTRICT,
       started_at INTEGER NOT NULL,
+      conversation_key TEXT CHECK (length(conversation_key) = 64),
       state TEXT NOT NULL CHECK (state IN ('dispatching', 'unknown'))
     )`);
+    if (!database.prepare("PRAGMA table_info(message_dispatch_attempts)").all()
+      .some(column => column.name === "conversation_key")) {
+      database.exec("ALTER TABLE message_dispatch_attempts ADD COLUMN conversation_key TEXT CHECK (length(conversation_key) = 64)");
+    }
     database.exec(`CREATE TABLE IF NOT EXISTS message_dispatch_evidence (
       operation_id TEXT PRIMARY KEY REFERENCES message_dispatch_attempts(operation_id) ON DELETE RESTRICT,
       observed_at INTEGER NOT NULL,
@@ -253,6 +276,19 @@ export class PreparedMessageOperations {
 
   private digest(value: string): string {
     return createHmac("sha256", this.digestKey).update(value).digest("hex");
+  }
+
+  private conversationKey(target: Pick<FixtureTarget | GeminiTarget, "origin" | "conversationId">): string {
+    return createHmac("sha256", this.conversationDigestKey)
+      .update(JSON.stringify([target.origin, target.conversationId])).digest("hex");
+  }
+
+  private hasUnresolvedDispatch(target: Pick<FixtureTarget | GeminiTarget, "origin" | "conversationId">): boolean {
+    return Boolean(this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
+      LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+      WHERE evidence.operation_id IS NULL
+      AND (attempt.conversation_key IS NULL OR attempt.conversation_key = ?) LIMIT 1`)
+      .get(this.conversationKey(target)));
   }
 
   private release(operationId: string): void {
@@ -555,9 +591,7 @@ export class PreparedMessageOperations {
 
   consumeGeminiFillApproval(owner: symbol, operationId: string, now = Date.now()) {
     const authorization = this.getGeminiFillAuthorization(owner, operationId, now);
-    if (!authorization || this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
-      LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
-      WHERE evidence.operation_id IS NULL LIMIT 1`).get()) return null;
+    if (!authorization || this.hasUnresolvedDispatch(authorization.target)) return null;
     this.fillApprovals.delete(operationId);
     this.fillReviewTokens.delete(operationId);
     this.consumedFillApprovals.add(operationId);
@@ -581,14 +615,11 @@ export class PreparedMessageOperations {
 
   private discardGeminiFillChecks(now: number): void {
     if (!this.geminiFillChecks.size) return;
-    const blocked = this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
-      LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
-      WHERE evidence.operation_id IS NULL LIMIT 1`).get();
     for (const [attemptId, pending] of this.geminiFillChecks) {
       const operation = this.geminiContents.get(pending.operationId);
       const live = operation && this.requests.getGeminiTarget(pending.owner, operation.connectionId, now);
       const approval = this.approvals.get(pending.operationId);
-      if (blocked || pending.expiresAt <= now || !operation || operation.owner !== pending.owner
+      if (this.hasUnresolvedDispatch(pending.target) || pending.expiresAt <= now || !operation || operation.owner !== pending.owner
         || !approval || approval.expiresAt <= now || !live || !this.sameGeminiTarget(pending.target, live)) {
         this.finishGeminiFillCheck(attemptId, null, now);
       }
@@ -737,9 +768,7 @@ export class PreparedMessageOperations {
 
   consumeFixtureFillApproval(owner: symbol, operationId: string, now = Date.now()) {
     const authorization = this.getFixtureFillAuthorization(owner, operationId, now);
-    if (!authorization || this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
-      LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
-      WHERE evidence.operation_id IS NULL LIMIT 1`).get()) return null;
+    if (!authorization || this.hasUnresolvedDispatch(authorization.target)) return null;
     this.fillApprovals.delete(operationId);
     this.fillReviewTokens.delete(operationId);
     this.consumedFillApprovals.add(operationId);
@@ -1203,7 +1232,7 @@ export class PreparedMessageOperations {
       throw new Error("RECOVERY_REQUIRED");
     }
     if (!this.getGeminiDispatchProof(owner, operationId, checkId ?? "", now)) throw new Error("DISPATCH_CHECK_REQUIRED");
-    this.recordDispatchIntent(operationId, now);
+    this.recordDispatchIntent(operationId, operation.target, now);
     this.approvals.delete(operationId);
     this.reviewTokens.delete(operationId);
     this.sendApprovals.delete(operationId);
@@ -1212,16 +1241,12 @@ export class PreparedMessageOperations {
     return Object.freeze({ operationId, state: "dispatching" as const, startedAt: now });
   }
 
-  private recordDispatchIntent(operationId: string, now: number): void {
+  private recordDispatchIntent(operationId: string, target: Pick<FixtureTarget | GeminiTarget, "origin" | "conversationId">, now: number): void {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      if (this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
-        LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
-        WHERE evidence.operation_id IS NULL LIMIT 1`).get()) {
-        throw new Error("DISPATCH_UNCERTAIN");
-      }
-      this.database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, state)
-        VALUES (?, ?, 'dispatching')`).run(operationId, now);
+      if (this.hasUnresolvedDispatch(target)) throw new Error("DISPATCH_UNCERTAIN");
+      this.database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
+        VALUES (?, ?, ?, 'dispatching')`).run(operationId, now, this.conversationKey(target));
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -1255,7 +1280,7 @@ export class PreparedMessageOperations {
       || check.checkedAt === null || check.checkedAt > now || check.expiresAt <= now) {
       throw new Error("DISPATCH_CHECK_REQUIRED");
     }
-    this.recordDispatchIntent(operationId, now);
+    this.recordDispatchIntent(operationId, operation.target, now);
     this.approvals.delete(operationId);
     this.reviewTokens.delete(operationId);
     this.sendApprovals.delete(operationId);

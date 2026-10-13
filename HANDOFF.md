@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-13 (T2d gated; installed fixture pickup/read/reload/removal verified; D10a decided; T3 next).
+Updated: 2026-10-13 (T3a conversation-scoped durable barrier gated; installed fixture T2 pickup/read/reload/removal verified; send orchestration next).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,7 +16,7 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest source checkpoint: T2d exact same-chat reload/rebind `7de5862` (entry below), after T2c `8960a0a`, T2b `c032ee7` and T2a `5b71471`. Its exact gate passed build, both typechecks, **193/193 units and 30/30 e2e checks**. T2's connection model is complete synthetically. Installed single-owner fixture pickup/read/reload/removal passed on 2026-10-13; fresh optional-permission prompt appearance, installed multi-owner/tab-close behavior and live Gemini admission remain unverified. Autonomous sending remains missing.
+- Latest source checkpoint: T3a conversation-scoped durable uncertainty barrier (entry below), after T2d `7de5862`. Its repaired exact gate passed build, both typechecks, **196/196 units and 30/30 e2e checks**. T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and live Gemini admission remain unverified. T3's resolution, hourly guard, shared-composer serialization and autonomous send orchestration remain missing.
 - Current coordination: local fixture HTTP 200 and Chromium process checked; no-data MCP diagnostic passed. The person confirmed the fixture visible and approved this MCP client through the popup. Pickup and fresh reads worked; same-tab reload retained the original handle with a new cursor epoch. The person then removed access; pickup returned no connections and the former handle returned `CONNECTION_NOT_FOUND` without page access. No current approval should be assumed; no live-site access, draft fill or send occurred.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
@@ -65,7 +65,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 1. **T1 Read robustness: done.** Stopped native watches restart with bounded backoff (R2). D8 captures the newest 32 visible rows with `omittedBefore`, per-message truncation at 16,000 UTF-16 units and a 96 KiB capture cap. Identity-preserving failures skip publication; changed targets still revoke (R1). Synthetic evidence only for these changes.
 2. **T2 Connection model: synthetic implementation done.** Startup (T2a), roster/removal (T2b), popup-first per-agent admission/pickup/no-expiry grants (T2c) and same-chat reload/rebind/gaps/observer reattachment (T2d) are gated. No automatic admission/re-admission (D13b). Individual disconnect/restart ends that owner's grant; tab/chat/browser changes end matching grants. Installed fixture pickup/read/reload/removal passed; fresh permission-prompt appearance and installed multi-owner/tab-close behavior remain unverified. Read/send authority is represented, not a working autonomous send pipeline (T3).
-3. **T3 Autonomous send.** A provider-neutral `chat_send_message` runs fill, fresh proof, durable intent, the one-offer job, browser reservation and one guarded activation, reusing today's pieces (D5). Add the append-only evidence rule (D9) with a settle window, per-connection resolution of unconfirmed sends with a one-click popup fallback (D10, R8), and the runaway guard: one message at a time and a configurable hourly cap. Relax "active tab of the current window" to "visible tab" (D11). Sandboxed synthetic tests cover the loop and its loss and crash cases.
+3. **T3 Autonomous send: in progress.** T3a scopes new durable intents and fill blocking to the shared conversation using a persistent private HMAC key; old unkeyed attempts remain globally blocking. Still missing: provider-neutral `chat_send_message` orchestration, whole-composer serialization, append-only evidence/settle window (D9), shared-chat resolution and popup fallback (D10, R8), hourly cap and visible-tab writes (D11). Reuse existing one-offer jobs, browser reservation and one guarded activation; cover the loop and loss/crash cases in sandboxed synthetic tests.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
 5. **T5 Live acceptance.** Coordinated reload, then one human-authorized session on a disposable chat: connect once, the agent sends a few neutral messages and reads the complete replies without further clicks, then the tab is closed.
 6. **T6 Later.** Hidden-tab operation (D11, possibly debugger input per D6), a second chat site on the provider-neutral pipeline, calibration and packaging.
@@ -79,7 +79,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 - **R5 No completion signal.** Gemini rows report `generationState: unknown`. Events are full snapshots, at most two per call, and the per-grant buffer now holds 128 events or 4 MiB (T1b), so streaming can still expire cursors. Agents should treat events as change hints and re-read (D3, T4).
 - **R6 Gemini commits would end uncertain.** Fixture evidence uses stable row IDs; Gemini rows have none (D9).
 - **R7 Setup and target limits.** Automatic broker start/startup facade connection is gated in T2a (D4); manual start is optional debugging. Only saved chats with exactly two path segments, such as `https://gemini.google.com/app/<id>`, qualify; new unsaved chats and multi-account paths such as `/u/<n>/app/<id>` do not. Fill and submit need the chat tab to be the active tab of the current window and visible (D11 relaxes this to visible).
-- **R8 One unconfirmed send blocks all sending for good.** `recordDispatchIntent` refuses every new intent while any journal attempt lacks evidence: across all chats, across broker restarts, and nothing ever resolves such an attempt. Only fixture evidence clears it today, so the first unconfirmed Gemini send would stop all sending. D10 makes the barrier per connection and resolves it from page evidence or one popup click (T3). The development journal currently holds no unresolved attempt.
+- **R8 Partially fixed (T3a).** New journal attempts pause only their conversation, shared across owners/tabs and broker restarts, rather than unrelated chats. Fill admission and pending Gemini fills use the same scope. Old attempts without a conversation key retain global blocking. Only existing fixture evidence clears uncertainty today; D10 page/person resolution and the popup fallback remain missing. The new guard is synthetic-tested, not installed-verified; restart is needed to load it into a running broker.
 
 ### Findings: architecture and maintainability
 
@@ -99,7 +99,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-Start T3 with the shared per-conversation durable uncertainty barrier and guard, then connect the provider-neutral autonomous pipeline in tested increments. T2 is gated, installed fixture pickup/read/reload/removal passed and D10a is decided. The fixture grant was removed; this test is not a live development fill/send grant. Do not reopen exclusive pickup or add automatic admission. No live-site access or real-chat approval has occurred.
+Continue T3 with durable per-conversation resolution and the hourly guard, then shared-composer serialization and provider-neutral send orchestration. T3a is gated, installed T2 fixture pickup/read/reload/removal passed and D10a is decided. The fixture grant was removed; this test is not a live development fill/send grant. Do not reopen exclusive pickup or add automatic admission. No live-site access or real-chat approval has occurred.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -166,6 +166,14 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T3a Conversation-Scoped Durable Uncertainty Barrier (2026-10-13)
+
+- New dispatch attempts store an HMAC of origin/conversation ID under a persistent 32-byte key in the same private database. All owners and documents of that chat share the pause; unrelated chats/providers can proceed. Intent insertion remains inside the original `BEGIN IMMEDIATE` transaction; refusal preserves proof and unconsumed consents. Fixture/Gemini fill admission and pending Gemini fill invalidation use the same scope.
+- Old databases gain a nullable `conversation_key` column; legacy unkeyed attempts still block globally. Constructor restart retains the key and marks unfinished attempts unknown, never restores authority. A malformed key, or a lost key with existing keyed attempts, refuses startup rather than minting a replacement and losing the pause.
+- First focused compile exposed a fixture-only helper type; widening it to the existing provider union repaired it. Focused intent/refusal, fill, persistence, provider-isolation, migration and key-loss checks passed. The first exact gate reached **194/196 units**, failing an old global-barrier assertion and exact old SQL-row shape; e2e did not run. The repaired tests retain the shared single-job cap and require other-chat progress only after that job ends, plus the same exact conversation digest after reopening the database.
+- After the two failures plus guard regressions passed 5/5, the new exact gate passed `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e`: **196/196 units and 30/30 e2e checks**. No deadlines, polling, assertions, sandbox or consent/ownership checks were relaxed.
+- This is ledger-only synthetic evidence, not autonomous sending. Resolution, hourly cap, full shared-composer serialization, provider-neutral orchestration and live acceptance remain. Installed fixture evidence below tested T2d, and its grant was removed; no installed restart or live access was performed for T3a. See AGENTS.md Safety Boundaries.
 
 ## Installed Fixture Pickup, Reload And Removal (2026-10-13)
 
