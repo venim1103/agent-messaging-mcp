@@ -807,6 +807,55 @@ test("broker waits for response drain before executing later commands and cleans
   }
 });
 
+test("resolved dispatch status IPC preserves owner and receipt boundaries without restoring submit", { timeout: 5000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-resolution-status-ipc-"));
+  const directory = join(home, "broker");
+  const database = new DatabaseSync(":memory:");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+  const clients: Awaited<ReturnType<typeof connectBroker>>[] = [];
+  try {
+    const facade = await connectBroker("facade", directory);
+    const stranger = await connectBroker("facade", directory);
+    const relay = await connectBroker("relay", directory);
+    clients.push(facade, stranger, relay);
+    const pending = await facade.requestConnection();
+    if (pending.kind !== "connection_requested") throw new Error("Expected fixture approval request");
+    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      tabId: 3, documentId: "synthetic-resolution-document" };
+    await relay.approveFixture(pending.payload.requestId, target);
+    const granted = await facade.getConnection(pending.payload.requestId);
+    if (granted.kind !== "connection_state" || granted.payload.state !== "ready_readonly") throw new Error("Expected fixture grant");
+    const prepared = await facade.prepareFixtureMessage(granted.payload.connectionId, 1, "Synthetic resolved IPC operation",
+      "a66b3997-9d43-4554-8399-267d1fe9f75c");
+    if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture receipt");
+    const { operationId, recoveryToken } = prepared.payload;
+    const startedAt = Date.now() - 5000;
+    const resolvedAt = Date.now();
+    database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
+      VALUES (?, ?, ?, 'unknown')`).run(operationId, startedAt, "a".repeat(64));
+    database.prepare(`INSERT INTO message_dispatch_resolutions (operation_id, resolved_at, outcome, source)
+      VALUES (?, ?, 'not_sent', 'person')`).run(operationId, resolvedAt);
+    const expected = { operationId, state: "resolved", startedAt,
+      resolution: { outcome: "not_sent", source: "person", resolvedAt } };
+    assert.deepEqual((await facade.getPreparedOperation(operationId)).payload, expected);
+    assert.deepEqual((await stranger.getPreparedOperation(operationId)).payload, { state: "unknown" });
+    assert.deepEqual((await stranger.getPreparedOperation(operationId, recoveryToken)).payload, expected);
+    assert.deepEqual((await stranger.getPreparedOperation(operationId, "0".repeat(64))).payload, { state: "unknown" });
+    assert.deepEqual((await facade.commitFixtureMessage(operationId)).payload, expected);
+    assert.deepEqual((await stranger.commitFixtureMessage(operationId)).payload, { code: "DISPATCH_UNAVAILABLE" });
+    assert.deepEqual((await facade.fillFixtureDraft(operationId)).payload, { code: "FILL_UNAVAILABLE" });
+    const jobs = await relay.listFixtureDispatchAttempts();
+    if (jobs.kind !== "fixture_dispatch_attempts") throw new Error("Expected fixture submit job list");
+    assert.deepEqual(jobs.payload.attempts, []);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+  } finally {
+    for (const client of clients) client.close();
+    await broker.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("authenticated private Gemini preparation remains owner-bound without fixture or recovery authority", async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-prepare-ipc-"));
   const directory = join(home, "broker");

@@ -568,7 +568,7 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   if (request.kind === "dispatch_fixture_message" || request.kind === "commit_fixture_message") {
     if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
     const status = operations.getOperation(owner, request.payload.operationId, now);
-    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") {
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") {
       return { ...response, kind: "fixture_dispatch" as const, payload: status };
     }
     if (!operations.getFixtureSendAuthorization(owner, request.payload.operationId, now)) {

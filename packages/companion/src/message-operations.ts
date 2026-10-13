@@ -33,7 +33,10 @@ export type FixtureDispatchResult = z.infer<typeof fixtureDispatchResultSchema>;
 export const fixtureDispatchStatusSchema = z.discriminatedUnion("state", [
   z.strictObject({ operationId: z.uuid(), state: z.literal("dispatch_uncertain"), startedAt: z.number().int().safe() }),
   z.strictObject({ operationId: z.uuid(), state: z.literal("observed_in_ui"), startedAt: z.number().int().safe(),
-    observedAt: z.number().int().safe(), messageId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/) })
+    observedAt: z.number().int().safe(), messageId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/) }),
+  z.strictObject({ operationId: z.uuid(), state: z.literal("resolved"), startedAt: z.number().int().safe(),
+    resolution: z.strictObject({ outcome: z.enum(["sent", "not_sent"]), source: z.enum(["page", "person"]),
+      resolvedAt: z.number().int().safe() }) })
 ]);
 export const fixtureDispatchCheckResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]),
@@ -263,21 +266,35 @@ export class PreparedMessageOperations {
       observed_at INTEGER NOT NULL,
       message_id TEXT NOT NULL CHECK (length(message_id) BETWEEN 1 AND 128)
     )`);
+    database.exec(`CREATE TABLE IF NOT EXISTS message_dispatch_resolutions (
+      operation_id TEXT PRIMARY KEY REFERENCES message_dispatch_attempts(operation_id) ON DELETE RESTRICT,
+      resolved_at INTEGER NOT NULL,
+      outcome TEXT NOT NULL CHECK (outcome IN ('sent', 'not_sent')),
+      source TEXT NOT NULL CHECK (source IN ('page', 'person'))
+    )`);
     database.exec("UPDATE message_dispatch_attempts SET state = 'unknown' WHERE state = 'dispatching'");
   }
 
   private dispatchStatus(operationId: string): FixtureDispatchStatus | null {
-    const record = this.database.prepare(`SELECT attempt.started_at, evidence.observed_at, evidence.message_id
+    const record = this.database.prepare(`SELECT attempt.started_at, evidence.observed_at, evidence.message_id,
+      resolution.resolved_at, resolution.outcome, resolution.source
       FROM message_dispatch_attempts AS attempt
       LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+      LEFT JOIN message_dispatch_resolutions AS resolution ON resolution.operation_id = attempt.operation_id
       WHERE attempt.operation_id = ?`).get(operationId) as {
-        started_at: number; observed_at: number | null; message_id: string | null
+        started_at: number; observed_at: number | null; message_id: string | null;
+        resolved_at: number | null; outcome: "sent" | "not_sent" | null; source: "page" | "person" | null
       } | undefined;
     if (!record) return null;
-    return record.observed_at !== null && record.message_id !== null
-      ? { operationId, state: "observed_in_ui", startedAt: record.started_at,
-        observedAt: record.observed_at, messageId: record.message_id }
-      : { operationId, state: "dispatch_uncertain", startedAt: record.started_at };
+    if (record.observed_at !== null && record.message_id !== null) {
+      return { operationId, state: "observed_in_ui", startedAt: record.started_at,
+        observedAt: record.observed_at, messageId: record.message_id };
+    }
+    if (record.resolved_at !== null && record.outcome !== null && record.source !== null) {
+      return Object.freeze({ operationId, state: "resolved", startedAt: record.started_at,
+        resolution: Object.freeze({ outcome: record.outcome, source: record.source, resolvedAt: record.resolved_at }) });
+    }
+    return { operationId, state: "dispatch_uncertain", startedAt: record.started_at };
   }
 
   private digest(value: string): string {
@@ -292,7 +309,8 @@ export class PreparedMessageOperations {
   private hasUnresolvedDispatch(target: Pick<FixtureTarget | GeminiTarget, "origin" | "conversationId">): boolean {
     return Boolean(this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
       LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
-      WHERE evidence.operation_id IS NULL
+      LEFT JOIN message_dispatch_resolutions AS resolution ON resolution.operation_id = attempt.operation_id
+      WHERE evidence.operation_id IS NULL AND resolution.operation_id IS NULL
       AND (attempt.conversation_key IS NULL OR attempt.conversation_key = ?) LIMIT 1`)
       .get(this.conversationKey(target)));
   }
@@ -302,6 +320,35 @@ export class PreparedMessageOperations {
       WHERE conversation_key = ? AND started_at > ?`)
       .get(this.conversationKey(target), now - SEND_RATE_WINDOW_MS)?.count;
     return typeof count !== "number" || count >= this.maxSendsPerHour;
+  }
+
+  resolveUnconfirmedDispatch(target: ApprovedTarget, operationId: string, outcome: "sent" | "not_sent", now = Date.now()) {
+    if (!Number.isSafeInteger(now) || now < 0 || (outcome !== "sent" && outcome !== "not_sent")) {
+      throw new Error("DISPATCH_RESOLUTION_UNAVAILABLE");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const record = this.database.prepare(`SELECT attempt.started_at, evidence.operation_id AS evidence_id,
+        resolution.outcome AS outcome FROM message_dispatch_attempts AS attempt
+        LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+        LEFT JOIN message_dispatch_resolutions AS resolution ON resolution.operation_id = attempt.operation_id
+        WHERE attempt.operation_id = ? AND attempt.conversation_key = ?`)
+        .get(operationId, this.conversationKey(target));
+      if (!record || typeof record.started_at !== "number" || !Number.isSafeInteger(record.started_at)
+        || record.started_at < 0 || now - record.started_at < FIXTURE_DISPATCH_CHECK_TIMEOUT_MS
+        || record.evidence_id !== null || (record.outcome !== null && record.outcome !== outcome)) {
+        throw new Error("DISPATCH_RESOLUTION_UNAVAILABLE");
+      }
+      this.database.prepare(`INSERT INTO message_dispatch_resolutions (operation_id, resolved_at, outcome, source)
+        VALUES (?, ?, ?, 'person') ON CONFLICT (operation_id) DO NOTHING`).run(operationId, now, outcome);
+      this.database.prepare("UPDATE message_dispatch_attempts SET state = 'unknown' WHERE operation_id = ?").run(operationId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    this.dispatchAuthorizations.delete(operationId);
+    return this.dispatchStatus(operationId)!;
   }
 
   private release(operationId: string): void {
@@ -1345,7 +1392,9 @@ export class PreparedMessageOperations {
       throw new Error("DISPATCH_UNAVAILABLE");
     }
     const status = this.getOperation(owner, operationId, now);
-    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") throw new Error("DISPATCH_UNCERTAIN");
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") {
+      throw new Error("DISPATCH_UNCERTAIN");
+    }
     if (status.state !== "approved") throw new Error("APPROVAL_REQUIRED");
     if (this.dispatchJobs.size + this.geminiDispatchJobs.size >= MAX_PENDING_FIXTURE_DISPATCHES) throw new Error("DISPATCH_CHECK_BUSY");
     const authorization = this.getGeminiSendAuthorization(owner, operationId, now);
@@ -1421,7 +1470,7 @@ export class PreparedMessageOperations {
     const now = Date.now();
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) throw new Error("DISPATCH_UNAVAILABLE");
     const status = this.getOperation(owner, operationId, now);
-    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") return status;
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") return status;
     const authorization = this.getFixtureSendAuthorization(owner, operationId, now);
     const operation = this.contents.get(operationId);
     if (!authorization || !operation || operation.owner !== owner) throw new Error("DISPATCH_UNAVAILABLE");
@@ -1439,7 +1488,9 @@ export class PreparedMessageOperations {
     deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) throw new Error("DISPATCH_UNAVAILABLE");
     const status = this.getOperation(owner, operationId, now);
-    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui") throw new Error("DISPATCH_UNCERTAIN");
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") {
+      throw new Error("DISPATCH_UNCERTAIN");
+    }
     if (status.state !== "approved") throw new Error("APPROVAL_REQUIRED");
     if (this.dispatchJobs.size + this.geminiDispatchJobs.size >= MAX_PENDING_FIXTURE_DISPATCHES) throw new Error("DISPATCH_CHECK_BUSY");
     const started = this.recordFixtureDispatchStart(owner, operationId, now, checkId);
