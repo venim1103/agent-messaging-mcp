@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { on, once } from "node:events";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { connect, Socket } from "node:net";
@@ -811,8 +811,10 @@ test("resolved dispatch status IPC preserves owner and receipt boundaries withou
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-resolution-status-ipc-"));
   const directory = join(home, "broker");
   const database = new DatabaseSync(":memory:");
-  const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+  const credentials = createBrokerCredentials();
+  const broker = await startBrokerSocket(directory, credentials, database);
   const clients: Awaited<ReturnType<typeof connectBroker>>[] = [];
+  let rawFacade: Socket | undefined;
   try {
     const facade = await connectBroker("facade", directory);
     const stranger = await connectBroker("facade", directory);
@@ -830,13 +832,39 @@ test("resolved dispatch status IPC preserves owner and receipt boundaries withou
     if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture receipt");
     const { operationId, recoveryToken } = prepared.payload;
     const startedAt = Date.now() - 5000;
-    const resolvedAt = Date.now();
+    const key = database.prepare("SELECT key FROM message_conversation_key WHERE singleton = 1").get()?.key;
+    assert.ok(key instanceof Uint8Array);
+    const digest = createHmac("sha256", key).update(JSON.stringify([target.origin, target.conversationId])).digest("hex");
     database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
-      VALUES (?, ?, ?, 'unknown')`).run(operationId, startedAt, "a".repeat(64));
-    database.prepare(`INSERT INTO message_dispatch_resolutions (operation_id, resolved_at, outcome, source)
-      VALUES (?, ?, 'not_sent', 'person')`).run(operationId, resolvedAt);
+      VALUES (?, ?, ?, 'unknown')`).run(operationId, startedAt, digest);
+    assert.throws(() => facade.listUnconfirmedDispatches(target), /Broker role cannot perform/);
+    assert.throws(() => facade.resolveUnconfirmedDispatch(target, operationId, "not_sent"), /Broker role cannot perform/);
+    rawFacade = connect(join(directory, "broker.sock"));
+    await once(rawFacade, "connect");
+    const envelope = { protocolVersion: PROTOCOL_VERSION, connectionGeneration: 0, deadlineMs: Date.now() + 4000 };
+    await exchange(rawFacade, { ...envelope, kind: "hello", requestId: randomUUID(), role: "facade",
+      credential: credentials.facade, payload: {} });
+    for (const kind of ["list_unconfirmed_dispatches", "resolve_unconfirmed_dispatch"]) {
+      const denied = await exchange(rawFacade, { ...envelope, kind, requestId: randomUUID(), payload: { target,
+        ...(kind === "resolve_unconfirmed_dispatch" ? { operationId, outcome: "not_sent" } : {}) } });
+      assert.ok(typeof denied === "object" && denied !== null && "payload" in denied);
+      assert.deepEqual(denied.payload, { code: "PERMISSION_DENIED" });
+    }
+    const listed = await relay.listUnconfirmedDispatches(target);
+    assert.equal(listed.kind, "unconfirmed_dispatches");
+    assert.deepEqual(listed.payload, { attempts: [{ operationId, startedAt }], hasMore: false });
+    assert.equal(JSON.stringify(listed.payload).includes(target.documentId), false);
+    const foreign = { origin: "https://gemini.google.com" as const, conversationId: "fixture-alpha",
+      url: "https://gemini.google.com/app/fixture-alpha", tabId: 4, documentId: "synthetic-foreign-document" };
+    assert.deepEqual((await relay.resolveUnconfirmedDispatch(foreign, operationId, "not_sent")).payload,
+      { code: "DISPATCH_RESOLUTION_UNAVAILABLE" });
+    const resolution = await relay.resolveUnconfirmedDispatch(target, operationId, "not_sent");
+    if (resolution.kind !== "dispatch_resolved") throw new Error("Expected attributed resolution");
+    const resolvedAt = resolution.payload.resolution.resolvedAt;
     const expected = { operationId, state: "resolved", startedAt,
       resolution: { outcome: "not_sent", source: "person", resolvedAt } };
+    assert.deepEqual(resolution.payload, expected);
+    assert.deepEqual((await relay.listUnconfirmedDispatches(target)).payload, { attempts: [], hasMore: false });
     assert.deepEqual((await facade.getPreparedOperation(operationId)).payload, expected);
     assert.deepEqual((await stranger.getPreparedOperation(operationId)).payload, { state: "unknown" });
     assert.deepEqual((await stranger.getPreparedOperation(operationId, recoveryToken)).payload, expected);
@@ -849,6 +877,7 @@ test("resolved dispatch status IPC preserves owner and receipt boundaries withou
     assert.deepEqual(jobs.payload.attempts, []);
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
   } finally {
+    rawFacade?.destroy();
     for (const client of clients) client.close();
     await broker.close();
     database.close();

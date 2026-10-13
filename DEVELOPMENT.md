@@ -34,7 +34,7 @@ Private state, never committed:
 - `~/.config/agent-messaging-mcp/native-host` is the native launcher script.
 - `~/.local/share/agent-messaging-mcp/chromium-dev` is the Chromium profile (a Podman volume) with logins and the native host manifest. Treat it as sensitive.
 
-New dispatch attempts carry a conversation HMAC under a persistent 32-byte key in the private database. Unresolved attempts block new intents and fills in that chat for every owner, including after restart, not unrelated chats. Old unkeyed attempts retain global blocking. Missing/corrupt keys with keyed attempts fail startup; do not delete or regenerate the key/database to bypass uncertainty. The ledger supports immutable attributed resolution/status, but trusted action transport/UI and page resolution remain unconnected; operationally only existing fixture UI evidence clears the pause. Autonomous sending remains unimplemented.
+New dispatch attempts carry a conversation HMAC under a persistent 32-byte key in the private database. Unresolved attempts block new intents and fills in that chat for every owner, including after restart, not unrelated chats. Old unkeyed attempts retain global blocking. Missing/corrupt keys with keyed attempts fail startup; do not delete or regenerate the key/database to bypass uncertainty. The ledger supports immutable attributed resolution/status through the trusted selected-chat popup controls below; automatic page resolution and autonomous sending remain unimplemented.
 
 `BROWSER_CHAT_MAX_SENDS_PER_HOUR` sets the broker's positive safe-integer limit (default 60). Restart the broker to change it; this ends current grants. All keyed journal attempts count within the rolling hour for that conversation across owners/restarts, including evidenced attempts; future timestamps remain counted after a backward clock shift. Fill admission and durable intent insertion refuse at the limit without restoring or consuming extra authority. Invalid configuration fails startup. No MCP argument can configure the limit.
 
@@ -141,7 +141,7 @@ Each human approval lasts at most two minutes and ends with the preparation or c
 | `chat_get_operation` | `operationId`, optional 64-hex `recoveryToken` | State, approval expiry, `draftFill` metadata | A token recovers only dispatch status after restart, never authority |
 | `chat_disconnect` | `connectionId` | `disconnected` | Cancels pending reads; closes nothing |
 
-Operation states are `awaiting_approval`, `approved` (ordinary no-send review only), `expired`, `stale`, `unknown`, `dispatch_uncertain`, `observed_in_ui` and `resolved`. `resolved` carries outcome, source and time: a declared page/person assessment, never provider acceptance or delivery; trusted resolution actions are not connected yet. It never restores the old operation's write authority, and its attempt still counts against the hourly limit. `draftFill` reports `fill_approved`, `filling`, `filled`, `failed` or `uncertain`; `filled` describes a past readback, not the current draft. `observed_in_ui` is UI evidence, not acceptance or delivery.
+Operation states are `awaiting_approval`, `approved` (ordinary no-send review only), `expired`, `stale`, `unknown`, `dispatch_uncertain`, `observed_in_ui` and `resolved`. `resolved` carries outcome, source and time: a declared page/person assessment, never provider acceptance or delivery. Trusted popup choices record person attribution; no page detector is connected yet. Resolution never restores the old operation's write authority, and its attempt still counts against the hourly limit. `draftFill` reports `fill_approved`, `filling`, `filled`, `failed` or `uncertain`; `filled` describes a past readback, not the current draft. `observed_in_ui` is UI evidence, not acceptance or delivery.
 
 Fixture send reconciliation stays uncertain when its baseline, an intervening event or the current capture omitted rows. A truncated outgoing row cannot prove an exact text match. Status recovery does not restore write authority.
 
@@ -154,12 +154,23 @@ The toolbar popup is the only approval surface; page scripts and MCP calls canno
 - **Inspect this chat**: a read-only diagnostic. On the fixture it lists rows and checks the native bridge. On Gemini it shows only structure metadata (regions, editors, row lengths, **Send controls**, **Prompt state** and **Nearby prompt controls**), never chat text.
 - **View pending requests**, then **Approve read-only fixture** or **Approve read-only Gemini chat**.
 - Agent roster: **Connect this chat** per agent, **Remove access**, **Disconnect all** and **Refresh agents**. The consent text discloses read/send authority and influence from chat content, and states that autonomous sending is not yet available.
+- **Unconfirmed Sends**: **Refresh status** loads eligible selected-chat operation IDs/timestamps; **Sent** / **Not sent** record an immutable person assessment, never activate Send or touch the composer. It does not automatically check on ordinary popup opens.
 - **Review fixture drafts** or **Review Gemini drafts**, then **Approve draft (no send)**.
 - **Review fixture draft fill** or **Review Gemini fill consent**, then **Allow draft fill (no send)**.
 - **Review fixture sending** or **Review Gemini send consent**, then **Approve fixture send** or **Approve Gemini send**.
 - Legacy debugger probes: **Test fixture input** on the rich fixture and, on Gemini, **Fill test draft**, which types a fixed sentence into the real composer outside the operation ledger. Use them only with explicit authorization; decision D6 covers removing them.
 
 Review lists show at most eight exact previews and clear when the tab, document, grant or expiry changes.
+
+### Unconfirmed Send Resolution
+
+Select the exact chat in the container browser, open its trusted toolbar popup, and use **Refresh status**. The list shows at most eight operation IDs/start times and an overflow marker, never message text, private URLs or recovery tokens. Attempts appear only after the old maximum four-second activation lease ends, without existing UI evidence or resolution. Old unkeyed attempts cannot be attributed to a guessed chat and remain globally blocking. **Nothing to resolve** means no eligible entries, not proof that no uncertainty exists.
+
+Choose **Sent** or **Not sent** only after assessing that attempt. The immutable outcome is attributed to the person, not page evidence or provider acceptance/delivery. Same-outcome replay returns the original record; conflicting, foreign, premature or legacy-unkeyed resolutions refuse. Recorded resolution releases that conversation's pause but retains the attempt's hourly count. It never authorizes old operation/key replay, fills or clears a draft, reactivates Send or changes connections; subsequent operations need their own authority.
+
+The private provider-neutral native/broker commands are relay-only: `list_unconfirmed_dispatches { target }` returns `unconfirmed_dispatches { attempts: [{ operationId, startedAt }], hasMore }`; `resolve_unconfirmed_dispatch { target, operationId, outcome }` returns `dispatch_resolved { operationId, state: "resolved", startedAt, resolution: { outcome, source: "person", resolvedAt } }`. They are not public MCP actions and accept no source, approval, draft, model/owner identity or retry fields. Unavailable resolutions use `DISPATCH_RESOLUTION_UNAVAILABLE`.
+
+The worker pins the active tab, exact URL, top-level document and conversation before/after the native request inside one original ten-second budget. Tab, document or grant changes clear popup rows; stale/malformed replies cannot revive them. Refresh after uncertainty or failure is read-only, not an action retry. Optional origin access must already be available; metadata refresh never asks for site permission or grants read/send access. Installed acceptance and current deployment state are recorded in [HANDOFF.md](HANDOFF.md).
 
 ## Gemini Target Rules
 

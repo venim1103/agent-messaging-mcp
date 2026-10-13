@@ -83,6 +83,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
         const request = typeof message === "object" && message !== null && "kind" in message
           && (message.kind === "list_chat_agents" || message.kind === "remove_chat_agent" || message.kind === "disconnect_chat"
             || message.kind === "approve_chat_agent" || message.kind === "list_available_agents"
+            || message.kind === "list_unconfirmed_dispatches" || message.kind === "resolve_unconfirmed_dispatch"
             || message.kind === "begin_chat_reload" || message.kind === "rebind_chat")
           ? parseNativeChatAgentRequest(message)
           : typeof message === "object" && message !== null && "kind" in message
@@ -165,8 +166,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | "gemini_dispatch_checks" | "gemini_dispatch_check_recorded"
             | "fixture_dispatch_attempts" | "fixture_dispatch_recorded"
             | "fixture_snapshot_published" | "gemini_snapshot_published"
-            | "fixture_gap_marked" | "gemini_gap_marked" | "error";
+            | "fixture_gap_marked" | "gemini_gap_marked" | "unconfirmed_dispatches" | "dispatch_resolved" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
+            | { attempts: ReadonlyArray<{ operationId: string; startedAt: number }>; hasMore: boolean }
+            | { operationId: string; state: "resolved"; startedAt: number;
+              resolution: { outcome: "sent" | "not_sent"; source: "page" | "person"; resolvedAt: number } }
             | { agents: ReadonlyArray<ChatAgent> } | { revoked: number; remainingAgents: number } | { agentId: string; expiresAt: null }
             | { fills: ReadonlyArray<{ operationId: string; attemptId: string; target: {
               origin: string; conversationId: string; url: string; tabId: number; documentId: string
@@ -200,6 +204,16 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               const result = await client.listChatAgents(request.payload.target);
               if (result.kind !== "chat_agents") throw new Error("Broker refused chat agent list");
               kind = "chat_agents";
+              payload = result.payload;
+            } else if (request.kind === "list_unconfirmed_dispatches") {
+              const result = await client.listUnconfirmedDispatches(request.payload.target);
+              if (result.kind !== "unconfirmed_dispatches" && result.kind !== "error") throw new Error("Broker refused dispatch list");
+              kind = result.kind;
+              payload = result.payload;
+            } else if (request.kind === "resolve_unconfirmed_dispatch") {
+              const result = await client.resolveUnconfirmedDispatch(request.payload.target, request.payload.operationId, request.payload.outcome);
+              if (result.kind !== "dispatch_resolved" && result.kind !== "error") throw new Error("Broker refused dispatch resolution");
+              kind = result.kind;
               payload = result.payload;
             } else if (request.kind === "list_available_agents") {
               const result = await client.listAvailableAgents();

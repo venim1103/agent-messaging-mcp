@@ -5,7 +5,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
-import { fixtureDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
+import { fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
   geminiFillStatusSchema,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
@@ -216,6 +216,17 @@ const replySchema = z.discriminatedUnion("kind", [
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ operationId: z.uuid(), state: z.literal("approved"),
       approvedAt: z.number().int().safe(), expiresAt: z.number().int().safe() })
+  }),
+  z.strictObject({
+    kind: z.literal("unconfirmed_dispatches"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ attempts: z.array(z.strictObject({ operationId: z.uuid(),
+      startedAt: z.number().int().safe().nonnegative() })).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("dispatch_resolved"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: resolvedDispatchStatusSchema
   }),
   z.strictObject({
     kind: z.literal("fixture_fill_reviews"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -439,7 +450,7 @@ const replySchema = z.discriminatedUnion("kind", [
       "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED", "REVIEW_UNAVAILABLE", "FILL_REVIEW_UNAVAILABLE",
       "SEND_REVIEW_UNAVAILABLE",
       "DISPATCH_CHECK_UNAVAILABLE", "DISPATCH_UNAVAILABLE",
-      "DISPATCH_UNCERTAIN", "PREFLIGHT_UNAVAILABLE", "FILL_UNAVAILABLE"]) })
+      "DISPATCH_UNCERTAIN", "DISPATCH_RESOLUTION_UNAVAILABLE", "PREFLIGHT_UNAVAILABLE", "FILL_UNAVAILABLE"]) })
   })
 ]);
 
@@ -517,6 +528,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
     let nextRequest: Promise<void> = Promise.resolve();
     let pendingRequests = 0;
     const request = (kind: "keep_alive" | "list_chat_agents" | "remove_chat_agent" | "disconnect_chat"
+      | "list_unconfirmed_dispatches" | "resolve_unconfirmed_dispatch"
       | "approve_chat_agent" | "wait_for_connection" | "list_available_agents" | "begin_chat_reload" | "rebind_chat"
       | "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "read_approved_events"
@@ -542,6 +554,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap"
       | "mark_gemini_observation_gap", payload: object) => {
       if (kind === "list_chat_agents" || kind === "remove_chat_agent" || kind === "disconnect_chat" || kind === "approve_chat_agent"
+        || kind === "list_unconfirmed_dispatches" || kind === "resolve_unconfirmed_dispatch"
         || kind === "list_available_agents" || kind === "begin_chat_reload" || kind === "rebind_chat"
         || kind === "list_pending" || kind === "list_fixture_read_challenges"
         || kind === "list_fixture_prepared_reviews" || kind === "approve_fixture_review"
@@ -631,6 +644,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       role,
       get closed() { return socket.destroyed; },
       listChatAgents: (target: ApprovedTarget) => request("list_chat_agents", { target }),
+      listUnconfirmedDispatches: (target: ApprovedTarget) => request("list_unconfirmed_dispatches", { target }),
+      resolveUnconfirmedDispatch: (target: ApprovedTarget, operationId: string, outcome: "sent" | "not_sent") =>
+        request("resolve_unconfirmed_dispatch", { target, operationId, outcome }),
       listAvailableAgents: () => request("list_available_agents", {}),
       removeChatAgent: (target: ApprovedTarget, agentId: string) => request("remove_chat_agent", { target, agentId }),
       disconnectChat: (target: ApprovedTarget) => request("disconnect_chat", { target }),

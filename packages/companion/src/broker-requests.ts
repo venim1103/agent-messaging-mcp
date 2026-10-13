@@ -46,6 +46,12 @@ const requestSchema = z.discriminatedUnion("kind", [
     target: z.union([fixtureTarget, geminiTarget])
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_available_agents"), payload: z.strictObject({}) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_unconfirmed_dispatches"), payload: z.strictObject({
+    target: z.union([fixtureTarget, geminiTarget])
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("resolve_unconfirmed_dispatch"), payload: z.strictObject({
+    target: z.union([fixtureTarget, geminiTarget]), operationId: z.uuid(), outcome: z.enum(["sent", "not_sent"])
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("begin_chat_reload"), payload: z.strictObject({
     target: z.union([fixtureTarget, geminiTarget])
   }) }),
@@ -227,6 +233,21 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return role === "facade"
       ? { ...response, kind: "connection_wait_authorized" as const, payload: request.payload }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "list_unconfirmed_dispatches" || request.kind === "resolve_unconfirmed_dispatch") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+    try {
+      return request.kind === "list_unconfirmed_dispatches"
+        ? { ...response, kind: "unconfirmed_dispatches" as const, payload: operations.listUnconfirmedDispatches(request.payload.target, now) }
+        : { ...response, kind: "dispatch_resolved" as const, payload: operations.resolveUnconfirmedDispatch(
+          request.payload.target, request.payload.operationId, request.payload.outcome, now) };
+    } catch (error) {
+      if (error instanceof Error && error.message === "DISPATCH_RESOLUTION_UNAVAILABLE") {
+        return { ...response, kind: "error" as const, payload: { code: error.message } };
+      }
+      throw error;
+    }
   }
   if (request.kind === "begin_chat_reload" || request.kind === "rebind_chat") {
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };

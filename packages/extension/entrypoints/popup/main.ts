@@ -21,6 +21,8 @@ type ChatAgent = { agentId: string; label: string; connectionCount: number; auto
 type ChatAgentsResult = { ok: true; agents: ChatAgent[]; countsKnown: boolean } | { ok: false; error: string };
 type ChatAgentApprovalResult = { ok: true; agentId: string; expiresAt: null } | { ok: false; error: string };
 type ChatAgentRemovalResult = { ok: true; revoked: number; remainingAgents: number } | { ok: false; error: string };
+type UnconfirmedDispatchesResult = { ok: true; attempts: { operationId: string; startedAt: number }[]; hasMore: boolean }
+  | { ok: false; error: string };
 type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
 type FixtureReviewsResult = { ok: true; reviews: { operationId: string; expiresAt: number;
@@ -38,6 +40,10 @@ const agentCount = document.querySelector<HTMLElement>("#agent-count");
 const agentList = document.querySelector<HTMLOListElement>("#agent-list");
 const refreshAgentsButton = document.querySelector<HTMLButtonElement>("#refresh-agents");
 const disconnectChatButton = document.querySelector<HTMLButtonElement>("#disconnect-chat");
+const unconfirmedPanel = document.querySelector<HTMLElement>("#unconfirmed-panel");
+const unconfirmedStatus = document.querySelector<HTMLElement>("#unconfirmed-status");
+const unconfirmedList = document.querySelector<HTMLOListElement>("#unconfirmed-list");
+const refreshUnconfirmedButton = document.querySelector<HTMLButtonElement>("#refresh-unconfirmed");
 const pendingButton = document.querySelector<HTMLButtonElement>("#view-pending");
 const fixtureReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-reviews");
 const fixtureFillReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-fill-reviews");
@@ -111,6 +117,7 @@ function inspectGeminiStructure(): GeminiPreview | null {
 }
 
 if (!inspectButton || !agentPanel || !agentCount || !agentList || !refreshAgentsButton || !disconnectChatButton
+  || !unconfirmedPanel || !unconfirmedStatus || !unconfirmedList || !refreshUnconfirmedButton
   || !pendingButton || !fixtureReviewButton || !fixtureFillReviewButton || !fixtureSendReviewButton || !fixtureInputButton || !geminiDraftReview
   || !geminiDraftPreview || !geminiDraftButton || !status || !result || !fixtureDocumentStatus || !pendingResult
   || !pendingTarget || !pendingRequests || !fixtureReviewResult || !fixtureReviewHeading || !fixtureReviews || !conversation || !messages) {
@@ -122,13 +129,79 @@ let selectedGeminiTab: { id: number; url: string } | null = null;
 let fixtureReviewExpiry: ReturnType<typeof setTimeout> | undefined;
 let fixtureReviewGeneration = 0;
 let agentRosterGeneration = 0;
+let unconfirmedGeneration = 0;
 
 function clearChatAgents() {
   agentRosterGeneration++;
+  unconfirmedGeneration++;
+  unconfirmedList?.replaceChildren();
+  if (unconfirmedStatus) unconfirmedStatus.textContent = "Unavailable";
+  if (refreshUnconfirmedButton) refreshUnconfirmedButton.disabled = false;
   agentList?.replaceChildren();
   if (agentCount) agentCount.textContent = "Unavailable";
   if (disconnectChatButton) disconnectChatButton.disabled = true;
 }
+
+async function refreshUnconfirmedDispatches(): Promise<void> {
+  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  if (!selected || !unconfirmedList || !unconfirmedStatus || !refreshUnconfirmedButton || !status) return;
+  const generation = ++unconfirmedGeneration;
+  refreshUnconfirmedButton.disabled = true;
+  unconfirmedList.replaceChildren();
+  unconfirmedStatus.textContent = "Checking...";
+  try {
+    const response = await browser.runtime.sendMessage({ kind: "list_unconfirmed_dispatches", tabId: selected.id,
+      expectedUrl: selected.url }) as UnconfirmedDispatchesResult;
+    if (generation !== unconfirmedGeneration) return;
+    if (!response?.ok) { unconfirmedStatus.textContent = "Unavailable"; return; }
+    unconfirmedStatus.textContent = response.attempts.length ? "Sending paused" : "Nothing to resolve";
+    for (const attempt of response.attempts) {
+      const row = document.createElement("li");
+      row.dataset.operationId = attempt.operationId;
+      const identity = document.createElement("p");
+      identity.className = "agent-instance";
+      identity.textContent = attempt.operationId;
+      const timestamp = document.createElement("time");
+      timestamp.dateTime = new Date(attempt.startedAt).toISOString();
+      timestamp.textContent = new Date(attempt.startedAt).toLocaleString();
+      row.append(timestamp, identity);
+      const buttons: HTMLButtonElement[] = [];
+      for (const outcome of ["sent", "not_sent"] as const) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = outcome === "sent" ? "Sent" : "Not sent";
+        button.addEventListener("click", async () => {
+          if (generation !== unconfirmedGeneration) return;
+          for (const control of buttons) control.disabled = true;
+          try {
+            const resolution = await browser.runtime.sendMessage({ kind: "resolve_unconfirmed_dispatch", tabId: selected.id,
+              expectedUrl: selected.url, operationId: attempt.operationId, outcome }) as { ok: boolean; error?: string };
+            if (generation !== unconfirmedGeneration) return;
+            status.textContent = resolution?.ok ? "Outcome recorded. Nothing was resent."
+              : resolution?.error ?? "Resolution status unavailable; refresh.";
+            await refreshUnconfirmedDispatches();
+          } catch {
+            if (generation === unconfirmedGeneration) status.textContent = "Resolution status unavailable; refresh.";
+          }
+        });
+        buttons.push(button);
+        row.append(button);
+      }
+      unconfirmedList.append(row);
+    }
+    if (response.hasMore) {
+      const remaining = document.createElement("li");
+      remaining.textContent = "More unconfirmed sends remain.";
+      unconfirmedList.append(remaining);
+    }
+  } catch {
+    if (generation === unconfirmedGeneration) unconfirmedStatus.textContent = "Unavailable";
+  } finally {
+    if (generation === unconfirmedGeneration) refreshUnconfirmedButton.disabled = false;
+  }
+}
+
+refreshUnconfirmedButton.addEventListener("click", () => { void refreshUnconfirmedDispatches(); });
 
 async function refreshChatAgents(): Promise<void> {
   const selected = selectedGeminiTab ?? selectedFixtureTab;
@@ -295,6 +368,8 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
     geminiDraftReview.hidden = false;
   }
   agentPanel.hidden = !selectedFixtureTab && !selectedGeminiTab;
+  unconfirmedPanel.hidden = agentPanel.hidden;
+  if (!unconfirmedPanel.hidden) unconfirmedStatus.textContent = "Not checked";
   if (!agentPanel.hidden) void refreshChatAgents();
 });
 

@@ -30,13 +30,14 @@ export const fixtureDispatchResultSchema = z.discriminatedUnion("ok", [
     "DRAFT_CHANGED", "SUBMIT_UNAVAILABLE", "DISPATCH_UNAVAILABLE", "DISPATCH_UNCERTAIN"]) })
 ]);
 export type FixtureDispatchResult = z.infer<typeof fixtureDispatchResultSchema>;
+export const resolvedDispatchStatusSchema = z.strictObject({ operationId: z.uuid(), state: z.literal("resolved"),
+  startedAt: z.number().int().safe(), resolution: z.strictObject({ outcome: z.enum(["sent", "not_sent"]),
+    source: z.enum(["page", "person"]), resolvedAt: z.number().int().safe() }) });
 export const fixtureDispatchStatusSchema = z.discriminatedUnion("state", [
   z.strictObject({ operationId: z.uuid(), state: z.literal("dispatch_uncertain"), startedAt: z.number().int().safe() }),
   z.strictObject({ operationId: z.uuid(), state: z.literal("observed_in_ui"), startedAt: z.number().int().safe(),
     observedAt: z.number().int().safe(), messageId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/) }),
-  z.strictObject({ operationId: z.uuid(), state: z.literal("resolved"), startedAt: z.number().int().safe(),
-    resolution: z.strictObject({ outcome: z.enum(["sent", "not_sent"]), source: z.enum(["page", "person"]),
-      resolvedAt: z.number().int().safe() }) })
+  resolvedDispatchStatusSchema
 ]);
 export const fixtureDispatchCheckResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]),
@@ -320,6 +321,26 @@ export class PreparedMessageOperations {
       WHERE conversation_key = ? AND started_at > ?`)
       .get(this.conversationKey(target), now - SEND_RATE_WINDOW_MS)?.count;
     return typeof count !== "number" || count >= this.maxSendsPerHour;
+  }
+
+  listUnconfirmedDispatches(target: ApprovedTarget, now = Date.now()) {
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error("DISPATCH_RESOLUTION_UNAVAILABLE");
+    const rows = this.database.prepare(`SELECT attempt.operation_id, attempt.started_at
+      FROM message_dispatch_attempts AS attempt
+      LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
+      LEFT JOIN message_dispatch_resolutions AS resolution ON resolution.operation_id = attempt.operation_id
+      WHERE attempt.conversation_key = ? AND attempt.started_at >= 0 AND attempt.started_at <= ?
+      AND evidence.operation_id IS NULL AND resolution.operation_id IS NULL
+      ORDER BY attempt.started_at, attempt.operation_id LIMIT ?`)
+      .all(this.conversationKey(target), now - FIXTURE_DISPATCH_CHECK_TIMEOUT_MS, MAX_PREPARED_REVIEWS + 1);
+    const attempts = rows.slice(0, MAX_PREPARED_REVIEWS).map(row => {
+      if (typeof row.operation_id !== "string" || !z.uuid().safeParse(row.operation_id).success
+        || typeof row.started_at !== "number" || !Number.isSafeInteger(row.started_at)) {
+        throw new Error("DISPATCH_RESOLUTION_UNAVAILABLE");
+      }
+      return Object.freeze({ operationId: row.operation_id, startedAt: row.started_at });
+    });
+    return Object.freeze({ attempts: Object.freeze(attempts), hasMore: rows.length > MAX_PREPARED_REVIEWS });
   }
 
   resolveUnconfirmedDispatch(target: ApprovedTarget, operationId: string, outcome: "sent" | "not_sent", now = Date.now()) {

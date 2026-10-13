@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { once } from "node:events";
 import { chmod, cp, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -1058,6 +1059,193 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
 });
 
 for (const provider of ["fixture", "gemini"]) {
+  test(`${provider} trusted popup resolves uncertainty without composer or authority changes`, { timeout: 20000 }, async (testContext) => {
+    const profile = await mkdtemp(join(tmpdir(), "agent-messaging-resolution-popup-"));
+    const unpacked = join(profile, "unpacked-extension");
+    await cp(extensionDirectory, unpacked, { recursive: true });
+    const manifestPath = join(unpacked, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.host_permissions = ["http://127.0.0.1:8787/*", "https://gemini.google.com/*"];
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const directory = join(profile, ".config/agent-messaging-mcp/broker");
+    const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
+    let context;
+    let broker;
+    let brokerExit;
+    let journal;
+    try {
+      testContext.signal.throwIfAborted();
+      context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
+        executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+        args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
+      const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+      const extensionId = new URL(worker.url()).hostname;
+      await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+      broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+      brokerExit = once(broker, "exit");
+      let ready = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        testContext.signal.throwIfAborted();
+        ready = await brokerSocketReady(join(directory, "broker.sock"));
+        if (ready) break;
+        await setTimeout(25);
+      }
+      assert.equal(ready, true, "Resolution broker did not start");
+      const { DatabaseSync } = await import("node:sqlite");
+      journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"));
+      const key = journal.prepare("SELECT key FROM message_conversation_key WHERE singleton = 1").get()?.key;
+      assert.ok(key instanceof Uint8Array);
+      const origin = provider === "fixture" ? "http://127.0.0.1:8787" : "https://gemini.google.com";
+      const conversationId = provider === "fixture" ? "fixture-alpha" : "synthetic-resolution";
+      const digest = id => createHmac("sha256", key).update(JSON.stringify([origin, id])).digest("hex");
+      const operationIds = Array.from({ length: 4 }, () => crypto.randomUUID());
+      const startedAt = Date.now() - 5000;
+      const prepare = journal.prepare(`INSERT INTO prepared_message_operations
+        (operation_id, owner_id, connection_id, idempotency_key, content_digest, target_digest, expires_at, state)
+        VALUES (?, 'synthetic-owner', 'synthetic-connection', ?, ?, ?, ?, 'awaiting_approval')`);
+      const insert = journal.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
+        VALUES (?, ?, ?, 'unknown')`);
+      operationIds.forEach((operationId, index) => {
+        prepare.run(operationId, crypto.randomUUID(), "0".repeat(64), "1".repeat(64), startedAt);
+        insert.run(operationId, index === 3 ? Date.now() + 60000 : startedAt,
+          digest(index === 2 ? `${conversationId}-other` : conversationId));
+      });
+      const page = await context.newPage();
+      const url = provider === "fixture" ? `${origin}/` : `${origin}/app/${conversationId}`;
+      const html = provider === "fixture" ? await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8")
+        : `<!doctype html><main><infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic row</p></user-query-content></user-query>
+          <model-response><model-response-content>Synthetic reply</model-response-content></model-response></infinite-scroller>
+          <div contenteditable="true" aria-label="Enter a prompt for Gemini"></div><button type="submit" aria-label="Send message">Send</button></main>`;
+      await page.route(url, route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
+      await page.goto(url);
+      const editor = page.locator(provider === "fixture" ? "#message" : "[contenteditable]");
+      await editor.fill("A person's synthetic unsent draft");
+      await page.evaluate(() => {
+        globalThis.resolutionEvents = { input: 0, click: 0, submit: 0 };
+        for (const kind of Object.keys(globalThis.resolutionEvents)) {
+          document.addEventListener(kind, () => globalThis.resolutionEvents[kind]++, true);
+        }
+      });
+      const selected = await worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        return { tabId: tab.id, expectedUrl: tab.url };
+      });
+      const popup = await context.newPage();
+      await popup.setViewportSize({ width: 360, height: 900 });
+      await page.bringToFront();
+      await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+      await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Not checked",
+        undefined, { timeout: 4000 });
+      await popup.getByRole("button", { name: "Refresh status", exact: true }).click();
+      await popup.waitForFunction(() => document.querySelectorAll("#unconfirmed-list li[data-operation-id]").length === 2,
+        undefined, { timeout: 4000 });
+      const storageBefore = await worker.evaluate(() => chrome.storage.session.get(null));
+      assert.deepEqual(new Set(await popup.locator("#unconfirmed-list li").evaluateAll(rows => rows.map(row => row.dataset.operationId))),
+        new Set(operationIds.slice(0, 2)));
+      assert.equal(await popup.locator("#unconfirmed-list").evaluate(list => [...list.querySelectorAll("p, time, button")]
+        .every(element => element.scrollWidth <= element.clientWidth)), true);
+      await popup.locator("main").screenshot({ path: join(tmpdir(), `agent-messaging-${provider}-resolutions.png`) });
+      for (const kind of ["list_unconfirmed_dispatches", "resolve_unconfirmed_dispatch"]) {
+        const forged = await worker.evaluate(async args => {
+          const [reply] = await chrome.scripting.executeScript({ target: { tabId: args.tabId }, args: [args],
+            func: args => chrome.runtime.sendMessage(args).catch(() => null) });
+          return reply.result ?? null;
+        }, { ...selected, kind, ...(kind === "resolve_unconfirmed_dispatch" ? { operationId: operationIds[0], outcome: "sent" } : {}) });
+        assert.equal(forged?.ok === true, false);
+      }
+      assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_resolutions").get().count, 0);
+      for (const [index, label, outcome] of [[0, "Not sent", "not_sent"], [1, "Sent", "sent"]]) {
+        await popup.locator(`[data-operation-id="${operationIds[index]}"]`).getByRole("button", { name: label, exact: true }).click();
+        await popup.waitForFunction(operationId => !document.querySelector(`[data-operation-id="${operationId}"]`),
+          operationIds[index], { timeout: 4000 });
+        const resolution = journal.prepare("SELECT outcome, source, resolved_at FROM message_dispatch_resolutions WHERE operation_id = ?").get(operationIds[index]);
+        assert.equal(resolution.outcome, outcome);
+        assert.equal(resolution.source, "person");
+        assert.ok(resolution.resolved_at >= startedAt);
+        const replay = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+          ...selected, kind: "resolve_unconfirmed_dispatch", operationId: operationIds[index], outcome });
+        assert.equal(replay.ok, true);
+        assert.deepEqual(journal.prepare("SELECT outcome, source, resolved_at FROM message_dispatch_resolutions WHERE operation_id = ?").get(operationIds[index]), resolution);
+      }
+      assert.equal(await popup.locator("#unconfirmed-status").textContent(), "Nothing to resolve");
+      const conflict = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+        ...selected, kind: "resolve_unconfirmed_dispatch", operationId: operationIds[0], outcome: "sent" });
+      assert.equal(conflict.ok, false);
+      const foreign = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+        ...selected, kind: "resolve_unconfirmed_dispatch", operationId: operationIds[2], outcome: "not_sent" });
+      assert.equal(foreign.ok, false);
+      assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_resolutions").get().count, 2);
+      assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_attempts").get().count, 4);
+      assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), storageBefore);
+      assert.equal(await editor.evaluate(element => element.value ?? element.textContent), "A person's synthetic unsent draft");
+      assert.deepEqual(await page.evaluate(() => globalThis.resolutionEvents), { input: 0, click: 0, submit: 0 });
+      await worker.evaluate(() => {
+        globalThis.malformedResolutionListing = true;
+        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+        chrome.runtime.connectNative = (...args) => {
+          const port = connect(...args);
+          const listen = port.onMessage.addListener.bind(port.onMessage);
+          port.onMessage.addListener = listener => listen(reply => {
+            if (reply.kind === "unconfirmed_dispatches" && globalThis.holdResolutionListing) {
+              globalThis.holdResolutionListing = false;
+              globalThis.releaseResolutionListing = () => listener(reply);
+            } else listener(reply.kind === "unconfirmed_dispatches" && globalThis.malformedResolutionListing
+              ? { ...reply, payload: { ...reply.payload, retryAllowed: true } } : reply);
+          });
+          return port;
+        };
+      });
+      await popup.getByRole("button", { name: "Refresh status", exact: true }).click();
+      await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Unavailable",
+        undefined, { timeout: 4000 });
+      assert.equal(await popup.locator("#unconfirmed-list li").count(), 0);
+      assert.equal(await popup.locator("#refresh-unconfirmed").isEnabled(), true);
+      await worker.evaluate(() => {
+        globalThis.malformedResolutionListing = false;
+        globalThis.holdResolutionListing = true;
+      });
+      await popup.evaluate(() => {
+        const send = chrome.runtime.sendMessage.bind(chrome.runtime);
+        chrome.runtime.sendMessage = (...args) => {
+          const response = send(...args);
+          if (args[0]?.kind === "list_unconfirmed_dispatches") globalThis.resolutionListingResponse = response;
+          return response;
+        };
+      });
+      await popup.getByRole("button", { name: "Refresh status", exact: true }).click();
+      let held = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        testContext.signal.throwIfAborted();
+        held = await worker.evaluate(() => typeof globalThis.releaseResolutionListing === "function");
+        if (held) break;
+        await setTimeout(25);
+      }
+      assert.equal(held, true, "Resolution listing reply was not held");
+      assert.equal(await popup.locator("#refresh-unconfirmed").isDisabled(), true);
+      const other = await context.newPage();
+      await other.goto("about:blank");
+      await other.bringToFront();
+      await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Unavailable"
+        && !document.querySelector("#refresh-unconfirmed")?.disabled, undefined, { timeout: 4000 });
+      await worker.evaluate(() => globalThis.releaseResolutionListing());
+      assert.equal((await popup.evaluate(() => globalThis.resolutionListingResponse)).ok, false);
+      assert.equal(await popup.locator("#unconfirmed-list li").count(), 0);
+      assert.equal(await popup.locator("#unconfirmed-status").textContent(), "Unavailable");
+      await page.bringToFront();
+      await popup.getByRole("button", { name: "Refresh status", exact: true }).click();
+      await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Nothing to resolve",
+        undefined, { timeout: 4000 });
+      assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), storageBefore);
+      assert.deepEqual(await page.evaluate(() => globalThis.resolutionEvents), { input: 0, click: 0, submit: 0 });
+    } finally {
+      journal?.close();
+      broker?.kill("SIGTERM");
+      if (brokerExit) await brokerExit;
+      await context?.close();
+      await rm(profile, { recursive: true, force: true });
+    }
+  });
+
   test(`${provider} popup roster removes one agent and preserves a newer approval`, { timeout: 20000 }, async (testContext) => {
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-roster-test-"));
     const unpacked = join(profile, "unpacked-extension");
@@ -1543,7 +1731,10 @@ async function exerciseFixtureDispatch(outcome) {
     let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
-    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+    let brokerStderr = "";
+    const started = performance.now();
+    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: ["ignore", "ignore", "pipe"] });
+    broker.stderr.on("data", chunk => { brokerStderr = `${brokerStderr}${chunk}`.slice(0, 1024); });
     brokerExit = once(broker, "exit");
     let ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
@@ -1555,7 +1746,10 @@ async function exerciseFixtureDispatch(outcome) {
       }
       await setTimeout(25);
     }
-    assert.equal(ready, true, "Broker did not start");
+    assert.equal(ready, true, `Broker did not start (${outcome}): ${JSON.stringify({
+      elapsedMs: Math.round(performance.now() - started), exitCode: broker.exitCode,
+      signalCode: broker.signalCode, stderr: brokerStderr
+    })}`);
     facade = await connectBroker("facade", directory);
     relay = await connectBroker("relay", directory);
     mcpClient = new Client({ name: "fixture-browser-commit-test", version: "0.0.1" });
@@ -1778,10 +1972,10 @@ test("worker and broker crashes after fixture activation never restore submit au
   for (const outcome of ["worker_crash", "broker_crash"]) await exerciseFixtureDispatch(outcome);
 });
 
-test("connected Gemini worker fills once and never retries lost script or completion results", { timeout: 25000 }, async (testContext) => {
-  let phase = "starting";
-  testContext.signal.addEventListener("abort", () => testContext.diagnostic(`Synthetic Gemini phase at test end: ${phase}`), { once: true });
-  for (const outcome of ["observed", "script-result-loss", "completion-request-loss", "worker-stop", "broker-stop"]) {
+for (const outcome of ["observed", "script-result-loss", "completion-request-loss", "worker-stop", "broker-stop"]) {
+  test(`connected Gemini worker fills once and never retries lost script or completion results (${outcome})`, { timeout: 25000 }, async (testContext) => {
+    let phase = "starting";
+    testContext.signal.addEventListener("abort", () => testContext.diagnostic(`Synthetic Gemini phase at test end: ${phase}`), { once: true });
     testContext.signal.throwIfAborted();
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-worker-fill-"));
     const unpacked = join(profile, "unpacked-extension");
@@ -2131,12 +2325,34 @@ test("connected Gemini worker fills once and never retries lost script or comple
       await rm(profile, { recursive: true, force: true });
       testContext.diagnostic(`Synthetic Gemini scenario cleaned up: ${outcome}`);
     }
-  }
-  phase = "complete";
-});
+    phase = "complete";
+  });
+}
 
 test("test-only Gemini host access carries exact synthetic rows and later observations", { timeout: 20000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-read-test-"));
+  const nativeWatchPidPath = join(profile, "native-watch.json");
+  const nativeWatchHarness = join(profile, "native-watch-relay.mjs");
+  await writeFile(nativeWatchHarness, `import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { NativeFrameDecoder } from ${JSON.stringify(fileURLToPath(new URL("../../packages/companion/dist/native-framing.js", import.meta.url)))};
+const relay = spawn(process.execPath, [${JSON.stringify(nativeRelayPath)}, ...process.argv.slice(2)], { stdio: ["pipe", "pipe", "inherit"] });
+const decoder = new NativeFrameDecoder();
+let marked = false;
+process.stdin.on("data", chunk => {
+  for (const request of decoder.push(chunk)) {
+    if (!marked && request.kind === "list_gemini_read_challenges") {
+      writeFileSync(${JSON.stringify(nativeWatchPidPath)}, JSON.stringify({ pid: relay.pid, parent: process.pid }), { mode: 0o600 });
+      marked = true;
+    }
+  }
+});
+process.stdin.pipe(relay.stdin);
+relay.stdout.pipe(process.stdout);
+relay.once("close", code => process.exit(code ?? 1));
+relay.once("error", () => process.exit(1));
+process.on("SIGTERM", () => relay.kill("SIGTERM"));
+`, { mode: 0o600 });
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
   const manifestPath = join(unpacked, "manifest.json");
@@ -2157,7 +2373,7 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     });
     const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
-    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeWatchHarness, profile));
     broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
     brokerExit = once(broker, "exit");
     let ready = false;
@@ -2347,9 +2563,20 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     assert.equal("url" in read.payload, false);
     assert.equal(JSON.stringify(read.payload).includes("Private draft"), false);
     assert.equal(await worker.evaluate(() => globalThis.syntheticGeminiWatches.length), 1);
-    await worker.evaluate(() => globalThis.syntheticGeminiWatches[0].disconnect());
+    const nativeWatch = JSON.parse(await readFile(nativeWatchPidPath, "utf8"));
+    assert.ok(Number.isSafeInteger(nativeWatch.pid) && nativeWatch.pid > 0);
+    assert.ok(Number.isSafeInteger(nativeWatch.parent) && nativeWatch.parent > 0);
+    assert.equal((await stat(`/proc/${nativeWatch.pid}`)).uid, process.getuid());
+    assert.equal((await readFile(`/proc/${nativeWatch.parent}/cmdline`, "utf8")).split("\0").includes(nativeWatchHarness), true);
+    assert.equal((await readFile(`/proc/${nativeWatch.pid}/cmdline`, "utf8")).split("\0").includes(nativeRelayPath), true);
+    assert.equal(Number((await readFile(`/proc/${nativeWatch.pid}/status`, "utf8")).match(/^PPid:\s+(\d+)$/m)?.[1]), nativeWatch.parent);
+    process.kill(nativeWatch.pid, "SIGTERM");
+    const recoveryStarted = performance.now();
     const afterNativeLoss = await facade.readApprovedSnapshot(state.payload.connectionId);
-    assert.equal(afterNativeLoss.kind, "gemini_snapshot", "Stopped native watch did not recover without reapproval");
+    assert.equal(afterNativeLoss.kind, "gemini_snapshot", `Stopped native watch did not recover without reapproval: ${JSON.stringify({
+      elapsedMs: Math.round(performance.now() - recoveryStarted), code: afterNativeLoss.kind === "error" ? afterNativeLoss.payload.code : null,
+      watches: await worker.evaluate(() => globalThis.syntheticGeminiWatches.length)
+    })}`);
     assert.deepEqual(afterNativeLoss.payload.messages, read.payload.messages);
     assert.equal(await worker.evaluate(() => globalThis.syntheticGeminiWatches.length), 2);
     const fillOffers = await worker.evaluate(() => globalThis.syntheticGeminiFillOffers);

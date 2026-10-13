@@ -108,7 +108,7 @@
         font: 13px/1.4 "Trebuchet MS", Verdana, sans-serif;
       }
 
-      #agent-panel {
+      #agent-panel, #unconfirmed-panel {
         margin-top: 16px;
         border-top: 1px solid #d4dbd7;
       }
@@ -136,6 +136,15 @@
       #agent-list .agent-connect {
         background: #185849;
       }
+
+      #unconfirmed-list {
+        max-height: 280px;
+      }
+
+      #unconfirmed-list button {
+        margin-top: 8px;
+        margin-right: 8px;
+      }
     </style>
   </head>
   <body>
@@ -152,6 +161,12 @@
         <ol id="agent-list" aria-label="Chat agents"></ol>
         <button type="button" id="refresh-agents">Refresh agents</button>
         <button type="button" id="disconnect-chat" disabled>Disconnect all</button>
+      </section>
+      <section id="unconfirmed-panel" hidden>
+        <h2>Unconfirmed Sends</h2>
+        <p id="unconfirmed-status" role="status">Checking...</p>
+        <ol id="unconfirmed-list" aria-label="Unconfirmed sends"></ol>
+        <button type="button" id="refresh-unconfirmed">Refresh status</button>
       </section>
       <button type="button" id="view-pending" hidden>View pending requests</button>
       <button type="button" id="view-fixture-reviews" hidden>Review fixture drafts</button>

@@ -254,6 +254,10 @@ const chatAgentRequestSchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ previous: chatAgentTargetSchema, target: chatAgentTargetSchema }) }),
   pendingListSchema.extend({ kind: z.literal("list_available_agents"), payload: z.strictObject({}) }),
   pendingListSchema.extend({ kind: z.literal("list_chat_agents"), payload: z.strictObject({ target: chatAgentTargetSchema }) }),
+  pendingListSchema.extend({ kind: z.literal("list_unconfirmed_dispatches"), payload: z.strictObject({ target: chatAgentTargetSchema }) }),
+  pendingListSchema.extend({ kind: z.literal("resolve_unconfirmed_dispatch"), payload: z.strictObject({
+    target: chatAgentTargetSchema, operationId: z.uuid(), outcome: z.enum(["sent", "not_sent"])
+  }) }),
   pendingListSchema.extend({ kind: z.literal("disconnect_chat"), payload: z.strictObject({ target: chatAgentTargetSchema }) }),
   pendingListSchema.extend({ kind: z.literal("approve_chat_agent"),
     payload: z.strictObject({ target: chatAgentTargetSchema, agentId: z.uuid() }) }),

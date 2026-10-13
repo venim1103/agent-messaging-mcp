@@ -1487,7 +1487,8 @@ async function chatDocumentTarget(tabId: number, expectedUrl: string, documentId
 }
 
 function sendChatAgentRequest(kind: "list_chat_agents" | "list_available_agents" | "remove_chat_agent"
-  | "approve_chat_agent" | "disconnect_chat" | "begin_chat_reload" | "rebind_chat", payload: object, deadlineMs: number): Promise<{ kind: string; payload: Record<string, unknown> }> {
+  | "approve_chat_agent" | "disconnect_chat" | "begin_chat_reload" | "rebind_chat"
+  | "list_unconfirmed_dispatches" | "resolve_unconfirmed_dispatch", payload: object, deadlineMs: number): Promise<{ kind: string; payload: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
     if (deadlineMs <= Date.now()) { reject(new Error("Agent request expired")); return; }
     const requestId = crypto.randomUUID();
@@ -1514,6 +1515,47 @@ function sendChatAgentRequest(kind: "list_chat_agents" | "list_available_agents"
     try { port.postMessage({ kind, protocolVersion, requestId, connectionGeneration: 0, deadlineMs, payload }); }
     catch { finish(); }
   });
+}
+
+async function manageSelectedUnconfirmedDispatches(tabId: number, expectedUrl: string,
+  operationId?: string, outcome?: "sent" | "not_sent") {
+  const deadlineMs = Date.now() + 10_000;
+  try {
+    await chatTabUpdates.get(tabId);
+    if (!await ensureFixtureReset() || Date.now() >= deadlineMs) throw new Error();
+    const target = await selectedChatTarget(tabId, expectedUrl);
+    if (!target || Date.now() >= deadlineMs) throw new Error();
+    const reply = await sendChatAgentRequest(operationId ? "resolve_unconfirmed_dispatch" : "list_unconfirmed_dispatches",
+      { target, ...(operationId ? { operationId, outcome } : {}) }, deadlineMs);
+    const current = await selectedChatTarget(tabId, expectedUrl, target.documentId);
+    if (!current || current.conversationId !== target.conversationId || Date.now() >= deadlineMs) throw new Error();
+    const payload = reply.payload;
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!operationId) {
+      const attempts = payload.attempts;
+      if (reply.kind !== "unconfirmed_dispatches" || Object.keys(payload).length !== 2
+        || typeof payload.hasMore !== "boolean" || !Array.isArray(attempts) || attempts.length > 8
+        || !attempts.every((item: unknown) => {
+          if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
+          const attempt = item as Record<string, unknown>;
+          return Object.keys(attempt).length === 2 && typeof attempt.operationId === "string" && uuid.test(attempt.operationId)
+            && typeof attempt.startedAt === "number" && Number.isSafeInteger(attempt.startedAt)
+            && attempt.startedAt >= 0 && attempt.startedAt <= Date.now();
+        }) || new Set(attempts.map(item => item.operationId)).size !== attempts.length) throw new Error();
+      return { ok: true as const, attempts: attempts as { operationId: string; startedAt: number }[], hasMore: payload.hasMore };
+    }
+    const resolution = payload.resolution;
+    if (reply.kind !== "dispatch_resolved" || Object.keys(payload).length !== 4 || payload.operationId !== operationId
+      || payload.state !== "resolved" || typeof payload.startedAt !== "number" || !Number.isSafeInteger(payload.startedAt)
+      || payload.startedAt < 0 || typeof resolution !== "object" || resolution === null || Array.isArray(resolution)) throw new Error();
+    const record = resolution as Record<string, unknown>;
+    if (Object.keys(record).length !== 3 || record.outcome !== outcome || record.source !== "person"
+      || typeof record.resolvedAt !== "number" || !Number.isSafeInteger(record.resolvedAt)
+      || record.resolvedAt < payload.startedAt || record.resolvedAt > Date.now()) throw new Error();
+    return { ok: true as const, operationId, outcome };
+  } catch {
+    return { ok: false as const, error: "Selected chat changed or resolution status unavailable; refresh" };
+  }
 }
 
 async function observeApprovedChatTarget(target: ChatTarget): Promise<void> {
@@ -2235,6 +2277,17 @@ export default defineBackground(() => {
       || typeof message !== "object" || message === null || Array.isArray(message)) return;
 
     const request = message as Record<string, unknown>;
+    if ((request.kind === "list_unconfirmed_dispatches" || request.kind === "resolve_unconfirmed_dispatch")
+      && Object.keys(request).length === (request.kind === "resolve_unconfirmed_dispatch" ? 5 : 3)
+      && typeof request.tabId === "number" && Number.isSafeInteger(request.tabId) && request.tabId > 0
+      && typeof request.expectedUrl === "string" && request.expectedUrl.length <= 512
+      && (request.kind === "list_unconfirmed_dispatches" || (typeof request.operationId === "string"
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.operationId)
+        && (request.outcome === "sent" || request.outcome === "not_sent")))) {
+      return manageSelectedUnconfirmedDispatches(request.tabId, request.expectedUrl,
+        typeof request.operationId === "string" ? request.operationId : undefined,
+        request.outcome === "sent" || request.outcome === "not_sent" ? request.outcome : undefined);
+    }
     if ((request.kind === "list_chat_agents" || request.kind === "remove_chat_agent" || request.kind === "disconnect_chat"
       || request.kind === "approve_chat_agent")
       && Object.keys(request).length === (["remove_chat_agent", "approve_chat_agent"].includes(request.kind as string) ? 4 : 3)
