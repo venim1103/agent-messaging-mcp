@@ -769,6 +769,78 @@ test("conversation-scoped dispatch intent shares uncertainty across owners witho
   }
 });
 
+test("conversation-scoped hourly guard counts evidenced attempts across owners and restart", () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  const ledger = new PreparedMessageOperations(requests, database, 2);
+  const owners = [Symbol("first rate owner"), Symbol("second rate owner"), Symbol("third rate owner")];
+  const operations: { owner: symbol; operationId: string; checkId: string }[] = [];
+  const restartOwner = Symbol("rate owner after restart");
+  let restarted: PreparedMessageOperations | undefined;
+  try {
+    for (const [index, owner] of owners.entries()) {
+      const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: index + 3, documentId: `synthetic-rate-document-${index}` };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approve(pending.requestId, target, 2000)!;
+      const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic hourly guard draft",
+        `a66b3997-9d43-4554-8399-${index.toString(16).padStart(12, "0")}`, 2001);
+      const review = ledger.listFixtureReviews(target, 2002).reviews[0]!;
+      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2002);
+      approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
+      ledger.createRecoveryReceipt(owner, prepared.operationId, 2003);
+      requests.publishFixtureSnapshot(target, [], 2004);
+      ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2004);
+      const checkId = checkSyntheticDispatch(ledger, owner, prepared.operationId, target, prepared.preview.text, 2005);
+      operations.push({ owner, operationId: prepared.operationId, checkId });
+    }
+    for (const [index, operation] of operations.slice(0, 2).entries()) {
+      ledger.recordFixtureDispatchStart(operation.owner, operation.operationId, 2006 + index, operation.checkId);
+      database.prepare("INSERT INTO message_dispatch_evidence (operation_id, observed_at, message_id) VALUES (?, ?, ?)")
+        .run(operation.operationId, 2008, `synthetic-rate-row-${index}`);
+    }
+    const third = operations[2]!;
+    assert.throws(() => ledger.recordFixtureDispatchStart(third.owner, third.operationId, 2009, third.checkId), /SEND_RATE_LIMITED/);
+    assert.ok(ledger.getFixtureSendAuthorization(third.owner, third.operationId, 2009));
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 2);
+    restarted = new PreparedMessageOperations(requests, database, 2);
+    for (const now of [2010, 1500, 3_602_005, 3_602_006]) {
+      const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 7, documentId: `synthetic-rate-restart-${now}` };
+      const pending = requests.create(restartOwner, now);
+      const grant = requests.approve(pending.requestId, target, now)!;
+      const prepared = restarted.prepare(restartOwner, grant.connectionId, 1, "Synthetic restart rate fill",
+        `b66b3997-9d43-4554-8399-${now.toString(16).padStart(12, "0")}`, now);
+      const review = restarted.listFixtureReviews(target, now).reviews[0]!;
+      restarted.approveFixtureReview(target, prepared.operationId, review.reviewId, now);
+      const fill = restarted.listFixtureFillReviews(target, now).reviews[0]!;
+      restarted.approveFixtureFillReview(target, prepared.operationId, fill.reviewId, now);
+      const authorization = restarted.consumeFixtureFillApproval(restartOwner, prepared.operationId, now);
+      if (now === 3_602_006) assert.ok(authorization);
+      else {
+        assert.equal(authorization, null);
+        assert.ok(restarted.getFixtureFillAuthorization(restartOwner, prepared.operationId, now));
+      }
+    }
+  } finally {
+    restarted?.disconnect(restartOwner);
+    for (const owner of owners) ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("conversation-scoped hourly guard refuses invalid operator configuration before database mutation", () => {
+  for (const limit of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    const database = new DatabaseSync(":memory:");
+    try {
+      assert.throws(() => new PreparedMessageOperations(new PendingConnectionRequests(), database, limit), /INVALID_SEND_RATE_LIMIT/);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type = 'table'").get()?.count, 0);
+    } finally {
+      database.close();
+    }
+  }
+});
+
 test("conversation-scoped journal migration leaves legacy unresolved attempts globally blocking", () => {
   const database = new DatabaseSync(":memory:");
   const requests = new PendingConnectionRequests();
@@ -782,7 +854,8 @@ test("conversation-scoped journal migration leaves legacy unresolved attempts gl
   try {
     const legacy = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic legacy journal operation",
       "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
-    database.exec("ALTER TABLE message_dispatch_attempts DROP COLUMN conversation_key; DROP TABLE message_conversation_key");
+    database.exec(`DROP INDEX message_dispatch_conversation_started;
+      ALTER TABLE message_dispatch_attempts DROP COLUMN conversation_key; DROP TABLE message_conversation_key`);
     database.prepare("INSERT INTO message_dispatch_attempts (operation_id, started_at, state) VALUES (?, ?, 'dispatching')")
       .run(legacy.operationId, 2002);
     migrated = new PreparedMessageOperations(requests, database);

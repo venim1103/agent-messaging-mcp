@@ -22,6 +22,8 @@ export const MAX_PENDING_FIXTURE_FILLS = 1;
 export const FIXTURE_DISPATCH_CHECK_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_DISPATCH_CHECKS = 16;
 export const MAX_PENDING_FIXTURE_DISPATCHES = 1;
+export const DEFAULT_MAX_SENDS_PER_HOUR = 60;
+const SEND_RATE_WINDOW_MS = 60 * 60_000;
 export const fixtureDispatchResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]), activated: z.literal(true) }),
   z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "COMPOSER_UNAVAILABLE",
@@ -208,7 +210,9 @@ export class PreparedMessageOperations {
   private readonly digestKey = randomBytes(32);
   private readonly conversationDigestKey: Uint8Array;
 
-  constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync) {
+  constructor(private readonly requests: PendingConnectionRequests, private readonly database: DatabaseSync,
+    private readonly maxSendsPerHour = Number(process.env.BROWSER_CHAT_MAX_SENDS_PER_HOUR ?? DEFAULT_MAX_SENDS_PER_HOUR)) {
+    if (!Number.isSafeInteger(maxSendsPerHour) || maxSendsPerHour < 1) throw new Error("INVALID_SEND_RATE_LIMIT");
     database.exec("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL");
     database.exec(`CREATE TABLE IF NOT EXISTS message_conversation_key (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -252,6 +256,8 @@ export class PreparedMessageOperations {
       .some(column => column.name === "conversation_key")) {
       database.exec("ALTER TABLE message_dispatch_attempts ADD COLUMN conversation_key TEXT CHECK (length(conversation_key) = 64)");
     }
+    database.exec(`CREATE INDEX IF NOT EXISTS message_dispatch_conversation_started
+      ON message_dispatch_attempts (conversation_key, started_at)`);
     database.exec(`CREATE TABLE IF NOT EXISTS message_dispatch_evidence (
       operation_id TEXT PRIMARY KEY REFERENCES message_dispatch_attempts(operation_id) ON DELETE RESTRICT,
       observed_at INTEGER NOT NULL,
@@ -289,6 +295,13 @@ export class PreparedMessageOperations {
       WHERE evidence.operation_id IS NULL
       AND (attempt.conversation_key IS NULL OR attempt.conversation_key = ?) LIMIT 1`)
       .get(this.conversationKey(target)));
+  }
+
+  private isSendRateLimited(target: Pick<FixtureTarget | GeminiTarget, "origin" | "conversationId">, now: number): boolean {
+    const count = this.database.prepare(`SELECT count(*) AS count FROM message_dispatch_attempts
+      WHERE conversation_key = ? AND started_at > ?`)
+      .get(this.conversationKey(target), now - SEND_RATE_WINDOW_MS)?.count;
+    return typeof count !== "number" || count >= this.maxSendsPerHour;
   }
 
   private release(operationId: string): void {
@@ -591,7 +604,8 @@ export class PreparedMessageOperations {
 
   consumeGeminiFillApproval(owner: symbol, operationId: string, now = Date.now()) {
     const authorization = this.getGeminiFillAuthorization(owner, operationId, now);
-    if (!authorization || this.hasUnresolvedDispatch(authorization.target)) return null;
+    if (!authorization || this.hasUnresolvedDispatch(authorization.target)
+      || this.isSendRateLimited(authorization.target, now)) return null;
     this.fillApprovals.delete(operationId);
     this.fillReviewTokens.delete(operationId);
     this.consumedFillApprovals.add(operationId);
@@ -619,7 +633,8 @@ export class PreparedMessageOperations {
       const operation = this.geminiContents.get(pending.operationId);
       const live = operation && this.requests.getGeminiTarget(pending.owner, operation.connectionId, now);
       const approval = this.approvals.get(pending.operationId);
-      if (this.hasUnresolvedDispatch(pending.target) || pending.expiresAt <= now || !operation || operation.owner !== pending.owner
+      if (this.hasUnresolvedDispatch(pending.target) || this.isSendRateLimited(pending.target, now)
+        || pending.expiresAt <= now || !operation || operation.owner !== pending.owner
         || !approval || approval.expiresAt <= now || !live || !this.sameGeminiTarget(pending.target, live)) {
         this.finishGeminiFillCheck(attemptId, null, now);
       }
@@ -768,7 +783,8 @@ export class PreparedMessageOperations {
 
   consumeFixtureFillApproval(owner: symbol, operationId: string, now = Date.now()) {
     const authorization = this.getFixtureFillAuthorization(owner, operationId, now);
-    if (!authorization || this.hasUnresolvedDispatch(authorization.target)) return null;
+    if (!authorization || this.hasUnresolvedDispatch(authorization.target)
+      || this.isSendRateLimited(authorization.target, now)) return null;
     this.fillApprovals.delete(operationId);
     this.fillReviewTokens.delete(operationId);
     this.consumedFillApprovals.add(operationId);
@@ -1245,6 +1261,7 @@ export class PreparedMessageOperations {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       if (this.hasUnresolvedDispatch(target)) throw new Error("DISPATCH_UNCERTAIN");
+      if (this.isSendRateLimited(target, now)) throw new Error("SEND_RATE_LIMITED");
       this.database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
         VALUES (?, ?, ?, 'dispatching')`).run(operationId, now, this.conversationKey(target));
       this.database.exec("COMMIT");

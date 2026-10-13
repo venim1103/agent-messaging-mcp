@@ -36,6 +36,8 @@ Private state, never committed:
 
 New dispatch attempts carry a conversation HMAC under a persistent 32-byte key in the private database. Unresolved attempts block new intents and fills in that chat for every owner, including after restart, not unrelated chats. Old unkeyed attempts retain global blocking. Missing/corrupt keys with keyed attempts fail startup; do not delete or regenerate the key/database to bypass uncertainty. Only existing UI evidence clears the pause today; resolution and autonomous sending remain unconnected.
 
+`BROWSER_CHAT_MAX_SENDS_PER_HOUR` sets the broker's positive safe-integer limit (default 60). Restart the broker to change it; this ends current grants. All keyed journal attempts count within the rolling hour for that conversation across owners/restarts, including evidenced attempts; future timestamps remain counted after a backward clock shift. Fill admission and durable intent insertion refuse at the limit without restoring or consuming extra authority. Invalid configuration fails startup. No MCP argument can configure the limit.
+
 ## Setup
 
 Everything runs inside the Podman devcontainer ([devcontainer.json](.devcontainer/devcontainer.json)): Chromium, the extension, the native host, the broker and the MCP facade. Browsers on the Windows or WSL host cannot be used, and their tabs and logins are not reachable. Port 8787 is forwarded only for optional viewing of the fixture.

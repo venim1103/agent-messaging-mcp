@@ -295,6 +295,8 @@ Default policy is approval for each send. A later explicitly granted autonomous 
 
 **Decision (2026-10-09, D1):** Autonomous mode is the product default. The single **Connect this chat** approval allows the agent to send in that chat until the connection ends; the agent cannot create, widen or renew it. A runaway guard allows one message at a time and a generous, configurable hourly cap. Every machine-side guard still applies to each message. Because no person reviews individual messages, chat content can steer what the agent sends into that chat (prompt injection), and the approval text must say so. The supervised three-consent flow remains for tests and as an optional stricter mode.
 
+**Implementation note (T3b, 2026-10-13):** The ledger enforces an operator-only hourly cap (default 60) shared by a conversation's owners and durable across restarts. It counts journal attempts, including evidenced outcomes, before consuming fill consent and again in the intent transaction. Invalid limits fail startup; a backward clock shift cannot drop future-dated attempts from the count. Full-composer serialization and autonomous orchestration remain unimplemented.
+
 ### Implemented authority chain (prototype)
 
 The prototype splits **Authorize** into three separate trusted popup consents and keeps every link's authority distinct. The chain is complete for the fixture; the [HANDOFF.md](HANDOFF.md) dashboard tracks which Gemini links are connected. Checkpoint history is in HANDOFF.md.
