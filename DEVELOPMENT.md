@@ -162,6 +162,8 @@ The toolbar popup is the only approval surface; page scripts and MCP calls canno
 
 Review lists show at most eight exact previews and clear when the tab, document, grant or expiry changes.
 
+Fill queue admission also retains the exact composer across operations: another operation is busy while a live filling, filled or fill-uncertain operation targets the same origin/conversation/tab/document. This covers multiple owners and competing operations of one owner. Busy does not consume the candidate's consent. Independent composers remain eligible after the global pending-fill slot clears. Definite fill failure, revocation, original preparation expiry or known dispatch outcome releases coordination, never authority. An unresolved durable intent still pauses its conversation. Clearing a draft manually does not end a live prepared operation or permit old-operation replay; no autonomous waiting/sending tool is connected yet.
+
 ### Unconfirmed Send Resolution
 
 Select the exact chat in the container browser, open its trusted toolbar popup, and use **Refresh status**. The list shows at most eight operation IDs/start times and an overflow marker, never message text, private URLs or recovery tokens. Attempts appear only after the old maximum four-second activation lease ends, without existing UI evidence or resolution. Old unkeyed attempts cannot be attributed to a guessed chat and remain globally blocking. **Nothing to resolve** means no eligible entries, not proof that no uncertainty exists.

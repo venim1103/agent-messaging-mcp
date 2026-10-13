@@ -709,6 +709,19 @@ export class PreparedMessageOperations {
     }
   }
 
+  private hasOccupiedComposer(operationId: string, target: ApprovedTarget, now: number): boolean {
+    for (const [candidateId, operation] of [...this.contents, ...this.geminiContents]) {
+      if (candidateId === operationId || operation.target.origin !== target.origin
+        || operation.target.conversationId !== target.conversationId || operation.target.tabId !== target.tabId
+        || operation.target.documentId !== target.documentId) continue;
+      const fill = this.fillStates.get(candidateId);
+      if (!fill || (fill.state !== "filling" && fill.state !== "filled" && fill.state !== "uncertain")) continue;
+      const status = this.getOperation(operation.owner, candidateId, now);
+      if (status.state === "approved" || status.state === "awaiting_approval") return true;
+    }
+    return false;
+  }
+
   requestGeminiFill(owner: symbol, operationId: string, now = Date.now(), deadlineMs = now + FIXTURE_FILL_TIMEOUT_MS) {
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     const authorization = this.getGeminiFillAuthorization(owner, operationId, now);
@@ -716,7 +729,8 @@ export class PreparedMessageOperations {
     const grantExpiresAt = operation && this.requests.getConnectionExpiresAt(owner, operation.connectionId, now);
     if (!authorization || !grantExpiresAt) return null;
     this.listFixtureFillChallenges(now);
-    if (this.fillChecks.size + this.geminiFillChecks.size >= MAX_PENDING_FIXTURE_FILLS) return "busy" as const;
+    if (this.fillChecks.size + this.geminiFillChecks.size >= MAX_PENDING_FIXTURE_FILLS
+      || this.hasOccupiedComposer(operationId, authorization.target, now)) return "busy" as const;
     if (!this.consumeGeminiFillApproval(owner, operationId, now)) return null;
     const attemptId = randomUUID();
     const expiresAt = Math.min(deadlineMs, authorization.expiresAt, grantExpiresAt, now + FIXTURE_FILL_TIMEOUT_MS);
@@ -1029,9 +1043,11 @@ export class PreparedMessageOperations {
   }
 
   requestFixtureFill(owner: symbol, operationId: string, now = Date.now()) {
-    if (!this.getFixtureFillAuthorization(owner, operationId, now)) return null;
+    const available = this.getFixtureFillAuthorization(owner, operationId, now);
+    if (!available) return null;
     this.listFixtureFillChallenges(now);
-    if (this.fillChecks.size + this.geminiFillChecks.size >= MAX_PENDING_FIXTURE_FILLS) return "busy" as const;
+    if (this.fillChecks.size + this.geminiFillChecks.size >= MAX_PENDING_FIXTURE_FILLS
+      || this.hasOccupiedComposer(operationId, available.target, now)) return "busy" as const;
     const authorization = this.consumeFixtureFillApproval(owner, operationId, now);
     if (!authorization) return null;
     const attemptId = randomUUID();

@@ -914,7 +914,23 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       }
     };
 
-    const second = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, "Second fixture draft",
+    const approveReplacementConnection = async (previous, expectedUrl) => {
+      assert.equal((await facade.disconnectFixture(previous.payload.connectionId)).payload.disconnected, true);
+      const pending = await facade.requestConnection();
+      assert.equal(pending.kind, "connection_requested");
+      const approved = await popup.evaluate(args => chrome.runtime.sendMessage({ kind: "approve_fixture", ...args }), {
+        tabId: selected.tabId, expectedUrl, pendingRequestId: pending.payload.requestId
+      });
+      assert.equal(approved.ok, true, JSON.stringify(approved));
+      const replacement = await facade.getConnection(pending.payload.requestId);
+      assert.equal(replacement.kind, "connection_state");
+      assert.equal(replacement.payload.state, "ready_readonly");
+      assert.notEqual(replacement.payload.connectionId, previous.payload.connectionId);
+      return replacement;
+    };
+    const secondConnection = await approveReplacementConnection(connection, url);
+    assert.equal((await facade.getPreparedOperation(prepared.payload.operationId)).payload.state, "stale");
+    const second = await facade.prepareFixtureMessage(secondConnection.payload.connectionId, 1, "Second fixture draft",
       "c66b3997-9d43-4554-8399-267d1fe9f75c");
     assert.equal(second.kind, "message_prepared");
     await approveFillCandidate(second.payload);
@@ -927,7 +943,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
     await fixture.locator("#message").fill("");
     assert.deepEqual((await facade.fillFixtureDraft(second.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
-    const third = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, "Third fixture draft",
+    const third = await facade.prepareFixtureMessage(secondConnection.payload.connectionId, 1, "Third fixture draft",
       "d66b3997-9d43-4554-8399-267d1fe9f75c");
     assert.equal(third.kind, "message_prepared");
     await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
@@ -978,7 +994,9 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     assert.equal(await fixture.locator("#rich-message").innerText(), richPrepared.payload.preview.text);
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
     await fixture.locator("#rich-message").fill("");
-    const lostPrepared = await facade.prepareFixtureMessage(richConnection.payload.connectionId, 1,
+    const lostConnection = await approveReplacementConnection(richConnection, richUrl);
+    assert.equal((await facade.getPreparedOperation(richPrepared.payload.operationId)).payload.state, "stale");
+    const lostPrepared = await facade.prepareFixtureMessage(lostConnection.payload.connectionId, 1,
       "Synthetic fill with a lost script result", "f66b3997-9d43-4554-8399-267d1fe9f75c");
     assert.equal(lostPrepared.kind, "message_prepared");
     await approveFillCandidate(lostPrepared.payload);
@@ -1008,6 +1026,8 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     }
     await fixture.locator("#rich-message").evaluate((editor) => editor.replaceChildren());
     assert.equal(await fixture.locator("#rich-message").innerText(), "");
+    assert.equal((await facade.disconnectFixture(lostConnection.payload.connectionId)).payload.disconnected, true);
+    assert.equal((await facade.getPreparedOperation(lostPrepared.payload.operationId)).payload.state, "stale");
     mcpClient = new Client({ name: "fixture-browser-fill-test", version: "0.0.1" });
     const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
     await mcpClient.connect(new StdioClientTransport({ command: process.execPath, args: [mcpEntry],
@@ -1725,12 +1745,6 @@ async function exerciseFixtureDispatch(outcome) {
   let facade;
   let relay;
   try {
-    context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
-      executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
-      args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
-    let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
-    const extensionId = new URL(worker.url()).hostname;
-    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     let brokerStderr = "";
     const started = performance.now();
     broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: ["ignore", "ignore", "pipe"] });
@@ -1750,6 +1764,12 @@ async function exerciseFixtureDispatch(outcome) {
       elapsedMs: Math.round(performance.now() - started), exitCode: broker.exitCode,
       signalCode: broker.signalCode, stderr: brokerStderr
     })}`);
+    context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
+      executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+      args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
+    let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+    const extensionId = new URL(worker.url()).hostname;
+    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     facade = await connectBroker("facade", directory);
     relay = await connectBroker("relay", directory);
     mcpClient = new Client({ name: "fixture-browser-commit-test", version: "0.0.1" });

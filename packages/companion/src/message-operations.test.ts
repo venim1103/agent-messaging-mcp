@@ -771,6 +771,122 @@ test("conversation-scoped dispatch intent shares uncertainty across owners witho
   }
 });
 
+test("completed fill retains composer coordination against another owner without consuming their consent", async () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  const ledger = new PreparedMessageOperations(requests, database);
+  const owners = [Symbol("first composer owner"), Symbol("second composer owner")];
+  const target: FixtureTarget = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+    tabId: 3, documentId: "synthetic-shared-composer" };
+  try {
+    const operationIds = owners.map(owner => {
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approve(pending.requestId, target, 2000)!;
+      const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic coordinated draft", randomUUID(), 2001);
+      const review = ledger.listFixtureReviews(target, 2002).reviews.find(candidate => candidate.operationId === prepared.operationId)!;
+      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2002);
+      const fill = ledger.listFixtureFillReviews(target, 2002).reviews.find(candidate => candidate.operationId === prepared.operationId)!;
+      ledger.approveFixtureFillReview(target, prepared.operationId, fill.reviewId, 2002);
+      return prepared.operationId;
+    });
+    const first = ledger.requestFixtureFill(owners[0]!, operationIds[0]!, 2003);
+    assert.ok(first && first !== "busy");
+    assert.equal(ledger.completeFixtureFill(target, first.attemptId, { ok: true, editor: "textarea" }, 2004), true);
+    assert.ok((await first.result)?.ok);
+    assert.equal(ledger.requestFixtureFill(owners[1]!, operationIds[1]!, 2005), "busy");
+    assert.ok(ledger.getFixtureFillAuthorization(owners[1]!, operationIds[1]!, 2005));
+    ledger.disconnect(owners[0]!);
+    const next = ledger.requestFixtureFill(owners[1]!, operationIds[1]!, 2006);
+    assert.ok(next && next !== "busy");
+    assert.equal(ledger.completeFixtureFill(target, next.attemptId, { ok: true, editor: "textarea" }, 2007), true);
+    assert.ok((await next.result)?.ok);
+  } finally {
+    for (const owner of owners) ledger.disconnect(owner);
+    database.close();
+  }
+});
+
+test("composer coordination is provider-neutral and respects uncertainty, independent targets and lifecycle", async () => {
+  for (const provider of ["fixture", "gemini"] as const) {
+    for (const scenario of ["same-owner", "uncertain", "failed", "independent", "revoked", "expiry"] as const) {
+      const requests = new PendingConnectionRequests();
+      const database = new DatabaseSync(":memory:");
+      const ledger = new PreparedMessageOperations(requests, database);
+      const firstOwner = Symbol("first coordinated operation");
+      const secondOwner = scenario === "same-owner" ? firstOwner : Symbol("second coordinated operation");
+      const target: FixtureTarget | GeminiTarget = provider === "fixture"
+        ? { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-composer" }
+        : { origin: "https://gemini.google.com", conversationId: "synthetic-composer", tabId: 3,
+          documentId: "synthetic-composer", url: "https://gemini.google.com/app/synthetic-composer" };
+      const secondTarget = scenario === "independent" ? { ...target, tabId: 4, documentId: "synthetic-independent-composer" } : target;
+      const prepare = (owner: symbol, candidate: FixtureTarget | GeminiTarget, now: number) => {
+        const pending = requests.create(owner, 1000);
+        const grant = candidate.origin === "https://gemini.google.com"
+          ? requests.approveGemini(pending.requestId, candidate, 2000)!
+          : requests.approve(pending.requestId, candidate, 2000)!;
+        const operation = candidate.origin === "https://gemini.google.com"
+          ? ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic coordinated operation", randomUUID(), now)
+          : ledger.prepare(owner, grant.connectionId, 1, "Synthetic coordinated operation", randomUUID(), now);
+        if (candidate.origin === "https://gemini.google.com") {
+          const review = ledger.listGeminiReviews(candidate, now).reviews.find(row => row.operationId === operation.operationId)!;
+          ledger.approveGeminiReview(candidate, operation.operationId, review.reviewId, now);
+          const fill = ledger.listGeminiFillReviews(candidate, now).reviews.find(row => row.operationId === operation.operationId)!;
+          ledger.approveGeminiFillReview(candidate, operation.operationId, fill.reviewId, now);
+        } else {
+          const review = ledger.listFixtureReviews(candidate, now).reviews.find(row => row.operationId === operation.operationId)!;
+          ledger.approveFixtureReview(candidate, operation.operationId, review.reviewId, now);
+          const fill = ledger.listFixtureFillReviews(candidate, now).reviews.find(row => row.operationId === operation.operationId)!;
+          ledger.approveFixtureFillReview(candidate, operation.operationId, fill.reviewId, now);
+        }
+        return operation;
+      };
+      const request = (owner: symbol, operationId: string, now: number) => provider === "fixture"
+        ? ledger.requestFixtureFill(owner, operationId, now) : ledger.requestGeminiFill(owner, operationId, now);
+      try {
+        const first = prepare(firstOwner, target, 2001);
+        const filling = request(firstOwner, first.operationId, 2002);
+        assert.ok(filling && filling !== "busy");
+        if (target.origin === "https://gemini.google.com") {
+          assert.equal(ledger.listGeminiFillChallenges(2002).length, 1);
+          assert.equal(ledger.completeGeminiFill(target, filling.attemptId, scenario === "uncertain"
+            ? { ok: false, code: "FILL_UNCERTAIN" } : scenario === "failed" ? { ok: false, code: "DRAFT_PRESENT" }
+              : { ok: true, editor: "contenteditable" }, 2003), true);
+        } else {
+          assert.equal(ledger.completeFixtureFill(target, filling.attemptId, scenario === "uncertain"
+            ? { ok: false, code: "FILL_UNCERTAIN" } : scenario === "failed" ? { ok: false, code: "DRAFT_PRESENT" }
+              : { ok: true, editor: "textarea" }, 2003), true);
+        }
+        await filling.result;
+        const preparedAt = scenario === "expiry" ? first.expiresAt - 1 : 2004;
+        const second = prepare(secondOwner, secondTarget, preparedAt);
+        const next = request(secondOwner, second.operationId, preparedAt);
+        if (scenario === "failed" || scenario === "independent") {
+          assert.ok(next && next !== "busy", `${provider}:${scenario}`);
+        } else {
+          assert.equal(next, "busy", `${provider}:${scenario}`);
+          const approval = provider === "fixture" ? ledger.getFixtureFillAuthorization(secondOwner, second.operationId, preparedAt)
+            : ledger.getGeminiFillAuthorization(secondOwner, second.operationId, preparedAt);
+          assert.ok(approval, `${provider}:${scenario}`);
+          if (scenario === "revoked") {
+            requests.disconnect(firstOwner);
+            const afterRevocation = request(secondOwner, second.operationId, preparedAt + 1);
+            assert.ok(afterRevocation && afterRevocation !== "busy");
+          }
+          if (scenario === "expiry") {
+            const afterExpiry = request(secondOwner, second.operationId, first.expiresAt);
+            assert.ok(afterExpiry && afterExpiry !== "busy");
+            assert.equal(ledger.getOperation(firstOwner, first.operationId, first.expiresAt).state, "expired");
+          }
+        }
+      } finally {
+        ledger.disconnect(firstOwner);
+        ledger.disconnect(secondOwner);
+        database.close();
+      }
+    }
+  }
+});
+
 test("unconfirmed dispatch listing is bounded read-only metadata and filters unavailable attempts", () => {
   const database = new DatabaseSync(":memory:");
   const ledger = new PreparedMessageOperations(new PendingConnectionRequests(), database);
@@ -1353,16 +1469,18 @@ test("staged Gemini and fixture fresh dispatch proofs share capacity without con
     const owner = Symbol(provider);
     try {
       const now = 2000;
-      const geminiTarget = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
+      const baseGeminiTarget = { origin: "https://gemini.google.com" as const, conversationId: "disposable-chat",
         url: "https://gemini.google.com/app/disposable-chat?hl=en", tabId: 3, documentId: "synthetic-gemini-document" };
-      const fixtureTarget = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+      const baseFixtureTarget = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
         tabId: 4, documentId: "synthetic-fixture-document" };
-      const geminiPending = requests.create(owner, now);
-      const geminiGrant = requests.approveGemini(geminiPending.requestId, geminiTarget, now)!;
-      const fixturePending = requests.create(owner, now);
-      const fixtureGrant = requests.approve(fixturePending.requestId, fixtureTarget, now)!;
       const prepared = [];
       for (let index = 0; index <= MAX_PENDING_FIXTURE_DISPATCH_CHECKS; index++) {
+        const geminiTarget = { ...baseGeminiTarget, tabId: 3 + index * 2, documentId: `synthetic-gemini-document-${index}` };
+        const fixtureTarget = { ...baseFixtureTarget, tabId: 4 + index * 2, documentId: `synthetic-fixture-document-${index}` };
+        const geminiPending = requests.create(owner, now);
+        const geminiGrant = requests.approveGemini(geminiPending.requestId, geminiTarget, now)!;
+        const fixturePending = requests.create(owner, now);
+        const fixtureGrant = requests.approve(fixturePending.requestId, fixtureTarget, now)!;
         const isGemini = index < MAX_PENDING_FIXTURE_DISPATCH_CHECKS ? provider === "gemini" : provider !== "gemini";
         const key = `a66b3997-9d43-4554-8399-${String(index).padStart(12, "0")}`;
         const operation = isGemini ? ledger.prepareGemini(owner, geminiGrant.connectionId, 1, `Synthetic Gemini proof ${index}`, key, now)
@@ -1935,19 +2053,21 @@ test("pending durable dispatch refuses a second job before creating another inte
   try {
     const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
       tabId: 3, documentId: "CHROME-doc_opaque-42" };
-    const pending = requests.create(owner, 1000);
-    const grant = requests.approve(pending.requestId, target, 2000)!;
     const checks: { operationId: string; checkId: string }[] = [];
-    requests.publishFixtureSnapshot(target, [], 2003);
-    for (const idempotencyKey of ["a66b3997-9d43-4554-8399-267d1fe9f75c", "b66b3997-9d43-4554-8399-267d1fe9f75c"]) {
+    for (const [index, idempotencyKey] of ["a66b3997-9d43-4554-8399-267d1fe9f75c", "b66b3997-9d43-4554-8399-267d1fe9f75c"].entries()) {
+      const candidateTarget = { ...target, tabId: target.tabId + index,
+        documentId: index === 0 ? target.documentId : "synthetic-second-dispatch-composer" };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approve(pending.requestId, candidateTarget, 2000)!;
+      requests.publishFixtureSnapshot(candidateTarget, [], 2003);
       const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic bounded job", idempotencyKey, 2001);
-      const review = ledger.listFixtureReviews(target, 2002).reviews.find(item => item.operationId === prepared.operationId)!;
-      ledger.approveFixtureReview(target, prepared.operationId, review.reviewId, 2002);
-      approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
+      const review = ledger.listFixtureReviews(candidateTarget, 2002).reviews.find(item => item.operationId === prepared.operationId)!;
+      ledger.approveFixtureReview(candidateTarget, prepared.operationId, review.reviewId, 2002);
+      approveSyntheticSend(ledger, owner, prepared.operationId, candidateTarget, 2003);
       ledger.createRecoveryReceipt(owner, prepared.operationId, 2003);
       ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2003);
       checks.push({ operationId: prepared.operationId,
-        checkId: checkSyntheticDispatch(ledger, owner, prepared.operationId, target, prepared.preview.text, 2004) });
+        checkId: checkSyntheticDispatch(ledger, owner, prepared.operationId, candidateTarget, prepared.preview.text, 2004) });
     }
     const first = ledger.requestFixtureDispatch(owner, checks[0]!.operationId, checks[0]!.checkId, 2005);
     assert.throws(() => ledger.requestFixtureDispatch(owner, checks[1]!.operationId, checks[1]!.checkId, 2005),
@@ -2078,13 +2198,15 @@ test("dispatch checks have bounded capacity and release expired slots without re
   const owner = Symbol("bounded fixture checks");
   const ledger = new PreparedMessageOperations(requests, database);
   try {
-    const target = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+    const baseTarget = { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
       tabId: 3, documentId: "CHROME-doc_opaque-42" };
-    const pending = requests.create(owner, 1000);
-    const grant = requests.approve(pending.requestId, target, 2000)!;
-    requests.publishFixtureSnapshot(target, [], 2003);
     const operationIds: string[] = [];
+    const targets: FixtureTarget[] = [];
     for (let index = 0; index <= MAX_PENDING_FIXTURE_DISPATCH_CHECKS; index++) {
+      const target = { ...baseTarget, tabId: 3 + index, documentId: `synthetic-capacity-composer-${index}` };
+      const pending = requests.create(owner, 1000);
+      const grant = requests.approve(pending.requestId, target, 2000)!;
+      requests.publishFixtureSnapshot(target, [], 2003);
       const prepared = ledger.prepare(owner, grant.connectionId, 1, "Synthetic bounded check",
         `a66b3997-9d43-4554-8399-${index.toString(16).padStart(12, "0")}`, 2001);
       const review = ledger.listFixtureReviews(target, 2002).reviews.find(item => item.operationId === prepared.operationId)!;
@@ -2092,6 +2214,7 @@ test("dispatch checks have bounded capacity and release expired slots without re
       approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
       ledger.recordFixtureDispatchBaseline(owner, prepared.operationId, 2003);
       operationIds.push(prepared.operationId);
+      targets.push(target);
       if (index < MAX_PENDING_FIXTURE_DISPATCH_CHECKS) ledger.requestFixtureDispatchCheck(owner, prepared.operationId, 2004);
     }
     assert.equal(ledger.listFixtureDispatchChecks(2005).length, MAX_PENDING_FIXTURE_DISPATCH_CHECKS);
@@ -2103,7 +2226,7 @@ test("dispatch checks have bounded capacity and release expired slots without re
     assert.equal(ledger.listFixtureDispatchChecks(2005).find(check => check.operationId === operationIds[0])?.checkId,
       replaced.checkId);
     assert.deepEqual(ledger.listFixtureDispatchChecks(6003), []);
-    requests.publishFixtureSnapshot(target, [], 6004);
+    requests.publishFixtureSnapshot(targets.at(-1)!, [], 6004);
     ledger.recordFixtureDispatchBaseline(owner, overflow, 6004);
     const next = ledger.requestFixtureDispatchCheck(owner, overflow, 6004);
     assert.deepEqual(ledger.listFixtureDispatchChecks(6004), [next]);
@@ -2667,20 +2790,24 @@ test("one unresolved fixture dispatch intent blocks a second approved operation"
       tabId: 3, documentId: "CHROME-doc_opaque-42" };
     const pending = requests.create(owner, 1000);
     const grant = requests.approve(pending.requestId, target, 2000)!;
+    const secondTarget = { ...target, tabId: 4, documentId: "synthetic-second-uncertain-composer" };
+    const secondPending = requests.create(owner, 1000);
+    const secondGrant = requests.approve(secondPending.requestId, secondTarget, 2000)!;
     const ledger = new PreparedMessageOperations(requests, database);
     const first = ledger.prepare(owner, grant.connectionId, 1, "First synthetic draft",
       "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
-    const second = ledger.prepare(owner, grant.connectionId, 1, "Second synthetic draft",
+    const second = ledger.prepare(owner, secondGrant.connectionId, 1, "Second synthetic draft",
       "b66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
-    for (const review of ledger.listFixtureReviews(target, 2002).reviews) {
-      ledger.approveFixtureReview(target, review.operationId, review.reviewId, 2003);
+    for (const [prepared, candidateTarget] of [[first, target], [second, secondTarget]] as const) {
+      const review = ledger.listFixtureReviews(candidateTarget, 2002).reviews.find(item => item.operationId === prepared.operationId)!;
+      ledger.approveFixtureReview(candidateTarget, prepared.operationId, review.reviewId, 2003);
+      approveSyntheticSend(ledger, owner, prepared.operationId, candidateTarget, 2003);
+      requests.publishFixtureSnapshot(candidateTarget, [], 2003);
     }
-    for (const prepared of [first, second]) approveSyntheticSend(ledger, owner, prepared.operationId, target, 2003);
-    requests.publishFixtureSnapshot(target, [], 2003);
     ledger.recordFixtureDispatchBaseline(owner, first.operationId, 2003);
     ledger.recordFixtureDispatchBaseline(owner, second.operationId, 2003);
     const firstCheck = checkSyntheticDispatch(ledger, owner, first.operationId, target, first.preview.text, 2003);
-    const secondCheck = checkSyntheticDispatch(ledger, owner, second.operationId, target, second.preview.text, 2003);
+    const secondCheck = checkSyntheticDispatch(ledger, owner, second.operationId, secondTarget, second.preview.text, 2003);
     assert.throws(() => ledger.recordFixtureDispatchStart(owner, first.operationId, 2004), /RECOVERY_REQUIRED/);
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
     const firstReceipt = ledger.createRecoveryReceipt(owner, first.operationId, 2004);
@@ -3119,14 +3246,17 @@ test("fixture fill queue consumes separate owner consent before one exact-target
     assert.equal(ledger.requestFixtureFill(owner, prepared.operationId, 2007), null);
     assert.deepEqual(ledger.listFixtureFillChallenges(2007), [{ attemptId: filling.attemptId,
       operationId: prepared.operationId, target, text: prepared.preview.text, expiresAt: 6006 }]);
-    const second = ledger.prepare(owner, grant.connectionId, 1, "Synthetic second fill",
+    const secondTarget = { ...target, tabId: 4, documentId: "synthetic-independent-fill-composer" };
+    const secondPending = requests.create(owner, 1000);
+    const secondGrant = requests.approve(secondPending.requestId, secondTarget, 2000)!;
+    const second = ledger.prepare(owner, secondGrant.connectionId, 1, "Synthetic second fill",
       "c66b3997-9d43-4554-8399-267d1fe9f75c", 2007);
-    const [secondReview] = ledger.listFixtureReviews(target, 2008).reviews;
+    const [secondReview] = ledger.listFixtureReviews(secondTarget, 2008).reviews;
     assert.ok(secondReview);
-    ledger.approveFixtureReview(target, second.operationId, secondReview.reviewId, 2008);
-    const [secondFillReview] = ledger.listFixtureFillReviews(target, 2009).reviews;
+    ledger.approveFixtureReview(secondTarget, second.operationId, secondReview.reviewId, 2008);
+    const [secondFillReview] = ledger.listFixtureFillReviews(secondTarget, 2009).reviews;
     assert.ok(secondFillReview);
-    ledger.approveFixtureFillReview(target, second.operationId, secondFillReview.reviewId, 2009);
+    ledger.approveFixtureFillReview(secondTarget, second.operationId, secondFillReview.reviewId, 2009);
     assert.equal(ledger.requestFixtureFill(owner, second.operationId, 2010), "busy");
     assert.ok(ledger.getFixtureFillAuthorization(owner, second.operationId, 2010));
     assert.equal(ledger.completeFixtureFill({ ...target, documentId: "other" }, filling.attemptId,
