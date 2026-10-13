@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-13 (T2d same-chat reload/rebind gated; installed acceptance and D10a precede T3 autonomous sending).
+Updated: 2026-10-13 (T2d same-chat reload/rebind gated; D10a decided; installed fixture acceptance prepared, awaiting human observation).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,7 +16,8 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest source checkpoint: T2d exact same-chat reload/rebind (entry below), after T2c `8960a0a`, T2b `c032ee7` and T2a `5b71471`. Its exact gate passed build, both typechecks, **193/193 units and 30/30 e2e checks**. T2's connection model is complete synthetically; installed optional-permission/reload acceptance and autonomous sending remain. The user resumed development and offered testing help on 2026-10-13.
+- Latest source checkpoint: T2d exact same-chat reload/rebind `7de5862` (entry below), after T2c `8960a0a`, T2b `c032ee7` and T2a `5b71471`. Its exact gate passed build, both typechecks, **193/193 units and 30/30 e2e checks**. T2's connection model is complete synthetically; installed optional-permission/reload acceptance and autonomous sending remain. The user resumed development and offered testing help on 2026-10-13.
+- Current coordination: local fixture returns HTTP 200; no-data MCP diagnostic passed and started a fresh facade/broker. At the person's explicit request, container Chromium was launched with the fixture URL in the development profile; its process is running. Rendered-page visibility, extension reload and trusted approval remain unconfirmed. No browser page was inspected/read, and no fill/send occurred.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
 
 ### Capability matrix
@@ -94,11 +95,11 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 ### Decisions
 
-Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a allows multiple agents per chat with a visible roster/count and individual revocation; D13b requires approval once per agent (2026-10-12). Still open: D10a clearing the agent's own leftover draft (before T3), D6 debugger permission (after T5), and the second chat site.
+Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a allows multiple agents per chat with a visible roster/count and individual revocation; D13b requires approval once per agent (2026-10-12). D10a decided 2026-10-13: clearing is allowed only for the agent's own exactly matching unsent leftover draft, never a person's draft; uncertainty must be resolved first. Still open: D6 debugger permission (after T5) and the second chat site.
 
 ### Next step
 
-Coordinate a bounded installed local-fixture test of optional permission, per-agent approval, reload, individual removal and tab closure. Check processes and prepare prerequisites before asking for human gestures/restarts. Ask D10a before T3; do not infer its answer from testing availability. T2 is gated; do not reopen exclusive pickup or add automatic admission. No installed-profile activity, live access or real-chat approval occurred at T2d.
+Confirm the person sees the opened local fixture, then coordinate extension/MCP refresh and trusted popup approval for a bounded fixture-only read/reload/removal test. T2 is gated and D10a decided; T3 may proceed using that policy, but this is not a live development fill/send grant. Do not reopen exclusive pickup or add automatic admission. No live-site access or real-chat approval has occurred.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -133,8 +134,9 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 - **Tests:** units and SDK checks for several facades receiving distinct handles on one chat, independent reads/cursors, strict owner-bound request/status/pickup, roster count/labels, duplicate display names distinguished by instance IDs, one owner's disconnect/restart and individual human removal leaving others intact, denied cross-owner revocation and no silent re-admission. Retain no-expiry/deadline/rebind/gap cases. Disposable-browser tests cover Connect/admission per D13b, roster/removal, same-chat reload, chat switch and tab close ending all target grants.
 - **Done when:** the gate passes, DEVELOPMENT.md documents the new flow and tools, and the capability matrix is updated.
 
-### T3 Autonomous send (ask the user about D10a first)
+### T3 Autonomous send (D10a decided 2026-10-13)
 
+- **Leftover draft (D10a):** the system may clear only its own exactly matching unsent leftover draft before a new operation, with fresh exact-target/ownership evidence. Text equality alone is insufficient. Never clear a person's draft, clear while a prior submit is unresolved, retry that operation or restore consumed authority. This policy decision is not a live-test grant.
 - **Tool:** `chat_send_message { connectionId, text, idempotencyKey }` on an autonomous connection. Results: `sent` (D9 evidence); `not_sent` with a code, after which the agent may send again with a new key; or `unresolved`, which pauses sending in that chat. Every result says `retryAllowed: false` for that operation, and the same key and text return the existing status.
 - **Pipeline:** in the broker, inside one absolute deadline: prepare (journal digest and receipt), fill job, fresh challenged read, proof job, durable intent, submit job with browser reservation and one guarded activation, then evidence. Add a dedicated budget for this request only (for example 30 s); every inner lease stays at most 4 s and is clipped to it. Owner disconnect before durable intent sends nothing; after it, the outcome is still recorded.
 - **Provider-neutral (D5):** implement the pipeline once, with provider adapters for text limits, editor kind and evidence. Reuse `fillGeminiDraft`, `inspectGeminiDraft` and `submitGeminiDraft`, the worker executors and `reserveBrowserSubmitAttempt` (Gemini namespace). Use generic phase commands for new browser jobs instead of more `*_gemini_*` families. Relax the staged job's post-offer cursor check (see the Staged Gemini One-Offer Dispatch Job entry).
@@ -164,6 +166,13 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## D10a And Installed Fixture Preparation (2026-10-13)
+
+- The user explicitly chose allowing clearance of only the agent's own exactly matching unsent leftover draft. DESIGN.md section 10 and decision D10a now record the policy, with ownership evidence, uncertainty resolution and no retry/restored authority. T3 remains unimplemented; no real-site write authorization was given.
+- After source commit `7de5862`, the fixture was started and returned HTTP 200. The no-data MCP diagnostic passed, auto-starting a fresh facade/broker. The user could not see Chromium and explicitly requested opening it; the assistant launched the established development profile with the local fixture URL. The process is running; actual fixture visibility and installed extension/permission acceptance require the person's observation. No generic browser control or page inspection/read, fill or send occurred.
+- The initial process check filtered `comm == node`; Node may report another process name. The corrected command identifies script paths but prints only service labels/PIDs, not URLs/profile arguments. Services were absent before the diagnostic and appeared after it; do not infer process readiness solely from the `comm` field.
+- Documentation-only follow-up: scoped content/link/added-line-length/whitespace validation, not another source gate. Source gate evidence remains T2d below. Next: confirm visible fixture and coordinate trusted popup gestures, then T3 with decided D10a. See AGENTS.md Safety Boundaries.
 
 ## T2d Same-Chat Reload/Rebind (2026-10-13)
 

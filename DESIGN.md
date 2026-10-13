@@ -318,7 +318,9 @@ Fixture evidence relies on stable row IDs. Gemini rows have none, so the staged 
 
 ### Unconfirmed sends (decided, D10)
 
-The prototype's durable barrier is global and permanent: one send without evidence blocks every later send in every chat, across restarts. The barrier becomes per connection. After activation, reconciliation watches for a bounded settle window. The exact new outgoing row (D9) means sent. The exact prepared text still in the composer, Send still available and no new outgoing row means not sent, and the agent may send again as a new operation. Anything else leaves the operation unresolved: that chat pauses sending, and the popup offers a one-click **Sent** / **Not sent** resolution. Nothing is resent automatically, and receipts still recover status only. Open sub-question D10a: may the system clear a leftover draft that exactly equals the agent's own not-sent text before the next send?
+The prototype's durable barrier is global and permanent: one send without evidence blocks every later send in every chat, across restarts. The barrier becomes per connection. After activation, reconciliation watches for a bounded settle window. The exact new outgoing row (D9) means sent. The exact prepared text still in the composer, Send still available and no new outgoing row means not sent, and the agent may send again as a new operation. Anything else leaves the operation unresolved: that chat pauses sending, and the popup offers a one-click **Sent** / **Not sent** resolution. Nothing is resent automatically, and receipts still recover status only.
+
+D10a (decided 2026-10-13): the system may clear only its own exactly matching leftover unsent draft before a new operation. Fresh exact-target and draft-ownership evidence is required; text equality alone does not prove ownership. Never clear a person's draft. An uncertain prior submit remains paused until resolved; clearing must not retry that operation or restore consumed authority. This policy choice is not authorization for any live development fill or send.
 
 ### Result states
 
@@ -533,7 +535,8 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D7 Checkpoint size: decided.** One checkpoint per authority boundary when it follows an established pattern, with shorter handoff entries.
 - **D8 Observation window and failure policy: decided.** Publish the newest rows with `omittedBefore`, mark per-message truncation explicitly within the frame limit, and when URL, document and conversation are unchanged skip a failed capture instead of revoking; challenged reads then return `OBSERVATION_UNAVAILABLE`. Identity changes still revoke.
 - **D9 Gemini outcome evidence: decided.** The append-only rule in section 10.
-- **D10 Unconfirmed sends: decided.** Resolve from page evidence and pause only the affected chat when still unclear, with a one-click popup resolution; the barrier becomes per connection (section 10). Sub-question D10a (clearing the agent's own leftover draft) is open.
+- **D10 Unconfirmed sends: decided.** Resolve from page evidence and pause only the affected chat when still unclear, with a one-click popup resolution; the barrier becomes per connection (section 10).
+- **D10a Leftover draft: decided (2026-10-13).** The user permits clearing only the agent's own exactly matching unsent leftover draft, never a person's draft. Require fresh target/ownership evidence and resolve uncertainty first; no retry or restored authority. See section 10. This policy is not a live-test grant.
 - **D11 Hidden tab: decided, phased.** First the chat tab must stay visible; its own window is fine, so "active tab of the current window" relaxes to "visible tab". Later a hidden tab must work too, so that only closing the tab or the browser disconnects.
 - **D12 Target platform: decided.** Keep the devcontainer: container Chromium, native host, broker and MCP server in one container (section 12).
 - **D13 Connection start: decided.** The person clicks **Connect this chat** first and the agent picks the chat up (section 4).
