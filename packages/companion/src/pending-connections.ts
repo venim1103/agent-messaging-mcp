@@ -372,6 +372,11 @@ export class PendingConnectionRequests {
     return target?.origin === "https://gemini.google.com" ? target : null;
   }
 
+  getAutonomousTarget(owner: symbol, connectionId: string, now = Date.now()): ApprovedTarget | null {
+    const grant = this.liveGrant(owner, connectionId, now);
+    return grant?.connection.state === "ready" ? grant.target : null;
+  }
+
   getConnectionExpiresAt(owner: symbol, connectionId: string, now = Date.now()): number | null {
     const grant = this.liveGrant(owner, connectionId, now);
     return grant ? grant.connection.expiresAt ?? Infinity : null;

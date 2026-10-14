@@ -4,8 +4,9 @@ import { connectBroker } from "./broker-client.js";
 import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { NativeFrameDecoder, writeNativeFrame } from "./native-framing.js";
 import type { ChatAgent } from "./pending-connections.js";
+import type { ChatSubmitJob } from "./message-operations.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
-  parseNativeChatAgentRequest,
+  parseNativeChatAgentRequest, parseNativeChatJobRequest,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
@@ -81,6 +82,9 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           continue;
         }
         const request = typeof message === "object" && message !== null && "kind" in message
+          && (message.kind === "list_chat_jobs" || message.kind === "complete_chat_job")
+          ? parseNativeChatJobRequest(message)
+          : typeof message === "object" && message !== null && "kind" in message
           && (message.kind === "list_chat_agents" || message.kind === "remove_chat_agent" || message.kind === "disconnect_chat"
             || message.kind === "approve_chat_agent" || message.kind === "list_available_agents"
             || message.kind === "list_unconfirmed_dispatches" || message.kind === "resolve_unconfirmed_dispatch"
@@ -165,9 +169,11 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | "fixture_dispatch_checks" | "fixture_dispatch_check_recorded"
             | "gemini_dispatch_checks" | "gemini_dispatch_check_recorded"
             | "fixture_dispatch_attempts" | "fixture_dispatch_recorded"
+            | "chat_jobs" | "chat_job_recorded"
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "unconfirmed_dispatches" | "dispatch_resolved" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
+            | { jobs: ReadonlyArray<ChatSubmitJob> }
             | { attempts: ReadonlyArray<{ operationId: string; startedAt: number }>; hasMore: boolean }
             | { operationId: string; state: "resolved"; startedAt: number;
               resolution: { outcome: "sent" | "not_sent"; source: "page" | "person"; resolvedAt: number } }
@@ -200,7 +206,18 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"), request.deadlineMs);
-            if (request.kind === "list_chat_agents") {
+            if (request.kind === "list_chat_jobs") {
+              const result = await client.listChatJobs(request.payload.phase, request.payload.provider);
+              if (result.kind !== "chat_jobs" && result.kind !== "error") throw new Error("Broker refused chat job list");
+              kind = result.kind;
+              payload = result.payload;
+            } else if (request.kind === "complete_chat_job") {
+              const result = await client.completeChatJob(request.payload.target, request.payload.operationId,
+                request.payload.jobId, request.payload.phase, request.payload.observation);
+              if (result.kind !== "chat_job_recorded" && result.kind !== "error") throw new Error("Broker refused chat job completion");
+              kind = result.kind;
+              payload = result.payload;
+            } else if (request.kind === "list_chat_agents") {
               const result = await client.listChatAgents(request.payload.target);
               if (result.kind !== "chat_agents") throw new Error("Broker refused chat agent list");
               kind = "chat_agents";

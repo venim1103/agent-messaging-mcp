@@ -1728,14 +1728,14 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
   });
 }
 
-async function exerciseFixtureDispatch(outcome) {
+async function exerciseChatDispatch(outcome, provider = "fixture") {
   let mcpClient;
-  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-dispatch-test-"));
+  const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
   const manifestPath = join(unpacked, "manifest.json");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  manifest.host_permissions = ["http://127.0.0.1:8787/*"];
+  manifest.host_permissions = [provider === "gemini" ? "https://gemini.google.com/*" : "http://127.0.0.1:8787/*"];
   await writeFile(manifestPath, JSON.stringify(manifest));
   const directory = join(profile, ".config/agent-messaging-mcp/broker");
   const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
@@ -1777,60 +1777,109 @@ async function exerciseFixtureDispatch(outcome) {
     await mcpClient.connect(new StdioClientTransport({ command: process.execPath, args: [mcpEntry],
       env: { ...process.env, HOME: profile } }));
     const fixture = await context.newPage();
-    const html = await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8");
-    await fixture.route("http://127.0.0.1:8787/**", route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
+    const html = provider === "gemini" ? `<!doctype html><html><head><meta charset="utf-8"><style>
+      main, infinite-scroller, user-query, user-query-content { display:block }
+      [contenteditable] { min-height:40px; width:480px; border:1px solid black }
+      </style></head><body><main><div contenteditable="true" aria-label="Enter a prompt for Gemini"></div>
+      <infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic existing row</p>
+      </user-query-content></user-query></infinite-scroller>
+      <button type="submit" aria-label="Send message">Send</button></main><script>
+      window.fixtureSubmitCount=0;
+      document.querySelector('button').addEventListener('click',()=>{
+        window.fixtureSubmitCount++;
+        const editor=document.querySelector('[contenteditable]');
+        const row=document.createElement('user-query');
+        const content=document.createElement('user-query-content');
+        const line=document.createElement('p');line.className='query-text-line';line.textContent=editor.innerText;
+        content.append(line);row.append(content);document.querySelector('infinite-scroller').append(row);
+        editor.textContent='';
+      });</script></body></html>` : await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8");
+    await fixture.route(provider === "gemini" ? "https://gemini.google.com/**" : "http://127.0.0.1:8787/**",
+      route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
     const rich = outcome === "lost_script" || outcome === "worker_crash";
-    const url = `http://127.0.0.1:8787/${rich ? "?editor=rich" : ""}`;
+    const url = provider === "gemini" ? "https://gemini.google.com/app/synthetic-neutral-submit?hl=en"
+      : `http://127.0.0.1:8787/${rich ? "?editor=rich" : ""}`;
     await fixture.goto(url);
-    await fixture.evaluate(() => {
+    if (provider === "fixture") await fixture.evaluate(() => {
       globalThis.fixtureSubmitCount = 0;
       document.querySelector("#composer").addEventListener("submit", () => { globalThis.fixtureSubmitCount++; });
     });
-    const selected = await worker.evaluate(async () => {
+    const selected = await worker.evaluate(async provider => {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const [identity] = await chrome.scripting.executeScript({ target: { tabId: tab.id },
-        func: () => document.querySelector("main")?.getAttribute("data-conversation-id") });
-      return { tabId: tab.id, documentId: identity.documentId, conversation: identity.result };
-    });
-    assert.equal(selected.conversation, "fixture-alpha");
-    const requested = await mcpClient.callTool({ name: "chat_request_connection", arguments: {} });
-    assert.equal(requested.isError, undefined);
-    const pending = requested.structuredContent;
+        func: () => ({ url: location.href, conversation: document.querySelector("main")?.getAttribute("data-conversation-id") }) });
+      return { tabId: tab.id, documentId: identity.documentId,
+        conversation: provider === "gemini" ? new URL(identity.result.url).pathname.split("/")[2] : identity.result.conversation };
+    }, provider);
+    assert.equal(selected.conversation, provider === "gemini" ? "synthetic-neutral-submit" : "fixture-alpha");
+    const requested = provider === "gemini" ? await facade.requestConnection()
+      : await mcpClient.callTool({ name: "chat_request_connection", arguments: {} });
+    if (provider === "fixture") assert.equal(requested.isError, undefined);
+    else assert.equal(requested.kind, "connection_requested");
+    const pending = provider === "gemini" ? requested.payload : requested.structuredContent;
     const popup = await context.newPage();
     await fixture.bringToFront();
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);
-    await popup.getByRole("button", { name: "Review fixture drafts" }).waitFor({ state: "visible", timeout: 4000 });
-    const approved = await popup.evaluate(args => chrome.runtime.sendMessage({ kind: "approve_fixture", ...args }),
-      { tabId: selected.tabId, expectedUrl: url, pendingRequestId: pending.requestId });
+    await popup.getByRole("button", { name: provider === "gemini" ? "Review Gemini drafts" : "Review fixture drafts" })
+      .waitFor({ state: "visible", timeout: 4000 });
+    const approved = await popup.evaluate(args => chrome.runtime.sendMessage(args),
+      { kind: provider === "gemini" ? "approve_gemini" : "approve_fixture",
+        tabId: selected.tabId, expectedUrl: url, pendingRequestId: pending.requestId });
     assert.equal(approved.ok, true, JSON.stringify(approved));
-    const connected = await mcpClient.callTool({ name: "chat_get_connection", arguments: { requestId: pending.requestId } });
-    const connection = connected.structuredContent;
+    const connected = provider === "gemini" ? await facade.getConnection(pending.requestId)
+      : await mcpClient.callTool({ name: "chat_get_connection", arguments: { requestId: pending.requestId } });
+    const connection = provider === "gemini" ? connected.payload : connected.structuredContent;
     assert.equal(connection.state, "ready_readonly");
-    const preparation = await mcpClient.callTool({ name: "chat_prepare_message", arguments: {
+    const preparation = provider === "gemini"
+      ? await facade.prepareGeminiMessage(connection.connectionId, 1, `Synthetic one-shot ${outcome}`, "a66b3997-9d43-4554-8399-267d1fe9f75c")
+      : await mcpClient.callTool({ name: "chat_prepare_message", arguments: {
       connectionId: connection.connectionId, expectedGeneration: 1, text: `Synthetic one-shot ${outcome}`,
       idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c"
     } });
-    assert.equal(preparation.isError, undefined);
-    const prepared = preparation.structuredContent;
-    for (const [purpose, status] of [["reviews", "Approved fixture draft"], ["fill-reviews", "Allowed fixture draft fill"]]) {
+    if (provider === "fixture") assert.equal(preparation.isError, undefined);
+    else assert.equal(preparation.kind, "gemini_message_prepared");
+    const prepared = provider === "gemini" ? preparation.payload : preparation.structuredContent;
+    if (provider === "gemini") {
+      for (const [list, approve] of [["list_gemini_prepared_reviews", "approve_gemini_review"],
+        ["list_gemini_fill_reviews", "approve_gemini_fill_review"]]) {
+        const reviews = await popup.evaluate(args => chrome.runtime.sendMessage(args), { kind: list, tabId: selected.tabId, expectedUrl: url });
+        assert.equal(reviews.ok, true);
+        assert.equal(reviews.reviews[0].preview.text, prepared.preview.text);
+        const consent = await popup.evaluate(args => chrome.runtime.sendMessage(args), { kind: approve, tabId: selected.tabId,
+          expectedUrl: url, operationId: prepared.operationId, reviewId: reviews.reviews[0].reviewId });
+        assert.equal(consent.ok, true);
+      }
+    } else for (const [purpose, status] of [["reviews", "Approved fixture draft"], ["fill-reviews", "Allowed fixture draft fill"]]) {
       await popup.evaluate(id => document.getElementById(id).click(), `view-fixture-${purpose}`);
       await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
       assert.equal(await popup.locator("#fixture-reviews pre").textContent(), prepared.preview.text);
       await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
       await popup.getByText(`${status} ${prepared.operationId}.`, { exact: false }).waitFor({ state: "visible", timeout: 4000 });
     }
-    const filled = await mcpClient.callTool({ name: "chat_fill_draft", arguments: { operationId: prepared.operationId } });
-    assert.equal(filled.structuredContent.ok, true);
-    const noConsent = await mcpClient.callTool({ name: "chat_commit_message", arguments: { operationId: prepared.operationId } });
-    assert.equal(noConsent.isError, true);
-    assert.deepEqual(noConsent.structuredContent, { operationId: prepared.operationId, ok: false,
-      code: "DISPATCH_UNAVAILABLE", retryAllowed: false });
-    await popup.evaluate(() => document.getElementById("view-fixture-send-reviews").click());
-    await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
-    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), prepared.preview.text);
-    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-    await popup.getByText(`Approved fixture send ${prepared.operationId}. No message was sent.`)
-      .waitFor({ state: "visible", timeout: 4000 });
+    const filled = provider === "gemini" ? await facade.fillGeminiDraft(prepared.operationId)
+      : await mcpClient.callTool({ name: "chat_fill_draft", arguments: { operationId: prepared.operationId } });
+    assert.equal((provider === "gemini" ? filled.payload : filled.structuredContent).ok, true);
+    if (provider === "gemini") {
+      assert.deepEqual((await facade.commitPreparedMessage(prepared.operationId)).payload, { code: "DISPATCH_UNAVAILABLE" });
+      const reviews = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
+        kind: "list_gemini_send_reviews", tabId: selected.tabId, expectedUrl: url });
+      assert.equal(reviews.ok, true);
+      assert.equal(reviews.reviews[0].preview.text, prepared.preview.text);
+      const consent = await popup.evaluate(args => chrome.runtime.sendMessage(args), { kind: "approve_gemini_send_review",
+        tabId: selected.tabId, expectedUrl: url, operationId: prepared.operationId, reviewId: reviews.reviews[0].reviewId });
+      assert.equal(consent.ok, true);
+    } else {
+      const noConsent = await mcpClient.callTool({ name: "chat_commit_message", arguments: { operationId: prepared.operationId } });
+      assert.equal(noConsent.isError, true);
+      assert.deepEqual(noConsent.structuredContent, { operationId: prepared.operationId, ok: false,
+        code: "DISPATCH_UNAVAILABLE", retryAllowed: false });
+      await popup.evaluate(() => document.getElementById("view-fixture-send-reviews").click());
+      await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
+      assert.equal(await popup.locator("#fixture-reviews pre").textContent(), prepared.preview.text);
+      await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+      await popup.getByText(`Approved fixture send ${prepared.operationId}. No message was sent.`)
+        .waitFor({ state: "visible", timeout: 4000 });
+    }
     assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 0);
     if (outcome === "lost_script" || outcome === "worker_crash" || outcome === "broker_crash") {
       await worker.evaluate(({ operationId, hold }) => {
@@ -1846,18 +1895,20 @@ async function exerciseFixtureDispatch(outcome) {
       }, { operationId: prepared.operationId, hold: outcome !== "lost_script" });
     }
     if (outcome === "lost_native_completion") {
-      await worker.evaluate(() => {
+      await worker.evaluate(provider => {
         const connect = chrome.runtime.connectNative.bind(chrome.runtime);
         chrome.runtime.connectNative = (...args) => {
           const port = connect(...args);
           const post = port.postMessage.bind(port);
           port.postMessage = message => {
-            if (message.kind === "complete_fixture_dispatch") { globalThis.fixtureDroppedCompletion = true; return; }
+            if (message.kind === (provider === "gemini" ? "complete_chat_job" : "complete_fixture_dispatch")) {
+              globalThis.fixtureDroppedCompletion = true; return;
+            }
             post(message);
           };
           return port;
         };
-      });
+      }, provider);
     }
     if (outcome === "blocked_after_reservation") {
       await worker.evaluate(({ tabId, documentId }) => {
@@ -1869,7 +1920,8 @@ async function exerciseFixtureDispatch(outcome) {
         };
       }, selected);
     }
-    const dispatching = mcpClient.callTool({ name: "chat_commit_message", arguments: { operationId: prepared.operationId } })
+    const dispatching = (provider === "gemini" ? facade.commitPreparedMessage(prepared.operationId)
+      : mcpClient.callTool({ name: "chat_commit_message", arguments: { operationId: prepared.operationId } }))
       .then(reply => ({ reply }), error => ({ error }));
     if (outcome !== "blocked_after_reservation") {
       await fixture.waitForFunction(() => globalThis.fixtureSubmitCount === 1, null, { timeout: 4000 });
@@ -1897,9 +1949,12 @@ async function exerciseFixtureDispatch(outcome) {
       broker.kill("SIGKILL");
       await brokerExit;
       const crashed = await dispatching;
-      assert.equal(crashed.reply?.isError, true);
-      assert.deepEqual(crashed.reply.structuredContent, { operationId: prepared.operationId, ok: false,
-        code: "DISPATCH_UNCERTAIN", retryAllowed: false, state: "dispatch_uncertain" });
+      if (provider === "gemini") assert.ok(crashed.error);
+      else {
+        assert.equal(crashed.reply?.isError, true);
+        assert.deepEqual(crashed.reply.structuredContent, { operationId: prepared.operationId, ok: false,
+          code: "DISPATCH_UNCERTAIN", retryAllowed: false, state: "dispatch_uncertain" });
+      }
       facade.close();
       relay.close();
       broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
@@ -1921,26 +1976,37 @@ async function exerciseFixtureDispatch(outcome) {
       assert.deepEqual((await facade.getConnection(pending.requestId)).payload, { state: "unknown" });
       assert.equal((await facade.getPreparedOperation(prepared.operationId, prepared.recoveryToken)).payload.state,
         "dispatch_uncertain");
-      assert.deepEqual((await facade.commitFixtureMessage(prepared.operationId)).payload,
+      assert.deepEqual((provider === "gemini" ? await facade.commitPreparedMessage(prepared.operationId)
+        : await facade.commitFixtureMessage(prepared.operationId)).payload,
         { code: "DISPATCH_UNAVAILABLE" });
-      assert.deepEqual((await relay.listFixtureDispatchAttempts()).payload, { attempts: [] });
+      assert.deepEqual((provider === "gemini" ? await relay.listChatJobs("submit", "gemini")
+        : await relay.listFixtureDispatchAttempts()).payload, provider === "gemini" ? { jobs: [] } : { attempts: [] });
     }
     const settled = await dispatching;
-    assert.ok(settled.reply);
-    const status = settled.reply.structuredContent;
-    assert.equal(status.state, outcome === "observed" ? "observed_in_ui" : "dispatch_uncertain");
-    assert.equal(status.ok, outcome === "observed");
-    assert.equal(status.retryAllowed, false);
-    assert.equal(settled.reply.isError, outcome !== "observed");
-    assert.equal(JSON.stringify(settled.reply).includes(prepared.preview.text), false);
-    assert.equal(JSON.stringify(settled.reply).includes(prepared.recoveryToken), false);
-    assert.equal(JSON.stringify(settled.reply).includes(selected.documentId), false);
+    if (provider !== "gemini" || outcome !== "broker_crash") assert.ok(settled.reply);
+    const status = provider === "gemini" ? outcome === "broker_crash"
+      ? (await facade.getPreparedOperation(prepared.operationId, prepared.recoveryToken)).payload : settled.reply.payload
+      : settled.reply.structuredContent;
+    assert.equal(status.state, outcome === "observed" ? provider === "gemini" ? "resolved" : "observed_in_ui" : "dispatch_uncertain");
+    if (provider === "fixture") {
+      assert.equal(status.ok, outcome === "observed");
+      assert.equal(status.retryAllowed, false);
+      assert.equal(settled.reply.isError, outcome !== "observed");
+    } else if (outcome === "observed") {
+      assert.equal(status.resolution.outcome, "sent");
+      assert.equal(status.resolution.source, "page");
+    }
+    assert.equal(JSON.stringify(status).includes(prepared.preview.text), false);
+    assert.equal(JSON.stringify(status).includes(prepared.recoveryToken), false);
+    assert.equal(JSON.stringify(status).includes(selected.documentId), false);
     if (outcome !== "broker_crash") {
-      assert.deepEqual((await mcpClient.callTool({ name: "chat_commit_message",
-        arguments: { operationId: prepared.operationId } })).structuredContent, status);
-      assert.deepEqual((await relay.listFixtureDispatchAttempts()).payload, { attempts: [] });
+      const replay = provider === "gemini" ? await facade.commitPreparedMessage(prepared.operationId)
+        : await mcpClient.callTool({ name: "chat_commit_message", arguments: { operationId: prepared.operationId } });
+      assert.deepEqual(provider === "gemini" ? replay.payload : replay.structuredContent, status);
+      assert.deepEqual((provider === "gemini" ? await relay.listChatJobs("submit", "gemini")
+        : await relay.listFixtureDispatchAttempts()).payload, provider === "gemini" ? { jobs: [] } : { attempts: [] });
       assert.equal((await facade.getPreparedOperation(prepared.operationId, prepared.recoveryToken)).payload.state, status.state);
-    } else {
+    } else if (provider === "fixture") {
       const recoveredStatus = await mcpClient.callTool({ name: "chat_get_operation", arguments: {
         operationId: prepared.operationId, recoveryToken: prepared.recoveryToken
       } });
@@ -1953,16 +2019,18 @@ async function exerciseFixtureDispatch(outcome) {
       await fixture.bringToFront();
       await popup.evaluate(tabId => chrome.runtime.sendMessage({ kind: "list_fixture_pending", tabId }), selected.tabId);
       worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
-      assert.deepEqual((await relay.listFixtureDispatchAttempts()).payload, { attempts: [] });
+      assert.deepEqual((provider === "gemini" ? await relay.listChatJobs("submit", "gemini")
+        : await relay.listFixtureDispatchAttempts()).payload, provider === "gemini" ? { jobs: [] } : { attempts: [] });
     }
-    assert.equal(await worker.evaluate(async operationId =>
-      (await chrome.storage.local.get(`fixture-submit-attempt-${operationId}`))[`fixture-submit-attempt-${operationId}`],
-    prepared.operationId), true);
+    assert.equal(await worker.evaluate(async ({ operationId, provider }) =>
+      (await chrome.storage.local.get(`${provider}-submit-attempt-${operationId}`))[`${provider}-submit-attempt-${operationId}`],
+    { operationId: prepared.operationId, provider }), true);
     if (outcome === "lost_native_completion") {
       assert.equal(await worker.evaluate(() => globalThis.fixtureDroppedCompletion), true);
     }
     assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), outcome === "blocked_after_reservation" ? 0 : 1);
-    assert.equal(await fixture.locator("ol[role=log] li").count(), outcome === "blocked_after_reservation" ? 2 : 3);
+    assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
+      (provider === "gemini" ? 1 : 2) + (outcome === "blocked_after_reservation" ? 0 : 1));
     const { DatabaseSync } = await import("node:sqlite");
     const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
     try {
@@ -1984,13 +2052,20 @@ async function exerciseFixtureDispatch(outcome) {
 
 test("private fixture submit activates once and stays uncertain after lost results or changed controls", { timeout: 30000 }, async () => {
   for (const outcome of ["observed", "lost_script", "lost_native_completion", "blocked_after_reservation"]) {
-    await exerciseFixtureDispatch(outcome);
+    await exerciseChatDispatch(outcome);
   }
 });
 
 test("worker and broker crashes after fixture activation never restore submit authority", { timeout: 30000 }, async () => {
-  for (const outcome of ["worker_crash", "broker_crash"]) await exerciseFixtureDispatch(outcome);
+  for (const outcome of ["worker_crash", "broker_crash"]) await exerciseChatDispatch(outcome);
 });
+
+for (const outcome of ["observed", "lost_script", "lost_native_completion", "blocked_after_reservation", "worker_crash", "broker_crash"]) {
+  test(`neutral Gemini worker submits once without restoring authority (${outcome})`, { timeout: 25000 }, async testContext => {
+    testContext.signal.throwIfAborted();
+    await exerciseChatDispatch(outcome, "gemini");
+  });
+}
 
 for (const outcome of ["observed", "script-result-loss", "completion-request-loss", "worker-stop", "broker-stop"]) {
   test(`connected Gemini worker fills once and never retries lost script or completion results (${outcome})`, { timeout: 25000 }, async (testContext) => {

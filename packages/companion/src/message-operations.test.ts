@@ -66,6 +66,24 @@ async function checkSyntheticGeminiDispatch(ledger: PreparedMessageOperations, o
   return checking.checkId;
 }
 
+test("autonomous send authority is an owned live popup grant, never a legacy read-only handle", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("autonomous authority owner");
+  const foreign = Symbol("foreign authority owner");
+  const agent = requests.registerAgent(owner, "Synthetic autonomous agent");
+  const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-autonomous-authority",
+    url: "https://gemini.google.com/app/synthetic-autonomous-authority", tabId: 4, documentId: "synthetic-authority-document" };
+  const pending = requests.create(owner, 1000);
+  const legacy = requests.approveGemini(pending.requestId, target, 2000)!;
+  assert.equal(requests.getAutonomousTarget(owner, legacy.connectionId, 2001), null);
+  const autonomous = requests.approveAgent(agent.agentId, target, 2000)!;
+  assert.deepEqual(requests.getAutonomousTarget(owner, autonomous.connectionId, 2001), target);
+  assert.equal(requests.getAutonomousTarget(foreign, autonomous.connectionId, 2001), null);
+  assert.deepEqual(requests.getAutonomousTarget(owner, autonomous.connectionId, 1_000_000), target);
+  requests.revokeChangedTab(target.tabId, null);
+  assert.equal(requests.getAutonomousTarget(owner, autonomous.connectionId, 1_000_001), null);
+});
+
 test("Gemini fresh-proof and activation-result contracts refuse authority, extra claims and fixture editors", () => {
   const proof = { ok: true, editor: "contenteditable", draftText: "Synthetic exact draft \u00e9\nSecond line",
     selected: true, writable: true, submitReady: true };
@@ -449,6 +467,9 @@ test("staged Gemini durable jobs offer once under original proof lease and remai
     assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, "foreign-attempt", activated, 2008), false);
     assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId,
       { ...activated, delivered: true } as typeof activated, 2008), false);
+    requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic job baseline" },
+      { direction: "incoming", text: "Synthetic later publication" }], 2008);
+    assert.deepEqual(ledger.listGeminiDispatchAttempts(2008), []);
     assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId, activated, 2008), true);
     const result = await dispatch.result;
     assert.deepEqual(result, { operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2007 });
@@ -460,6 +481,72 @@ test("staged Gemini durable jobs offer once under original proof lease and remai
   } finally {
     ledger.disconnect(owner);
     database.close();
+  }
+});
+
+test("Gemini dispatch evidence requires continuous exact append-only outgoing rows", async () => {
+  for (const mode of ["sent", "reply", "streaming-reply", "duplicate", "baseline-edit", "transient-edit", "row-disappears",
+    "wrong-text", "incoming-first", "omitted-baseline", "omitted-current", "truncated-baseline", "truncated-outgoing", "gap"]) {
+    const requests = new PendingConnectionRequests();
+    const database = new DatabaseSync(":memory:");
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("Gemini evidence owner");
+    const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-evidence",
+      url: "https://gemini.google.com/app/synthetic-evidence", tabId: 4, documentId: "synthetic-evidence-document" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+    try {
+      const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic evidence message", randomUUID(), 2001);
+      const review = ledger.listGeminiReviews(target, 2002).reviews[0]!;
+      ledger.approveGeminiReview(target, prepared.operationId, review.reviewId, 2002);
+      await approveSyntheticGeminiSend(ledger, owner, prepared.operationId, target, 2003);
+      const receipt = ledger.createGeminiRecoveryReceipt(owner, prepared.operationId, 2003);
+      const baseline = [{ direction: "incoming" as const, text: "Synthetic evidence baseline",
+        ...(mode === "truncated-baseline" ? { truncated: true as const } : {}) }];
+      requests.publishGeminiSnapshot(target, baseline, 2004, undefined, mode === "omitted-baseline");
+      const checkId = await checkSyntheticGeminiDispatch(ledger, owner, prepared.operationId, target, prepared.preview.text, 2005);
+      const dispatch = ledger.requestGeminiDispatch(owner, prepared.operationId, checkId, 2007);
+      assert.equal(ledger.listGeminiDispatchAttempts(2007)[0]?.operationId, prepared.operationId);
+      assert.equal(ledger.reconcileGeminiObservation(Symbol("foreign"), prepared.operationId, 2007).state, "unknown");
+      const outgoing = { direction: "outgoing" as const,
+        text: mode === "wrong-text" ? "Synthetic different message" : prepared.preview.text,
+        ...(mode === "truncated-outgoing" ? { truncated: true as const } : {}) };
+      if (mode === "transient-edit") {
+        requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic temporary edit" }], 2008);
+      } else if (mode === "row-disappears") requests.publishGeminiSnapshot(target, [...baseline, outgoing], 2008);
+      else if (mode === "gap") assert.equal(requests.markGeminiObservationGap(target, 2008), 1);
+      const rows = mode === "baseline-edit" ? [{ direction: "incoming" as const, text: "Synthetic changed baseline" }, outgoing]
+        : mode === "row-disappears" ? baseline
+        : mode === "incoming-first" ? [...baseline, { direction: "incoming" as const, text: "Synthetic intervening reply" }, outgoing]
+        : mode === "duplicate" ? [...baseline, outgoing, outgoing]
+        : mode === "reply" || mode === "streaming-reply"
+          ? [...baseline, outgoing, { direction: "incoming" as const, text: "Synthetic reply" }]
+          : [...baseline, outgoing];
+      requests.publishGeminiSnapshot(target, rows, 2009, undefined, mode === "omitted-current");
+      if (mode === "streaming-reply") {
+        requests.publishGeminiSnapshot(target, [...baseline, outgoing,
+          { direction: "incoming", text: "Synthetic reply continued" }], 2010);
+      }
+      const completed = ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId,
+        { ok: true, editor: "contenteditable", activated: true }, 2011);
+      assert.equal(completed, mode !== "gap", mode);
+      const result = await dispatch.result;
+      const positive = ["sent", "reply", "streaming-reply"].includes(mode);
+      assert.equal(result.state, positive ? "resolved" : "dispatch_uncertain", mode);
+      if (result.state === "resolved") assert.deepEqual(result.resolution,
+        { outcome: "sent", source: "page", resolvedAt: mode === "streaming-reply" ? 2010 : 2009 });
+      assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), result);
+      assert.deepEqual(ledger.listGeminiDispatchAttempts(2011), []);
+      assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId,
+        { ok: true, editor: "contenteditable", activated: true }, 2011), false);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()?.count, positive ? 1 : 0);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 0);
+      assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, 2011), null);
+      assert.equal(JSON.stringify(database.prepare("SELECT * FROM message_dispatch_resolutions").all()).includes(prepared.preview.text), false);
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
   }
 });
 
@@ -504,7 +591,12 @@ test("staged Gemini durable jobs never reoffer or restore authority after loss, 
         assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId,
           { ok: false, code: "DISPATCH_UNCERTAIN" }, 2008), true);
       }
-      if (mode === "offer-loss" || mode === "expired") assert.deepEqual(ledger.listGeminiDispatchAttempts(originalProof.expiresAt), []);
+      if (mode === "cursor-after-offer" || mode === "completion-loss") {
+        assert.deepEqual(ledger.listGeminiDispatchAttempts(2008), []);
+      }
+      if (["offer-loss", "expired", "cursor-after-offer", "completion-loss"].includes(mode)) {
+        assert.deepEqual(ledger.listGeminiDispatchAttempts(originalProof.expiresAt), []);
+      }
       else assert.deepEqual(ledger.listGeminiDispatchAttempts(2008), []);
       const result = await dispatch.result;
       assert.deepEqual(result, { operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2007 }, mode);
@@ -522,6 +614,86 @@ test("staged Gemini durable jobs never reoffer or restore authority after loss, 
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 0);
     } finally {
       restarted?.disconnect(owner);
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
+test("provider-neutral prepared commits keep one deadline, owned consent and one-offer submit jobs", async () => {
+  for (const provider of ["fixture", "gemini"] as const) {
+    const requests = new PendingConnectionRequests();
+    const database = new DatabaseSync(":memory:");
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("neutral commit owner");
+    const target = provider === "fixture"
+      ? { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const, tabId: 3, documentId: "synthetic-neutral-fixture" }
+      : { origin: "https://gemini.google.com" as const, conversationId: "synthetic-neutral-gemini", tabId: 4,
+        documentId: "synthetic-neutral-gemini", url: "https://gemini.google.com/app/synthetic-neutral-gemini" };
+    const pending = requests.create(owner);
+    const grant = target.origin === "https://gemini.google.com" ? requests.approveGemini(pending.requestId, target)!
+      : requests.approve(pending.requestId, target)!;
+    try {
+      const prepared = target.origin === "https://gemini.google.com"
+        ? ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic neutral commit", randomUUID())
+        : ledger.prepare(owner, grant.connectionId, 1, "Synthetic neutral commit", randomUUID());
+      await assert.rejects(ledger.commitPreparedMessage(owner, prepared.operationId, Date.now() + 100), /DISPATCH_UNAVAILABLE/);
+      if (target.origin === "https://gemini.google.com") {
+        const review = ledger.listGeminiReviews(target).reviews[0]!;
+        ledger.approveGeminiReview(target, prepared.operationId, review.reviewId);
+        await approveSyntheticGeminiSend(ledger, owner, prepared.operationId, target, Date.now());
+        await assert.rejects(ledger.commitFixtureMessage(owner, prepared.operationId, Date.now() + 100), /DISPATCH_UNAVAILABLE/);
+      } else {
+        const review = ledger.listFixtureReviews(target).reviews[0]!;
+        ledger.approveFixtureReview(target, prepared.operationId, review.reviewId);
+        approveSyntheticSend(ledger, owner, prepared.operationId, target, Date.now());
+      }
+      await assert.rejects(ledger.commitPreparedMessage(Symbol("foreign"), prepared.operationId, Date.now() + 100), /DISPATCH_UNAVAILABLE/);
+      const deadlineMs = Date.now() + 500;
+      const committing = ledger.commitPreparedMessage(owner, prepared.operationId, deadlineMs);
+      if (target.origin === "https://gemini.google.com") {
+        const challenge = requests.listGeminiReadChallenges()[0]!;
+        assert.ok(challenge.expiresAt <= deadlineMs);
+        requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic neutral baseline" }], Date.now(), challenge.challengeId);
+      } else {
+        const challenge = requests.listFixtureReadChallenges()[0]!;
+        assert.ok(challenge.expiresAt <= deadlineMs);
+        requests.publishFixtureSnapshot(target, [], Date.now(), challenge.challengeId);
+      }
+      await Promise.resolve();
+      if (target.origin === "https://gemini.google.com") {
+        const check = ledger.listGeminiDispatchChecks()[0]!;
+        assert.ok(check.expiresAt <= deadlineMs);
+        ledger.completeGeminiDispatchCheck(target, prepared.operationId, check.checkId,
+          { ok: true, editor: "contenteditable", draftText: prepared.preview.text, selected: true, writable: true, submitReady: true });
+      } else {
+        const check = ledger.listFixtureDispatchChecks()[0]!;
+        assert.ok(check.expiresAt <= deadlineMs);
+        ledger.completeFixtureDispatchCheck(target, prepared.operationId, check.checkId,
+          { ok: true, editor: "textarea", draftText: prepared.preview.text, selected: true, writable: true, submitReady: true });
+      }
+      await Promise.resolve();
+      const job = ledger.listChatSubmitJobs(provider)[0]!;
+      assert.equal(job.operationId, prepared.operationId);
+      assert.equal(job.jobId, prepared.operationId);
+      assert.equal(job.phase, "submit");
+      assert.deepEqual(job.target, { ...target, provider });
+      assert.ok(job.expiresAt <= deadlineMs);
+      assert.deepEqual(ledger.listChatSubmitJobs(provider), []);
+      assert.deepEqual(ledger.listChatSubmitJobs(provider === "fixture" ? "gemini" : "fixture"), []);
+      if (target.origin === "https://gemini.google.com") {
+        requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic neutral baseline" },
+          { direction: "outgoing", text: prepared.preview.text }]);
+      } else requests.publishFixtureSnapshot(target, [{ id: "synthetic-neutral-outgoing", direction: "outgoing", text: prepared.preview.text }]);
+      const activation = { ok: true as const, editor: provider === "gemini" ? "contenteditable" as const : "textarea" as const,
+        activated: true as const };
+      assert.equal(ledger.completeChatSubmitJob(target, prepared.operationId, job.jobId, activation), true);
+      const result = await committing;
+      assert.equal(result.state, provider === "gemini" ? "resolved" : "observed_in_ui");
+      assert.deepEqual(await ledger.commitPreparedMessage(owner, prepared.operationId, deadlineMs), result);
+      assert.equal(ledger.completeChatSubmitJob(target, prepared.operationId, job.jobId, activation), false);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+    } finally {
       ledger.disconnect(owner);
       database.close();
     }

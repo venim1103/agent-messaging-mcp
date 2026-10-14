@@ -915,7 +915,9 @@ test("authenticated private Gemini preparation remains owner-bound without fixtu
     const prepared = await facade.prepareGeminiMessage(connectionId, 1, text, key);
     if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected private Gemini preparation");
     assert.deepEqual(prepared.payload.preview, { target: "gemini", text });
-    assert.equal("recoveryToken" in prepared.payload, false);
+    assert.match(prepared.payload.recoveryToken, /^[0-9a-f]{64}$/);
+    assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId, prepared.payload.recoveryToken)).payload,
+      { state: "unknown" });
     assert.deepEqual((await facade.prepareGeminiMessage(connectionId, 1, text, key)).payload, prepared.payload);
     assert.deepEqual((await facade.prepareGeminiMessage(connectionId, 1, "Changed text", key)).payload, { code: "IDEMPOTENCY_CONFLICT" });
     const operationId = prepared.payload.operationId;
@@ -933,9 +935,11 @@ test("authenticated private Gemini preparation remains owner-bound without fixtu
     assert.deepEqual((await facade.fillFixtureDraft(operationId)).payload, { code: "FILL_UNAVAILABLE" });
     assert.deepEqual((await facade.commitFixtureMessage(operationId)).payload, { code: "DISPATCH_UNAVAILABLE" });
     assert.deepEqual((await facade.getPreparedOperation(operationId, "a".repeat(64))).payload, { state: "unknown" });
-    assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 1);
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
-    const journal = JSON.stringify(database.prepare("SELECT * FROM prepared_message_operations").all());
+    const journal = JSON.stringify([database.prepare("SELECT * FROM prepared_message_operations").all(),
+      database.prepare("SELECT * FROM message_operation_recovery").all()]);
+    assert.equal(journal.includes(prepared.payload.recoveryToken), false);
     assert.equal(journal.includes(text), false);
     assert.equal(journal.includes(target.url), false);
     assert.throws(() => relay.fillGeminiDraft(operationId), /Broker role cannot perform/);
@@ -1026,7 +1030,8 @@ test("authenticated private Gemini preparation remains owner-bound without fixtu
     assert.equal(checked.kind, "gemini_dispatch_check");
     assert.deepEqual(checked.payload, { operationId, checkId, ready: true });
     assert.deepEqual((await relay.completeGeminiDispatchCheck(target, operationId, checkId, observation)).payload, { accepted: false });
-    assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 1);
+    assert.deepEqual((await facade.getPreparedOperation(operationId, prepared.payload.recoveryToken)).payload, { state: "unknown" });
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
   } finally {
     for (const client of clients) client.close();
@@ -1132,7 +1137,9 @@ test("private Gemini fill IPC loses no authority after dropped replies, owner cl
         { accepted: false });
       assert.equal(offered, 1, outcome);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
-      assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 1);
+      assert.equal(JSON.stringify(database.prepare("SELECT * FROM message_operation_recovery").all())
+        .includes(prepared.payload.recoveryToken), false);
     } finally {
       context.mock.restoreAll();
       for (const client of clients) client.close();
@@ -1265,7 +1272,9 @@ test("private Gemini proof IPC never reoffers after actual reply loss, owner clo
       assert.deepEqual((await observer.completeGeminiDispatchCheck(target, operationId, checkId, observation)).payload, { accepted: false });
       assert.equal(offered, 1);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
-      assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 0);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 1);
+      assert.equal(JSON.stringify(database.prepare("SELECT * FROM message_operation_recovery").all())
+        .includes(prepared.payload.recoveryToken), false);
     } finally {
       context.mock.restoreAll();
       for (const client of clients) client.close();

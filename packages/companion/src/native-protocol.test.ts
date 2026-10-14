@@ -13,7 +13,7 @@ import { connectBroker } from "./broker-client.js";
 import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
-  parseNativeChatAgentRequest,
+  parseNativeChatAgentRequest, parseNativeChatJobRequest,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
@@ -42,6 +42,41 @@ const request = {
   deadlineMs: now + 10_000,
   payload: {}
 };
+
+test("native neutral submit jobs validate phase, provider, exact target and one activation observation", () => {
+  for (const target of [
+    { provider: "fixture", origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-neutral" },
+    { provider: "gemini", origin: "https://gemini.google.com", conversationId: "synthetic-neutral", tabId: 4,
+      documentId: "synthetic-neutral", url: "https://gemini.google.com/app/synthetic-neutral?hl=en" }
+  ]) {
+    const listing = { ...request, kind: "list_chat_jobs", payload: { phase: "submit", provider: target.provider } };
+    assert.deepEqual(parseNativeChatJobRequest(listing, now), listing);
+    const completion = { ...request, kind: "complete_chat_job", payload: { target, phase: "submit", operationId: request.requestId,
+      jobId: request.requestId, observation: { ok: true, editor: target.provider === "gemini" ? "contenteditable" : "textarea", activated: true } } };
+    assert.deepEqual(parseNativeChatJobRequest(completion, now), completion);
+    for (const message of [listing, completion]) {
+      for (const invalid of [
+        { ...message, deadlineMs: now }, { ...message, deadlineMs: now + 30_001 },
+        { ...message, payload: { ...message.payload, approved: true } },
+        { ...message, payload: { ...message.payload, phase: "fill" } },
+        { ...message, payload: { ...message.payload, selector: "button" } }
+      ]) assert.throws(() => parseNativeChatJobRequest(invalid, now), /Invalid native chat job request/);
+    }
+    assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+      jobId: randomUUID() } }, now));
+    assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+      observation: { ...completion.payload.observation, editor: target.provider === "gemini" ? "textarea" : "contenteditable" } } }, now));
+    assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+      observation: { ...completion.payload.observation, delivered: true } } }, now));
+    if (target.provider === "gemini") {
+      for (const url of ["https://gemini.google.com/app/other", `${target.url}#fragment`,
+        "https://gemini.google.com/not-app/synthetic-neutral", "https://example.com/app/synthetic-neutral"]) {
+        assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+          target: { ...target, url } } }, now));
+      }
+    }
+  }
+});
 
 test("native agent roster and removal accept only bounded exact-target envelopes", () => {
   const available = { ...request, kind: "list_available_agents", payload: {} };

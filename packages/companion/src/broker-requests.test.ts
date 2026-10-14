@@ -7,6 +7,42 @@ import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS }
   from "./pending-connections.js";
 
+test("neutral submit jobs are strict relay-only phase commands and commits stay facade-owned", () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  const operations = new PreparedMessageOperations(requests, database);
+  const owner = Symbol("neutral phase owner");
+  const envelope = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+    connectionGeneration: 0, deadlineMs: 10_000 };
+  const target = { provider: "gemini", origin: "https://gemini.google.com", conversationId: "synthetic-neutral-phase",
+    url: "https://gemini.google.com/app/synthetic-neutral-phase", tabId: 4, documentId: "synthetic-neutral-phase" } as const;
+  try {
+    const listing = { ...envelope, kind: "list_chat_jobs", payload: { phase: "submit", provider: "gemini" } };
+    assert.deepEqual(handleBrokerRequest(listing, "facade", owner, requests, 2000, operations).payload, { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(listing, "relay", Symbol("relay"), requests, 2000, operations),
+      { ...envelope, kind: "chat_jobs", payload: { jobs: [] } });
+    const completion = { ...envelope, kind: "complete_chat_job", payload: { target, phase: "submit",
+      operationId: envelope.requestId, jobId: envelope.requestId, observation: { ok: true, editor: "contenteditable", activated: true } } };
+    assert.deepEqual(handleBrokerRequest(completion, "facade", owner, requests, 2000, operations).payload, { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(completion, "relay", Symbol("relay"), requests, 2000, operations).payload, { accepted: false });
+    const commit = { ...envelope, kind: "commit_prepared_message", payload: { operationId: envelope.requestId } };
+    assert.deepEqual(handleBrokerRequest(commit, "relay", Symbol("relay"), requests, 2000, operations).payload, { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(commit, "facade", owner, requests, 2000, operations).payload, { code: "DISPATCH_UNAVAILABLE" });
+    for (const message of [listing, completion, commit]) {
+      assert.throws(() => handleBrokerRequest({ ...message, payload: { ...message.payload, approved: true } },
+        "relay", Symbol("relay"), requests, 2000, operations));
+    }
+    assert.throws(() => handleBrokerRequest({ ...completion, payload: { ...completion.payload,
+      target: { ...target, provider: "fixture" } } }, "relay", Symbol("relay"), requests, 2000, operations));
+    assert.throws(() => handleBrokerRequest({ ...completion, payload: { ...completion.payload,
+      observation: { ...completion.payload.observation, delivered: true } } }, "relay", Symbol("relay"), requests, 2000, operations));
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+  } finally {
+    operations.disconnect(owner);
+    database.close();
+  }
+});
+
 test("facade keepalive is a strict no-op and cannot renew browser grants", () => {
   const requests = new PendingConnectionRequests();
   const owner = Symbol("fixture owner");

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
 import { fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
-  geminiFillStatusSchema,
+  geminiFillStatusSchema, chatSubmitJobSchema, type ChatTarget, type GeminiDispatchResult,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureDispatchCheckResult,
@@ -320,6 +320,19 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ accepted: z.boolean() })
   }),
   z.strictObject({
+    kind: z.literal("chat_jobs"), protocolVersion: z.literal(PROTOCOL_VERSION), requestId: z.uuid(),
+    connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ jobs: z.array(chatSubmitJobSchema).max(MAX_PENDING_FIXTURE_DISPATCHES) })
+  }),
+  z.strictObject({
+    kind: z.literal("chat_job_recorded"), protocolVersion: z.literal(PROTOCOL_VERSION), requestId: z.uuid(),
+    connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(), payload: z.strictObject({ accepted: z.boolean() })
+  }),
+  z.strictObject({
+    kind: z.literal("chat_dispatch"), protocolVersion: z.literal(PROTOCOL_VERSION), requestId: z.uuid(),
+    connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(), payload: fixtureDispatchStatusSchema
+  }),
+  z.strictObject({
     kind: z.literal("gemini_fill_challenges"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ fills: z.array(z.strictObject({ attemptId: z.uuid(), operationId: z.uuid(),
@@ -363,7 +376,7 @@ const replySchema = z.discriminatedUnion("kind", [
     kind: z.literal("gemini_message_prepared"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ operationId: z.uuid(), connectionId: z.uuid(), state: z.literal("awaiting_approval"),
-      expiresAt: z.number().int().safe(), preview: geminiReview.shape.preview })
+      expiresAt: z.number().int().safe(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/), preview: geminiReview.shape.preview })
   }),
   z.strictObject({
     kind: z.literal("message_prepared"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -539,6 +552,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "check_fixture_dispatch" | "list_fixture_dispatch_checks" | "complete_fixture_dispatch_check"
       | "check_gemini_dispatch" | "list_gemini_dispatch_checks" | "complete_gemini_dispatch_check"
       | "dispatch_fixture_message" | "commit_fixture_message" | "list_fixture_dispatch_attempts" | "complete_fixture_dispatch"
+      | "commit_prepared_message" | "list_chat_jobs" | "complete_chat_job"
       | "fill_fixture_draft" | "complete_fixture_fill"
       | "fill_gemini_draft" | "list_gemini_fill_challenges" | "complete_gemini_fill"
       | "list_pending" | "list_fixture_read_challenges" | "list_fixture_prepared_reviews"
@@ -564,6 +578,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         || kind === "list_fixture_dispatch_checks" || kind === "complete_fixture_dispatch_check"
         || kind === "list_gemini_dispatch_checks" || kind === "complete_gemini_dispatch_check"
         || kind === "list_fixture_dispatch_attempts" || kind === "complete_fixture_dispatch"
+        || kind === "list_chat_jobs" || kind === "complete_chat_job"
         || kind === "complete_fixture_fill"
         || kind === "list_gemini_fill_challenges" || kind === "complete_gemini_fill"
         || kind === "list_gemini_read_challenges"
@@ -688,6 +703,10 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         observation: GeminiDispatchCheckResult) => request("complete_gemini_dispatch_check", { target, operationId, checkId, observation }),
       dispatchFixtureMessage: (operationId: string, checkId: string) => request("dispatch_fixture_message", { operationId, checkId }),
       commitFixtureMessage: (operationId: string) => request("commit_fixture_message", { operationId }),
+      commitPreparedMessage: (operationId: string) => request("commit_prepared_message", { operationId }),
+      listChatJobs: (phase: "submit", provider: "fixture" | "gemini") => request("list_chat_jobs", { phase, provider }),
+      completeChatJob: (target: ChatTarget, operationId: string, jobId: string, phase: "submit",
+        observation: FixtureDispatchResult | GeminiDispatchResult) => request("complete_chat_job", { target, operationId, jobId, phase, observation }),
       listFixtureDispatchAttempts: () => request("list_fixture_dispatch_attempts", {}),
       completeFixtureDispatch: (target: FixtureTarget, operationId: string, attemptId: string,
         observation: FixtureDispatchResult) => request("complete_fixture_dispatch", { target, operationId, attemptId, observation }),

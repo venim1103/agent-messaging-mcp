@@ -2,7 +2,7 @@ import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
 import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureFillResultSchema,
   fixturePreflightResultSchema, geminiFillResultSchema, geminiDispatchCheckResultSchema, MAX_PREPARED_MESSAGE_BYTES,
-  PreparedMessageOperations } from "./message-operations.js";
+  chatTargetSchema, chatSubmitResultSchema, PreparedMessageOperations } from "./message-operations.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
   PendingConnectionRequests }
@@ -118,6 +118,13 @@ const requestSchema = z.discriminatedUnion("kind", [
     operationId: z.uuid(), checkId: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("commit_fixture_message"), payload: z.strictObject({ operationId: z.uuid() }) }),
+  z.strictObject({ ...envelope, kind: z.literal("commit_prepared_message"), payload: z.strictObject({ operationId: z.uuid() }) }),
+  z.strictObject({ ...envelope, kind: z.literal("list_chat_jobs"), payload: z.strictObject({
+    phase: z.literal("submit"), provider: z.enum(["fixture", "gemini"])
+  }) }),
+  z.strictObject({ ...envelope, kind: z.literal("complete_chat_job"), payload: z.strictObject({
+    phase: z.literal("submit"), target: chatTargetSchema, operationId: z.uuid(), jobId: z.uuid(), observation: chatSubmitResultSchema
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_fixture_dispatch_attempts"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("complete_fixture_dispatch"), payload: z.strictObject({
     target: fixtureTarget, operationId: z.uuid(), attemptId: z.uuid(), observation: fixtureDispatchResultSchema
@@ -433,6 +440,19 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
         payload: { attempts: operations?.listFixtureDispatchAttempts(now) ?? [] } }
       : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
+  if (request.kind === "list_chat_jobs") {
+    return role === "relay"
+      ? { ...response, kind: "chat_jobs" as const,
+        payload: { jobs: operations?.listChatSubmitJobs(request.payload.provider, now) ?? [] } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "complete_chat_job") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    return operations
+      ? { ...response, kind: "chat_job_recorded" as const, payload: { accepted: operations.completeChatSubmitJob(
+        request.payload.target, request.payload.operationId, request.payload.jobId, request.payload.observation, now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+  }
   if (request.kind === "complete_fixture_dispatch") {
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
     return operations
@@ -586,6 +606,17 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       ? { ...response, kind: "gemini_dispatch_check_authorized" as const, payload: { operationId: request.payload.operationId } }
       : { ...response, kind: "error" as const, payload: { code: "DISPATCH_CHECK_UNAVAILABLE" } };
   }
+  if (request.kind === "commit_prepared_message") {
+    if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+    const status = operations.getOperation(owner, request.payload.operationId, now);
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") {
+      return { ...response, kind: "chat_dispatch" as const, payload: status };
+    }
+    return operations.getFixtureSendAuthorization(owner, request.payload.operationId, now)
+      || operations.getGeminiSendAuthorization(owner, request.payload.operationId, now)
+      ? { ...response, kind: "chat_commit_authorized" as const, payload: request.payload }
+      : { ...response, kind: "error" as const, payload: { code: "DISPATCH_UNAVAILABLE" } };
+  }
   if (request.kind === "dispatch_fixture_message" || request.kind === "commit_fixture_message") {
     if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
     const status = operations.getOperation(owner, request.payload.operationId, now);
@@ -603,9 +634,11 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     if (!operations) return { ...response, kind: "error" as const,
       payload: { code: "PREPARATION_UNAVAILABLE" } };
     try {
+      const prepared = operations.prepareGemini(owner, request.payload.connectionId, request.payload.expectedGeneration,
+        request.payload.text, request.payload.idempotencyKey, now);
+      const receipt = operations.createGeminiRecoveryReceipt(owner, prepared.operationId, now);
       return { ...response, kind: "gemini_message_prepared" as const,
-        payload: operations.prepareGemini(owner, request.payload.connectionId, request.payload.expectedGeneration,
-          request.payload.text, request.payload.idempotencyKey, now) };
+        payload: { ...prepared, recoveryToken: receipt.recoveryToken } };
     } catch (error) {
       if (error instanceof Error && ["CONNECTION_NOT_FOUND", "GENERATION_MISMATCH", "INVALID_MESSAGE_TEXT",
         "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED", "OPERATION_UNAVAILABLE",

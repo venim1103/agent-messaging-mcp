@@ -60,6 +60,22 @@ export const geminiDispatchResultSchema = z.discriminatedUnion("ok", [
   fixtureDispatchResultSchema.options[1]
 ]);
 export type GeminiDispatchResult = z.infer<typeof geminiDispatchResultSchema>;
+export const chatTargetSchema = z.discriminatedUnion("provider", [
+  z.strictObject({ provider: z.literal("fixture"), origin: z.literal("http://127.0.0.1:8787"),
+    conversationId: z.literal("fixture-alpha"), tabId: z.number().int().safe().positive(),
+    documentId: z.string().regex(/^[!-~]{1,128}$/) }),
+  z.strictObject({ provider: z.literal("gemini"), origin: z.literal("https://gemini.google.com"),
+    conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), url: z.string().min(1).max(512),
+    tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/) })
+]);
+export type ChatTarget = z.infer<typeof chatTargetSchema>;
+export const chatSubmitResultSchema = z.union([fixtureDispatchResultSchema, geminiDispatchResultSchema]);
+export const chatSubmitJobSchema = z.strictObject({ operationId: z.uuid(), jobId: z.uuid(), phase: z.literal("submit"),
+  target: chatTargetSchema, text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES)
+    .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES), expiresAt: z.number().int().safe() })
+  .refine(job => job.jobId === job.operationId && (job.target.provider !== "gemini"
+    || (job.text.length <= 2048 && job.text.trim() === job.text && !job.text.includes("\r"))));
+export type ChatSubmitJob = z.infer<typeof chatSubmitJobSchema>;
 export const fixturePreflightResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]) }),
   z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
@@ -103,6 +119,12 @@ const fixtureObservationSchema = z.strictObject({
   omittedBefore: z.boolean(),
   messages: z.array(z.strictObject({ id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
     direction: z.enum(["incoming", "outgoing"]), text: z.string().max(16_000), truncated: z.literal(true).optional()
+  })).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
+});
+const geminiObservationSchema = z.strictObject({
+  kind: z.literal("gemini_snapshot"), omittedBefore: z.boolean(),
+  messages: z.array(z.strictObject({ direction: z.enum(["incoming", "outgoing"]), text: z.string().max(16_000),
+    truncated: z.literal(true).optional(), identityQuality: z.literal("uncertain"), generationState: z.literal("unknown")
   })).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
 });
 
@@ -175,7 +197,7 @@ type PendingFixtureDispatch = {
   owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number; startedAt: number;
   issued: boolean; timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureDispatchStatus) => void
 };
-type GeminiDispatchStatus = Readonly<{ operationId: string; state: "dispatch_uncertain"; startedAt: number }>;
+type GeminiDispatchStatus = FixtureDispatchStatus;
 type PendingGeminiDispatch = {
   owner: symbol; operationId: string; target: GeminiTarget; text: string; expiresAt: number; startedAt: number;
   baseline: GeminiSnapshot; issued: boolean; timer: ReturnType<typeof setTimeout>; resolve: (status: GeminiDispatchStatus) => void
@@ -199,6 +221,7 @@ export class PreparedMessageOperations {
   private readonly sendApprovals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
   private readonly recoveryReceipts = new Map<string, string>();
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
+  private readonly geminiDispatchBaselines = new Map<string, GeminiSnapshot>();
   private readonly dispatchChecks = new Map<string, FixtureDispatchCheck>();
   private readonly geminiDispatchChecks = new Map<string, GeminiDispatchCheck>();
   private readonly dispatchInspections = new Map<string, {
@@ -396,6 +419,7 @@ export class PreparedMessageOperations {
     this.sendApprovals.delete(operationId);
     this.recoveryReceipts.delete(operationId);
     this.dispatchBaselines.delete(operationId);
+    this.geminiDispatchBaselines.delete(operationId);
     this.discardFixtureDispatchCheck(operationId);
     this.discardGeminiDispatchCheck(operationId);
     this.dispatchAuthorizations.delete(operationId);
@@ -1420,7 +1444,8 @@ export class PreparedMessageOperations {
     if (!pending) return;
     this.geminiDispatchJobs.delete(operationId);
     clearTimeout(pending.timer);
-    pending.resolve(Object.freeze({ operationId, state: "dispatch_uncertain", startedAt: pending.startedAt }));
+    pending.resolve(this.dispatchStatus(operationId) ??
+      Object.freeze({ operationId, state: "dispatch_uncertain", startedAt: pending.startedAt }));
   }
 
   requestGeminiDispatch(owner: symbol, operationId: string, checkId: string, now = Date.now(),
@@ -1459,7 +1484,9 @@ export class PreparedMessageOperations {
       && intent?.state === "dispatching" && intent.started_at === pending.startedAt
       && pending.baseline.capturedAt <= now && pending.baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS > now
       && !!current && current !== "not_ready" && current.capturedAt <= now && current.capturedAt >= pending.baseline.capturedAt
-      && current.cursor.epoch === pending.baseline.cursor.epoch && current.cursor.sequence === pending.baseline.cursor.sequence
+      && current.cursor.epoch === pending.baseline.cursor.epoch
+      && (pending.issued ? current.cursor.sequence >= pending.baseline.cursor.sequence
+        : current.cursor.sequence === pending.baseline.cursor.sequence)
       && !this.database.prepare("SELECT 1 FROM message_dispatch_evidence WHERE operation_id = ?").get(pending.operationId);
   }
 
@@ -1473,6 +1500,7 @@ export class PreparedMessageOperations {
       }
       if (pending.issued) continue;
       pending.issued = true;
+      this.geminiDispatchBaselines.set(operationId, pending.baseline);
       attempts.push(Object.freeze({ operationId, attemptId: operationId, target: pending.target,
         text: pending.text, expiresAt: pending.expiresAt }));
     }
@@ -1489,8 +1517,61 @@ export class PreparedMessageOperations {
       this.finishGeminiDispatch(operationId);
       return false;
     }
+    if (observation.ok) this.reconcileGeminiObservation(pending.owner, operationId, now);
     this.finishGeminiDispatch(operationId);
     return true;
+  }
+
+  private geminiDispatchEvidence(owner: symbol, operationId: string, now: number) {
+    const operation = this.geminiContents.get(operationId);
+    const baseline = this.geminiDispatchBaselines.get(operationId);
+    const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
+    const status = this.dispatchStatus(operationId);
+    if (!operation || operation.owner !== owner || !baseline || baseline.omittedBefore
+      || baseline.messages.some(message => message.truncated) || !live || !this.sameGeminiTarget(operation.target, live)
+      || status?.state !== "dispatch_uncertain" || this.ambiguousEvidence.has(operationId)) return null;
+    const snapshot = this.requests.getGeminiSnapshot(owner, operation.connectionId, now);
+    if (!snapshot || snapshot === "not_ready" || snapshot.omittedBefore || snapshot.capturedAt < status.startedAt
+      || snapshot.capturedAt > now || snapshot.cursor.epoch !== baseline.cursor.epoch
+      || snapshot.cursor.sequence < baseline.cursor.sequence) return null;
+    const events = this.requests.readGeminiEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
+    if (!events || events === "not_ready" || events.state !== "ok"
+      || events.cursor.sequence !== snapshot.cursor.sequence) return null;
+    let appended = false;
+    for (const capture of [...events.events.map(event => geminiObservationSchema.safeParse(event.payload)),
+      geminiObservationSchema.safeParse({ kind: "gemini_snapshot", omittedBefore: snapshot.omittedBefore, messages: snapshot.messages })]) {
+      if (!capture.success || capture.data.omittedBefore || capture.data.messages.some(message => message.truncated)
+        || baseline.messages.some((message, index) => message.direction !== capture.data.messages[index]?.direction
+          || message.text !== capture.data.messages[index]?.text)) {
+        this.ambiguousEvidence.add(operationId);
+        return null;
+      }
+      const added = capture.data.messages.slice(baseline.messages.length);
+      if (!added.length) {
+        if (appended) {
+          this.ambiguousEvidence.add(operationId);
+          return null;
+        }
+        continue;
+      }
+      if (added[0]?.direction !== "outgoing" || added[0].text !== operation.text
+        || added.slice(1).some(message => message.direction !== "incoming")) {
+        this.ambiguousEvidence.add(operationId);
+        return null;
+      }
+      appended = true;
+    }
+    return Object.freeze({ outcome: appended ? "sent" as const : "unchanged" as const, observedAt: snapshot.capturedAt });
+  }
+
+  reconcileGeminiObservation(owner: symbol, operationId: string, now = Date.now()) {
+    const status = this.getOperation(owner, operationId, now);
+    if (status.state !== "dispatch_uncertain") return status;
+    const evidence = this.geminiDispatchEvidence(owner, operationId, now);
+    if (evidence?.outcome !== "sent") return status;
+    this.database.prepare(`INSERT INTO message_dispatch_resolutions (operation_id, resolved_at, outcome, source)
+      VALUES (?, ?, 'sent', 'page') ON CONFLICT (operation_id) DO NOTHING`).run(operationId, evidence.observedAt);
+    return this.dispatchStatus(operationId) ?? status;
   }
 
   private finishFixtureDispatch(operationId: string): void {
@@ -1504,21 +1585,56 @@ export class PreparedMessageOperations {
   }
 
   async commitFixtureMessage(owner: symbol, operationId: string, deadlineMs: number) {
+    if (!this.contents.has(operationId) && !this.dispatchStatus(operationId)) throw new Error("DISPATCH_UNAVAILABLE");
+    return this.commitPreparedMessage(owner, operationId, deadlineMs);
+  }
+
+  async commitPreparedMessage(owner: symbol, operationId: string, deadlineMs: number) {
     const now = Date.now();
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) throw new Error("DISPATCH_UNAVAILABLE");
     const status = this.getOperation(owner, operationId, now);
     if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") return status;
-    const authorization = this.getFixtureSendAuthorization(owner, operationId, now);
-    const operation = this.contents.get(operationId);
+    const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
+    const gemini = operation?.target.origin === "https://gemini.google.com";
+    const adapter = gemini ? {
+      authorize: () => this.getGeminiSendAuthorization(owner, operationId, now),
+      read: (connectionId: string, expiresAt: number) => this.requests.requestFreshGeminiRead(owner, connectionId, now, expiresAt),
+      inspect: (expiresAt: number) => this.requestGeminiDispatchInspection(owner, operationId, Date.now(), expiresAt),
+      dispatch: (checkId: string, expiresAt: number) => this.requestGeminiDispatch(owner, operationId, checkId, Date.now(), expiresAt)
+    } : {
+      authorize: () => this.getFixtureSendAuthorization(owner, operationId, now),
+      read: (connectionId: string, expiresAt: number) => this.requests.requestFreshFixtureRead(owner, connectionId, now, expiresAt),
+      inspect: (expiresAt: number) => this.requestFixtureDispatchInspection(owner, operationId, Date.now(), expiresAt),
+      dispatch: (checkId: string, expiresAt: number) => this.requestFixtureDispatch(owner, operationId, checkId, Date.now(), expiresAt)
+    };
+    const authorization = adapter.authorize();
     if (!authorization || !operation || operation.owner !== owner) throw new Error("DISPATCH_UNAVAILABLE");
     const expiresAt = Math.min(deadlineMs, authorization.expiresAt);
-    const reading = this.requests.requestFreshFixtureRead(owner, operation.connectionId, now, expiresAt);
+    this.createRecoveryReceiptRecord(operationId);
+    const reading = adapter.read(operation.connectionId, expiresAt);
     if (!reading || reading === "busy") throw new Error("DISPATCH_UNAVAILABLE");
     const snapshot = await reading.result;
     if (!snapshot || snapshot === "not_ready" || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
-    const inspecting = this.requestFixtureDispatchInspection(owner, operationId, Date.now(), expiresAt);
+    const inspecting = adapter.inspect(expiresAt);
     if (inspecting === "busy" || !await inspecting.result || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
-    return this.requestFixtureDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt).result;
+    return adapter.dispatch(inspecting.checkId, expiresAt).result;
+  }
+
+  listChatSubmitJobs(provider: "fixture" | "gemini", now = Date.now()) {
+    const attempts = provider === "gemini" ? this.listGeminiDispatchAttempts(now) : this.listFixtureDispatchAttempts(now);
+    return attempts.map(attempt => Object.freeze(chatSubmitJobSchema.parse({ operationId: attempt.operationId, jobId: attempt.attemptId,
+      phase: "submit" as const, target: Object.freeze({ ...attempt.target, provider }),
+      text: attempt.text, expiresAt: attempt.expiresAt })));
+  }
+
+  completeChatSubmitJob(target: ApprovedTarget, operationId: string, jobId: string,
+    observation: FixtureDispatchResult | GeminiDispatchResult, now = Date.now()) {
+    if (target.origin === "https://gemini.google.com") {
+      const parsed = geminiDispatchResultSchema.safeParse(observation);
+      return parsed.success && this.completeGeminiDispatch(target, operationId, jobId, parsed.data, now);
+    }
+    const parsed = fixtureDispatchResultSchema.safeParse(observation);
+    return parsed.success && this.completeFixtureDispatch(target, operationId, jobId, parsed.data, now);
   }
 
   requestFixtureDispatch(owner: symbol, operationId: string, checkId: string, now = Date.now(),

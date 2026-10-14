@@ -1,6 +1,7 @@
 import * as z from "zod/v4";
 import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureFillResultSchema,
-  fixturePreflightResultSchema, geminiFillResultSchema, geminiDispatchCheckResultSchema } from "./message-operations.js";
+  fixturePreflightResultSchema, geminiFillResultSchema, geminiDispatchCheckResultSchema,
+  chatTargetSchema, chatSubmitResultSchema } from "./message-operations.js";
 import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
   MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES } from "./pending-connections.js";
 
@@ -248,6 +249,27 @@ function isValidGeminiTarget(target: z.infer<typeof geminiTargetSchema>): boolea
 }
 
 const chatAgentTargetSchema = z.union([fixtureTargetSchema, geminiTargetSchema.refine(isValidGeminiTarget)]);
+const chatJobTargetSchema = chatTargetSchema.refine(target => target.provider === "fixture"
+  || (isValidGeminiTarget(target) && new URL(target.url).pathname === `/app/${target.conversationId}`));
+const chatJobRequestSchema = z.discriminatedUnion("kind", [
+  pendingListSchema.extend({ kind: z.literal("list_chat_jobs"), payload: z.strictObject({
+    phase: z.literal("submit"), provider: z.enum(["fixture", "gemini"])
+  }) }),
+  pendingListSchema.extend({ kind: z.literal("complete_chat_job"), payload: z.strictObject({
+    phase: z.literal("submit"), target: chatJobTargetSchema, operationId: z.uuid(), jobId: z.uuid(), observation: chatSubmitResultSchema
+  }).refine(payload => payload.operationId === payload.jobId && (!payload.observation.ok
+    || (payload.target.provider === "gemini" ? payload.observation.editor === "contenteditable"
+      : payload.observation.editor !== "contenteditable"))) })
+]);
+
+export function parseNativeChatJobRequest(message: unknown, now = Date.now()) {
+  const result = chatJobRequestSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native chat job request");
+  }
+  return result.data;
+}
+
 const chatAgentRequestSchema = z.discriminatedUnion("kind", [
   pendingListSchema.extend({ kind: z.literal("begin_chat_reload"), payload: z.strictObject({ target: chatAgentTargetSchema }) }),
   pendingListSchema.extend({ kind: z.literal("rebind_chat"),
