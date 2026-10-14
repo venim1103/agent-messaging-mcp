@@ -394,6 +394,8 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ state: z.literal("unknown") }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("expired") }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("stale") }),
+      z.strictObject({ operationId: z.uuid(), state: z.literal("prepared"),
+        expiresAt: z.number().int().safe(), draftFill: fixtureDraftFillStateSchema.optional() }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("awaiting_approval"),
         expiresAt: z.number().int().safe(), draftFill: fixtureDraftFillStateSchema.optional() }),
       z.strictObject({ operationId: z.uuid(), state: z.literal("approved"),

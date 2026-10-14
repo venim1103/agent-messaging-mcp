@@ -70,11 +70,13 @@ export const chatTargetSchema = z.discriminatedUnion("provider", [
 ]);
 export type ChatTarget = z.infer<typeof chatTargetSchema>;
 export const chatSubmitResultSchema = z.union([fixtureDispatchResultSchema, geminiDispatchResultSchema]);
-export const chatSubmitJobSchema = z.strictObject({ operationId: z.uuid(), jobId: z.uuid(), phase: z.literal("submit"),
+export const chatJobSchema = z.strictObject({ operationId: z.uuid(), jobId: z.uuid(), phase: z.enum(["fill", "proof", "submit"]),
   target: chatTargetSchema, text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES)
     .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES), expiresAt: z.number().int().safe() })
-  .refine(job => job.jobId === job.operationId && (job.target.provider !== "gemini"
+  .refine(job => (job.phase !== "submit" || job.jobId === job.operationId) && (job.target.provider !== "gemini"
     || (job.text.length <= 2048 && job.text.trim() === job.text && !job.text.includes("\r"))));
+export type ChatJob = z.infer<typeof chatJobSchema>;
+export const chatSubmitJobSchema = chatJobSchema.safeExtend({ phase: z.literal("submit") });
 export type ChatSubmitJob = z.infer<typeof chatSubmitJobSchema>;
 export const fixturePreflightResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]) }),
@@ -98,6 +100,16 @@ export const geminiFillResultSchema = z.discriminatedUnion("ok", [
     "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "FILL_UNAVAILABLE", "FILL_UNCERTAIN"]) })
 ]);
 export type GeminiFillResult = z.infer<typeof geminiFillResultSchema>;
+const chatCompletionIdentity = { target: chatTargetSchema, operationId: z.uuid(), jobId: z.uuid() };
+export const chatJobCompletionSchema = z.discriminatedUnion("phase", [
+  z.strictObject({ ...chatCompletionIdentity, phase: z.literal("fill"), observation: z.union([fixtureFillResultSchema, geminiFillResultSchema]) }),
+  z.strictObject({ ...chatCompletionIdentity, phase: z.literal("proof"),
+    observation: z.union([fixtureDispatchCheckResultSchema, geminiDispatchCheckResultSchema]) }),
+  z.strictObject({ ...chatCompletionIdentity, phase: z.literal("submit"), observation: chatSubmitResultSchema })
+]).refine(payload => (payload.phase !== "submit" || payload.operationId === payload.jobId)
+  && (!payload.observation.ok || (payload.target.provider === "gemini"
+    ? payload.observation.editor === "contenteditable" : payload.observation.editor !== "contenteditable")));
+export type ChatJobObservation = z.infer<typeof chatJobCompletionSchema>["observation"];
 export const geminiFillStatusSchema = z.discriminatedUnion("ok", [
   geminiFillResultSchema.options[0].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() }),
   geminiFillResultSchema.options[1].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() })
@@ -202,14 +214,21 @@ type PendingGeminiDispatch = {
   owner: symbol; operationId: string; target: GeminiTarget; text: string; expiresAt: number; startedAt: number;
   baseline: GeminiSnapshot; issued: boolean; timer: ReturnType<typeof setTimeout>; resolve: (status: GeminiDispatchStatus) => void
 };
+type PendingComposerWait = {
+  owner: symbol; target: ApprovedTarget; expiresAt: number; result: Promise<boolean>;
+  timer: ReturnType<typeof setTimeout> | null; resolve: (ready: boolean) => void
+};
 
 export class PreparedMessageOperations {
   private readonly owners = new Map<symbol, string>();
+  private readonly composerReservations = new Map<string, Readonly<{ owner: symbol; target: ApprovedTarget; expiresAt: number }>>();
+  private readonly composerWaits = new Map<string, PendingComposerWait>();
+  private readonly neutralJobOffers = new Map<string, Set<string>>();
   private readonly contents = new Map<string, Readonly<{
-    owner: symbol; connectionId: string; target: FixtureTarget; text: string; expiresAt: number
+    owner: symbol; connectionId: string; target: FixtureTarget; text: string; expiresAt: number; autonomous?: true
   }>>();
   private readonly geminiContents = new Map<string, Readonly<{
-    owner: symbol; connectionId: string; target: GeminiTarget; text: string; expiresAt: number
+    owner: symbol; connectionId: string; target: GeminiTarget; text: string; expiresAt: number; autonomous?: true
   }>>();
   private readonly reviewTokens = new Map<string, string>();
   private readonly approvals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
@@ -424,6 +443,10 @@ export class PreparedMessageOperations {
     this.discardGeminiDispatchCheck(operationId);
     this.dispatchAuthorizations.delete(operationId);
     this.ambiguousEvidence.delete(operationId);
+    this.neutralJobOffers.delete(operationId);
+    this.composerReservations.delete(operationId);
+    this.finishComposerWait(operationId, false);
+    for (const waitingId of this.composerWaits.keys()) this.checkComposerWait(waitingId);
   }
 
   private discardExpired(now: number): void {
@@ -476,9 +499,102 @@ export class PreparedMessageOperations {
     return this.prepareBound(owner, connectionId, expectedGeneration, target, "gemini", text, idempotencyKey, now);
   }
 
+  prepareAutonomous(owner: symbol, connectionId: string, text: string, idempotencyKey: string,
+    deadlineMs: number, now = Date.now()) {
+    this.discardExpired(now);
+    const target = this.requests.getAutonomousTarget(owner, connectionId, now);
+    if (!target) throw new Error("CONNECTION_NOT_FOUND");
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now || deadlineMs > now + 30_000) {
+      throw new Error("INVALID_REQUEST_DEADLINE");
+    }
+    const prepared = this.prepareBound(owner, connectionId, 1, target,
+      target.origin === "https://gemini.google.com" ? "gemini" : "fixture-alpha", text, idempotencyKey, now, deadlineMs);
+    const receipt = this.createRecoveryReceiptRecord(prepared.operationId);
+    return Object.freeze({ ...prepared, state: "prepared" as const, recoveryToken: receipt.recoveryToken });
+  }
+
+  getAutonomousAuthorization(owner: symbol, operationId: string, now = Date.now()) {
+    this.discardExpired(now);
+    const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
+    const live = operation && this.requests.getAutonomousTarget(owner, operation.connectionId, now);
+    if (!operation?.autonomous || operation.owner !== owner || !this.owners.has(owner) || !live
+      || operation.target.origin !== live.origin || operation.target.conversationId !== live.conversationId
+      || operation.target.tabId !== live.tabId || operation.target.documentId !== live.documentId
+      || (operation.target.origin === "https://gemini.google.com"
+        && (live.origin !== "https://gemini.google.com" || operation.target.url !== live.url))) return null;
+    return Object.freeze({ operationId, target: operation.target, text: operation.text, expiresAt: operation.expiresAt });
+  }
+
+  private getAutonomousPhaseAuthorization(owner: symbol, operationId: string, phase: "fill" | "send", now: number) {
+    const authorization = this.getAutonomousAuthorization(owner, operationId, now);
+    const reservation = this.composerReservations.get(operationId);
+    const fill = this.fillStates.get(operationId);
+    if (!authorization || reservation?.owner !== owner || reservation.expiresAt <= now
+      || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?").get(operationId)
+      || (phase === "fill" ? this.consumedFillApprovals.has(operationId)
+        : fill?.state !== "filled" || fill.completedAt > now
+          || (authorization.target.origin === "https://gemini.google.com" ? fill.editor !== "contenteditable" : fill.editor === "contenteditable"))) {
+      return null;
+    }
+    return Object.freeze({ ...authorization, expiresAt: Math.min(authorization.expiresAt, reservation.expiresAt) });
+  }
+
+  acquireComposer(owner: symbol, operationId: string, deadlineMs: number): Promise<boolean> {
+    const now = Date.now();
+    const authorization = this.getAutonomousAuthorization(owner, operationId, now);
+    if (!authorization || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now
+      || this.hasUnresolvedDispatch(authorization.target)) return Promise.resolve(false);
+    const existing = this.composerWaits.get(operationId);
+    if (existing) return existing.result;
+    const reservation = this.composerReservations.get(operationId);
+    if (reservation) return Promise.resolve(reservation.owner === owner && reservation.expiresAt > now);
+    if ([...this.composerWaits.values()].some(wait => wait.owner === owner)) return Promise.resolve(false);
+    let resolve!: PendingComposerWait["resolve"];
+    const result = new Promise<boolean>(done => { resolve = done; });
+    this.composerWaits.set(operationId, { owner, target: authorization.target, expiresAt: Math.min(deadlineMs, authorization.expiresAt),
+      timer: null, result, resolve });
+    this.checkComposerWait(operationId);
+    return result;
+  }
+
+  private finishComposerWait(operationId: string, ready: boolean): void {
+    const pending = this.composerWaits.get(operationId);
+    if (!pending) return;
+    this.composerWaits.delete(operationId);
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.resolve(ready);
+  }
+
+  private checkComposerWait(operationId: string): void {
+    const pending = this.composerWaits.get(operationId);
+    if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    const now = Date.now();
+    const authorization = this.getAutonomousAuthorization(pending.owner, operationId, now);
+    if (this.composerWaits.get(operationId) !== pending) return;
+    if (!authorization || pending.expiresAt <= now || this.hasUnresolvedDispatch(pending.target)) {
+      this.finishComposerWait(operationId, false);
+      return;
+    }
+    const first = [...this.composerWaits].find(([, wait]) => this.sameComposerTarget(wait.target, pending.target));
+    if (first?.[0] === operationId && !this.hasOccupiedComposer(operationId, pending.target, now)) {
+      this.composerReservations.set(operationId, Object.freeze({ owner: pending.owner, target: pending.target, expiresAt: pending.expiresAt }));
+      this.finishComposerWait(operationId, true);
+      return;
+    }
+    pending.timer = setTimeout(() => this.checkComposerWait(operationId), Math.min(25, pending.expiresAt - now));
+  }
+
+  releaseComposer(owner: symbol, operationId: string): boolean {
+    if (this.composerReservations.get(operationId)?.owner !== owner) return false;
+    this.composerReservations.delete(operationId);
+    for (const waitingId of this.composerWaits.keys()) this.checkComposerWait(waitingId);
+    return true;
+  }
+
   private prepareBound<TargetLabel extends "fixture-alpha" | "gemini">(owner: symbol, connectionId: string,
     expectedGeneration: number, target: ApprovedTarget, label: TargetLabel, text: string,
-    idempotencyKey: string, now: number): PreparedMessage<TargetLabel> {
+    idempotencyKey: string, now: number, autonomousExpiresAt?: number): PreparedMessage<TargetLabel> {
     if (expectedGeneration !== 1) throw new Error("GENERATION_MISMATCH");
     if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > MAX_PREPARED_MESSAGE_BYTES || !text.trim()) {
       throw new Error("INVALID_MESSAGE_TEXT");
@@ -496,7 +612,8 @@ export class PreparedMessageOperations {
     const ownerId = this.owners.get(owner) ?? randomUUID();
     this.owners.set(owner, ownerId);
     const contentDigest = this.digest(text);
-    const targetDigest = this.digest(JSON.stringify({ connectionId, expectedGeneration, target }));
+    const targetDigest = this.digest(JSON.stringify({ connectionId, expectedGeneration, target,
+      mode: autonomousExpiresAt === undefined ? undefined : "autonomous" }));
     const existing = this.database.prepare(`SELECT operation_id, owner_id, connection_id, content_digest,
       target_digest, expires_at FROM prepared_message_operations
       WHERE idempotency_key = ?`).get(idempotencyKey) as {
@@ -521,15 +638,16 @@ export class PreparedMessageOperations {
       .get() as { count: number };
     if (recorded.count >= MAX_RECORDED_PREPARED_MESSAGES) throw new Error("TOO_MANY_PREPARED");
     const operationId = randomUUID();
-    const expiresAt = now + PREPARED_MESSAGE_TTL_MS;
+    const expiresAt = Math.min(now + PREPARED_MESSAGE_TTL_MS, autonomousExpiresAt ?? Infinity);
     this.database.prepare(`INSERT INTO prepared_message_operations
       (operation_id, owner_id, connection_id, idempotency_key, content_digest, target_digest, expires_at, state)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_approval')`)
       .run(operationId, ownerId, connectionId, idempotencyKey, contentDigest, targetDigest, expiresAt);
+    const mode = autonomousExpiresAt === undefined ? {} : { autonomous: true as const };
     if (target.origin === "https://gemini.google.com") {
-      this.geminiContents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt }));
+      this.geminiContents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt, ...mode }));
     } else {
-      this.contents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt }));
+      this.contents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt, ...mode }));
     }
     return Object.freeze({ operationId, connectionId, state: "awaiting_approval", expiresAt,
       preview: Object.freeze({ target: label, text }) });
@@ -546,7 +664,7 @@ export class PreparedMessageOperations {
     this.discardExpired(now);
     const reviews: Omit<PreparedReview<"gemini">, "reviewId">[] = [];
     for (const [operationId, operation] of this.geminiContents) {
-      if (this.approvals.has(operationId) || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?")
+      if (operation.autonomous || this.approvals.has(operationId) || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?")
         .get(operationId) || !this.sameGeminiTarget(operation.target, target)) continue;
       this.reviewTokens.delete(operationId);
       const live = this.requests.getGeminiTarget(operation.owner, operation.connectionId, now);
@@ -672,6 +790,10 @@ export class PreparedMessageOperations {
   getGeminiSendAuthorization(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const operation = this.geminiContents.get(operationId);
+    if (operation?.autonomous) {
+      const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
+      return authority?.target.origin === "https://gemini.google.com" ? Object.freeze({ ...authority, target: authority.target }) : null;
+    }
     const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
     const grantExpiresAt = operation && this.requests.getConnectionExpiresAt(owner, operation.connectionId, now);
     const consent = this.sendApprovals.get(operationId);
@@ -686,6 +808,10 @@ export class PreparedMessageOperations {
   getGeminiFillAuthorization(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const operation = this.geminiContents.get(operationId);
+    if (operation?.autonomous) {
+      const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "fill", now);
+      return authority?.target.origin === "https://gemini.google.com" ? Object.freeze({ ...authority, target: authority.target }) : null;
+    }
     const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
     const consent = this.fillApprovals.get(operationId);
     if (!operation || operation.owner !== owner || !live || !this.sameGeminiTarget(operation.target, live)
@@ -727,21 +853,33 @@ export class PreparedMessageOperations {
       const approval = this.approvals.get(pending.operationId);
       if (this.hasUnresolvedDispatch(pending.target) || this.isSendRateLimited(pending.target, now)
         || pending.expiresAt <= now || !operation || operation.owner !== pending.owner
-        || !approval || approval.expiresAt <= now || !live || !this.sameGeminiTarget(pending.target, live)) {
+        || (!operation.autonomous && (!approval || approval.expiresAt <= now))
+        || !live || !this.sameGeminiTarget(pending.target, live)
+        || (operation.autonomous && !this.requests.getAutonomousTarget(pending.owner, operation.connectionId, now))) {
         this.finishGeminiFillCheck(attemptId, null, now);
       }
     }
   }
 
+  private sameComposerTarget(left: ApprovedTarget, right: ApprovedTarget): boolean {
+    return left.origin === right.origin && left.conversationId === right.conversationId
+      && left.tabId === right.tabId && left.documentId === right.documentId;
+  }
+
   private hasOccupiedComposer(operationId: string, target: ApprovedTarget, now: number): boolean {
+    for (const [candidateId, reservation] of this.composerReservations) {
+      if (!this.getAutonomousAuthorization(reservation.owner, candidateId, now) || reservation.expiresAt <= now) {
+        this.composerReservations.delete(candidateId);
+        continue;
+      }
+      if (candidateId !== operationId && this.sameComposerTarget(reservation.target, target)) return true;
+    }
     for (const [candidateId, operation] of [...this.contents, ...this.geminiContents]) {
-      if (candidateId === operationId || operation.target.origin !== target.origin
-        || operation.target.conversationId !== target.conversationId || operation.target.tabId !== target.tabId
-        || operation.target.documentId !== target.documentId) continue;
+      if (candidateId === operationId || !this.sameComposerTarget(operation.target, target)) continue;
       const fill = this.fillStates.get(candidateId);
       if (!fill || (fill.state !== "filling" && fill.state !== "filled" && fill.state !== "uncertain")) continue;
       const status = this.getOperation(operation.owner, candidateId, now);
-      if (status.state === "approved" || status.state === "awaiting_approval") return true;
+      if (status.state === "approved" || status.state === "awaiting_approval" || status.state === "prepared") return true;
     }
     return false;
   }
@@ -791,7 +929,7 @@ export class PreparedMessageOperations {
     this.discardExpired(now);
     const reviews: Omit<PreparedReview, "reviewId">[] = [];
     for (const [operationId, operation] of this.contents) {
-      if (this.approvals.has(operationId)) continue;
+      if (operation.autonomous || this.approvals.has(operationId)) continue;
       if (this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?")
         .get(operationId)) continue;
       if (operation.target.tabId !== target.tabId || operation.target.documentId !== target.documentId
@@ -879,6 +1017,10 @@ export class PreparedMessageOperations {
   getFixtureFillAuthorization(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const operation = this.contents.get(operationId);
+    if (operation?.autonomous) {
+      const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "fill", now);
+      return authority?.target.origin === "http://127.0.0.1:8787" ? Object.freeze({ ...authority, target: authority.target }) : null;
+    }
     const consent = this.fillApprovals.get(operationId);
     if (!operation || operation.owner !== owner || !consent || consent.expiresAt <= now
       || this.consumedFillApprovals.has(operationId) || this.getOperation(owner, operationId, now).state !== "approved") {
@@ -942,6 +1084,10 @@ export class PreparedMessageOperations {
   getFixtureSendAuthorization(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const operation = this.contents.get(operationId);
+    if (operation?.autonomous) {
+      const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
+      return authority?.target.origin === "http://127.0.0.1:8787" ? Object.freeze({ ...authority, target: authority.target }) : null;
+    }
     const consent = this.sendApprovals.get(operationId);
     if (!operation || operation.owner !== owner || !consent || consent.expiresAt <= now
       || this.fillStates.get(operationId)?.state !== "filled"
@@ -1066,7 +1212,8 @@ export class PreparedMessageOperations {
     pending.resolve(status);
   }
 
-  requestFixtureFill(owner: symbol, operationId: string, now = Date.now()) {
+  requestFixtureFill(owner: symbol, operationId: string, now = Date.now(), deadlineMs = now + FIXTURE_FILL_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     const available = this.getFixtureFillAuthorization(owner, operationId, now);
     if (!available) return null;
     this.listFixtureFillChallenges(now);
@@ -1075,7 +1222,7 @@ export class PreparedMessageOperations {
     const authorization = this.consumeFixtureFillApproval(owner, operationId, now);
     if (!authorization) return null;
     const attemptId = randomUUID();
-    const expiresAt = Math.min(authorization.expiresAt, now + FIXTURE_FILL_TIMEOUT_MS);
+    const expiresAt = Math.min(deadlineMs, authorization.expiresAt, now + FIXTURE_FILL_TIMEOUT_MS);
     let resolve!: PendingFixtureFill["resolve"];
     const result = new Promise<FixtureFillStatus | null>((done) => { resolve = done; });
     const timer = setTimeout(() => this.finishFillCheck(attemptId, null), expiresAt - now);
@@ -1087,7 +1234,8 @@ export class PreparedMessageOperations {
 
   listFixtureFillChallenges(now = Date.now()) {
     for (const [attemptId, pending] of this.fillChecks) {
-      if (pending.expiresAt <= now || this.getOperation(pending.owner, pending.operationId, now).state !== "approved") {
+      const state = this.getOperation(pending.owner, pending.operationId, now).state;
+      if (pending.expiresAt <= now || (state !== "approved" && state !== "prepared")) {
         this.finishFillCheck(attemptId, null, now);
       }
     }
@@ -1103,7 +1251,7 @@ export class PreparedMessageOperations {
     if (!parsed.success || !pending || pending.expiresAt <= now
       || pending.target.origin !== target.origin || pending.target.conversationId !== target.conversationId
       || pending.target.tabId !== target.tabId || pending.target.documentId !== target.documentId
-      || this.getOperation(pending.owner, pending.operationId, now).state !== "approved") return false;
+      || !["approved", "prepared"].includes(this.getOperation(pending.owner, pending.operationId, now).state)) return false;
     this.finishFillCheck(attemptId, { ...parsed.data, operationId: pending.operationId, completedAt: now });
     return true;
   }
@@ -1113,7 +1261,8 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     const approval = this.approvals.get(operationId);
     const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
-    if (!operation || operation.owner !== owner || !approval || approval.expiresAt <= now || !live
+    const autonomous = operation?.autonomous && this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
+    if (!operation || operation.owner !== owner || (!autonomous && (!approval || approval.expiresAt <= now)) || !live
       || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
       || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId
       || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?").get(operationId)) {
@@ -1131,9 +1280,11 @@ export class PreparedMessageOperations {
   private freshDispatchBaseline(owner: symbol, operationId: string, now: number) {
     const operation = this.contents.get(operationId);
     const consent = this.sendApprovals.get(operationId);
+    const fill = this.fillStates.get(operationId);
+    const approvedAt = operation?.autonomous && fill?.state === "filled" ? fill.completedAt : consent?.approvedAt;
     const baseline = this.dispatchBaselines.get(operationId);
     const current = operation && this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
-    if (!consent || !baseline || baseline.capturedAt < consent.approvedAt || baseline.capturedAt > now
+    if (approvedAt === undefined || !baseline || baseline.capturedAt < approvedAt || baseline.capturedAt > now
       || baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS <= now
       || !current || current === "not_ready" || current.capturedAt > now
       || current.capturedAt < baseline.capturedAt
@@ -1200,9 +1351,11 @@ export class PreparedMessageOperations {
     if (this.geminiDispatchChecks.has(operationId)
       || this.dispatchChecks.size + this.geminiDispatchChecks.size >= MAX_PENDING_FIXTURE_DISPATCH_CHECKS) return "busy" as const;
     const operation = this.geminiContents.get(operationId)!;
-    const consent = this.sendApprovals.get(operationId)!;
+    const consent = this.sendApprovals.get(operationId);
+    const fill = this.fillStates.get(operationId);
+    const approvedAt = operation.autonomous && fill?.state === "filled" ? fill.completedAt : consent?.approvedAt;
     const baseline = this.requests.getGeminiSnapshot(owner, operation.connectionId, now);
-    if (!baseline || baseline === "not_ready" || baseline.capturedAt < consent.approvedAt || baseline.capturedAt > now
+    if (approvedAt === undefined || !baseline || baseline === "not_ready" || baseline.capturedAt < approvedAt || baseline.capturedAt > now
       || baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS <= now) throw new Error("OBSERVATION_UNAVAILABLE");
     const check = Object.freeze({ checkId: randomUUID(), owner, target: authorization.target, text: authorization.text,
       createdAt: now, expiresAt: Math.min(deadlineMs, authorization.expiresAt, now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS,
@@ -1627,6 +1780,53 @@ export class PreparedMessageOperations {
       text: attempt.text, expiresAt: attempt.expiresAt })));
   }
 
+  requestChatFill(owner: symbol, operationId: string, now = Date.now(), deadlineMs = now + FIXTURE_FILL_TIMEOUT_MS) {
+    const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "fill", now);
+    if (!authority) return null;
+    return authority.target.origin === "https://gemini.google.com" ? this.requestGeminiFill(owner, operationId, now, deadlineMs)
+      : this.requestFixtureFill(owner, operationId, now, deadlineMs);
+  }
+
+  requestChatProof(owner: symbol, operationId: string, now = Date.now(), deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
+    const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
+    if (!authority) throw new Error("DISPATCH_CHECK_UNAVAILABLE");
+    return authority.target.origin === "https://gemini.google.com" ? this.requestGeminiDispatchInspection(owner, operationId, now, deadlineMs)
+      : this.requestFixtureDispatchInspection(owner, operationId, now, deadlineMs);
+  }
+
+  listChatJobs(phase: ChatJob["phase"], provider: "fixture" | "gemini", now = Date.now()) {
+    if (phase === "submit") return this.listChatSubmitJobs(provider, now);
+    const checks = phase === "fill" ? provider === "gemini" ? this.listGeminiFillChallenges(now) : this.listFixtureFillChallenges(now)
+      : provider === "gemini" ? this.listGeminiDispatchChecks(now) : this.listFixtureDispatchChecks(now);
+    const jobs: ChatJob[] = [];
+    for (const check of checks) {
+      const jobId = "attemptId" in check ? check.attemptId : check.checkId;
+      const key = `${phase}:${jobId}`;
+      const offered = this.neutralJobOffers.get(check.operationId) ?? new Set<string>();
+      if (offered.has(key)) continue;
+      const job = chatJobSchema.parse({ operationId: check.operationId, jobId, phase, target: { ...check.target, provider },
+        text: check.text, expiresAt: check.expiresAt });
+      offered.add(key);
+      this.neutralJobOffers.set(check.operationId, offered);
+      jobs.push(Object.freeze({ ...job, target: Object.freeze(job.target) }));
+    }
+    return Object.freeze(jobs);
+  }
+
+  completeChatJob(target: ChatTarget, operationId: string, jobId: string, phase: ChatJob["phase"],
+    observation: ChatJobObservation, now = Date.now()): boolean {
+    const parsed = chatJobCompletionSchema.safeParse({ target, operationId, jobId, phase, observation });
+    if (!parsed.success) return false;
+    if (parsed.data.phase === "submit") return this.completeChatSubmitJob(target, operationId, jobId, parsed.data.observation, now);
+    if (!this.neutralJobOffers.get(operationId)?.has(`${phase}:${jobId}`)) return false;
+    if (parsed.data.phase === "fill") return target.provider === "gemini"
+      ? this.completeGeminiFill(target, jobId, parsed.data.observation as GeminiFillResult, now)
+      : this.completeFixtureFill(target, jobId, parsed.data.observation as FixtureFillResult, now);
+    return target.provider === "gemini"
+      ? this.completeGeminiDispatchCheck(target, operationId, jobId, parsed.data.observation as GeminiDispatchCheckResult, now)
+      : this.completeFixtureDispatchCheck(target, operationId, jobId, parsed.data.observation as FixtureDispatchCheckResult, now);
+  }
+
   completeChatSubmitJob(target: ApprovedTarget, operationId: string, jobId: string,
     observation: FixtureDispatchResult | GeminiDispatchResult, now = Date.now()) {
     if (target.origin === "https://gemini.google.com") {
@@ -1777,6 +1977,9 @@ export class PreparedMessageOperations {
     const draftFill = this.fillStates.get(operationId)
       ?? (fillConsent ? Object.freeze({ state: "fill_approved" as const, expiresAt: fillConsent.expiresAt }) : undefined);
     const fill = draftFill ? { draftFill } : {};
+    if (retained.autonomous) return this.getAutonomousAuthorization(owner, operationId, now)
+      ? { operationId, state: "prepared" as const, expiresAt: record.expires_at, ...fill }
+      : { operationId, state: "stale" as const };
     return approval
       ? { operationId, state: "approved" as const, expiresAt: record.expires_at,
         approvalExpiresAt: approval.expiresAt, ...fill }

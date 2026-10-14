@@ -84,6 +84,200 @@ test("autonomous send authority is an owned live popup grant, never a legacy rea
   assert.equal(requests.getAutonomousTarget(owner, autonomous.connectionId, 1_000_001), null);
 });
 
+test("autonomous preparation uses only exact owned grants and never renews its request deadline", () => {
+  for (const provider of ["fixture", "gemini"] as const) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("autonomous preparation owner");
+    const foreign = Symbol("foreign preparation owner");
+    const agent = requests.registerAgent(owner, "Synthetic preparation agent");
+    const target = provider === "gemini"
+      ? { origin: "https://gemini.google.com" as const, conversationId: "synthetic-autonomous-preparation",
+        url: "https://gemini.google.com/app/synthetic-autonomous-preparation", tabId: 8, documentId: "autonomous-document" }
+      : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 8, documentId: "autonomous-document" };
+    try {
+      const pending = requests.create(owner, 1000);
+      const legacy = provider === "gemini" ? requests.approveGemini(pending.requestId, target as GeminiTarget, 2000)!
+        : requests.approve(pending.requestId, target as FixtureTarget, 2000)!;
+      assert.throws(() => ledger.prepareAutonomous(owner, legacy.connectionId, "Synthetic autonomous message",
+        randomUUID(), 32_001, 2001), /CONNECTION_NOT_FOUND/);
+      const connection = requests.approveAgent(agent.agentId, target, 2000)!;
+      assert.throws(() => ledger.prepareAutonomous(foreign, connection.connectionId, "Synthetic autonomous message",
+        randomUUID(), 32_001, 2001), /CONNECTION_NOT_FOUND/);
+      for (const deadline of [2001, 32_002, Infinity, 2001.5]) {
+        assert.throws(() => ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic autonomous message",
+          randomUUID(), deadline, 2001), /INVALID_REQUEST_DEADLINE/);
+      }
+      assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()?.count, 0);
+      const key = randomUUID();
+      const prepared = ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic autonomous message", key, 6000, 2001);
+      assert.equal(prepared.state, "prepared");
+      assert.equal(prepared.expiresAt, 6000);
+      assert.match(prepared.recoveryToken, /^[0-9a-f]{64}$/);
+      assert.deepEqual(ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic autonomous message", key, 8000, 2002), prepared);
+      assert.deepEqual(ledger.getAutonomousAuthorization(owner, prepared.operationId, 2002), {
+        operationId: prepared.operationId, target, text: "Synthetic autonomous message", expiresAt: 6000
+      });
+      assert.equal(ledger.getAutonomousAuthorization(foreign, prepared.operationId, 2002), null);
+      assert.equal(ledger.getFixtureFillAuthorization(owner, prepared.operationId, 2002), null);
+      assert.equal(ledger.getGeminiFillAuthorization(owner, prepared.operationId, 2002), null);
+      assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, prepared.recoveryToken), { state: "unknown" });
+      const journal = JSON.stringify(database.prepare("SELECT * FROM prepared_message_operations").all());
+      assert.equal(journal.includes("Synthetic autonomous message"), false);
+      assert.equal(journal.includes(prepared.recoveryToken), false);
+      assert.throws(() => provider === "gemini"
+        ? ledger.prepareGemini(owner, connection.connectionId, 1, "Synthetic autonomous message", key, 2002)
+        : ledger.prepare(owner, connection.connectionId, 1, "Synthetic autonomous message", key, 2002), /IDEMPOTENCY_CONFLICT/);
+      const suspended = requests.beginChatReload(target, 2003);
+      assert.equal(suspended, 1);
+      assert.equal(ledger.getAutonomousAuthorization(owner, prepared.operationId, 2003), null);
+      assert.equal(ledger.getAutonomousAuthorization(owner, prepared.operationId, 6000), null);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    } finally {
+      ledger.disconnect(owner);
+      requests.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
+test("autonomous composer waiting is owned, deadline-bound and shared with legacy fills", async () => {
+  for (const provider of ["fixture", "gemini"] as const) {
+    for (const outcome of ["release", "same-owner", "same-owner-close", "waiting-removal", "active-removal", "deadline", "independent", "legacy-fill"]) {
+      const database = new DatabaseSync(":memory:");
+      const requests = new PendingConnectionRequests();
+      const ledger = new PreparedMessageOperations(requests, database);
+      const firstOwner = Symbol("first composer owner");
+      const secondOwner = outcome === "same-owner" || outcome === "same-owner-close" ? firstOwner : Symbol("second composer owner");
+      const firstAgent = requests.registerAgent(firstOwner, "First synthetic composer agent");
+      const secondAgent = secondOwner === firstOwner ? firstAgent : requests.registerAgent(secondOwner, "Second synthetic composer agent");
+      const target = provider === "gemini"
+        ? { origin: "https://gemini.google.com" as const, conversationId: "synthetic-autonomous-coordination",
+          url: "https://gemini.google.com/app/synthetic-autonomous-coordination", tabId: 8, documentId: "coordination-document" }
+        : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+          tabId: 8, documentId: "coordination-document" };
+      const secondTarget = outcome === "independent" ? { ...target, tabId: 9, documentId: "independent-composer-document" } : target;
+      try {
+        const now = Date.now();
+        const firstConnection = requests.approveAgent(firstAgent.agentId, target, now)!;
+        const secondConnection = requests.approveAgent(secondAgent.agentId, secondTarget, now)!;
+        const first = ledger.prepareAutonomous(firstOwner, firstConnection.connectionId, "First synthetic message", randomUUID(), now + 2000, now);
+        const second = ledger.prepareAutonomous(secondOwner, secondConnection.connectionId, "Second synthetic message", randomUUID(),
+          now + (outcome === "deadline" ? 50 : 2000), now);
+        assert.equal(await ledger.acquireComposer(firstOwner, first.operationId, first.expiresAt), true, outcome);
+        assert.equal(await ledger.acquireComposer(secondOwner, first.operationId, first.expiresAt), secondOwner === firstOwner, outcome);
+        if (outcome === "legacy-fill") {
+          const pending = requests.create(secondOwner);
+          const legacy = provider === "gemini" ? requests.approveGemini(pending.requestId, target as GeminiTarget)!
+            : requests.approve(pending.requestId, target as FixtureTarget)!;
+          const prepared = provider === "gemini"
+            ? ledger.prepareGemini(secondOwner, legacy.connectionId, 1, "Legacy synthetic message", randomUUID())
+            : ledger.prepare(secondOwner, legacy.connectionId, 1, "Legacy synthetic message", randomUUID());
+          const ordinary = provider === "gemini" ? ledger.listGeminiReviews(target as GeminiTarget).reviews
+            : ledger.listFixtureReviews(target as FixtureTarget).reviews;
+          const review = ordinary.find(candidate => candidate.operationId === prepared.operationId)!;
+          if (provider === "gemini") ledger.approveGeminiReview(target as GeminiTarget, prepared.operationId, review.reviewId);
+          else ledger.approveFixtureReview(target as FixtureTarget, prepared.operationId, review.reviewId);
+          const fills = provider === "gemini" ? ledger.listGeminiFillReviews(target as GeminiTarget).reviews
+            : ledger.listFixtureFillReviews(target as FixtureTarget).reviews;
+          const fillReview = fills.find(candidate => candidate.operationId === prepared.operationId)!;
+          if (provider === "gemini") ledger.approveGeminiFillReview(target as GeminiTarget, prepared.operationId, fillReview.reviewId);
+          else ledger.approveFixtureFillReview(target as FixtureTarget, prepared.operationId, fillReview.reviewId);
+          assert.equal(provider === "gemini" ? ledger.requestGeminiFill(secondOwner, prepared.operationId)
+            : ledger.requestFixtureFill(secondOwner, prepared.operationId), "busy");
+          assert.ok(provider === "gemini" ? ledger.getGeminiFillAuthorization(secondOwner, prepared.operationId)
+            : ledger.getFixtureFillAuthorization(secondOwner, prepared.operationId));
+          ledger.releaseComposer(firstOwner, first.operationId);
+          continue;
+        }
+        let finished = false;
+        const waiting = ledger.acquireComposer(secondOwner, second.operationId, second.expiresAt).then(ready => { finished = true; return ready; });
+        assert.equal(ledger.releaseComposer(Symbol("foreign coordinator"), first.operationId), false);
+        if (outcome === "independent") assert.equal(await waiting, true);
+        else if (outcome === "deadline") assert.equal(await waiting, false);
+        else {
+          await new Promise<void>(done => setTimeout(done, 5));
+          assert.equal(finished, false);
+          const third = ledger.prepareAutonomous(secondOwner, secondConnection.connectionId, "Third synthetic message", randomUUID(), now + 2000);
+          assert.equal(await ledger.acquireComposer(secondOwner, third.operationId, third.expiresAt), false);
+          if (outcome === "waiting-removal") requests.disconnect(secondOwner);
+          else if (outcome === "active-removal" || outcome === "same-owner-close") { ledger.disconnect(firstOwner); requests.disconnect(firstOwner); }
+          else assert.equal(ledger.releaseComposer(firstOwner, first.operationId), true);
+          assert.equal(await waiting, outcome !== "waiting-removal" && outcome !== "same-owner-close");
+        }
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+      } finally {
+        ledger.disconnect(firstOwner);
+        ledger.disconnect(secondOwner);
+        requests.disconnect(firstOwner);
+        requests.disconnect(secondOwner);
+        database.close();
+      }
+    }
+  }
+});
+
+test("neutral autonomous fill and proof jobs reuse bounded queues without supervised approvals", async () => {
+  for (const provider of ["fixture", "gemini"] as const) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("neutral autonomous phases");
+    const agent = requests.registerAgent(owner, "Synthetic neutral phase agent");
+    const target = provider === "gemini"
+      ? { origin: "https://gemini.google.com" as const, conversationId: "synthetic-neutral-phases",
+        url: "https://gemini.google.com/app/synthetic-neutral-phases", tabId: 8, documentId: "phase-document" }
+      : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const, tabId: 8, documentId: "phase-document" };
+    try {
+      const connection = requests.approveAgent(agent.agentId, target)!;
+      const prepared = ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic neutral phase message", randomUUID(), Date.now() + 5000);
+      assert.equal(ledger.requestChatFill(owner, prepared.operationId), null);
+      assert.equal(await ledger.acquireComposer(owner, prepared.operationId, prepared.expiresAt), true);
+      const now = Date.now();
+      const filling = ledger.requestChatFill(owner, prepared.operationId, now, prepared.expiresAt);
+      assert.ok(filling && filling !== "busy");
+      assert.equal(ledger.requestChatFill(owner, prepared.operationId), null);
+      const job = ledger.listChatJobs("fill", provider)[0]!;
+      assert.equal(job.operationId, prepared.operationId);
+      assert.equal(job.phase, "fill");
+      assert.equal(job.expiresAt, Math.min(prepared.expiresAt, now + FIXTURE_FILL_TIMEOUT_MS));
+      assert.deepEqual(ledger.listChatJobs("fill", provider), []);
+      const fillObservation = provider === "gemini" ? { ok: true as const, editor: "contenteditable" as const }
+        : { ok: true as const, editor: "textarea" as const };
+      const wrongEditor = provider === "gemini" ? { ok: true as const, editor: "textarea" as const }
+        : { ok: true as const, editor: "contenteditable" as const };
+      assert.equal(ledger.completeChatJob(job.target, prepared.operationId, job.jobId, "fill", wrongEditor), false);
+      assert.equal(ledger.completeChatJob({ ...job.target, documentId: "foreign-phase-document" }, prepared.operationId, job.jobId,
+        "fill", fillObservation), false);
+      assert.equal(ledger.completeChatJob(job.target, prepared.operationId, job.jobId, "fill", fillObservation), true);
+      assert.equal((await filling.result)?.ok, true);
+      assert.equal(ledger.getOperation(owner, prepared.operationId).state, "prepared");
+      assert.deepEqual(provider === "gemini" ? ledger.listGeminiReviews(target as GeminiTarget).reviews
+        : ledger.listFixtureReviews(target as FixtureTarget).reviews, []);
+      if (provider === "gemini") requests.publishGeminiSnapshot(target as GeminiTarget, [{ direction: "incoming", text: "Synthetic baseline" }]);
+      else requests.publishFixtureSnapshot(target as FixtureTarget, [{ id: "synthetic-baseline", direction: "incoming", text: "Synthetic baseline" }]);
+      const checking = ledger.requestChatProof(owner, prepared.operationId, Date.now(), prepared.expiresAt);
+      assert.notEqual(checking, "busy");
+      if (checking === "busy") throw new Error("Expected neutral proof job");
+      const proof = ledger.listChatJobs("proof", provider)[0]!;
+      assert.equal(proof.jobId, checking.checkId);
+      assert.deepEqual(ledger.listChatJobs("proof", provider), []);
+      const proofObservation = { ...fillObservation, draftText: prepared.preview.text,
+        selected: true as const, writable: true as const, submitReady: true as const };
+      assert.equal(ledger.completeChatJob(proof.target, prepared.operationId, proof.jobId, "proof", proofObservation), true);
+      assert.equal(await checking.result, true);
+      assert.equal(ledger.completeChatJob(proof.target, prepared.operationId, proof.jobId, "proof", proofObservation), false);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    } finally {
+      ledger.disconnect(owner);
+      requests.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
 test("Gemini fresh-proof and activation-result contracts refuse authority, extra claims and fixture editors", () => {
   const proof = { ok: true, editor: "contenteditable", draftText: "Synthetic exact draft \u00e9\nSecond line",
     selected: true, writable: true, submitReady: true };
