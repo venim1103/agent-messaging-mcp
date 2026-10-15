@@ -66,7 +66,10 @@ export function fillGeminiDraft(input: { expectedUrl: string; text: string; oper
   if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
     || typeof input.attemptId !== "string" || !identifier.test(input.attemptId)
     || !Number.isSafeInteger(input.expiresAt)) return { ok: false, code: "FILL_UNAVAILABLE" };
-  const scope = globalThis as typeof globalThis & { geminiDraftFillAttempts?: Set<string> };
+  const scope = globalThis as typeof globalThis & {
+    geminiDraftFillAttempts?: Set<string>;
+    agentDraftOwnership?: import("./draft-ownership").DraftOwnershipTracker;
+  };
   const attempts = scope.geminiDraftFillAttempts ??= new Set<string>();
   if (attempts.has(input.attemptId) || attempts.size >= 100) return { ok: false, code: "FILL_UNAVAILABLE" };
   attempts.add(input.attemptId);
@@ -131,10 +134,12 @@ export function fillGeminiDraft(input: { expectedUrl: string; text: string; oper
     if (ready.root !== focused.root || ready.timeline !== focused.timeline || ready.editor !== focused.editor
       || document.activeElement !== ready.editor || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNAVAILABLE" };
     inputStarted = true;
+    scope.agentDraftOwnership?.begin(input.operationId, input.text, input.expectedUrl, ready.editor, ready.root);
     if (!Document.prototype.execCommand.call(document, "insertText", false, input.text)) return { ok: false, code: "FILL_UNCERTAIN" };
     const completed = inspect(true);
     if (!completed.ok || completed.root !== ready.root || completed.timeline !== ready.timeline || completed.editor !== ready.editor
       || document.activeElement !== ready.editor || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNCERTAIN" };
+    scope.agentDraftOwnership?.confirm(input.operationId);
     return { ok: true, editor: "contenteditable" };
   } catch {
     return { ok: false, code: inputStarted ? "FILL_UNCERTAIN" : "FILL_UNAVAILABLE" };

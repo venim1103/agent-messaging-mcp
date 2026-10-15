@@ -6,6 +6,7 @@ import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, ins
   observeGeminiIdentity, observeGeminiMessages, submitGeminiDraft }
   from "../lib/gemini-observation";
 import { createNativeRequestChannel } from "../lib/native-channel";
+import { installDraftOwnershipTracker } from "../lib/draft-ownership";
 
 const nativeHostName = "com.agent_messaging_mcp.bridge";
 const protocolVersion = 1;
@@ -734,6 +735,9 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
   try {
     const binding = await chatJobBinding(check);
     if (binding) {
+      if (check.phase === "fill") await browser.scripting.executeScript({
+        target: { tabId: check.target.tabId, documentIds: [check.target.documentId] }, func: installDraftOwnershipTracker
+      });
       const args = { expectedUrl: binding.expectedUrl, text: check.text };
       const provePrepared = check.phase !== "fill";
       const result = check.target.provider === "gemini"

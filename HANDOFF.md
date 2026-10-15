@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-15 (T3m public autonomous send and idempotent status recovery are gated with all units and 64 end-to-end checks; paused at the person's request).
+Updated: 2026-10-15 (resumed autonomous work; T3n document-local draft provenance is gated with all units and 65 end-to-end checks; clearing is not enabled).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,14 +16,14 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest gated source checkpoint: T3m (the commit containing the [checkpoint entry below](#t3m-public-autonomous-send-and-status-replay-2026-10-15)), after T3l `a6e98c8`, T3k `e9db742`, T3j `a703e22`, T3i `02ac199` and T3h `8c85ed1`. The exact gate passed build, both typechecks, **all units and 64/64 e2e checks**, zero failures/cancellations. Public `chat_send_message` connects the existing broker-owned pipeline for fixture/routed-Gemini synthetic flows. D10a and installed/live autonomous acceptance remain missing.
+- Latest gated source checkpoint: T3n (the commit containing the [checkpoint entry below](#t3n-document-local-draft-provenance-2026-10-15)), after public autonomous send T3m `5e30519`. The exact repaired gate passed build, both typechecks, **all units and 65/65 e2e checks**, zero failures/cancellations. Neutral fills now retain conservative document-local draft provenance. D10a clearing and installed/live autonomous acceptance remain missing.
 - The person's earlier eleven-change audit is complete: the ten pending T3h files were retained, and the eleventh was the bounded native-channel helper. Later checkpoints connect neutral orchestration and public sending. Earlier cancellations, baseline comparison and diagnostic evidence remain in their dated entries.
 - T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Installed Gemini single-owner approval/pickup, fresh reads, same-chat events and removal now passed (entry below). Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3d's installed fixture empty-status check passed after coordinated reload; installed outcome buttons remain untested.
 - Latest installed write evidence: one supervised fixture textarea message passed separate trusted draft, fill and Send approvals, one MCP fill and one submit, `observed_in_ui`, fresh read/status and the person's visual confirmation of one outgoing row with an empty editor. An earlier fill refusal/expiry is preserved below. This is not autonomous sending, Gemini writing or installed T3e coordination evidence.
-- Initial resume baseline was clean `main` at `9dd6bd7`, aligned with tracked `origin/main`; this follow-up resumed at `c551f59`, also aligned with the tracked remote. The earlier eleven pending source/test changes were committed in T3h `8c85ed1`, leaving a clean worktree before T3i. The assistant made no push or new branch.
+- This resumption began at clean `main` / T3m `5e30519`, aligned with tracked `origin/main`; the earlier pause is superseded by the person's request to continue autonomously and commit useful increments. Earlier resume baselines are historical. The assistant made no push or new branch.
 - Current coordination: builds, browser checks and timing traces used disposable test processes; the baseline source snapshot and diagnostic trace/build artifacts were removed. A read-only process check found no leftover matching test broker/native relay. The person freshly authorized the clock check below; no clock/security setting was changed, installed service restarted or live chat accessed. Earlier test grants remain ended; do not transfer old handles to a new owner or treat prior evidence as fresh permission.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
-- Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e-T3m have synthetic/source-gate evidence only. A future reload ends current grants; do not assume installed code contains these newer changes.
+- Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e-T3n have synthetic/source-gate evidence only. A future reload ends current grants; do not assume installed code contains these newer changes.
 
 ### Capability matrix
 
@@ -59,6 +59,8 @@ T3l adds a distinct one-offer read-only `settle` job after the old activation le
 
 T3m adds public `chat_send_message { connectionId, text, idempotencyKey }` with `sent`, `not_sent` or `unresolved`, always `retryAllowed: false`. It reuses neutral preparation/commit inside one original 30-second deadline, returning the receipt when prepared. Exact owned durable-key replay reads status only, including after grant removal while original metadata remains; changed arguments conflict. Late expected errors prefer durable status, and transport loss after commit begins stays unresolved. D10a and installed/live autonomous acceptance remain missing.
 
+T3n records successful neutral fills in one document-local isolated-world tracker, bound to operation, exact URL, root/editor objects and exact trusted insertion/readback. Input, retyping identical text, relevant mutations, observed mismatches, replacement, visibility loss and pagehide invalidate it; the known textarea insertion's deferred blur-change is handled separately. It stores no durable draft data, grants no write authority and clears nothing. Public synthetic browser cases verify retained provenance and human-retyping invalidation for both providers.
+
 Autonomous same-chat reload preserves existing handles after fresh new-document identity verification, invalidates observation cursors and reinstalls observers. Old-document reads/publications are blocked during suspension; removal/disconnect still work. Only the exact URL/chat/tab may rebind; legacy reload still revokes. Failure or uncertainty disconnects pinned targets, without new approval, automatic readmission or job replay. Installed fixture reload retained the same handle and produced a fresh cursor epoch; failure/race coverage and Gemini reload evidence remain synthetic.
 
 ### Gemini send chain
@@ -87,7 +89,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 1. **T1 Read robustness: done.** Stopped native watches restart with bounded backoff (R2). D8 captures the newest 32 visible rows with `omittedBefore`, per-message truncation at 16,000 UTF-16 units and a 96 KiB capture cap. Identity-preserving failures skip publication; changed targets still revoke (R1). Synthetic evidence only for these changes.
 2. **T2 Connection model: synthetic implementation done.** Startup (T2a), roster/removal (T2b), popup-first per-agent admission/pickup/no-expiry grants (T2c) and same-chat reload/rebind/gaps/observer reattachment (T2d) are gated. No automatic admission/re-admission (D13b). Individual disconnect/restart ends that owner's grant; tab/chat/browser changes end matching grants. Installed fixture pickup/read/reload/removal and Gemini single-owner approval/pickup/read/events/removal passed. Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3 connects autonomous sending below.
-3. **T3 Autonomous send: in progress.** T3a-T3m are gated, including public sending, status-only key replay, dedicated original send budgets, bounded page-sent/not-sent evidence and counted autonomous submit/proof-loss browser cases. Still missing: own-leftover clearing (D10a), broader authority-loss browser settlement cases and explicit own-window acceptance (D11). Retain original deadlines, one-offer jobs, browser reservation and one activation.
+3. **T3 Autonomous send: in progress.** T3a-T3n are gated, including public sending, status-only key replay, original send budgets, bounded page-sent/not-sent evidence and conservative own-draft provenance. Still missing: broker-authorized own-leftover clearing (D10a), broader authority-loss/concurrent-cancellation browser cases and explicit own-window acceptance (D11). Retain original deadlines, one-offer jobs, browser reservation and one activation.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
 5. **T5 Live acceptance.** Coordinated reload, then one human-authorized session on a disposable chat: connect once, the agent sends a few neutral messages and reads the complete replies without further clicks, then the tab is closed.
 6. **T6 Later.** Hidden-tab operation (D11, possibly debugger input per D6), a second chat site on the provider-neutral pipeline, calibration and packaging.
@@ -122,7 +124,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-Paused at the person's request after gated T3m. Do not start another implementation slice or rerun the successful gate until asked to resume. Next when resumed: D10a own-leftover ownership/clearing, then broader authority-loss/own-window acceptance. Retain the original deadline, four-second browser leases, bounded settlement and no failed-write replay. Preserve earlier failures and the bounded clock sample. Installed acceptance, live access, further clock probes and host/security/settings work still need fresh authorization.
+Continue autonomous implementation after the person's explicit resumption. Next: D10a broker-authorized clearing of this owner's known resolved unsent leftover, using fresh document provenance; then broader authority-loss/concurrent-cancellation and own-window acceptance. Provenance alone is not clearing permission. Retain original deadlines, four-second browser leases, bounded settlement and no failed-write replay. Preserve earlier failures and the bounded clock sample. Installed acceptance, live access, further clock probes and host/security/settings work still need fresh authorization.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -189,6 +191,14 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T3n Document-Local Draft Provenance (2026-10-15)
+
+- The person resumed autonomous implementation with periodic local commits. This checkpoint prepares D10a without enabling any deletion: successful neutral fixture/Gemini fills record one operation/URL/root/editor-bound isolated-world marker after exact trusted insertion and readback. It is memory-only and cannot restore fill/submit authority. Legacy supervised behavior is unchanged.
+- Human input, including retyping the identical text, synthetic input/change, relevant DOM mutations, root/editor replacement and restoration, observed mismatches, visibility loss and pagehide invalidate ownership conservatively. Initial multiline checks failed twice: Chromium emits a separate trusted null-data `insertText` event per newline; exact reconstructed payload handling repaired them. An initial public fixture check then exposed the agent insertion's deferred native textarea blur-change; handling that one exact trusted event repaired the same focused check.
+- Focused low-level two-provider and public retained-draft browser cases pass. Public flows assert provenance in the actual isolated world, permanent loss after same-text human retyping, one activation/intent and unchanged status-only replay. No real account, installed reload, new consent, provider family or draft-clearing action was used.
+- First exact gate passed build/types/all units; E2E passed **64/65**, one assertion failure, zero cancellations. The older supervised Gemini proof matrix counted four inspector executions instead of five; all new provenance cases passed. Its precise cause was not reproduced. Per-mode invocation assertions and explicit visible/selected-chat prerequisites now prevent an earlier refusal from standing in for the intended inspector fault. The focused matrix passed with all five executions; no deadline, polling, authority assertion or sandbox was weakened.
+- Repaired exact gate: `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e` passed build, both typechecks, all units and **65/65 e2e**, zero failures/cancellations. Numeric unit summary was host-elided; chained E2E execution confirms unit success. Next: broker-owned D10a clearing admission and one-offer bounded execution; no automatic retry of an old attempt. Safety boundaries remain in AGENTS.md.
 
 ## T3m Public Autonomous Send And Status Replay (2026-10-15)
 

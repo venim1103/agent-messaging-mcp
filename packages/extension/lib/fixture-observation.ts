@@ -132,7 +132,10 @@ export function fillFixtureDraft(input: {
     || input.text.length > 2048 || new TextEncoder().encode(input.text).length > 4000) {
     return { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" };
   }
-  const scope = globalThis as typeof globalThis & { fixtureDraftFillAttempts?: Set<string> };
+  const scope = globalThis as typeof globalThis & {
+    fixtureDraftFillAttempts?: Set<string>;
+    agentDraftOwnership?: import("./draft-ownership").DraftOwnershipTracker;
+  };
   const attempts = scope.fixtureDraftFillAttempts ??= new Set<string>();
   if (attempts.has(input.attemptId) || attempts.size >= 100) return { ok: false, code: "FILL_UNAVAILABLE" };
   attempts.add(input.attemptId);
@@ -210,12 +213,14 @@ export function fillFixtureDraft(input: {
     if (!ready.ok) return ready;
     if (ready.root !== focused.root || ready.editor !== focused.editor || document.activeElement !== ready.editor
       || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNAVAILABLE" };
+    scope.agentDraftOwnership?.begin(input.operationId, input.text, input.expectedUrl, ready.editor, ready.root);
     if (!document.execCommand("insertText", false, input.text)) return { ok: false, code: "FILL_UNCERTAIN" };
     const text = ready.editor instanceof HTMLTextAreaElement ? ready.editor.value : ready.editor.innerText;
     const roots = document.querySelectorAll<HTMLElement>("main[data-conversation-id]");
     if (location.href !== input.expectedUrl || roots.length !== 1 || roots[0] !== ready.root
       || ready.root.dataset.conversationId !== "fixture-alpha" || !ready.editor.isConnected
       || document.activeElement !== ready.editor || text !== input.text) return { ok: false, code: "FILL_UNCERTAIN" };
+    scope.agentDraftOwnership?.confirm(input.operationId);
     return { ok: true, editor: ready.kind };
   } catch {
     return { ok: false, code: "FILL_UNCERTAIN" };

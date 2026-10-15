@@ -9,6 +9,7 @@ import { captureFixtureSnapshot, fillFixtureDraft, inspectFixturePreflight, obse
 import { PreparedMessageOperations } from "../../packages/companion/dist/message-operations.js";
 import { PendingConnectionRequests } from "../../packages/companion/dist/pending-connections.js";
 import { createFixtureServer } from "../fixtures/server.mjs";
+import { installDraftOwnershipTracker } from "../../packages/extension/lib/draft-ownership.ts";
 
 test("browser input reaches the rich editor without accepting synthetic input", async () => {
   const server = createFixtureServer();
@@ -300,6 +301,58 @@ test("one-shot fixture draft fill preserves user input and never activates Send"
     await page.goto("about:blank");
     assert.deepEqual(await page.evaluate(fillFixtureDraft, fillInput("http://127.0.0.1:8787/")),
       { ok: false, code: "TARGET_CHANGED" });
+  } finally {
+    await browser.close();
+  }
+});
+
+test("draft ownership requires a known fill and rejects retyped text or replaced editors", async () => {
+  const html = await readFile(new URL("../fixtures/chat.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("http://127.0.0.1:8787/**", route => route.fulfill({
+      status: 200, contentType: "text/html; charset=utf-8", body: html
+    }));
+    for (const kind of ["textarea", "rich"]) {
+      for (const mode of ["untouched", "blur", "foreign", "retyped", "input", "change", "changed-restored", "replaced", "root-replaced", "released", "unknown"]) {
+        const expectedUrl = `http://127.0.0.1:8787/${kind === "rich" ? "?editor=rich" : ""}`;
+        await page.goto(expectedUrl);
+        await page.evaluate(installDraftOwnershipTracker);
+        const input = { expectedUrl, text: "Owned exact draft\nSecond exact line", operationId: crypto.randomUUID(),
+          attemptId: crypto.randomUUID(), expiresAt: Date.now() + 4000 };
+        const editor = page.getByRole("textbox", { name: "Message" });
+        if (mode === "unknown") await editor.fill(input.text);
+        else assert.deepEqual(await page.evaluate(fillFixtureDraft, input), { ok: true, editor: kind });
+        if (mode === "blur") await editor.evaluate(element => element.blur());
+        if (mode === "retyped") { await editor.fill(""); await editor.fill(input.text); }
+        if (mode === "input") await editor.evaluate(element => element.dispatchEvent(new InputEvent("input")));
+        if (mode === "change") await editor.evaluate(element => element.dispatchEvent(new Event("change", { bubbles: true })));
+        if (mode === "changed-restored") await editor.evaluate((element, input) => {
+          if (element instanceof HTMLTextAreaElement) element.value = "Changed";
+          else element.textContent = "Changed";
+          if (window.agentDraftOwnership.matches(input.operationId, input.text, input.expectedUrl, element, document.querySelector("main"))) {
+            throw new Error("Changed draft retained ownership");
+          }
+          if (element instanceof HTMLTextAreaElement) element.value = input.text;
+          else element.innerText = input.text;
+        }, input);
+        if (mode === "replaced" || mode === "root-replaced") await editor.evaluate((element, mode) => {
+          const original = mode === "root-replaced" ? document.querySelector("main") : element;
+          const replacement = original.cloneNode(true);
+          original.replaceWith(replacement);
+          replacement.replaceWith(original);
+        }, mode);
+        if (mode === "released") await page.evaluate(input => window.agentDraftOwnership.release(input.operationId), input);
+        const owned = await page.evaluate(({ input, mode }) => window.agentDraftOwnership.matches(
+          mode === "foreign" ? crypto.randomUUID() : input.operationId, input.text, input.expectedUrl,
+          document.querySelector("#composer textarea:not([hidden]), #composer [contenteditable=true]"), document.querySelector("main")
+        ), { input, mode });
+        assert.equal(owned, mode === "untouched" || mode === "blur", `${kind}/${mode}`);
+        assert.equal(kind === "rich" ? await editor.innerText() : await editor.inputValue(), input.text);
+        assert.equal(await page.locator("ol#messages > li").count(), 2);
+      }
+    }
   } finally {
     await browser.close();
   }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright-core";
+import { installDraftOwnershipTracker } from "../../packages/extension/lib/draft-ownership.ts";
 import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl,
   observeGeminiIdentity, observeGeminiMessages, submitGeminiDraft }
   from "../../packages/extension/lib/gemini-observation.ts";
@@ -213,6 +214,7 @@ test("isolated one-shot Gemini draft fill uses native input and never activates 
     for (const scenario of ["ready", "existing", "readonly", "blocked", "focus-draft", "focus-target", "focus-timeline", "input-replaced", "input-ambiguous-root", "expired",
       "overlong-lease", "wrong-query", "oversized", "byte-oversized", "whitespace", "capacity"]) {
       await page.goto(expectedUrl);
+      await page.evaluate(installDraftOwnershipTracker);
       await page.locator("[contenteditable]").evaluate((editor, scenario) => {
         if (scenario === "existing") editor.innerText = "Existing user draft";
         if (scenario === "readonly") editor.setAttribute("aria-readonly", "true");
@@ -260,6 +262,15 @@ test("isolated one-shot Gemini draft fill uses native input and never activates 
       assert.equal(await page.evaluate(() => window.nativeInsertCalls), ["ready", "input-replaced", "input-ambiguous-root"].includes(scenario) ? 1 : 0, scenario);
       assert.equal(await page.evaluate(() => window.activations), 0, scenario);
       assert.equal(await page.locator("[contenteditable]").innerText(), actualText, scenario);
+      assert.equal(await page.evaluate(input => window.agentDraftOwnership.matches(input.operationId, input.text,
+        input.expectedUrl, document.querySelector("[contenteditable]"), document.querySelector("main")), input), scenario === "ready", scenario);
+      if (scenario === "ready") {
+        await page.locator("[contenteditable]").fill("");
+        await page.locator("[contenteditable]").fill(input.text);
+        assert.equal(await page.evaluate(input => window.agentDraftOwnership.matches(input.operationId, input.text,
+          input.expectedUrl, document.querySelector("[contenteditable]"), document.querySelector("main")), input), false);
+        assert.equal(await page.evaluate(() => window.activations), 0);
+      }
     }
   } finally {
     await browser.close();

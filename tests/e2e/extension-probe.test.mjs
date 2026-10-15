@@ -2114,6 +2114,21 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         assert.equal(await worker.evaluate(async ({ operationId, provider }) =>
           (await chrome.storage.local.get(`${provider}-submit-attempt-${operationId}`))[`${provider}-submit-attempt-${operationId}`],
         { operationId: status.operationId, provider }), true);
+        const checkOwnership = () => worker.evaluate(async ({ selected, operationId, text, url, provider }) => {
+          const [result] = await chrome.scripting.executeScript({ target: { tabId: selected.tabId, documentIds: [selected.documentId] },
+            func: ({ operationId, text, url, provider }) => globalThis.agentDraftOwnership?.matches(operationId, text, url,
+              document.querySelector(provider === "gemini" ? "[contenteditable]" : "#message"), document.querySelector("main")),
+            args: [{ operationId, text, url, provider }] });
+          return result.result;
+        }, { selected, operationId: status.operationId, text: argumentsValue.text, url, provider });
+        assert.equal(await checkOwnership(), retainedDraft);
+        if (outcome === "not_sent") {
+          const editor = fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message");
+          await editor.fill("");
+          await editor.fill(argumentsValue.text);
+          assert.equal(await checkOwnership(), false);
+          assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
+        }
         const encoded = JSON.stringify(withoutReceipt);
         for (const privateValue of [argumentsValue.text, recoveryToken, selected.documentId]) assert.equal(encoded.includes(privateValue), false);
         const { DatabaseSync } = await import("node:sqlite");
@@ -2729,6 +2744,8 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
             return result;
           };
         });
+        await page.bringToFront();
+        assert.equal(await page.evaluate(() => document.visibilityState), "visible");
         const bodyBeforeProof = await page.locator("body").innerHTML();
         const focusBeforeProof = await page.evaluate(() => document.activeElement.outerHTML);
         phase = `${outcome}:read-only-proof`;
@@ -2744,6 +2761,13 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
         const proofIds = new Set([proof.payload.checkId]);
         for (const mode of ["changed-draft", "disabled-submit", "result-loss", "grant-loss"]) {
           phase = `${outcome}:proof-${mode}`;
+          await page.bringToFront();
+          assert.equal(await page.evaluate(() => document.visibilityState), "visible", mode);
+          assert.equal(await worker.evaluate(async tabId => {
+            const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+            return active?.id === tabId;
+          }, selected.tabId), true, mode);
+          const executionsBefore = await worker.evaluate(() => globalThis.syntheticGeminiProofExecutions);
           await page.evaluate(({ mode, text }) => {
             document.querySelector("[contenteditable]").innerText = mode === "changed-draft" ? "Preserve this synthetic changed draft" : text;
             document.querySelector("button").disabled = mode === "disabled-submit";
@@ -2762,6 +2786,8 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
           const refused = await facade.checkGeminiDispatch(prepared.payload.operationId);
           assert.equal(refused.kind, "gemini_dispatch_check", mode);
           assert.equal(refused.payload.ready, false, mode);
+          assert.equal(await worker.evaluate(() => globalThis.syntheticGeminiProofExecutions), executionsBefore + 1,
+            `The ${mode} boundary must execute its page inspector exactly once`);
           assert.equal(proofIds.has(refused.payload.checkId), false);
           proofIds.add(refused.payload.checkId);
           assert.equal(await page.locator("body").innerHTML(), body, mode);
