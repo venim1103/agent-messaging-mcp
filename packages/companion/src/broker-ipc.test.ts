@@ -49,7 +49,7 @@ for (const target of [
   { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
     documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" }
 ] as const) {
-  test(`${target.origin} autonomous IPC joins neutral phases with the original send deadline`, { timeout: 5000 }, async () => {
+  test(`${target.origin} autonomous IPC preserves its original deadline and durable status after a late error`, { timeout: 5000 }, async testContext => {
     const home = await mkdtemp(join(tmpdir(), "agent-messaging-autonomous-ipc-"));
     const directory = join(home, "broker");
     const database = new DatabaseSync(":memory:");
@@ -87,6 +87,12 @@ for (const target of [
       assert.deepEqual((await facade.prepareChatMessage(connection.connectionId, prepared.payload.preview.text, key, deadlineMs + 1000)).payload, prepared.payload);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
       assert.deepEqual((await relay.listChatJobs("fill", target.origin === "https://gemini.google.com" ? "gemini" : "fixture")).payload, { jobs: [] });
+      const originalCommit = PreparedMessageOperations.prototype.commitAutonomousMessage;
+      const lateError = testContext.mock.method(PreparedMessageOperations.prototype, "commitAutonomousMessage",
+        async function(this: PreparedMessageOperations, owner: symbol, operationId: string, originalDeadline: number) {
+          await originalCommit.call(this, owner, operationId, originalDeadline);
+          throw new Error("DISPATCH_UNAVAILABLE");
+        });
       const committing = facade.commitPreparedMessage(prepared.payload.operationId, deadlineMs);
       const provider = target.origin === "https://gemini.google.com" ? "gemini" : "fixture";
       const listing = await relay.listChatJobs("fill", provider);
@@ -132,6 +138,10 @@ for (const target of [
       assert.ok(result.kind === "chat_dispatch");
       assert.equal(result.deadlineMs, deadlineMs);
       assert.equal(result.payload.state, provider === "gemini" ? "resolved" : "observed_in_ui");
+      assert.equal(lateError.mock.calls.length, 1);
+      assert.deepEqual((await facade.prepareChatMessage(connection.connectionId, prepared.payload.preview.text, key, deadlineMs)).payload, result.payload);
+      assert.deepEqual((await facade.prepareChatMessage(connection.connectionId, "Synthetic changed IPC replay", key, deadlineMs)).payload,
+        { code: "IDEMPOTENCY_CONFLICT" });
       assert.deepEqual((await facade.commitPreparedMessage(prepared.payload.operationId, deadlineMs)).payload, result.payload);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
       assert.throws(() => brokerRequestDeadline(Date.now(), undefined, 30_000), /Invalid broker request deadline/);

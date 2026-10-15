@@ -523,6 +523,26 @@ export class PreparedMessageOperations {
     return Object.freeze({ ...prepared, state: "prepared" as const, recoveryToken: receipt.recoveryToken });
   }
 
+  getAutonomousReplay(owner: symbol, connectionId: string, text: string, idempotencyKey: string, now = Date.now()) {
+    this.discardExpired(now);
+    if (!this.owners.has(owner)) return null;
+    const record = this.database.prepare(`SELECT operation_id, owner_id, connection_id, content_digest, target_digest
+      FROM prepared_message_operations WHERE idempotency_key = ?`).get(idempotencyKey) as {
+        operation_id: string; owner_id: string; connection_id: string; content_digest: string; target_digest: string
+      } | undefined;
+    if (!record) return null;
+    if (record.owner_id !== this.owners.get(owner)) throw new Error("OPERATION_UNAVAILABLE");
+    const operation = this.contents.get(record.operation_id) ?? this.geminiContents.get(record.operation_id);
+    const target = operation?.autonomous && operation.owner === owner && operation.connectionId === connectionId
+      ? operation.target : this.requests.getAutonomousTarget(owner, connectionId, now);
+    if (!target) return null;
+    if (record.connection_id !== connectionId || record.content_digest !== this.digest(text)
+      || record.target_digest !== this.digest(JSON.stringify({ connectionId, expectedGeneration: 1, target, mode: "autonomous" }))) {
+      throw new Error("IDEMPOTENCY_CONFLICT");
+    }
+    return this.dispatchStatus(record.operation_id);
+  }
+
   getAutonomousAuthorization(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);

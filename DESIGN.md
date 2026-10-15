@@ -362,6 +362,7 @@ Keep the public tool list small and stable. Per-connection capabilities are retu
 | `chat_get_connection` | Connection request ID | Pending/ready state, connection handle, generation, target summary, capabilities, and health |
 | `chat_read_messages` | Connection handle, bounded limit, optional snapshot-pagination token | Structured snapshot, coverage, freshness, and event cursor; no automatic scrolling |
 | `chat_wait_for_events` | Connection handle, event cursor, bounded timeout and limit | Incremental observations/revisions/status changes; returns normally on timeout |
+| `chat_send_message` | Autonomous connection handle, text, idempotency key | One broker-owned attempt; sent, not sent or unresolved assessment; exact-key status replay never activates again |
 | `chat_prepare_message` | Connection handle, expected generation, text, idempotency key | Operation ID, canonical preview, and approval state |
 | `chat_commit_message` | Operation ID | Executes only if approved and still valid; otherwise reports the blocking state |
 | `chat_get_operation` | Operation ID, optional status-recovery secret | Current status and evidence; receipt recovery cannot restore approval or permit replay |
@@ -369,7 +370,9 @@ Keep the public tool list small and stable. Per-connection capabilities are retu
 
 Tool names use lowercase letters, digits, underscores, and hyphens for VS Code host compatibility. This table describes the intended interface, not a claim that every argument/capability is implemented. Use shared Zod schemas, bounded inputs, output schemas, and structured tool results. Include a serialized text representation where needed for older clients. Mark reads appropriately; mark sending as a non-read-only external action. Tool annotations help clients present risk but are not access controls.
 
-**Implementation note (2026-10-09):** The prototype adds `chat_fill_draft` for one separately approved unsent fill, plus the diagnostic `browser_chat_feasibility`. `chat_request_connection` takes no label and `chat_read_messages` has no pagination token. Prepare, fill and commit are public for the fixture only; Gemini writes are private and incomplete. Commit accepts only an owned operation ID and always returns `retryAllowed: false`. Inputs use strict Zod schemas and results carry `structuredContent`, but no tool declares an output schema, and most refusals are plain `CODE: No chat was accessed.` text without retry guidance; fill and commit return structured codes. Per-provider availability is in the [DEVELOPMENT.md](DEVELOPMENT.md) tool reference and the [HANDOFF.md](HANDOFF.md) capability matrix.
+**Implementation note:** Legacy supervised prepare, fill and commit remain fixture-only public tools; autonomous fixture/Gemini sending uses `chat_send_message`. The broker owns its one original deadline and all write phases. Exact-key replay reads existing status, and receipt recovery never grants writes. Every send/commit result has `retryAllowed: false`; transport loss after commit begins stays unresolved. Installed/live acceptance is separate from synthetic coverage in the [HANDOFF.md](HANDOFF.md) capability matrix.
+
+The prototype also has `chat_fill_draft` for one separately approved unsent fill and diagnostic `browser_chat_feasibility`. `chat_request_connection` takes no label and `chat_read_messages` has no pagination token. Inputs use strict Zod schemas and results carry `structuredContent`, but no tool declares an output schema. Most legacy refusals are plain `CODE: No chat was accessed.` text; write tools return structured codes. See the [DEVELOPMENT.md](DEVELOPMENT.md) tool reference for exact contracts.
 
 ### Target tools (decided direction, 2026-10-09)
 

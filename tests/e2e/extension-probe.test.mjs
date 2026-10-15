@@ -2000,9 +2000,9 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     }
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     facade = await connectBroker("facade", directory, undefined, undefined,
-      autonomous ? "Synthetic autonomous browser owner" : undefined);
+      autonomous === true ? "Synthetic autonomous browser owner" : undefined);
     relay = await connectBroker("relay", directory);
-    mcpClient = new Client({ name: "fixture-browser-commit-test", version: "0.0.1" });
+    mcpClient = new Client({ name: autonomous === "public" ? "Synthetic autonomous browser owner" : "fixture-browser-commit-test", version: "0.0.1" });
     const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
     await mcpClient.connect(new StdioClientTransport({ command: process.execPath, args: [mcpEntry],
       env: { ...process.env, HOME: profile } }));
@@ -2074,12 +2074,54 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       await popup.locator("#agent-list li").filter({ hasText: "Synthetic autonomous browser owner" })
         .getByRole("button", { name: "Connect this chat" }).click({ timeout: 4000 });
       await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("1 connected"), null, { timeout: 4000 });
-      const pickup = await facade.waitForConnection(0);
-      assert.ok(pickup.kind === "connection_pickup" && pickup.payload.connections[0]);
-      const connection = pickup.payload.connections[0];
+      const pickup = autonomous === "public"
+        ? (await mcpClient.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent
+        : (await facade.waitForConnection(0)).payload;
+      assert.ok(pickup.connections[0]);
+      const connection = pickup.connections[0];
       assert.equal(connection.state, "ready");
       assert.equal(connection.expiresAt, null);
       assert.deepEqual(connection.capabilities, ["read", "send"]);
+      if (autonomous === "public") {
+        setPhase("public autonomous send");
+        const argumentsValue = { connectionId: connection.connectionId, text: "Synthetic public autonomous message",
+          idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
+        await fixture.bringToFront();
+        const result = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
+        const status = result.structuredContent;
+        const expectedState = outcome === "observed" ? "sent" : outcome === "not_sent" ? "not_sent" : "unresolved";
+        assert.equal(result.isError, expectedState !== "sent");
+        assert.equal(status.state, expectedState);
+        assert.equal(status.retryAllowed, false);
+        assert.match(status.recoveryToken, /^[0-9a-f]{64}$/);
+        if (outcome === "not_sent") assert.equal(status.resolution.source, "page");
+        if (outcome === "lost_settle") assert.equal(await worker.evaluate(() => globalThis.fixtureDroppedCompletionCount), 1);
+        setPhase("public status and replay");
+        const replay = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
+        const { recoveryToken, ...withoutReceipt } = status;
+        assert.deepEqual(replay.structuredContent, withoutReceipt);
+        assert.deepEqual((await facade.getPreparedOperation(status.operationId, recoveryToken)).payload.state,
+          expectedState === "unresolved" ? "dispatch_uncertain" : provider === "gemini" || expectedState === "not_sent" ? "resolved" : "observed_in_ui");
+        const conflict = await mcpClient.callTool({ name: "chat_send_message", arguments: { ...argumentsValue, text: "Synthetic conflicting public text" } });
+        assert.equal(conflict.structuredContent.code, "IDEMPOTENCY_CONFLICT");
+        assert.equal(conflict.structuredContent.retryAllowed, false);
+        assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
+        assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
+          (provider === "gemini" ? 1 : 2) + (retainedDraft ? 0 : 1));
+        assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
+          editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), retainedDraft ? argumentsValue.text : "");
+        for (const phase of ["fill", "proof", "submit", "settle"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
+        assert.equal(await worker.evaluate(async ({ operationId, provider }) =>
+          (await chrome.storage.local.get(`${provider}-submit-attempt-${operationId}`))[`${provider}-submit-attempt-${operationId}`],
+        { operationId: status.operationId, provider }), true);
+        const encoded = JSON.stringify(withoutReceipt);
+        for (const privateValue of [argumentsValue.text, recoveryToken, selected.documentId]) assert.equal(encoded.includes(privateValue), false);
+        const { DatabaseSync } = await import("node:sqlite");
+        const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
+        try { assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, 1); }
+        finally { journal.close(); }
+        return;
+      }
       setPhase("autonomous prepare and commit");
       const deadlineMs = Date.now() + 12_000;
       const preparation = await facade.prepareChatMessage(connection.connectionId, "Synthetic autonomous browser message",
@@ -2365,6 +2407,12 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
 }
 
 for (const provider of ["fixture", "gemini"]) {
+  for (const outcome of ["observed", "not_sent", "lost_settle"]) {
+    test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
+      testContext.signal.throwIfAborted();
+      await exerciseChatDispatch(outcome, provider, testContext, "public");
+    });
+  }
   for (const outcome of ["observed", "delayed", "lost_script", "lost_native_completion", "not_sent", "not_sent_changed", "lost_settle"]) {
     test(`autonomous ${provider} worker sends once after one popup connection approval (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();

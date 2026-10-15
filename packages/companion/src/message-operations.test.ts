@@ -1069,7 +1069,8 @@ test("autonomous page-not-sent requires fresh terminal proof and continuous unch
         : requests.publishFixtureSnapshot(target, messages, Date.now(), challengeId, omittedBefore);
       try {
         const connection = requests.approveAgent(agent.agentId, target)!;
-        const prepared = ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic terminal draft", randomUUID(), Date.now() + 30_000);
+        const idempotencyKey = randomUUID();
+        const prepared = ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic terminal draft", idempotencyKey, Date.now() + 30_000);
         const committing = ledger.commitAutonomousMessage(owner, prepared.operationId, prepared.expiresAt);
         await Promise.resolve();
         const fill = ledger.listChatJobs("fill", provider)[0]!;
@@ -1135,11 +1136,18 @@ test("autonomous page-not-sent requires fresh terminal proof and continuous unch
             { outcome: "not_sent", source: "page", resolvedAt: Date.now() });
         } else assert.equal(result.state, "dispatch_uncertain");
         assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, prepared.recoveryToken), result);
+        assert.deepEqual(ledger.getAutonomousReplay(owner, connection.connectionId, prepared.preview.text, idempotencyKey), result);
+        assert.throws(() => ledger.getAutonomousReplay(owner, connection.connectionId, "Synthetic changed replay", idempotencyKey), /IDEMPOTENCY_CONFLICT/);
+        assert.equal(ledger.getAutonomousReplay(Symbol("foreign replay"), connection.connectionId, prepared.preview.text, idempotencyKey), null);
         assert.deepEqual(await ledger.commitAutonomousMessage(owner, prepared.operationId, prepared.expiresAt), result);
         for (const phase of ["fill", "proof", "submit", "settle"] as const) assert.deepEqual(ledger.listChatJobs(phase, provider), []);
         assert.equal(ledger.requestChatFill(owner, prepared.operationId), null);
         assert.throws(() => ledger.requestChatProof(owner, prepared.operationId), /DISPATCH_CHECK_UNAVAILABLE/);
         assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+        if (outcome === "unchanged") {
+          assert.deepEqual(ledger.getAutonomousReplay(owner, connection.connectionId, prepared.preview.text, idempotencyKey, prepared.expiresAt + 1), result);
+          assert.deepEqual(ledger.listChatJobs("fill", provider), []);
+        }
       } finally {
         ledger.disconnect(owner);
         requests.disconnect(owner);

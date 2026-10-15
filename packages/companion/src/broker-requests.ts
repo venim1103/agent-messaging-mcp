@@ -637,6 +637,9 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   if (request.kind === "prepare_chat_message") {
     if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
     try {
+      const replay = operations.getAutonomousReplay(owner, request.payload.connectionId, request.payload.text,
+        request.payload.idempotencyKey, now);
+      if (replay) return { ...response, kind: "chat_dispatch" as const, payload: replay };
       return { ...response, kind: "chat_message_prepared" as const, payload: operations.prepareAutonomous(owner,
         request.payload.connectionId, request.payload.text, request.payload.idempotencyKey, request.deadlineMs, now) };
     } catch (error) {

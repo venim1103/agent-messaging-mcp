@@ -115,6 +115,13 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                     "OBSERVATION_UNAVAILABLE", "DISPATCH_CHECK_REQUIRED", "DISPATCH_CHECK_BUSY",
                     "UNSUPPORTED_MESSAGE_TEXT", "DISPATCH_CHECK_UNAVAILABLE",
                     "DISPATCH_UNAVAILABLE", "DISPATCH_UNCERTAIN"].includes(error.message)) throw error;
+                  if (!socket.destroyed && operations && reply.kind === "chat_autonomous_commit_authorized") {
+                    const status = operations.getOperation(owner, reply.payload.operationId);
+                    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") {
+                      await writeBrokerResponse(socket, { ...reply, kind: "chat_dispatch", payload: status });
+                      return;
+                    }
+                  }
                   if (!socket.destroyed) await writeBrokerResponse(socket, { ...reply, kind: "error",
                     payload: { code: error.message === "DISPATCH_UNCERTAIN" ? "DISPATCH_UNCERTAIN" : "DISPATCH_UNAVAILABLE" } });
                 }

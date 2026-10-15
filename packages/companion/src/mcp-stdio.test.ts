@@ -66,7 +66,7 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
       "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_wait_for_connection", "chat_read_messages",
-      "chat_wait_for_events", "chat_prepare_message", "chat_fill_draft", "chat_commit_message", "chat_get_operation", "chat_disconnect"
+      "chat_wait_for_events", "chat_send_message", "chat_prepare_message", "chat_fill_draft", "chat_commit_message", "chat_get_operation", "chat_disconnect"
     ]);
     assert.ok(tools.every((tool) => /^[a-z0-9_-]+$/.test(tool.name)));
     const fillTool = tools.find((tool) => tool.name === "chat_fill_draft");
@@ -77,6 +77,11 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     assert.equal(commitTool?.annotations?.destructiveHint, true);
     assert.equal(commitTool?.annotations?.idempotentHint, false);
     assert.equal(commitTool?.inputSchema.additionalProperties, false);
+    const sendTool = tools.find(tool => tool.name === "chat_send_message");
+    assert.equal(sendTool?.annotations?.readOnlyHint, false);
+    assert.equal(sendTool?.annotations?.destructiveHint, true);
+    assert.equal(sendTool?.annotations?.idempotentHint, true);
+    assert.equal(sendTool?.inputSchema.additionalProperties, false);
 
     const result = await client.callTool({ name: "browser_chat_feasibility", arguments: {} });
     assert.equal(result.isError, undefined);
@@ -98,6 +103,7 @@ for (const target of [
     const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-pickup-"));
     const directory = join(home, ".config/agent-messaging-mcp/broker");
     let broker: Awaited<ReturnType<typeof startBrokerSocket>> | undefined;
+    let database: ReturnType<typeof openPrivateOperationDatabase> | undefined;
     const clients = [new Client({ name: "pickup-one", version: "0.0.1" }), new Client({ name: "pickup-two", version: "0.0.1" })] as const;
     const environment = { ...process.env };
     delete environment.BROWSER_CHAT_AGENT_LABEL;
@@ -106,7 +112,8 @@ for (const target of [
     let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
     try {
       await mkdir(join(home, ".config/agent-messaging-mcp"), { recursive: true, mode: 0o700 });
-      broker = await startBrokerSocket(directory, createBrokerCredentials());
+      database = openPrivateOperationDatabase(join(home, ".config/agent-messaging-mcp"));
+      broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
       await Promise.all(clients.map(client => client.connect(new StdioClientTransport(options))));
       for (const client of clients) {
         const empty = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
@@ -146,6 +153,36 @@ for (const target of [
       assert.deepEqual(foreign.structuredContent, { state: "unknown" });
       assert.deepEqual((await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
         { connections: [], timedOut: true });
+      const sendArguments = { connectionId: connection.connectionId, text: "Synthetic SDK autonomous draft",
+        idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
+      const foreignSend = await clients[1].callTool({ name: "chat_send_message", arguments: sendArguments });
+      assert.deepEqual(foreignSend.structuredContent, { state: "not_sent", code: "CONNECTION_NOT_FOUND", retryAllowed: false });
+      for (const extra of [{ approved: true }, { provider: "fixture" }, { mode: "autonomous" }, { timeoutMs: 60_000 }]) {
+        assert.equal((await clients[0].callTool({ name: "chat_send_message", arguments: { ...sendArguments, ...extra } })).isError, true);
+      }
+      const sending = clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
+      const provider = target.origin === "https://gemini.google.com" ? "gemini" : "fixture";
+      let offered: Awaited<ReturnType<typeof relay.listChatJobs>> | undefined;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        offered = await relay.listChatJobs("fill", provider);
+        if (offered.kind === "chat_jobs" && offered.payload.jobs.length) break;
+        await setTimeout(25);
+      }
+      if (offered?.kind !== "chat_jobs" || !offered.payload.jobs[0]) throw new Error("Expected one owned SDK fill job");
+      const fill = offered.payload.jobs[0];
+      assert.equal((await relay.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", { ok: false, code: "FILL_UNAVAILABLE" })).kind,
+        "chat_job_recorded");
+      const refused = await sending;
+      const refusedStatus = refused.structuredContent as { operationId: string; state: string; code: string; recoveryToken: string; retryAllowed: boolean };
+      assert.equal(refused.isError, true);
+      assert.equal(refusedStatus.operationId, fill.operationId);
+      assert.equal(refusedStatus.state, "not_sent");
+      assert.equal(refusedStatus.code, "DISPATCH_UNAVAILABLE");
+      assert.equal(refusedStatus.retryAllowed, false);
+      assert.match(refusedStatus.recoveryToken, /^[0-9a-f]{64}$/);
+      assert.deepEqual((await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments })).structuredContent, refusedStatus);
+      assert.deepEqual((await relay.listChatJobs("fill", provider)).payload, { jobs: [] });
+      assert.equal((await clients[0].callTool({ name: "chat_send_message", arguments: { ...sendArguments, text: "Synthetic changed SDK draft" } })).isError, true);
       assert.equal((await relay.approveChatAgent(target, second.agentId)).kind, "chat_agent_approved");
       const other = await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
       const otherPickup = other.structuredContent as typeof pickup;
@@ -164,6 +201,7 @@ for (const target of [
       relay?.close();
       await Promise.all(clients.map(client => client.close()));
       await broker?.close();
+      database?.close();
       await rm(home, { recursive: true, force: true });
     }
   });

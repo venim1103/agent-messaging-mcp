@@ -8,7 +8,7 @@ import { setTimeout as waitForBroker } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import * as z from "zod/v4";
 import { connectBroker } from "./broker-client.js";
-import { MAX_PREPARED_MESSAGE_BYTES } from "./message-operations.js";
+import { fixtureDispatchStatusSchema, MAX_PREPARED_MESSAGE_BYTES } from "./message-operations.js";
 
 const server = new McpServer({ name: "browser-chat-feasibility", version: "0.0.1" });
 const runtimeDirectory = join(homedir(), ".config/agent-messaging-mcp/broker");
@@ -99,6 +99,19 @@ function commitFailure(operationId: string, code: "DISPATCH_UNAVAILABLE" | "DISP
   return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(payload) }], structuredContent: payload };
 }
 
+function sendResult(state: "sent" | "not_sent" | "unresolved", code: string, metadata: Record<string, unknown> = {}) {
+  const payload = { ...metadata, state, code, retryAllowed: false };
+  return { isError: state !== "sent", content: [{ type: "text" as const, text: JSON.stringify(payload) }], structuredContent: payload };
+}
+
+function sendStatus(status: z.infer<typeof fixtureDispatchStatusSchema>, recoveryToken?: string) {
+  const state = status.state === "observed_in_ui" ? "sent"
+    : status.state === "resolved" ? status.resolution.outcome : "unresolved";
+  const code = status.state === "resolved" ? `${status.resolution.source === "page" ? "PAGE" : "PERSON"}_${state.toUpperCase()}`
+    : state === "sent" ? "OBSERVED_IN_UI" : "DISPATCH_UNCERTAIN";
+  return sendResult(state, code, { ...status, ...(recoveryToken ? { recoveryToken } : {}) });
+}
+
 function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); };
@@ -146,7 +159,7 @@ server.registerTool("chat_get_connection", {
 });
 
 server.registerTool("chat_wait_for_connection", {
-  description: "Wait up to 20 seconds for autonomous connections approved for this MCP agent in the trusted popup. This never creates or widens approval and never returns another agent's connections. Sending tools are still being implemented.",
+  description: "Wait up to 20 seconds for autonomous connections approved for this MCP agent in the trusted popup. This never creates or widens approval and never returns another agent's connections.",
   inputSchema: z.object({ timeoutMs: z.number().int().min(0).max(20_000).optional() }).strict(),
   annotations: { readOnlyHint: true, idempotentHint: true }
 }, async ({ timeoutMs }, extra) => {
@@ -217,6 +230,47 @@ server.registerTool("chat_wait_for_events", {
   }
 });
 
+server.registerTool("chat_send_message", {
+  description: "Send once in an owned autonomous fixture or Gemini chat approved for this agent through Connect this chat. One original deadline spans preparation, fill, fresh proof, durable intent, one activation and bounded evidence. Returns sent, not_sent or unresolved, always retryAllowed false; sent is a page or person assessment, not provider acceptance or delivery. The same key and arguments return existing status without another submission. Never automatically resend an unresolved result or clear a person's draft. Recovery tokens permit status only.",
+  inputSchema: z.object({ connectionId: z.uuid(), text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES),
+    idempotencyKey: z.uuid() }).strict(),
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true }
+}, async ({ connectionId, text, idempotencyKey }, extra) => {
+  const deadlineMs = Date.now() + 30_000;
+  let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let prepared: { operationId: string; expiresAt: number; recoveryToken: string } | undefined;
+  let commitStarted = false;
+  const cancel = () => client?.close();
+  extra.mcpReq.signal.addEventListener("abort", cancel, { once: true });
+  try {
+    if (extra.mcpReq.signal.aborted) return sendResult("not_sent", "CANCELLED");
+    client = await pendingBroker();
+    if (extra.mcpReq.signal.aborted) { cancel(); return sendResult("not_sent", "CANCELLED"); }
+    const preparation = await client.prepareChatMessage(connectionId, text, idempotencyKey, deadlineMs);
+    if (preparation.kind === "error") return sendResult(preparation.payload.code === "DISPATCH_UNCERTAIN" ? "unresolved" : "not_sent",
+      preparation.payload.code);
+    if (preparation.kind === "chat_dispatch") return sendStatus(preparation.payload);
+    if (preparation.kind !== "chat_message_prepared") throw new Error("Unexpected autonomous preparation reply");
+    const { operationId, expiresAt, recoveryToken } = preparation.payload;
+    prepared = { operationId, expiresAt, recoveryToken };
+    if (extra.mcpReq.signal.aborted || expiresAt <= Date.now()) return sendResult("not_sent",
+      extra.mcpReq.signal.aborted ? "CANCELLED" : "OPERATION_EXPIRED", { operationId, recoveryToken });
+    commitStarted = true;
+    const result = await client.commitPreparedMessage(operationId, Math.min(deadlineMs, expiresAt));
+    if (result.kind === "error") return sendResult(result.payload.code === "DISPATCH_UNAVAILABLE" ? "not_sent" : "unresolved",
+      result.payload.code, { operationId, recoveryToken });
+    if (result.kind !== "chat_dispatch") throw new Error("Unexpected autonomous commit reply");
+    return sendStatus(result.payload, recoveryToken);
+  } catch {
+    client?.close();
+    if (broker === client) broker = undefined;
+    return sendResult(commitStarted ? "unresolved" : "not_sent", commitStarted ? "DISPATCH_UNCERTAIN" : "BROKER_UNAVAILABLE",
+      prepared ? { operationId: prepared.operationId, recoveryToken: prepared.recoveryToken } : {});
+  } finally {
+    extra.mcpReq.signal.removeEventListener("abort", cancel);
+  }
+});
+
 server.registerTool("chat_prepare_message", {
   description: "Prepare an immutable fixture-only preview and private status-recovery token for an owned connection. The fixture draft expires after 3 minutes. This cannot approve, fill, or send; Gemini preparation is unavailable.",
   inputSchema: z.object({ connectionId: z.uuid(), expectedGeneration: z.literal(1),
@@ -281,7 +335,7 @@ server.registerTool("chat_commit_message", {
 });
 
 server.registerTool("chat_get_operation", {
-  description: "Read fixture operation status with separate owned draftFill consent/in-flight/readback/uncertainty metadata. Filled describes past exact readback, not current draft state or send permission. A recoveryToken recovers only dispatch_uncertain or observed_in_ui metadata after restart, not fill state, browser access, approval, or resend permission. UI evidence is not service acceptance or delivery; no status query performs a submit.",
+  description: "Read owned fixture or Gemini operation status, including durable dispatch uncertainty and immutable page/person resolutions. A recoveryToken recovers dispatch status after restart, never fill state, browser access, approval or resend permission. Filled describes past exact readback, not the current draft. Page or person evidence is not service acceptance or delivery; no status query performs a submit.",
   inputSchema: z.object({ operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   annotations: { readOnlyHint: true }
 }, async ({ operationId, recoveryToken }) => {
@@ -296,7 +350,7 @@ server.registerTool("chat_get_operation", {
 });
 
 server.registerTool("chat_disconnect", {
-  description: "Revoke an owned read-only browser-chat connection without closing its tab. Pending reads are cancelled and subsequent access is denied.",
+  description: "End an owned browser-chat connection without closing its tab. Pending access is cancelled and subsequent reads and writes are denied; an already activated send cannot be undone.",
   inputSchema: z.object({ connectionId: z.uuid() }).strict()
 }, async ({ connectionId }) => {
   try {
