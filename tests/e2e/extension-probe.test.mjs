@@ -1938,7 +1938,7 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
 
 async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
   const setPhase = trackTestPhase(testContext, `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
-  const retainedDraft = ["not_sent", "not_sent_changed", "lost_settle"].includes(outcome);
+  const retainedDraft = ["not_sent", "not_sent_changed", "lost_settle", "owned_leftover"].includes(outcome);
   let mcpClient;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
   const unpacked = join(profile, "unpacked-extension");
@@ -2052,6 +2052,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     if (autonomous && retainedDraft) await fixture.evaluate(({ provider, outcome }) => {
       const control = document.querySelector(provider === "gemini" ? 'button[type="submit"]' : "#composer");
       control.addEventListener(provider === "gemini" ? "click" : "submit", event => {
+        if (outcome === "owned_leftover" && globalThis.fixtureSubmitCount > 0) return;
         event.preventDefault();
         event.stopImmediatePropagation();
         globalThis.fixtureSubmitCount++;
@@ -2089,7 +2090,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         await fixture.bringToFront();
         const result = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
         const status = result.structuredContent;
-        const expectedState = outcome === "observed" ? "sent" : outcome === "not_sent" ? "not_sent" : "unresolved";
+        const expectedState = outcome === "observed" ? "sent" : outcome === "lost_settle" ? "unresolved" : "not_sent";
         assert.equal(result.isError, expectedState !== "sent");
         assert.equal(status.state, expectedState);
         assert.equal(status.retryAllowed, false);
@@ -2127,13 +2128,39 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           await editor.fill("");
           await editor.fill(argumentsValue.text);
           assert.equal(await checkOwnership(), false);
+          const refused = await mcpClient.callTool({ name: "chat_send_message", arguments: {
+            ...argumentsValue, idempotencyKey: crypto.randomUUID(), text: "Synthetic new message must preserve the retyped draft"
+          } });
+          assert.equal(refused.structuredContent.state, "not_sent");
+          assert.equal(refused.structuredContent.retryAllowed, false);
+          assert.equal(await editor.evaluate(element => element instanceof HTMLTextAreaElement ? element.value : element.innerText), argumentsValue.text);
           assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
         }
         const encoded = JSON.stringify(withoutReceipt);
         for (const privateValue of [argumentsValue.text, recoveryToken, selected.documentId]) assert.equal(encoded.includes(privateValue), false);
         const { DatabaseSync } = await import("node:sqlite");
         const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
-        try { assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, 1); }
+        try {
+          assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, 1);
+          if (outcome === "owned_leftover") {
+            setPhase("fresh send replacing known own leftover");
+            const next = { ...argumentsValue, idempotencyKey: crypto.randomUUID(), text: "Synthetic independently requested next message" };
+            const nextResult = await mcpClient.callTool({ name: "chat_send_message", arguments: next });
+            assert.equal(nextResult.structuredContent.state, "sent");
+            assert.equal(nextResult.structuredContent.retryAllowed, false);
+            assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 2);
+            assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
+              editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), "");
+            const snapshot = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+            assert.equal(snapshot.structuredContent.messages.filter(message => message.text === argumentsValue.text).length, 0);
+            assert.equal(snapshot.structuredContent.messages.filter(message => message.text === next.text).length, 1);
+            assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, 2);
+            assert.equal((await facade.getPreparedOperation(status.operationId, recoveryToken)).payload.resolution.outcome, "not_sent");
+            await mcpClient.callTool({ name: "chat_send_message", arguments: next });
+            assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 2);
+            assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, 2);
+          }
+        }
         finally { journal.close(); }
         return;
       }
@@ -2422,7 +2449,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
 }
 
 for (const provider of ["fixture", "gemini"]) {
-  for (const outcome of ["observed", "not_sent", "lost_settle"]) {
+  for (const outcome of ["observed", "not_sent", "lost_settle", "owned_leftover"]) {
     test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();
       await exerciseChatDispatch(outcome, provider, testContext, "public");

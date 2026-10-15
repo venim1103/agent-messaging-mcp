@@ -59,7 +59,8 @@ export function inspectGeminiDraft(input: { expectedUrl: string; text: string; d
   return { ok: true, editor: "contenteditable" };
 }
 
-export function fillGeminiDraft(input: { expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number }):
+export function fillGeminiDraft(input: { expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number;
+  leftover?: { operationId: string; text: string } }):
   { ok: true; editor: "contenteditable" } | { ok: false;
     code: "FILL_UNAVAILABLE" | "FILL_UNCERTAIN" | "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_PRESENT" } {
   const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -77,6 +78,9 @@ export function fillGeminiDraft(input: { expectedUrl: string; text: string; oper
   if (input.expiresAt <= now || input.expiresAt > now + 4_000) return { ok: false, code: "FILL_UNAVAILABLE" };
   if (typeof input.text !== "string" || input.text.length > 2048 || new TextEncoder().encode(input.text).length > 4000
     || !input.text || input.text !== input.text.trim() || input.text.includes("\r")) return { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" };
+  if (input.leftover && (!identifier.test(input.leftover.operationId) || input.leftover.operationId === input.operationId
+    || typeof input.leftover.text !== "string" || !input.leftover.text || input.leftover.text.length > 2048
+    || new TextEncoder().encode(input.leftover.text).length > 4000)) return { ok: false, code: "FILL_UNAVAILABLE" };
   if (window.top !== window || location.href !== input.expectedUrl || location.origin !== "https://gemini.google.com") {
     return { ok: false, code: "TARGET_CHANGED" };
   }
@@ -100,7 +104,9 @@ export function fillGeminiDraft(input: { expectedUrl: string; text: string; oper
       || editor.closest("[inert], [aria-hidden=true], [aria-disabled=true], [aria-readonly=true]")
       || editor.parentElement?.closest("[contenteditable]")
       || editor.querySelector("[contenteditable], input, textarea, [role=textbox]")) return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
-    if (filled ? editor.innerText !== input.text : Boolean(editor.textContent?.length || editor.innerText.trim())) {
+    const replacing = !filled && Boolean(editor.textContent?.length || editor.innerText.trim());
+    if (filled ? editor.innerText !== input.text : replacing && (!input.leftover
+      || !scope.agentDraftOwnership?.matches(input.leftover.operationId, input.leftover.text, input.expectedUrl, editor, root))) {
       return { ok: false as const, code: "DRAFT_PRESENT" as const };
     }
     for (let ancestor: HTMLElement | null = editor; ancestor; ancestor = ancestor.parentElement) {
@@ -111,7 +117,7 @@ export function fillGeminiDraft(input: { expectedUrl: string; text: string; oper
     const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
     if (rect.width <= 0 || rect.height <= 0 || rect.left < 0 || rect.top < 0 || rect.right > innerWidth || rect.bottom > innerHeight
       || !hit || (hit !== editor && !editor.contains(hit))) return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
-    return { ok: true as const, root, timeline: timelines[0]!, editor };
+    return { ok: true as const, root, timeline: timelines[0]!, editor, replacing };
   };
   let inputStarted = false;
   try {
@@ -120,21 +126,23 @@ export function fillGeminiDraft(input: { expectedUrl: string; text: string; oper
     HTMLElement.prototype.focus.call(before.editor, { preventScroll: true });
     const focused = inspect();
     if (!focused.ok) return focused;
-    if (focused.root !== before.root || focused.timeline !== before.timeline || focused.editor !== before.editor
+    if (focused.root !== before.root || focused.timeline !== before.timeline || focused.editor !== before.editor || focused.replacing !== before.replacing
       || document.activeElement !== focused.editor || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNAVAILABLE" };
     const selection = window.getSelection();
     if (!selection) return { ok: false, code: "FILL_UNAVAILABLE" };
     const range = document.createRange();
     range.selectNodeContents(focused.editor);
-    range.collapse(true);
+    if (!focused.replacing) range.collapse(true);
     selection.removeAllRanges();
     selection.addRange(range);
     const ready = inspect();
     if (!ready.ok) return ready;
-    if (ready.root !== focused.root || ready.timeline !== focused.timeline || ready.editor !== focused.editor
+    if (ready.root !== focused.root || ready.timeline !== focused.timeline || ready.editor !== focused.editor || ready.replacing !== focused.replacing
       || document.activeElement !== ready.editor || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNAVAILABLE" };
     inputStarted = true;
-    scope.agentDraftOwnership?.begin(input.operationId, input.text, input.expectedUrl, ready.editor, ready.root);
+    const recorded = scope.agentDraftOwnership?.begin(input.operationId, input.text, input.expectedUrl, ready.editor, ready.root,
+      ready.replacing ? input.leftover : undefined);
+    if (ready.replacing && !recorded) return { ok: false, code: "FILL_UNAVAILABLE" };
     if (!Document.prototype.execCommand.call(document, "insertText", false, input.text)) return { ok: false, code: "FILL_UNCERTAIN" };
     const completed = inspect(true);
     if (!completed.ok || completed.root !== ready.root || completed.timeline !== ready.timeline || completed.editor !== ready.editor

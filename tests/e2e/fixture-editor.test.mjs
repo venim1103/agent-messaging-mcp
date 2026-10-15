@@ -351,6 +351,13 @@ test("draft ownership requires a known fill and rejects retyped text or replaced
         assert.equal(owned, mode === "untouched" || mode === "blur", `${kind}/${mode}`);
         assert.equal(kind === "rich" ? await editor.innerText() : await editor.inputValue(), input.text);
         assert.equal(await page.locator("ol#messages > li").count(), 2);
+        const replacement = { ...input, operationId: crypto.randomUUID(), attemptId: crypto.randomUUID(),
+          text: "New independently requested message\nSecond new line", expiresAt: Date.now() + 4000,
+          leftover: { operationId: mode === "foreign" ? crypto.randomUUID() : input.operationId, text: input.text } };
+        assert.deepEqual(await page.evaluate(fillFixtureDraft, replacement), owned
+          ? { ok: true, editor: kind } : { ok: false, code: "DRAFT_PRESENT" }, `${kind}/${mode} replacement`);
+        assert.equal(kind === "rich" ? await editor.innerText() : await editor.inputValue(), owned ? replacement.text : input.text);
+        assert.equal(await page.locator("ol#messages > li").count(), 2);
       }
     }
   } finally {

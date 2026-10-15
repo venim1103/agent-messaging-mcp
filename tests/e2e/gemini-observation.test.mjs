@@ -265,10 +265,18 @@ test("isolated one-shot Gemini draft fill uses native input and never activates 
       assert.equal(await page.evaluate(input => window.agentDraftOwnership.matches(input.operationId, input.text,
         input.expectedUrl, document.querySelector("[contenteditable]"), document.querySelector("main")), input), scenario === "ready", scenario);
       if (scenario === "ready") {
+        const replacement = { ...input, operationId: crypto.randomUUID(), attemptId: crypto.randomUUID(),
+          text: "New independently requested Gemini message\nSecond line", expiresAt: Date.now() + 4000,
+          leftover: { operationId: input.operationId, text: input.text } };
+        assert.deepEqual(await page.evaluate(fillGeminiDraft, replacement), { ok: true, editor: "contenteditable" });
+        assert.equal(await page.locator("[contenteditable]").innerText(), replacement.text);
         await page.locator("[contenteditable]").fill("");
-        await page.locator("[contenteditable]").fill(input.text);
+        await page.locator("[contenteditable]").fill(replacement.text);
         assert.equal(await page.evaluate(input => window.agentDraftOwnership.matches(input.operationId, input.text,
-          input.expectedUrl, document.querySelector("[contenteditable]"), document.querySelector("main")), input), false);
+          input.expectedUrl, document.querySelector("[contenteditable]"), document.querySelector("main")), replacement), false);
+        assert.deepEqual(await page.evaluate(fillGeminiDraft, { ...replacement, operationId: crypto.randomUUID(), attemptId: crypto.randomUUID(),
+          expiresAt: Date.now() + 4000, leftover: { operationId: replacement.operationId, text: replacement.text } }), { ok: false, code: "DRAFT_PRESENT" });
+        assert.equal(await page.locator("[contenteditable]").innerText(), replacement.text);
         assert.equal(await page.evaluate(() => window.activations), 0);
       }
     }

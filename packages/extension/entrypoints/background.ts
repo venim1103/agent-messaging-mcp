@@ -46,7 +46,8 @@ type FixtureDispatchChallenge = Omit<FixturePreflightChallenge, "challengeId"> &
 type FixtureSubmitChallenge = FixtureFillChallenge & { dispatch: true };
 type BrowserJobTarget = (Extract<ChatTarget, { origin: "http://127.0.0.1:8787" }> & { provider: "fixture" })
   | (Extract<ChatTarget, { origin: "https://gemini.google.com" }> & { provider: "gemini" });
-type ChatBrowserJob = { operationId: string; jobId: string; phase: "fill" | "proof" | "submit" | "settle"; target: BrowserJobTarget; text: string; expiresAt: number };
+type ChatBrowserJob = { operationId: string; jobId: string; phase: "fill" | "proof" | "submit" | "settle"; target: BrowserJobTarget;
+  text: string; expiresAt: number; leftover?: { operationId: string; text: string } };
 type ChatJobObservation = ReturnType<typeof fillFixtureDraft> | ReturnType<typeof fillGeminiDraft>
   | FixtureDispatchObservation | GeminiDispatchObservation | ChatSubmitObservation;
 type ChatSubmitObservation = ReturnType<typeof submitFixtureDraft> | ReturnType<typeof submitGeminiDraft>;
@@ -746,7 +747,16 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
             checkSubmit: provePrepared }] })
         : await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
           func: inspectFixturePreflight, args: [{ ...args, draftState: provePrepared ? "prepared" : "empty" }] });
-      const checked = result[0];
+      let checked = result[0];
+      if (check.phase === "fill" && check.leftover && checked?.result && !checked.result.ok
+        && (checked.result.code === "DRAFT_PRESENT" || checked.result.code === "DRAFT_CHANGED")) {
+        const previous = check.target.provider === "gemini"
+          ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
+            func: inspectGeminiDraft, args: [{ expectedUrl: binding.expectedUrl, text: check.leftover.text, draftMode: "prepared" }] })
+          : await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
+            func: inspectFixturePreflight, args: [{ expectedUrl: binding.expectedUrl, text: check.leftover.text, draftState: "prepared" }] });
+        checked = previous[0];
+      }
       if (checked?.frameId === 0 && checked.documentId === check.target.documentId && checked.result
         && await chatJobBinding(check)) {
         if (provePrepared) {
@@ -758,7 +768,8 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
         } else if (!checked.result.ok) observation = checked.result;
         else {
           observation = { ok: false, code: "FILL_UNCERTAIN" };
-          const input = { ...args, operationId: check.operationId, attemptId: check.jobId, expiresAt: binding.expiresAt };
+          const input = { ...args, operationId: check.operationId, attemptId: check.jobId, expiresAt: binding.expiresAt,
+            ...(check.leftover ? { leftover: check.leftover } : {}) };
           const filled = check.target.provider === "gemini"
             ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
               func: fillGeminiDraft, args: [input] })
@@ -959,12 +970,19 @@ function parseChatJobs(value: unknown, requestId: string, deadlineMs: number, pr
   return payload.jobs.map((entry: unknown): ChatBrowserJob => {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error();
     const job = entry as Record<string, unknown>;
-    if (Object.keys(job).length !== 6 || job.phase !== phase || !validId(job.operationId) || !validId(job.jobId)
+    if (Object.keys(job).length !== ("leftover" in job ? 7 : 6) || job.phase !== phase || !validId(job.operationId) || !validId(job.jobId)
       || (phase === "submit" && job.jobId !== job.operationId) || typeof job.expiresAt !== "number" || !Number.isSafeInteger(job.expiresAt)
       || job.expiresAt > Date.now() + 4_000 || typeof job.text !== "string" || !job.text || job.text.length > 2048
       || new TextEncoder().encode(job.text).length > 4_000
       || (provider === "gemini" && (job.text.trim() !== job.text || job.text.includes("\r")))
       || typeof job.target !== "object" || job.target === null || Array.isArray(job.target)) throw new Error();
+    if ("leftover" in job) {
+      if (phase !== "fill" || typeof job.leftover !== "object" || job.leftover === null || Array.isArray(job.leftover)) throw new Error();
+      const leftover = job.leftover as Record<string, unknown>;
+      if (Object.keys(leftover).length !== 2 || !validId(leftover.operationId) || leftover.operationId === job.operationId
+        || typeof leftover.text !== "string" || !leftover.text || leftover.text.length > 2048
+        || new TextEncoder().encode(leftover.text).length > 4000 || leftover.text.trim() !== leftover.text || leftover.text.includes("\r")) throw new Error();
+    }
     const target = job.target as Record<string, unknown>;
     if (target.provider !== provider || Object.keys(target).length !== (provider === "gemini" ? 6 : 5)
       || typeof target.tabId !== "number" || !Number.isSafeInteger(target.tabId) || target.tabId < 1

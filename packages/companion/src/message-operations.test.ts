@@ -1145,6 +1145,24 @@ test("autonomous page-not-sent requires fresh terminal proof and continuous unch
         assert.throws(() => ledger.requestChatProof(owner, prepared.operationId), /DISPATCH_CHECK_UNAVAILABLE/);
         assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
         if (outcome === "unchanged") {
+          const foreign = Symbol("foreign leftover owner");
+          const foreignAgent = requests.registerAgent(foreign, "Synthetic foreign leftover agent");
+          const foreignConnection = requests.approveAgent(foreignAgent.agentId, target)!;
+          for (const [nextOwner, nextConnection] of [[foreign, foreignConnection], [owner, connection]] as const) {
+            const next = ledger.prepareAutonomous(nextOwner, nextConnection.connectionId, "Synthetic next draft", randomUUID(), Date.now() + 10_000);
+            assert.equal(await ledger.acquireComposer(nextOwner, next.operationId, next.expiresAt), true);
+            const filling = ledger.requestChatFill(nextOwner, next.operationId);
+            assert.ok(filling && filling !== "busy");
+            const nextFill = ledger.listChatJobs("fill", provider)[0]!;
+            assert.deepEqual(nextFill.leftover, nextOwner === owner ? { operationId: prepared.operationId, text: prepared.preview.text } : undefined);
+            assert.deepEqual(ledger.listChatJobs("fill", provider), []);
+            assert.equal(ledger.completeChatJob(nextFill.target, nextFill.operationId, nextFill.jobId, "fill", { ok: false, code: "DRAFT_PRESENT" }), true);
+            await filling.result;
+            ledger.releaseComposer(nextOwner, next.operationId);
+          }
+          ledger.disconnect(foreign);
+          requests.disconnect(foreign);
+          assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
           assert.deepEqual(ledger.getAutonomousReplay(owner, connection.connectionId, prepared.preview.text, idempotencyKey, prepared.expiresAt + 1), result);
           assert.deepEqual(ledger.listChatJobs("fill", provider), []);
         }

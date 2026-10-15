@@ -117,7 +117,8 @@ export function inspectFixturePreflight(input: {
 }
 
 export function fillFixtureDraft(input: {
-  expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number
+  expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number;
+  leftover?: { operationId: string; text: string }
 }): FixtureFill {
   const fixtureUrl = "http://127.0.0.1:8787/";
   const richUrl = `${fixtureUrl}?editor=rich`;
@@ -132,6 +133,9 @@ export function fillFixtureDraft(input: {
     || input.text.length > 2048 || new TextEncoder().encode(input.text).length > 4000) {
     return { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" };
   }
+  if (input.leftover && (!identifier.test(input.leftover.operationId) || input.leftover.operationId === input.operationId
+    || typeof input.leftover.text !== "string" || !input.leftover.text || input.leftover.text.length > 2048
+    || new TextEncoder().encode(input.leftover.text).length > 4000)) return { ok: false, code: "FILL_UNAVAILABLE" };
   const scope = globalThis as typeof globalThis & {
     fixtureDraftFillAttempts?: Set<string>;
     agentDraftOwnership?: import("./draft-ownership").DraftOwnershipTracker;
@@ -158,6 +162,7 @@ export function fillFixtureDraft(input: {
     const editors = [...form.querySelectorAll<HTMLElement>("textarea, [contenteditable=true], [role=textbox]")].filter(visible);
     const editor = editors[0];
     const kind = input.expectedUrl === richUrl ? "rich" as const : "textarea" as const;
+    let replacing = false;
     if (editors.length !== 1 || !editor || editor.closest("[inert], [aria-disabled=true], fieldset:disabled")) {
       return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
     }
@@ -165,16 +170,16 @@ export function fillFixtureDraft(input: {
       if (!(editor instanceof HTMLTextAreaElement) || editor.id !== "message" || editor.matches(":disabled") || editor.readOnly) {
         return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
       }
-      if (editor.value.length) return { ok: false as const, code: "DRAFT_PRESENT" as const };
+      replacing = editor.value.length > 0;
     } else {
       if (editor.id !== "rich-message" || !editor.isContentEditable || editor.getAttribute("aria-readonly") === "true") {
         return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
       }
       const placeholder = editor.childNodes.length === 1 && editor.firstChild instanceof HTMLBRElement;
-      if (editor.textContent?.length || (editor.childNodes.length > 0 && !placeholder)) {
-        return { ok: false as const, code: "DRAFT_PRESENT" as const };
-      }
+      replacing = Boolean(editor.textContent?.length || (editor.childNodes.length > 0 && !placeholder));
     }
+    if (replacing && (!input.leftover || !scope.agentDraftOwnership?.matches(input.leftover.operationId,
+      input.leftover.text, input.expectedUrl, editor, root))) return { ok: false as const, code: "DRAFT_PRESENT" as const };
     const buttons = form.querySelectorAll("button[type=submit]");
     const button = buttons[0];
     if (buttons.length !== 1 || !(button instanceof HTMLButtonElement) || button.form !== form || !visible(button)
@@ -189,7 +194,7 @@ export function fillFixtureDraft(input: {
         return { ok: false as const, code };
       }
     }
-    return { ok: true as const, root, editor, kind };
+    return { ok: true as const, root, editor, kind, replacing };
   };
   try {
     const before = inspect();
@@ -197,23 +202,25 @@ export function fillFixtureDraft(input: {
     before.editor.focus({ preventScroll: true });
     const focused = inspect();
     if (!focused.ok) return focused;
-    if (focused.root !== before.root || focused.editor !== before.editor || document.activeElement !== focused.editor
+    if (focused.root !== before.root || focused.editor !== before.editor || focused.replacing !== before.replacing || document.activeElement !== focused.editor
       || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNAVAILABLE" };
-    if (focused.editor instanceof HTMLTextAreaElement) focused.editor.setSelectionRange(0, 0);
+    if (focused.editor instanceof HTMLTextAreaElement) focused.editor.setSelectionRange(0, focused.replacing ? input.leftover!.text.length : 0);
     else {
       const selection = window.getSelection();
       if (!selection) return { ok: false, code: "FILL_UNAVAILABLE" };
       const range = document.createRange();
       range.selectNodeContents(focused.editor);
-      range.collapse(true);
+      if (!focused.replacing) range.collapse(true);
       selection.removeAllRanges();
       selection.addRange(range);
     }
     const ready = inspect();
     if (!ready.ok) return ready;
-    if (ready.root !== focused.root || ready.editor !== focused.editor || document.activeElement !== ready.editor
+    if (ready.root !== focused.root || ready.editor !== focused.editor || ready.replacing !== focused.replacing || document.activeElement !== ready.editor
       || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNAVAILABLE" };
-    scope.agentDraftOwnership?.begin(input.operationId, input.text, input.expectedUrl, ready.editor, ready.root);
+    const recorded = scope.agentDraftOwnership?.begin(input.operationId, input.text, input.expectedUrl, ready.editor, ready.root,
+      ready.replacing ? input.leftover : undefined);
+    if (ready.replacing && !recorded) return { ok: false, code: "FILL_UNAVAILABLE" };
     if (!document.execCommand("insertText", false, input.text)) return { ok: false, code: "FILL_UNCERTAIN" };
     const text = ready.editor instanceof HTMLTextAreaElement ? ready.editor.value : ready.editor.innerText;
     const roots = document.querySelectorAll<HTMLElement>("main[data-conversation-id]");

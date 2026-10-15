@@ -1,5 +1,6 @@
 export type DraftOwnershipTracker = {
-  begin(operationId: string, text: string, expectedUrl: string, editor: HTMLElement, root: HTMLElement): boolean;
+  begin(operationId: string, text: string, expectedUrl: string, editor: HTMLElement, root: HTMLElement,
+    leftover?: { operationId: string; text: string }): boolean;
   confirm(operationId: string): boolean;
   matches(operationId: string, text: string, expectedUrl: string, editor: HTMLElement, root: HTMLElement): boolean;
   release(operationId: string): void;
@@ -57,13 +58,16 @@ export function installDraftOwnershipTracker(): void {
     return record.invalid ? null : record;
   };
   scope.agentDraftOwnership = Object.freeze({
-    begin(operationId, text, expectedUrl, editor, root) {
+    begin(operationId, text, expectedUrl, editor, root, leftover) {
+      const previous = leftover ? current() : null;
+      const replaceable = previous && !previous.filling && previous.operationId === leftover?.operationId
+        && previous.text === leftover.text && previous.expectedUrl === expectedUrl && previous.editor === editor && previous.root === root;
       record = null;
       observer.takeRecords();
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(operationId)
         || !text || text.length > 2048 || location.href !== expectedUrl || window.top !== window
         || document.visibilityState !== "visible" || !editor.isConnected || !root.isConnected
-        || !root.contains(editor) || textOf(editor).length) return false;
+        || !root.contains(editor) || (leftover ? !replaceable : textOf(editor).length > 0)) return false;
       record = { operationId, text, expectedUrl, editor, root, filling: true, inserted: "", pendingChange: false, invalid: false };
       return true;
     },

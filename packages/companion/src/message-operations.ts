@@ -73,8 +73,11 @@ export type ChatTarget = z.infer<typeof chatTargetSchema>;
 export const chatSubmitResultSchema = z.union([fixtureDispatchResultSchema, geminiDispatchResultSchema]);
 export const chatJobSchema = z.strictObject({ operationId: z.uuid(), jobId: z.uuid(), phase: z.enum(["fill", "proof", "submit", "settle"]),
   target: chatTargetSchema, text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES)
-    .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES), expiresAt: z.number().int().safe() })
-  .refine(job => (job.phase !== "submit" || job.jobId === job.operationId) && (job.target.provider !== "gemini"
+    .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES), expiresAt: z.number().int().safe(),
+  leftover: z.strictObject({ operationId: z.uuid(), text: z.string().min(1).max(2048)
+    .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES && text.trim() === text && !text.includes("\r")) }).optional() })
+  .refine(job => (!job.leftover || (job.phase === "fill" && job.leftover.operationId !== job.operationId))
+    && (job.phase !== "submit" || job.jobId === job.operationId) && (job.target.provider !== "gemini"
     || (job.text.length <= 2048 && job.text.trim() === job.text && !job.text.includes("\r"))));
 export type ChatJob = z.infer<typeof chatJobSchema>;
 export const chatSubmitJobSchema = chatJobSchema.safeExtend({ phase: z.literal("submit") });
@@ -1934,6 +1937,23 @@ export class PreparedMessageOperations {
       text: attempt.text, expiresAt: attempt.expiresAt })));
   }
 
+  private ownUnsentLeftover(operationId: string, now: number) {
+    const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
+    if (!operation?.autonomous) return undefined;
+    for (const [previousId, previous] of [...this.contents, ...this.geminiContents].reverse()) {
+      if (previousId === operationId || !previous.autonomous || previous.owner !== operation.owner
+        || previous.connectionId !== operation.connectionId || previous.expiresAt <= now
+        || !this.sameComposerTarget(previous.target, operation.target)
+        || (previous.target.origin === "https://gemini.google.com" && (operation.target.origin !== "https://gemini.google.com"
+          || previous.target.url !== operation.target.url)) || this.fillStates.get(previousId)?.state !== "filled") continue;
+      const status = this.dispatchStatus(previousId);
+      if (status?.state === "resolved" && status.resolution.outcome === "not_sent") {
+        return Object.freeze({ operationId: previousId, text: previous.text });
+      }
+    }
+    return undefined;
+  }
+
   requestChatFill(owner: symbol, operationId: string, now = Date.now(), deadlineMs = now + FIXTURE_FILL_TIMEOUT_MS) {
     const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "fill", now);
     if (!authority) return null;
@@ -1988,8 +2008,9 @@ export class PreparedMessageOperations {
       const key = `${phase}:${jobId}`;
       const offered = this.neutralJobOffers.get(check.operationId) ?? new Set<string>();
       if (offered.has(key)) continue;
+      const leftover = phase === "fill" ? this.ownUnsentLeftover(check.operationId, now) : undefined;
       const job = chatJobSchema.parse({ operationId: check.operationId, jobId, phase, target: { ...check.target, provider },
-        text: check.text, expiresAt: check.expiresAt });
+        text: check.text, expiresAt: check.expiresAt, ...(leftover ? { leftover } : {}) });
       offered.add(key);
       this.neutralJobOffers.set(check.operationId, offered);
       jobs.push(Object.freeze({ ...job, target: Object.freeze(job.target) }));
