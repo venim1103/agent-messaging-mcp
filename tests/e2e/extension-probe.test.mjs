@@ -1913,8 +1913,8 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
   });
 }
 
-async function exerciseChatDispatch(outcome, provider = "fixture", testContext) {
-  const setPhase = trackTestPhase(testContext, `${provider} submit ${outcome}`);
+async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
+  const setPhase = trackTestPhase(testContext, `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
   let mcpClient;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
   const unpacked = join(profile, "unpacked-extension");
@@ -1973,7 +1973,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext) 
       }, provider);
     }
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
-    facade = await connectBroker("facade", directory);
+    facade = await connectBroker("facade", directory, undefined, undefined,
+      autonomous ? "Synthetic autonomous browser owner" : undefined);
     relay = await connectBroker("relay", directory);
     mcpClient = new Client({ name: "fixture-browser-commit-test", version: "0.0.1" });
     const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
@@ -2015,6 +2016,54 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext) 
         conversation: provider === "gemini" ? new URL(identity.result.url).pathname.split("/")[2] : identity.result.conversation };
     }, provider);
     assert.equal(selected.conversation, provider === "gemini" ? "synthetic-neutral-submit" : "fixture-alpha");
+    if (autonomous) {
+      const popup = await context.newPage();
+      await fixture.bringToFront();
+      await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+      await popup.locator("#agent-list li").filter({ hasText: "Synthetic autonomous browser owner" })
+        .getByRole("button", { name: "Connect this chat" }).click({ timeout: 4000 });
+      await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("1 connected"), null, { timeout: 4000 });
+      const pickup = await facade.waitForConnection(0);
+      assert.ok(pickup.kind === "connection_pickup" && pickup.payload.connections[0]);
+      const connection = pickup.payload.connections[0];
+      assert.equal(connection.state, "ready");
+      assert.equal(connection.expiresAt, null);
+      assert.deepEqual(connection.capabilities, ["read", "send"]);
+      setPhase("autonomous prepare and commit");
+      const deadlineMs = Date.now() + 12_000;
+      const preparation = await facade.prepareChatMessage(connection.connectionId, "Synthetic autonomous browser message",
+        "a66b3997-9d43-4554-8399-267d1fe9f75c", deadlineMs);
+      assert.equal(preparation.kind, "chat_message_prepared");
+      const prepared = preparation.payload;
+      assert.equal(prepared.state, "prepared");
+      assert.equal(prepared.expiresAt, deadlineMs);
+      assert.match(prepared.recoveryToken, /^[0-9a-f]{64}$/);
+      assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 0);
+      await fixture.bringToFront();
+      const dispatch = await facade.commitPreparedMessage(prepared.operationId, deadlineMs);
+      setPhase("autonomous status and replay");
+      assert.equal(dispatch.kind, "chat_dispatch");
+      assert.equal(dispatch.deadlineMs, deadlineMs);
+      assert.equal(dispatch.payload.state, provider === "gemini" ? "resolved" : "observed_in_ui");
+      assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
+      assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
+        (provider === "gemini" ? 1 : 2) + 1);
+      assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
+        editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), "");
+      assert.deepEqual((await facade.commitPreparedMessage(prepared.operationId, deadlineMs)).payload, dispatch.payload);
+      for (const phase of ["fill", "proof", "submit"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
+      assert.equal((await facade.getPreparedOperation(prepared.operationId, prepared.recoveryToken)).payload.state, dispatch.payload.state);
+      assert.equal(await worker.evaluate(async ({ operationId, provider }) =>
+        (await chrome.storage.local.get(`${provider}-submit-attempt-${operationId}`))[`${provider}-submit-attempt-${operationId}`],
+      { operationId: prepared.operationId, provider }), true);
+      const encoded = JSON.stringify(dispatch.payload);
+      for (const privateValue of [prepared.preview.text, prepared.recoveryToken, selected.documentId]) assert.equal(encoded.includes(privateValue), false);
+      const { DatabaseSync } = await import("node:sqlite");
+      const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
+      try { assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, 1); }
+      finally { journal.close(); }
+      return;
+    }
     const requested = provider === "gemini" ? await facade.requestConnection()
       : await mcpClient.callTool({ name: "chat_request_connection", arguments: {} });
     if (provider === "fixture") assert.equal(requested.isError, undefined);
@@ -2240,6 +2289,13 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext) 
     await rm(profile, { recursive: true, force: true });
     setPhase("complete");
   }
+}
+
+for (const provider of ["fixture", "gemini"]) {
+  test(`autonomous ${provider} worker sends once after one popup connection approval`, { timeout: 15000 }, async testContext => {
+    testContext.signal.throwIfAborted();
+    await exerciseChatDispatch("observed", provider, testContext, true);
+  });
 }
 
 test("private fixture submit activates once and stays uncertain after lost results or changed controls", { timeout: 30000 }, async testContext => {

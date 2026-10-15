@@ -7,6 +7,56 @@ import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS }
   from "./pending-connections.js";
 
+test("neutral autonomous preparation is facade-owned and returns its receipt before commit authority", () => {
+  for (const provider of ["fixture", "gemini"] as const) {
+    const requests = new PendingConnectionRequests();
+    const database = new DatabaseSync(":memory:");
+    const operations = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("autonomous preparation owner");
+    const legacyOwner = Symbol("legacy preparation owner");
+    const agent = requests.registerAgent(owner, "Synthetic autonomous preparation agent");
+    const target = provider === "gemini"
+      ? { origin: "https://gemini.google.com" as const, conversationId: "synthetic-neutral-preparation",
+        url: "https://gemini.google.com/app/synthetic-neutral-preparation", tabId: 4, documentId: "neutral-preparation" }
+      : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 4, documentId: "neutral-preparation" };
+    try {
+      const grant = requests.approveAgent(agent.agentId, target, 2000)!;
+      const envelope = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+        connectionGeneration: 0, deadlineMs: 6000 };
+      const prepare = { ...envelope, kind: "prepare_chat_message", payload: { connectionId: grant.connectionId,
+        text: "Synthetic autonomous preparation", idempotencyKey: "d279ef76-d6cd-4898-8c43-204543943bac" } };
+      const legacyPending = requests.create(legacyOwner, 2000);
+      const legacy = target.origin === "https://gemini.google.com" ? requests.approveGemini(legacyPending.requestId, target, 2000)!
+        : requests.approve(legacyPending.requestId, target, 2000)!;
+      assert.deepEqual(handleBrokerRequest({ ...prepare, payload: { ...prepare.payload, connectionId: legacy.connectionId } },
+        "facade", legacyOwner, requests, 2001, operations).payload, { code: "CONNECTION_NOT_FOUND" });
+      assert.deepEqual(handleBrokerRequest(prepare, "relay", Symbol("relay"), requests, 2001, operations).payload, { code: "PERMISSION_DENIED" });
+      assert.deepEqual(handleBrokerRequest(prepare, "facade", Symbol("foreign"), requests, 2001, operations).payload, { code: "CONNECTION_NOT_FOUND" });
+      for (const extra of [{ approved: true }, { provider }, { mode: "autonomous" }, { expectedGeneration: 1 }, { expiresAt: 9000 }]) {
+        assert.throws(() => handleBrokerRequest({ ...prepare, payload: { ...prepare.payload, ...extra } }, "facade", owner, requests, 2001, operations));
+      }
+      const prepared = handleBrokerRequest(prepare, "facade", owner, requests, 2001, operations);
+      if (prepared.kind !== "chat_message_prepared") throw new Error("Expected autonomous preparation");
+      assert.equal(prepared.payload.state, "prepared");
+      assert.equal(prepared.payload.expiresAt, 6000);
+      assert.match(prepared.payload.recoveryToken, /^[0-9a-f]{64}$/);
+      assert.deepEqual(handleBrokerRequest({ ...prepare, deadlineMs: 9000 }, "facade", owner, requests, 2002, operations).payload, prepared.payload);
+      const commit = { ...envelope, kind: "commit_prepared_message", payload: { operationId: prepared.payload.operationId } };
+      assert.equal(handleBrokerRequest(commit, "facade", owner, requests, 2002, operations).kind, "chat_autonomous_commit_authorized");
+      assert.deepEqual(handleBrokerRequest(commit, "facade", Symbol("foreign"), requests, 2002, operations).payload, { code: "DISPATCH_UNAVAILABLE" });
+      assert.deepEqual(handleBrokerRequest(commit, "relay", Symbol("relay"), requests, 2002, operations).payload, { code: "PERMISSION_DENIED" });
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+      assert.deepEqual(operations.listChatJobs("fill", provider, 2002), []);
+    } finally {
+      operations.disconnect(owner);
+      requests.disconnect(owner);
+      requests.disconnect(legacyOwner);
+      database.close();
+    }
+  }
+});
+
 test("neutral jobs are strict relay-only phase commands and commits stay facade-owned", () => {
   const requests = new PendingConnectionRequests();
   const database = new DatabaseSync(":memory:");

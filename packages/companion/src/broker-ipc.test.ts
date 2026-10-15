@@ -49,6 +49,106 @@ for (const target of [
   { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
     documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" }
 ] as const) {
+  test(`${target.origin} autonomous IPC joins neutral phases with the original send deadline`, { timeout: 5000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-autonomous-ipc-"));
+    const directory = join(home, "broker");
+    const database = new DatabaseSync(":memory:");
+    const broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+    let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let foreign: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    try {
+      facade = await connectBroker("facade", directory, undefined, undefined, "Synthetic autonomous IPC owner");
+      foreign = await connectBroker("facade", directory, undefined, undefined, "Synthetic foreign IPC owner");
+      relay = await connectBroker("relay", directory);
+      const roster = await relay.listChatAgents(target);
+      assert.ok(roster.kind === "chat_agents");
+      const agent = roster.payload.agents.find(candidate => candidate.label === "Synthetic autonomous IPC owner")!;
+      await relay.approveChatAgent(target, agent.agentId);
+      const pickup = await facade.waitForConnection(0);
+      assert.ok(pickup.kind === "connection_pickup" && pickup.payload.connections[0]);
+      const connection = pickup.payload.connections[0];
+      const deadlineMs = Date.now() + 12_000;
+      const key = randomUUID();
+      const prepared = await facade.prepareChatMessage(connection.connectionId, "Synthetic autonomous IPC message", key, deadlineMs);
+      assert.ok(prepared.kind === "chat_message_prepared");
+      assert.equal(prepared.payload.state, "prepared");
+      assert.equal(prepared.payload.expiresAt, deadlineMs);
+      assert.match(prepared.payload.recoveryToken, /^[0-9a-f]{64}$/);
+      for (const invalidDeadline of [0, Date.now() + 31_000, NaN, Infinity, 1.5]) {
+        await assert.rejects(facade.prepareChatMessage(connection.connectionId, "Synthetic invalid budget", randomUUID(), invalidDeadline),
+          /Invalid autonomous request deadline/);
+        await assert.rejects(facade.commitPreparedMessage(prepared.payload.operationId, invalidDeadline), /Invalid autonomous request deadline/);
+      }
+      assert.throws(() => relay!.prepareChatMessage(connection.connectionId, "Synthetic denied message", randomUUID(), deadlineMs), /Broker role cannot perform/);
+      assert.deepEqual((await foreign.prepareChatMessage(connection.connectionId, "Synthetic denied message", randomUUID(), deadlineMs)).payload,
+        { code: "CONNECTION_NOT_FOUND" });
+      assert.deepEqual((await foreign.commitPreparedMessage(prepared.payload.operationId, deadlineMs)).payload, { code: "DISPATCH_UNAVAILABLE" });
+      assert.deepEqual((await facade.prepareChatMessage(connection.connectionId, prepared.payload.preview.text, key, deadlineMs + 1000)).payload, prepared.payload);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+      assert.deepEqual((await relay.listChatJobs("fill", target.origin === "https://gemini.google.com" ? "gemini" : "fixture")).payload, { jobs: [] });
+      const committing = facade.commitPreparedMessage(prepared.payload.operationId, deadlineMs);
+      const provider = target.origin === "https://gemini.google.com" ? "gemini" : "fixture";
+      const listing = await relay.listChatJobs("fill", provider);
+      assert.ok(listing.kind === "chat_jobs" && listing.payload.jobs[0]);
+      const fill = listing.payload.jobs[0];
+      assert.equal(fill.phase, "fill");
+      assert.equal(fill.operationId, prepared.payload.operationId);
+      assert.equal(fill.expiresAt <= Math.min(deadlineMs, Date.now() + 4000), true);
+      assert.deepEqual((await relay.listChatJobs("fill", provider)).payload, { jobs: [] });
+      const filled = await relay.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", provider === "gemini"
+        ? { ok: true, editor: "contenteditable" } : { ok: true, editor: "textarea" });
+      assert.equal(filled.kind, "chat_job_recorded");
+      assert.deepEqual(filled.payload, { accepted: true });
+      if (target.origin === "https://gemini.google.com") {
+        const challenges = await relay.listGeminiReadChallenges();
+        assert.ok(challenges.kind === "gemini_read_challenges" && challenges.payload.challenges[0]);
+        await relay.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic IPC baseline" }], challenges.payload.challenges[0].challengeId);
+      } else {
+        const challenges = await relay.listFixtureReadChallenges();
+        assert.ok(challenges.kind === "fixture_read_challenges" && challenges.payload.challenges[0]);
+        await relay.publishFixtureSnapshot(target, [], challenges.payload.challenges[0].challengeId);
+      }
+      const proofs = await relay.listChatJobs("proof", provider);
+      assert.ok(proofs.kind === "chat_jobs" && proofs.payload.jobs[0]);
+      const proof = proofs.payload.jobs[0];
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+      const observation = { ok: true as const, draftText: prepared.payload.preview.text,
+        selected: true as const, writable: true as const, submitReady: true as const };
+      assert.deepEqual((await relay.completeChatJob(proof.target, proof.operationId, proof.jobId, "proof", provider === "gemini"
+        ? { ...observation, editor: "contenteditable" } : { ...observation, editor: "textarea" })).payload, { accepted: true });
+      const submits = await relay.listChatJobs("submit", provider);
+      assert.ok(submits.kind === "chat_jobs" && submits.payload.jobs[0]);
+      const submit = submits.payload.jobs[0];
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      assert.deepEqual((await relay.listChatJobs("submit", provider)).payload, { jobs: [] });
+      if (target.origin === "https://gemini.google.com") {
+        await relay.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic IPC baseline" },
+          { direction: "outgoing", text: prepared.payload.preview.text }]);
+      } else await relay.publishFixtureSnapshot(target, [{ id: "synthetic-autonomous-ipc-outgoing", direction: "outgoing", text: prepared.payload.preview.text }]);
+      assert.deepEqual((await relay.completeChatJob(submit.target, submit.operationId, submit.jobId, "submit", provider === "gemini"
+        ? { ok: true, editor: "contenteditable", activated: true } : { ok: true, editor: "textarea", activated: true })).payload, { accepted: true });
+      const result = await committing;
+      assert.ok(result.kind === "chat_dispatch");
+      assert.equal(result.deadlineMs, deadlineMs);
+      assert.equal(result.payload.state, provider === "gemini" ? "resolved" : "observed_in_ui");
+      assert.deepEqual((await facade.commitPreparedMessage(prepared.payload.operationId, deadlineMs)).payload, result.payload);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      assert.throws(() => brokerRequestDeadline(Date.now(), undefined, 30_000), /Invalid broker request deadline/);
+      facade.close();
+      assert.deepEqual((await foreign.getPreparedOperation(prepared.payload.operationId, prepared.payload.recoveryToken)).payload, result.payload);
+      assert.deepEqual((await foreign.commitPreparedMessage(prepared.payload.operationId, deadlineMs)).payload, { code: "DISPATCH_UNAVAILABLE" });
+      assert.deepEqual((await foreign.waitForConnection(0)).payload, { connections: [], timedOut: true });
+    } finally {
+      facade?.close();
+      foreign?.close();
+      relay?.close();
+      await broker.close();
+      database.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   test(`${target.origin} roster IPC is relay-only and removes one approved agent`, { timeout: 5000 }, async () => {
     const home = await mkdtemp(join(tmpdir(), "agent-messaging-agent-roster-"));
     const directory = join(home, "broker");

@@ -375,6 +375,14 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ disconnected: z.boolean() })
   }),
   z.strictObject({
+    kind: z.literal("chat_message_prepared"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ operationId: z.uuid(), connectionId: z.uuid(), state: z.literal("prepared"),
+      expiresAt: z.number().int().safe(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/),
+      preview: z.union([geminiReview.shape.preview, z.strictObject({ target: z.literal("fixture-alpha"),
+        text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES) })]) })
+  }),
+  z.strictObject({
     kind: z.literal("gemini_message_prepared"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ operationId: z.uuid(), connectionId: z.uuid(), state: z.literal("awaiting_approval"),
@@ -551,7 +559,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
       | "disconnect_fixture" | "prepare_fixture_message" | "get_prepared_operation"
-      | "prepare_gemini_message"
+      | "prepare_gemini_message" | "prepare_chat_message"
       | "check_fixture_preflight" | "complete_fixture_preflight"
       | "check_fixture_dispatch" | "list_fixture_dispatch_checks" | "complete_fixture_dispatch_check"
       | "check_gemini_dispatch" | "list_gemini_dispatch_checks" | "complete_gemini_dispatch_check"
@@ -570,7 +578,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "approve_fixture" | "approve_gemini"
       | "publish_fixture_snapshot" | "publish_gemini_snapshot"
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap"
-      | "mark_gemini_observation_gap", payload: object) => {
+      | "mark_gemini_observation_gap", payload: object, originalDeadlineMs?: number) => {
       if (kind === "list_chat_agents" || kind === "remove_chat_agent" || kind === "disconnect_chat" || kind === "approve_chat_agent"
         || kind === "list_unconfirmed_dispatches" || kind === "resolve_unconfirmed_dispatch"
         || kind === "list_available_agents" || kind === "begin_chat_reload" || kind === "rebind_chat"
@@ -596,6 +604,10 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         ? role !== "relay" : role !== "facade") {
         throw new Error("Broker role cannot perform this operation");
       }
+      if (originalDeadlineMs !== undefined && ((kind !== "prepare_chat_message" && kind !== "commit_prepared_message")
+        || !Number.isSafeInteger(originalDeadlineMs) || originalDeadlineMs <= Date.now() || originalDeadlineMs > Date.now() + 30_000)) {
+        return Promise.reject(new Error("Invalid autonomous request deadline"));
+      }
       if (pendingRequests >= MAX_BROKER_PENDING_REQUESTS) return Promise.reject(new Error("Broker request queue is full"));
       pendingRequests++;
       const operation = nextRequest.then(async () => {
@@ -603,11 +615,15 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         const requestId = randomUUID();
         const startedAt = Date.now();
         const budgetMs = kind === "wait_for_connection" ? MAX_CONNECTION_WAIT_MS + 250 : 5000;
-        const deadlineMs = brokerRequestDeadline(startedAt, upstreamDeadlineMs, budgetMs);
+        const deadlineMs = originalDeadlineMs === undefined ? brokerRequestDeadline(startedAt, upstreamDeadlineMs, budgetMs)
+          : Math.min(originalDeadlineMs, upstreamDeadlineMs ?? originalDeadlineMs);
+        if (deadlineMs <= startedAt) throw new Error("Invalid autonomous request deadline");
         const frame = encodeNativeFrame({ kind, protocolVersion: PROTOCOL_VERSION, requestId,
           connectionGeneration: 0, deadlineMs, payload });
         const responseStartedAt = Date.now();
-        const responseTimeoutMs = brokerRequestDeadline(responseStartedAt, deadlineMs, budgetMs) - responseStartedAt;
+        const responseTimeoutMs = (originalDeadlineMs === undefined ? brokerRequestDeadline(responseStartedAt, deadlineMs, budgetMs)
+          : deadlineMs) - responseStartedAt;
+        if (responseTimeoutMs <= 0) throw new Error("Invalid autonomous request deadline");
         const decoder = new NativeFrameDecoder();
         const response = new Promise<unknown>((resolve, reject) => {
           const timer = setTimeout(() => socket.destroy(new Error("Broker request timed out")), responseTimeoutMs);
@@ -690,6 +706,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         request("prepare_fixture_message", { connectionId, expectedGeneration, text, idempotencyKey }),
       prepareGeminiMessage: (connectionId: string, expectedGeneration: 1, text: string, idempotencyKey: string) =>
         request("prepare_gemini_message", { connectionId, expectedGeneration, text, idempotencyKey }),
+      prepareChatMessage: (connectionId: string, text: string, idempotencyKey: string, deadlineMs = Date.now() + 30_000) =>
+        request("prepare_chat_message", { connectionId, text, idempotencyKey }, deadlineMs),
       getPreparedOperation: (operationId: string, recoveryToken?: string) =>
         request("get_prepared_operation", { operationId,
           ...(recoveryToken === undefined ? {} : { recoveryToken }) }),
@@ -707,7 +725,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         observation: GeminiDispatchCheckResult) => request("complete_gemini_dispatch_check", { target, operationId, checkId, observation }),
       dispatchFixtureMessage: (operationId: string, checkId: string) => request("dispatch_fixture_message", { operationId, checkId }),
       commitFixtureMessage: (operationId: string) => request("commit_fixture_message", { operationId }),
-      commitPreparedMessage: (operationId: string) => request("commit_prepared_message", { operationId }),
+      commitPreparedMessage: (operationId: string, deadlineMs?: number) => request("commit_prepared_message", { operationId }, deadlineMs),
       listChatJobs: (phase: ChatJob["phase"], provider: "fixture" | "gemini") => request("list_chat_jobs", { phase, provider }),
       completeChatJob: (target: ChatTarget, operationId: string, jobId: string, phase: ChatJob["phase"],
         observation: ChatJobObservation) => request("complete_chat_job", { target, operationId, jobId, phase, observation }),

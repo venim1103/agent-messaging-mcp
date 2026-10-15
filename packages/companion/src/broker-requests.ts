@@ -93,6 +93,9 @@ const requestSchema = z.discriminatedUnion("kind", [
     connectionId: z.uuid(), expectedGeneration: z.literal(1),
     text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), idempotencyKey: z.uuid()
   }) }),
+  z.strictObject({ ...envelope, kind: z.literal("prepare_chat_message"), payload: z.strictObject({
+    connectionId: z.uuid(), text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), idempotencyKey: z.uuid()
+  }) }),
   z.strictObject({ ...envelope, kind: z.literal("get_prepared_operation"), payload: z.strictObject({
     operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional()
   }) }),
@@ -610,6 +613,9 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") {
       return { ...response, kind: "chat_dispatch" as const, payload: status };
     }
+    if (operations.getAutonomousAuthorization(owner, request.payload.operationId, now)) {
+      return { ...response, kind: "chat_autonomous_commit_authorized" as const, payload: request.payload };
+    }
     return operations.getFixtureSendAuthorization(owner, request.payload.operationId, now)
       || operations.getGeminiSendAuthorization(owner, request.payload.operationId, now)
       ? { ...response, kind: "chat_commit_authorized" as const, payload: request.payload }
@@ -627,6 +633,19 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return request.kind === "commit_fixture_message"
       ? { ...response, kind: "fixture_commit_authorized" as const, payload: request.payload }
       : { ...response, kind: "fixture_dispatch_authorized" as const, payload: request.payload };
+  }
+  if (request.kind === "prepare_chat_message") {
+    if (!operations) return { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
+    try {
+      return { ...response, kind: "chat_message_prepared" as const, payload: operations.prepareAutonomous(owner,
+        request.payload.connectionId, request.payload.text, request.payload.idempotencyKey, request.deadlineMs, now) };
+    } catch (error) {
+      if (error instanceof Error && ["CONNECTION_NOT_FOUND", "INVALID_MESSAGE_TEXT", "INVALID_IDEMPOTENCY_KEY",
+        "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED", "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED", "DISPATCH_UNCERTAIN"].includes(error.message)) {
+        return { ...response, kind: "error" as const, payload: { code: error.message } };
+      }
+      throw error;
+    }
   }
   if (request.kind === "prepare_gemini_message") {
     if (!operations) return { ...response, kind: "error" as const,
