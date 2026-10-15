@@ -224,6 +224,7 @@ export class PreparedMessageOperations {
   private readonly composerReservations = new Map<string, Readonly<{ owner: symbol; target: ApprovedTarget; expiresAt: number }>>();
   private readonly composerWaits = new Map<string, PendingComposerWait>();
   private readonly neutralJobOffers = new Map<string, Set<string>>();
+  private readonly autonomousCommits = new Map<string, Readonly<{ owner: symbol; result: Promise<FixtureDispatchStatus> }>>();
   private readonly contents = new Map<string, Readonly<{
     owner: symbol; connectionId: string; target: FixtureTarget; text: string; expiresAt: number; autonomous?: true
   }>>();
@@ -444,6 +445,7 @@ export class PreparedMessageOperations {
     this.dispatchAuthorizations.delete(operationId);
     this.ambiguousEvidence.delete(operationId);
     this.neutralJobOffers.delete(operationId);
+    this.autonomousCommits.delete(operationId);
     this.composerReservations.delete(operationId);
     this.finishComposerWait(operationId, false);
     for (const waitingId of this.composerWaits.keys()) this.checkComposerWait(waitingId);
@@ -543,7 +545,8 @@ export class PreparedMessageOperations {
     const now = Date.now();
     const authorization = this.getAutonomousAuthorization(owner, operationId, now);
     if (!authorization || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now
-      || this.hasUnresolvedDispatch(authorization.target)) return Promise.resolve(false);
+      || (this.hasUnresolvedDispatch(authorization.target)
+        && !this.hasOccupiedComposer(operationId, authorization.target, now))) return Promise.resolve(false);
     const existing = this.composerWaits.get(operationId);
     if (existing) return existing.result;
     const reservation = this.composerReservations.get(operationId);
@@ -572,7 +575,8 @@ export class PreparedMessageOperations {
     const now = Date.now();
     const authorization = this.getAutonomousAuthorization(pending.owner, operationId, now);
     if (this.composerWaits.get(operationId) !== pending) return;
-    if (!authorization || pending.expiresAt <= now || this.hasUnresolvedDispatch(pending.target)) {
+    if (!authorization || pending.expiresAt <= now || (this.hasUnresolvedDispatch(pending.target)
+      && !this.hasOccupiedComposer(operationId, pending.target, now))) {
       this.finishComposerWait(operationId, false);
       return;
     }
@@ -1747,6 +1751,51 @@ export class PreparedMessageOperations {
   async commitFixtureMessage(owner: symbol, operationId: string, deadlineMs: number) {
     if (!this.contents.has(operationId) && !this.dispatchStatus(operationId)) throw new Error("DISPATCH_UNAVAILABLE");
     return this.commitPreparedMessage(owner, operationId, deadlineMs);
+  }
+
+  async commitAutonomousMessage(owner: symbol, operationId: string, deadlineMs: number): Promise<FixtureDispatchStatus> {
+    const now = Date.now();
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now || deadlineMs > now + 30_000) throw new Error("DISPATCH_UNAVAILABLE");
+    const status = this.getOperation(owner, operationId, now);
+    const running = this.autonomousCommits.get(operationId);
+    if (running) {
+      if (running.owner !== owner) throw new Error("DISPATCH_UNAVAILABLE");
+      return running.result;
+    }
+    const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
+    if (!operation?.autonomous || operation.owner !== owner) throw new Error("DISPATCH_UNAVAILABLE");
+    if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") return status;
+    const authorization = this.getAutonomousAuthorization(owner, operationId, now);
+    if (!authorization) throw new Error("DISPATCH_UNAVAILABLE");
+    const expiresAt = Math.min(deadlineMs, authorization.expiresAt);
+    const result = (async () => {
+      if (!await this.acquireComposer(owner, operationId, expiresAt)) throw new Error("DISPATCH_UNAVAILABLE");
+      try {
+        const filling = this.requestChatFill(owner, operationId, Date.now(), expiresAt);
+        if (!filling || filling === "busy" || !(await filling.result)?.ok || expiresAt <= Date.now()) {
+          throw new Error("DISPATCH_UNAVAILABLE");
+        }
+        const reading = operation.target.origin === "https://gemini.google.com"
+          ? this.requests.requestFreshGeminiRead(owner, operation.connectionId, Date.now(), expiresAt)
+          : this.requests.requestFreshFixtureRead(owner, operation.connectionId, Date.now(), expiresAt);
+        if (!reading || reading === "busy") throw new Error("DISPATCH_UNAVAILABLE");
+        const snapshot = await reading.result;
+        if (!snapshot || snapshot === "not_ready" || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
+        const inspecting = this.requestChatProof(owner, operationId, Date.now(), expiresAt);
+        if (inspecting === "busy" || !await inspecting.result || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
+        const dispatching = operation.target.origin === "https://gemini.google.com"
+          ? this.requestGeminiDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt)
+          : this.requestFixtureDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt);
+        return await dispatching.result;
+      } finally {
+        this.releaseComposer(owner, operationId);
+      }
+    })().then(completed => {
+      this.autonomousCommits.delete(operationId);
+      return completed;
+    });
+    this.autonomousCommits.set(operationId, Object.freeze({ owner, result }));
+    return result;
   }
 
   async commitPreparedMessage(owner: symbol, operationId: string, deadlineMs: number) {
