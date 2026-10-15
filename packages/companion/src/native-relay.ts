@@ -4,7 +4,7 @@ import { connectBroker } from "./broker-client.js";
 import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { NativeFrameDecoder, writeNativeFrame } from "./native-framing.js";
 import type { ChatAgent } from "./pending-connections.js";
-import type { ChatSubmitJob } from "./message-operations.js";
+import type { ChatJob } from "./message-operations.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
   parseNativeChatAgentRequest, parseNativeChatJobRequest,
   parseNativeGeminiGap,
@@ -173,7 +173,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "unconfirmed_dispatches" | "dispatch_resolved" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
-            | { jobs: ReadonlyArray<ChatSubmitJob> }
+            | { jobs: ReadonlyArray<ChatJob> }
             | { attempts: ReadonlyArray<{ operationId: string; startedAt: number }>; hasMore: boolean }
             | { operationId: string; state: "resolved"; startedAt: number;
               resolution: { outcome: "sent" | "not_sent"; source: "page" | "person"; resolvedAt: number } }

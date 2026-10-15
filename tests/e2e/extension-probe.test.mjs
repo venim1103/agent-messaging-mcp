@@ -15,6 +15,7 @@ import { chromium } from "playwright-core";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
+import { createNativeRequestChannel } from "../../packages/extension/lib/native-channel.ts";
 
 const extensionDirectory = fileURLToPath(new URL("../../packages/extension/.output/chrome-mv3/", import.meta.url));
 const nativeRelayPath = fileURLToPath(new URL("../../packages/companion/dist/native-relay.js", import.meta.url));
@@ -28,6 +29,173 @@ async function brokerSocketReady(socketPath) {
     return false;
   }
 }
+
+function trackTestPhase(testContext, label) {
+  const started = performance.now();
+  let phase = "preparing";
+  testContext?.signal.addEventListener("abort", () => {
+    testContext.diagnostic(`${label} at test end: ${phase} (${Math.round(performance.now() - started)} ms)`);
+  }, { once: true });
+  return next => {
+    phase = next;
+    testContext?.diagnostic(`${label}: ${phase} (${Math.round(performance.now() - started)} ms)`);
+  };
+}
+
+async function createNativeWatchHarness(profile, requestKind) {
+  const pidPath = join(profile, "native-watch.json");
+  const relayPath = join(profile, "native-watch-relay.mjs");
+  await writeFile(relayPath, `import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { NativeFrameDecoder } from ${JSON.stringify(fileURLToPath(new URL("../../packages/companion/dist/native-framing.js", import.meta.url)))};
+const relay = spawn(process.execPath, [${JSON.stringify(nativeRelayPath)}, ...process.argv.slice(2)], { stdio: ["pipe", "pipe", "inherit"] });
+const decoder = new NativeFrameDecoder();
+let marked = false;
+process.stdin.on("data", chunk => {
+  for (const request of decoder.push(chunk)) {
+    if (!marked && request.kind === ${JSON.stringify(requestKind)}) {
+      writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ pid: relay.pid, parent: process.pid }), { mode: 0o600 });
+      marked = true;
+    }
+  }
+});
+process.stdin.pipe(relay.stdin);
+relay.stdout.pipe(process.stdout);
+relay.once("close", code => process.exit(code ?? 1));
+relay.once("error", () => process.exit(1));
+process.on("SIGTERM", () => relay.kill("SIGTERM"));
+`, { mode: 0o600 });
+  return { pidPath, relayPath };
+}
+
+async function stopNativeWatch(harness) {
+  const watch = JSON.parse(await readFile(harness.pidPath, "utf8"));
+  assert.ok(Number.isSafeInteger(watch.pid) && watch.pid > 0);
+  assert.ok(Number.isSafeInteger(watch.parent) && watch.parent > 0);
+  assert.equal((await stat(`/proc/${watch.pid}`)).uid, process.getuid());
+  assert.equal((await readFile(`/proc/${watch.parent}/cmdline`, "utf8")).split("\0").includes(harness.relayPath), true);
+  assert.equal((await readFile(`/proc/${watch.pid}/cmdline`, "utf8")).split("\0").includes(nativeRelayPath), true);
+  assert.equal(Number((await readFile(`/proc/${watch.pid}/status`, "utf8")).match(/^PPid:\s+(\d+)$/m)?.[1]), watch.parent);
+  process.kill(watch.pid, "SIGTERM");
+}
+
+function createNativeChannelHarness() {
+  const ports = [];
+  const request = createNativeRequestChannel(() => {
+    const messages = [];
+    const listeners = {};
+    const port = { messages, listeners, disconnected: false,
+      postMessage: message => messages.push(message),
+      disconnect() { this.disconnected = true; },
+      onMessage: { addListener: listener => { listeners.message = listener; } },
+      onDisconnect: { addListener: listener => { listeners.disconnect = listener; } } };
+    ports.push(port);
+    return port;
+  });
+  return { ports, request };
+}
+
+test("native request channel reuses bounded ports without replay after loss or expiry", async testContext => {
+  testContext.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 100_000 });
+  const { ports, request } = createNativeChannelHarness();
+  const reply = (port, index, payload = {}) => port.listeners.message({
+    ...port.messages[index], kind: "chat_agents", payload
+  });
+  const first = request("list_chat_agents", {}, Date.now() + 2_000);
+  reply(ports[0], 0, { marker: "first" });
+  assert.deepEqual((await first).payload, { marker: "first" });
+  const second = request("list_chat_agents", {}, Date.now() + 2_000);
+  const third = request("list_chat_agents", {}, Date.now() + 2_000);
+  assert.equal(ports.length, 1);
+  assert.equal(new Set(ports[0].messages.map(message => message.requestId)).size, 3);
+  reply(ports[0], 2, { marker: "third" });
+  reply(ports[0], 1, { marker: "second" });
+  assert.deepEqual((await second).payload, { marker: "second" });
+  assert.deepEqual((await third).payload, { marker: "third" });
+  testContext.mock.timers.tick(999);
+  assert.equal(ports[0].disconnected, false);
+  testContext.mock.timers.tick(1);
+  assert.equal(ports[0].disconnected, true);
+
+  const pending = Array.from({ length: 16 }, () => request("list_chat_agents", {}, Date.now() + 2_000));
+  await assert.rejects(request("list_chat_agents", {}, Date.now() + 2_000), /unavailable/);
+  assert.equal(ports.length, 2);
+  assert.equal(ports[1].messages.length, 16);
+  for (let index = 0; index < 16; index++) reply(ports[1], index);
+  await Promise.all(pending);
+
+  const expiring = assert.rejects(request("list_chat_agents", {}, Date.now() + 100), /unavailable/);
+  const concurrent = assert.rejects(request("list_chat_agents", {}, Date.now() + 2_000), /unavailable/);
+  testContext.mock.timers.tick(100);
+  await Promise.all([expiring, concurrent]);
+  assert.equal(ports[1].disconnected, true);
+  assert.equal(ports.length, 2);
+  const afterExpiry = request("list_chat_agents", {}, Date.now() + 2_000);
+  assert.equal(ports.length, 3);
+  reply(ports[1], 16);
+  reply(ports[2], 0);
+  await afterExpiry;
+
+  const disconnected = assert.rejects(request("list_chat_agents", {}, Date.now() + 2_000), /unavailable/);
+  ports[2].listeners.disconnect();
+  await disconnected;
+  assert.equal(ports.length, 3);
+  await assert.rejects(request("list_chat_agents", {}, Date.now()), /unavailable/);
+  await assert.rejects(request("list_chat_agents", {}, Date.now() + 30_001), /unavailable/);
+  assert.equal(ports.length, 3);
+});
+
+test("native request channel fails closed on malformed replies and startup or post errors", async testContext => {
+  testContext.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 100_000 });
+  for (const mutate of [
+    () => null,
+    () => [],
+    message => ({ ...message, extra: true }),
+    message => ({ ...message, requestId: crypto.randomUUID() }),
+    message => ({ ...message, protocolVersion: 2 }),
+    message => ({ ...message, connectionGeneration: 1 }),
+    message => ({ ...message, deadlineMs: message.deadlineMs + 1 }),
+    message => ({ ...message, kind: null }),
+    message => ({ ...message, payload: null }),
+    message => ({ ...message, payload: [] })
+  ]) {
+    const { request, ports } = createNativeChannelHarness();
+    const first = assert.rejects(request("list_chat_agents", {}, Date.now() + 1_000), /unavailable/);
+    const second = assert.rejects(request("list_chat_agents", {}, Date.now() + 1_000), /unavailable/);
+    ports[0].listeners.message(mutate({ ...ports[0].messages[0], kind: "chat_agents", payload: {} }));
+    await Promise.all([first, second]);
+    assert.equal(ports[0].disconnected, true);
+    assert.equal(ports[0].messages.length, 2);
+    assert.equal(ports.length, 1);
+  }
+
+  const { request, ports } = createNativeChannelHarness();
+  const first = request("list_chat_agents", {}, Date.now() + 1_000);
+  ports[0].listeners.message({ ...ports[0].messages[0], kind: "chat_agents", payload: {} });
+  await first;
+  let failedPosts = 0;
+  ports[0].postMessage = () => { failedPosts++; throw new Error("Synthetic post failure"); };
+  await assert.rejects(request("list_chat_agents", {}, Date.now() + 1_000), /unavailable/);
+  assert.equal(failedPosts, 1);
+  assert.equal(ports[0].disconnected, true);
+  testContext.mock.timers.tick(10_000);
+  assert.equal(ports.length, 1);
+
+  let connectionAttempts = 0;
+  const refused = createNativeRequestChannel(() => { connectionAttempts++; throw new Error("Synthetic connection failure"); });
+  await assert.rejects(refused("list_chat_agents", {}, Date.now() + 1_000), /unavailable/);
+  assert.equal(connectionAttempts, 1);
+
+  let registrationDisconnects = 0;
+  const failedRegistration = createNativeRequestChannel(() => ({
+    postMessage() { assert.fail("A request was posted after listener registration failed"); },
+    disconnect() { registrationDisconnects++; },
+    onMessage: { addListener() { throw new Error("Synthetic listener failure"); } },
+    onDisconnect: { addListener() {} }
+  }));
+  await assert.rejects(failedRegistration("list_chat_agents", {}, Date.now() + 1_000), /unavailable/);
+  assert.equal(registrationDisconnects, 1);
+});
 
 test("extension broker readiness rejects a socket until its permissions are private", async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-extension-readiness-"));
@@ -597,8 +765,10 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
   }
 });
 
-test("trusted fixture popup separates consent from one-shot exact-document draft fill", { timeout: 30000 }, async () => {
+test("trusted fixture popup separates consent from one-shot exact-document draft fill", { timeout: 30000 }, async testContext => {
+  const setPhase = trackTestPhase(testContext, "Fixture consent");
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-review-test-"));
+  const nativeWatch = await createNativeWatchHarness(profile, "list_fixture_read_challenges");
   let mcpClient;
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
@@ -621,7 +791,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     });
     const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
-    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeWatch.relayPath, profile));
     broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
     brokerExit = once(broker, "exit");
     let ready = false;
@@ -671,6 +841,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       kind: "list_fixture_prepared_reviews", ...args
     }), reviewArgs);
     assert.equal(before.ok, false);
+    setPhase("late-review boundaries");
 
     for (const scenario of [
       { selector: "#view-fixture-reviews", outcome: "empty" },
@@ -720,6 +891,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       }
     }
 
+    setPhase("read-watch recovery");
     const created = await facade.requestConnection();
     if (created.kind !== "connection_requested") throw new Error("Expected fixture request");
     await worker.evaluate(() => {
@@ -746,7 +918,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     }
     const beforeNativeLoss = await facade.readFixtureSnapshot(connection.payload.connectionId);
     assert.equal(beforeNativeLoss.kind, "fixture_snapshot");
-    await worker.evaluate(() => globalThis.syntheticFixtureWatches[0].disconnect());
+    await stopNativeWatch(nativeWatch);
     const afterNativeLoss = await facade.readFixtureSnapshot(connection.payload.connectionId);
     assert.equal(afterNativeLoss.kind, "fixture_snapshot", "Fixture native watch did not recover without reapproval");
     assert.deepEqual(afterNativeLoss.payload.messages, beforeNativeLoss.payload.messages);
@@ -760,6 +932,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     assert.equal((await facade.getConnection(created.payload.requestId)).payload.state, "ready_readonly");
     await fixture.locator("ol#messages li").first().evaluate(row => row.append(globalThis.syntheticMissingParagraph));
     assert.equal((await facade.readFixtureSnapshot(connection.payload.connectionId)).kind, "fixture_snapshot");
+    setPhase("textarea consent and fill");
     const text = "Synthetic <script>alert(1)</script> &\nSecond line";
     const prepared = await facade.prepareFixtureMessage(connection.payload.connectionId, 1, text,
       "b66b3997-9d43-4554-8399-267d1fe9f75c");
@@ -855,6 +1028,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     assert.equal(staleSendReview.ok, false);
     const postConsentSnapshot = await facade.readFixtureSnapshot(connection.payload.connectionId);
     assert.equal(postConsentSnapshot.kind, "fixture_snapshot");
+    setPhase("textarea proof boundaries");
     const exactInspection = await facade.checkFixtureDispatch(prepared.payload.operationId);
     assert.equal(exactInspection.kind, "fixture_dispatch_check", JSON.stringify(exactInspection.payload));
     assert.equal(exactInspection.payload.ready, true);
@@ -929,6 +1103,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       return replacement;
     };
     const secondConnection = await approveReplacementConnection(connection, url);
+    setPhase("draft and changed-chat refusals");
     assert.equal((await facade.getPreparedOperation(prepared.payload.operationId)).payload.state, "stale");
     const second = await facade.prepareFixtureMessage(secondConnection.payload.connectionId, 1, "Second fixture draft",
       "c66b3997-9d43-4554-8399-267d1fe9f75c");
@@ -959,6 +1134,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     assert.equal(afterSwitch.ok, false);
 
     const richUrl = "http://127.0.0.1:8787/?editor=rich";
+    setPhase("rich fill and proof");
     await fixture.goto(richUrl);
     await fixture.bringToFront();
     await popup.reload();
@@ -1026,6 +1202,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     }
     await fixture.locator("#rich-message").evaluate((editor) => editor.replaceChildren());
     assert.equal(await fixture.locator("#rich-message").innerText(), "");
+    setPhase("MCP rich fill");
     assert.equal((await facade.disconnectFixture(lostConnection.payload.connectionId)).payload.disconnected, true);
     assert.equal((await facade.getPreparedOperation(lostPrepared.payload.operationId)).payload.state, "stale");
     mcpClient = new Client({ name: "fixture-browser-fill-test", version: "0.0.1" });
@@ -1489,6 +1666,24 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
         await setTimeout(25);
       }
       assert.equal(ready, true, "Autonomous broker did not start");
+      if (scenario === "reload-failure") {
+        await worker.evaluate(() => {
+          globalThis.syntheticRebindCorruptions = 0;
+          const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+          chrome.runtime.connectNative = (...args) => {
+            const port = connect(...args);
+            const listen = port.onMessage.addListener.bind(port.onMessage);
+            port.onMessage.addListener = listener => listen(reply => {
+              if (reply.kind === "chat_rebound") {
+                globalThis.syntheticRebindCorruptions++;
+                return listener({ ...reply, payload: { ...reply.payload, renewed: true } });
+              }
+              listener(reply);
+            });
+            return port;
+          };
+        });
+      }
       const options = { command: process.execPath, args: [mcpEntry],
         env: { ...process.env, HOME: profile, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
       delete options.env.BROWSER_CHAT_AGENT_LABEL;
@@ -1585,18 +1780,7 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
       if (scenario === "reload" || scenario === "reload-failure") {
         const originalDocument = await worker.evaluate(async key => (await chrome.storage.session.get(key))[key].documentId, key);
         let oldRead;
-        if (scenario === "reload-failure") {
-          await worker.evaluate(() => {
-            const connect = chrome.runtime.connectNative.bind(chrome.runtime);
-            chrome.runtime.connectNative = (...args) => {
-              const port = connect(...args);
-              const listen = port.onMessage.addListener.bind(port.onMessage);
-              port.onMessage.addListener = listener => listen(reply => listener(reply.kind === "chat_rebound"
-                ? { ...reply, payload: { ...reply.payload, renewed: true } } : reply));
-              return port;
-            };
-          });
-        } else {
+        if (scenario !== "reload-failure") {
           await worker.evaluate(documentId => {
             const execute = chrome.scripting.executeScript.bind(chrome.scripting);
             chrome.scripting.executeScript = async options => {
@@ -1631,6 +1815,7 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
         }
         assert.equal(reloaded, true, "Reload did not settle the tracked grant");
         if (scenario === "reload-failure") {
+          assert.equal(await worker.evaluate(() => globalThis.syntheticRebindCorruptions), 1);
           for (const client of clients) {
             assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
               { connections: [], timedOut: true });
@@ -1728,7 +1913,8 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
   });
 }
 
-async function exerciseChatDispatch(outcome, provider = "fixture") {
+async function exerciseChatDispatch(outcome, provider = "fixture", testContext) {
+  const setPhase = trackTestPhase(testContext, `${provider} submit ${outcome}`);
   let mcpClient;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
   const unpacked = join(profile, "unpacked-extension");
@@ -1764,11 +1950,28 @@ async function exerciseChatDispatch(outcome, provider = "fixture") {
       elapsedMs: Math.round(performance.now() - started), exitCode: broker.exitCode,
       signalCode: broker.signalCode, stderr: brokerStderr
     })}`);
+    setPhase("browser startup");
     context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
       executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
     let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
+    if (outcome === "lost_native_completion") {
+      await worker.evaluate(provider => {
+        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+        chrome.runtime.connectNative = (...args) => {
+          const port = connect(...args);
+          const post = port.postMessage.bind(port);
+          port.postMessage = message => {
+            if (message.kind === (provider === "gemini" ? "complete_chat_job" : "complete_fixture_dispatch")) {
+              globalThis.fixtureDroppedCompletion = true; return;
+            }
+            post(message);
+          };
+          return port;
+        };
+      }, provider);
+    }
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     facade = await connectBroker("facade", directory);
     relay = await connectBroker("relay", directory);
@@ -1830,6 +2033,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture") {
       : await mcpClient.callTool({ name: "chat_get_connection", arguments: { requestId: pending.requestId } });
     const connection = provider === "gemini" ? connected.payload : connected.structuredContent;
     assert.equal(connection.state, "ready_readonly");
+    setPhase("prepare and fill");
     const preparation = provider === "gemini"
       ? await facade.prepareGeminiMessage(connection.connectionId, 1, `Synthetic one-shot ${outcome}`, "a66b3997-9d43-4554-8399-267d1fe9f75c")
       : await mcpClient.callTool({ name: "chat_prepare_message", arguments: {
@@ -1881,6 +2085,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture") {
         .waitFor({ state: "visible", timeout: 4000 });
     }
     assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 0);
+    setPhase("proof and submit");
     if (outcome === "lost_script" || outcome === "worker_crash" || outcome === "broker_crash") {
       await worker.evaluate(({ operationId, hold }) => {
         const execute = chrome.scripting.executeScript.bind(chrome.scripting);
@@ -1893,22 +2098,6 @@ async function exerciseChatDispatch(outcome, provider = "fixture") {
           return result;
         };
       }, { operationId: prepared.operationId, hold: outcome !== "lost_script" });
-    }
-    if (outcome === "lost_native_completion") {
-      await worker.evaluate(provider => {
-        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
-        chrome.runtime.connectNative = (...args) => {
-          const port = connect(...args);
-          const post = port.postMessage.bind(port);
-          port.postMessage = message => {
-            if (message.kind === (provider === "gemini" ? "complete_chat_job" : "complete_fixture_dispatch")) {
-              globalThis.fixtureDroppedCompletion = true; return;
-            }
-            post(message);
-          };
-          return port;
-        };
-      }, provider);
     }
     if (outcome === "blocked_after_reservation") {
       await worker.evaluate(({ tabId, documentId }) => {
@@ -1983,6 +2172,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture") {
         : await relay.listFixtureDispatchAttempts()).payload, provider === "gemini" ? { jobs: [] } : { attempts: [] });
     }
     const settled = await dispatching;
+    setPhase("status and replay");
     if (provider !== "gemini" || outcome !== "broker_crash") assert.ok(settled.reply);
     const status = provider === "gemini" ? outcome === "broker_crash"
       ? (await facade.getPreparedOperation(prepared.operationId, prepared.recoveryToken)).payload : settled.reply.payload
@@ -2040,6 +2230,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture") {
       }
     } finally { journal.close(); }
   } finally {
+    setPhase("cleanup");
     await mcpClient?.close().catch(() => {});
     facade?.close();
     relay?.close();
@@ -2047,12 +2238,14 @@ async function exerciseChatDispatch(outcome, provider = "fixture") {
     if (brokerExit) await brokerExit;
     await context?.close();
     await rm(profile, { recursive: true, force: true });
+    setPhase("complete");
   }
 }
 
-test("private fixture submit activates once and stays uncertain after lost results or changed controls", { timeout: 30000 }, async () => {
+test("private fixture submit activates once and stays uncertain after lost results or changed controls", { timeout: 30000 }, async testContext => {
   for (const outcome of ["observed", "lost_script", "lost_native_completion", "blocked_after_reservation"]) {
-    await exerciseChatDispatch(outcome);
+    testContext.signal.throwIfAborted();
+    await exerciseChatDispatch(outcome, "fixture", testContext);
   }
 });
 
@@ -2109,6 +2302,22 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
       relay = await connectBroker("relay", brokerDirectory);
       const page = await context.newPage();
       const url = "https://gemini.google.com/app/synthetic-worker-fill?hl=en";
+      await worker.evaluate(scenario => {
+        globalThis.syntheticFillCompletionDrops = 0;
+        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+        chrome.runtime.connectNative = (...args) => {
+          const port = connect(...args);
+          const post = port.postMessage.bind(port);
+          port.postMessage = message => {
+            if (scenario === "completion-request-loss" && message.kind === "complete_gemini_fill") {
+              globalThis.syntheticFillCompletionDrops++;
+              return;
+            }
+            post(message);
+          };
+          return port;
+        };
+      }, outcome);
       await page.route("https://gemini.google.com/**", route => route.fulfill({ contentType: "text/html; charset=utf-8",
         body: `<!doctype html><html><head><meta charset="utf-8"><style>
           main, infinite-scroller, user-query, user-query-content { display:block }
@@ -2166,7 +2375,6 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
         } });
         const execute = chrome.scripting.executeScript.bind(chrome.scripting);
         globalThis.syntheticFillExecutions = 0;
-        globalThis.syntheticFillCompletionDrops = 0;
         chrome.scripting.executeScript = async details => {
           const results = await execute(details);
           if (details.func.toString().includes("geminiDraftFillAttempts")) {
@@ -2177,19 +2385,6 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
             }
           }
           return results;
-        };
-        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
-        chrome.runtime.connectNative = (...args) => {
-          const port = connect(...args);
-          const post = port.postMessage.bind(port);
-          port.postMessage = message => {
-            if (scenario === "completion-request-loss" && message.kind === "complete_gemini_fill") {
-              globalThis.syntheticFillCompletionDrops++;
-              return;
-            }
-            post(message);
-          };
-          return port;
         };
       }, { scenario: outcome, ...selected });
       const nativeInsertCalls = () => worker.evaluate(async target => {
@@ -2424,30 +2619,10 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
   });
 }
 
-test("test-only Gemini host access carries exact synthetic rows and later observations", { timeout: 20000 }, async () => {
+test("test-only Gemini host access carries exact synthetic rows and later observations", { timeout: 20000 }, async testContext => {
+  const setPhase = trackTestPhase(testContext, "Gemini read workflow");
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-read-test-"));
-  const nativeWatchPidPath = join(profile, "native-watch.json");
-  const nativeWatchHarness = join(profile, "native-watch-relay.mjs");
-  await writeFile(nativeWatchHarness, `import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
-import { NativeFrameDecoder } from ${JSON.stringify(fileURLToPath(new URL("../../packages/companion/dist/native-framing.js", import.meta.url)))};
-const relay = spawn(process.execPath, [${JSON.stringify(nativeRelayPath)}, ...process.argv.slice(2)], { stdio: ["pipe", "pipe", "inherit"] });
-const decoder = new NativeFrameDecoder();
-let marked = false;
-process.stdin.on("data", chunk => {
-  for (const request of decoder.push(chunk)) {
-    if (!marked && request.kind === "list_gemini_read_challenges") {
-      writeFileSync(${JSON.stringify(nativeWatchPidPath)}, JSON.stringify({ pid: relay.pid, parent: process.pid }), { mode: 0o600 });
-      marked = true;
-    }
-  }
-});
-process.stdin.pipe(relay.stdin);
-relay.stdout.pipe(process.stdout);
-relay.once("close", code => process.exit(code ?? 1));
-relay.once("error", () => process.exit(1));
-process.on("SIGTERM", () => relay.kill("SIGTERM"));
-`, { mode: 0o600 });
+  const nativeWatch = await createNativeWatchHarness(profile, "list_gemini_read_challenges");
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
   const manifestPath = join(unpacked, "manifest.json");
@@ -2468,7 +2643,7 @@ process.on("SIGTERM", () => relay.kill("SIGTERM"));
     });
     const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
-    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeWatchHarness, profile));
+    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeWatch.relayPath, profile));
     broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
     brokerExit = once(broker, "exit");
     let ready = false;
@@ -2558,6 +2733,7 @@ process.on("SIGTERM", () => relay.kill("SIGTERM"));
     const prepared = await facade.prepareGeminiMessage(state.payload.connectionId, 1,
       "Synthetic trusted Gemini consent only", "c66b3997-9d43-4554-8399-267d1fe9f75c");
     if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected private Gemini candidate");
+    setPhase("supervised consent boundaries");
     const reviewArgs = { tabId: selected.tabId, expectedUrl: url };
     assert.equal(await popup.locator("#view-fixture-send-reviews").isVisible(), true);
     assert.equal(await popup.locator("#view-fixture-send-reviews").textContent(), "Review Gemini send consent");
@@ -2658,14 +2834,8 @@ process.on("SIGTERM", () => relay.kill("SIGTERM"));
     assert.equal("url" in read.payload, false);
     assert.equal(JSON.stringify(read.payload).includes("Private draft"), false);
     assert.equal(await worker.evaluate(() => globalThis.syntheticGeminiWatches.length), 1);
-    const nativeWatch = JSON.parse(await readFile(nativeWatchPidPath, "utf8"));
-    assert.ok(Number.isSafeInteger(nativeWatch.pid) && nativeWatch.pid > 0);
-    assert.ok(Number.isSafeInteger(nativeWatch.parent) && nativeWatch.parent > 0);
-    assert.equal((await stat(`/proc/${nativeWatch.pid}`)).uid, process.getuid());
-    assert.equal((await readFile(`/proc/${nativeWatch.parent}/cmdline`, "utf8")).split("\0").includes(nativeWatchHarness), true);
-    assert.equal((await readFile(`/proc/${nativeWatch.pid}/cmdline`, "utf8")).split("\0").includes(nativeRelayPath), true);
-    assert.equal(Number((await readFile(`/proc/${nativeWatch.pid}/status`, "utf8")).match(/^PPid:\s+(\d+)$/m)?.[1]), nativeWatch.parent);
-    process.kill(nativeWatch.pid, "SIGTERM");
+    setPhase("read-watch recovery");
+    await stopNativeWatch(nativeWatch);
     const recoveryStarted = performance.now();
     const afterNativeLoss = await facade.readApprovedSnapshot(state.payload.connectionId);
     assert.equal(afterNativeLoss.kind, "gemini_snapshot", `Stopped native watch did not recover without reapproval: ${JSON.stringify({
@@ -2713,6 +2883,7 @@ process.on("SIGTERM", () => relay.kill("SIGTERM"));
     assert.equal(JSON.stringify(observed.events).includes("Private draft"), false);
 
     const manager = await context.newPage();
+    setPhase("worker wake");
     await manager.goto("chrome://extensions/");
     const serviceWorkers = await context.newCDPSession(manager);
     let confirmStopped;
@@ -2758,6 +2929,7 @@ process.on("SIGTERM", () => relay.kill("SIGTERM"));
 
     const second = await facade.requestConnection();
     if (second.kind !== "connection_requested") throw new Error("Expected another synthetic Gemini request");
+    setPhase("read-window and revocation boundaries");
     await page.bringToFront();
     const secondApproval = await popup.evaluate(({ tabId, expectedUrl, pendingRequestId }) => chrome.runtime.sendMessage({
       kind: "approve_gemini", tabId, expectedUrl, pendingRequestId

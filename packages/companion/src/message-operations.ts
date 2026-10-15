@@ -905,9 +905,10 @@ export class PreparedMessageOperations {
     return { attemptId, result };
   }
 
-  listGeminiFillChallenges(now = Date.now()) {
+  listGeminiFillChallenges(now = Date.now(), autonomous = false) {
     this.discardExpired(now);
-    return [...this.geminiFillChecks].filter(([, pending]) => !pending.issued).map(([attemptId, pending]) => {
+    return [...this.geminiFillChecks].filter(([, pending]) => !pending.issued
+      && (this.geminiContents.get(pending.operationId)?.autonomous === true) === autonomous).map(([attemptId, pending]) => {
       pending.issued = true;
       return Object.freeze({ attemptId, operationId: pending.operationId, target: pending.target,
         text: pending.text, expiresAt: pending.expiresAt });
@@ -1232,14 +1233,15 @@ export class PreparedMessageOperations {
     return { attemptId, result };
   }
 
-  listFixtureFillChallenges(now = Date.now()) {
+  listFixtureFillChallenges(now = Date.now(), autonomous = false) {
     for (const [attemptId, pending] of this.fillChecks) {
       const state = this.getOperation(pending.owner, pending.operationId, now).state;
       if (pending.expiresAt <= now || (state !== "approved" && state !== "prepared")) {
         this.finishFillCheck(attemptId, null, now);
       }
     }
-    return [...this.fillChecks].map(([attemptId, pending]) => Object.freeze({
+    return [...this.fillChecks].filter(([, pending]) => (this.contents.get(pending.operationId)?.autonomous === true) === autonomous)
+      .map(([attemptId, pending]) => Object.freeze({
       attemptId, operationId: pending.operationId, target: pending.target, text: pending.text, expiresAt: pending.expiresAt
     }));
   }
@@ -1368,12 +1370,12 @@ export class PreparedMessageOperations {
     return { checkId: check.checkId, result };
   }
 
-  listGeminiDispatchChecks(now = Date.now()) {
+  listGeminiDispatchChecks(now = Date.now(), autonomous = false) {
     this.discardExpired(now);
     this.discardInvalidGeminiDispatchChecks(now);
     const offered: Readonly<{ operationId: string; checkId: string; target: GeminiTarget; text: string; expiresAt: number }>[] = [];
     for (const [operationId, check] of this.geminiDispatchChecks) {
-      if (check.checkedAt !== null || check.issued) continue;
+      if (check.checkedAt !== null || check.issued || (this.geminiContents.get(operationId)?.autonomous === true) !== autonomous) continue;
       this.geminiDispatchChecks.set(operationId, Object.freeze({ ...check, issued: true }));
       offered.push(Object.freeze({ operationId, checkId: check.checkId, target: check.target, text: check.text, expiresAt: check.expiresAt }));
     }
@@ -1444,7 +1446,7 @@ export class PreparedMessageOperations {
       text: check.text, expiresAt: check.expiresAt });
   }
 
-  listFixtureDispatchChecks(now = Date.now()) {
+  listFixtureDispatchChecks(now = Date.now(), autonomous = false) {
     this.discardExpired(now);
     for (const [operationId, check] of this.dispatchChecks) {
       try {
@@ -1457,7 +1459,8 @@ export class PreparedMessageOperations {
         this.discardFixtureDispatchCheck(operationId);
       }
     }
-    return [...this.dispatchChecks].filter(([, check]) => check.checkedAt === null)
+    return [...this.dispatchChecks].filter(([operationId, check]) => check.checkedAt === null
+      && (this.contents.get(operationId)?.autonomous === true) === autonomous)
       .map(([operationId, check]) => Object.freeze({ operationId, checkId: check.checkId,
         target: check.target, text: check.text, expiresAt: check.expiresAt }));
   }
@@ -1502,7 +1505,9 @@ export class PreparedMessageOperations {
     const operation = this.geminiContents.get(operationId);
     const approval = this.approvals.get(operationId);
     const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
-    if (!operation || operation.owner !== owner || !approval || approval.expiresAt <= now || !live
+    const authorized = operation?.autonomous ? this.getAutonomousPhaseAuthorization(owner, operationId, "send", now)
+      : approval && approval.expiresAt > now;
+    if (!operation || operation.owner !== owner || !authorized || !live
       || !this.sameGeminiTarget(operation.target, live)) throw new Error("APPROVAL_REQUIRED");
     if (!this.getGeminiSendAuthorization(owner, operationId, now)) throw new Error("SEND_APPROVAL_REQUIRED");
     if (!this.database.prepare("SELECT 1 FROM message_operation_recovery WHERE operation_id = ?").get(operationId)) {
@@ -1543,7 +1548,9 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     const approval = this.approvals.get(operationId);
     const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
-    if (!operation || operation.owner !== owner || !approval || approval.expiresAt <= now || !live
+    const authorized = operation?.autonomous ? this.getAutonomousPhaseAuthorization(owner, operationId, "send", now)
+      : approval && approval.expiresAt > now;
+    if (!operation || operation.owner !== owner || !authorized || !live
       || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
       || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId) {
       throw new Error("APPROVAL_REQUIRED");
@@ -1610,7 +1617,7 @@ export class PreparedMessageOperations {
     if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") {
       throw new Error("DISPATCH_UNCERTAIN");
     }
-    if (status.state !== "approved") throw new Error("APPROVAL_REQUIRED");
+    if (status.state !== "approved" && status.state !== "prepared") throw new Error("APPROVAL_REQUIRED");
     if (this.dispatchJobs.size + this.geminiDispatchJobs.size >= MAX_PENDING_FIXTURE_DISPATCHES) throw new Error("DISPATCH_CHECK_BUSY");
     const authorization = this.getGeminiSendAuthorization(owner, operationId, now);
     const proof = this.getGeminiDispatchProof(owner, operationId, checkId, now);
@@ -1774,7 +1781,7 @@ export class PreparedMessageOperations {
   }
 
   listChatSubmitJobs(provider: "fixture" | "gemini", now = Date.now()) {
-    const attempts = provider === "gemini" ? this.listGeminiDispatchAttempts(now) : this.listFixtureDispatchAttempts(now);
+    const attempts = provider === "gemini" ? this.listGeminiDispatchAttempts(now) : this.listFixtureDispatchAttempts(now, true);
     return attempts.map(attempt => Object.freeze(chatSubmitJobSchema.parse({ operationId: attempt.operationId, jobId: attempt.attemptId,
       phase: "submit" as const, target: Object.freeze({ ...attempt.target, provider }),
       text: attempt.text, expiresAt: attempt.expiresAt })));
@@ -1796,8 +1803,8 @@ export class PreparedMessageOperations {
 
   listChatJobs(phase: ChatJob["phase"], provider: "fixture" | "gemini", now = Date.now()) {
     if (phase === "submit") return this.listChatSubmitJobs(provider, now);
-    const checks = phase === "fill" ? provider === "gemini" ? this.listGeminiFillChallenges(now) : this.listFixtureFillChallenges(now)
-      : provider === "gemini" ? this.listGeminiDispatchChecks(now) : this.listFixtureDispatchChecks(now);
+    const checks = phase === "fill" ? provider === "gemini" ? this.listGeminiFillChallenges(now, true) : this.listFixtureFillChallenges(now, true)
+      : provider === "gemini" ? this.listGeminiDispatchChecks(now, true) : this.listFixtureDispatchChecks(now, true);
     const jobs: ChatJob[] = [];
     for (const check of checks) {
       const jobId = "attemptId" in check ? check.attemptId : check.checkId;
@@ -1844,7 +1851,7 @@ export class PreparedMessageOperations {
     if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") {
       throw new Error("DISPATCH_UNCERTAIN");
     }
-    if (status.state !== "approved") throw new Error("APPROVAL_REQUIRED");
+    if (status.state !== "approved" && status.state !== "prepared") throw new Error("APPROVAL_REQUIRED");
     if (this.dispatchJobs.size + this.geminiDispatchJobs.size >= MAX_PENDING_FIXTURE_DISPATCHES) throw new Error("DISPATCH_CHECK_BUSY");
     const started = this.recordFixtureDispatchStart(owner, operationId, now, checkId);
     const authorization = this.consumeFixtureDispatchAuthorization(owner, operationId, now);
@@ -1858,12 +1865,13 @@ export class PreparedMessageOperations {
     return { operationId, result };
   }
 
-  listFixtureDispatchAttempts(now = Date.now()) {
+  listFixtureDispatchAttempts(now = Date.now(), includeAutonomous = false) {
     this.discardExpired(now);
     const attempts: Array<Readonly<{ operationId: string; attemptId: string; target: FixtureTarget;
       text: string; expiresAt: number }>> = [];
     for (const [operationId, pending] of this.dispatchJobs) {
       const operation = this.contents.get(operationId);
+      if (operation?.autonomous && !includeAutonomous) continue;
       const live = operation && this.requests.getApprovedTarget(pending.owner, operation.connectionId, now);
       const intent = this.database.prepare("SELECT state, started_at FROM message_dispatch_attempts WHERE operation_id = ?")
         .get(operationId) as { state: string; started_at: number } | undefined;

@@ -7,7 +7,7 @@ import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS }
   from "./pending-connections.js";
 
-test("neutral submit jobs are strict relay-only phase commands and commits stay facade-owned", () => {
+test("neutral jobs are strict relay-only phase commands and commits stay facade-owned", () => {
   const requests = new PendingConnectionRequests();
   const database = new DatabaseSync(":memory:");
   const operations = new PreparedMessageOperations(requests, database);
@@ -17,6 +17,21 @@ test("neutral submit jobs are strict relay-only phase commands and commits stay 
   const target = { provider: "gemini", origin: "https://gemini.google.com", conversationId: "synthetic-neutral-phase",
     url: "https://gemini.google.com/app/synthetic-neutral-phase", tabId: 4, documentId: "synthetic-neutral-phase" } as const;
   try {
+    for (const phase of ["fill", "proof", "submit"]) {
+      const listing = { ...envelope, kind: "list_chat_jobs", payload: { phase, provider: "gemini" } };
+      const observation = phase === "submit" ? { ok: true, editor: "contenteditable", activated: true }
+        : phase === "proof" ? { ok: true, editor: "contenteditable", draftText: "Synthetic neutral draft",
+          selected: true, writable: true, submitReady: true } : { ok: true, editor: "contenteditable" };
+      const completion = { ...envelope, kind: "complete_chat_job", payload: { target, phase,
+        operationId: envelope.requestId, jobId: envelope.requestId, observation } };
+      for (const message of [listing, completion]) {
+        assert.deepEqual(handleBrokerRequest(message, "facade", owner, requests, 2000, operations).payload, { code: "PERMISSION_DENIED" });
+        assert.throws(() => handleBrokerRequest({ ...message, payload: { ...message.payload, approved: true } },
+          "relay", Symbol("relay"), requests, 2000, operations));
+      }
+      assert.deepEqual(handleBrokerRequest(listing, "relay", Symbol("relay"), requests, 2000, operations).payload, { jobs: [] });
+      assert.deepEqual(handleBrokerRequest(completion, "relay", Symbol("relay"), requests, 2000, operations).payload, { accepted: false });
+    }
     const listing = { ...envelope, kind: "list_chat_jobs", payload: { phase: "submit", provider: "gemini" } };
     assert.deepEqual(handleBrokerRequest(listing, "facade", owner, requests, 2000, operations).payload, { code: "PERMISSION_DENIED" });
     assert.deepEqual(handleBrokerRequest(listing, "relay", Symbol("relay"), requests, 2000, operations),

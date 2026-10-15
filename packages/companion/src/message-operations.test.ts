@@ -219,7 +219,7 @@ test("autonomous composer waiting is owned, deadline-bound and shared with legac
   }
 });
 
-test("neutral autonomous fill and proof jobs reuse bounded queues without supervised approvals", async () => {
+test("neutral autonomous phases reuse bounded queues without supervised approvals", async () => {
   for (const provider of ["fixture", "gemini"] as const) {
     const database = new DatabaseSync(":memory:");
     const requests = new PendingConnectionRequests();
@@ -239,6 +239,7 @@ test("neutral autonomous fill and proof jobs reuse bounded queues without superv
       const filling = ledger.requestChatFill(owner, prepared.operationId, now, prepared.expiresAt);
       assert.ok(filling && filling !== "busy");
       assert.equal(ledger.requestChatFill(owner, prepared.operationId), null);
+      assert.deepEqual(provider === "gemini" ? ledger.listGeminiFillChallenges() : ledger.listFixtureFillChallenges(), []);
       const job = ledger.listChatJobs("fill", provider)[0]!;
       assert.equal(job.operationId, prepared.operationId);
       assert.equal(job.phase, "fill");
@@ -261,6 +262,7 @@ test("neutral autonomous fill and proof jobs reuse bounded queues without superv
       const checking = ledger.requestChatProof(owner, prepared.operationId, Date.now(), prepared.expiresAt);
       assert.notEqual(checking, "busy");
       if (checking === "busy") throw new Error("Expected neutral proof job");
+      assert.deepEqual(provider === "gemini" ? ledger.listGeminiDispatchChecks() : ledger.listFixtureDispatchChecks(), []);
       const proof = ledger.listChatJobs("proof", provider)[0]!;
       assert.equal(proof.jobId, checking.checkId);
       assert.deepEqual(ledger.listChatJobs("proof", provider), []);
@@ -270,6 +272,22 @@ test("neutral autonomous fill and proof jobs reuse bounded queues without superv
       assert.equal(await checking.result, true);
       assert.equal(ledger.completeChatJob(proof.target, prepared.operationId, proof.jobId, "proof", proofObservation), false);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+      const submitting = provider === "gemini"
+        ? ledger.requestGeminiDispatch(owner, prepared.operationId, proof.jobId, Date.now(), prepared.expiresAt)
+        : ledger.requestFixtureDispatch(owner, prepared.operationId, proof.jobId, Date.now(), prepared.expiresAt);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      if (provider === "fixture") assert.deepEqual(ledger.listFixtureDispatchAttempts(), []);
+      const submit = ledger.listChatJobs("submit", provider)[0]!;
+      assert.equal(submit.jobId, prepared.operationId);
+      assert.equal(submit.expiresAt <= proof.expiresAt, true);
+      assert.deepEqual(ledger.listChatJobs("submit", provider), []);
+      const submitObservation = provider === "gemini"
+        ? { ok: true as const, editor: "contenteditable" as const, activated: true as const }
+        : { ok: true as const, editor: "textarea" as const, activated: true as const };
+      assert.equal(ledger.completeChatJob(submit.target, prepared.operationId, submit.jobId, "submit", submitObservation), true);
+      assert.equal((await submitting.result).state, "dispatch_uncertain");
+      assert.equal(ledger.completeChatJob(submit.target, prepared.operationId, submit.jobId, "submit", submitObservation), false);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
     } finally {
       ledger.disconnect(owner);
       requests.disconnect(owner);

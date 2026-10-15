@@ -6,7 +6,7 @@ import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
 import { fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
-  geminiFillStatusSchema, chatSubmitJobSchema, type ChatTarget, type GeminiDispatchResult,
+  geminiFillStatusSchema, chatJobSchema, type ChatJob, type ChatTarget, type ChatJobObservation,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureDispatchCheckResult,
@@ -322,7 +322,9 @@ const replySchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("chat_jobs"), protocolVersion: z.literal(PROTOCOL_VERSION), requestId: z.uuid(),
     connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
-    payload: z.strictObject({ jobs: z.array(chatSubmitJobSchema).max(MAX_PENDING_FIXTURE_DISPATCHES) })
+    payload: z.strictObject({ jobs: z.array(chatJobSchema).max(MAX_PENDING_FIXTURE_DISPATCH_CHECKS) })
+      .refine(({ jobs }) => jobs.length <= (jobs[0]?.phase === "proof" ? MAX_PENDING_FIXTURE_DISPATCH_CHECKS : MAX_PENDING_FIXTURE_DISPATCHES)
+        && jobs.every(job => job.phase === jobs[0]?.phase && job.target.provider === jobs[0]?.target.provider))
   }),
   z.strictObject({
     kind: z.literal("chat_job_recorded"), protocolVersion: z.literal(PROTOCOL_VERSION), requestId: z.uuid(),
@@ -706,9 +708,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       dispatchFixtureMessage: (operationId: string, checkId: string) => request("dispatch_fixture_message", { operationId, checkId }),
       commitFixtureMessage: (operationId: string) => request("commit_fixture_message", { operationId }),
       commitPreparedMessage: (operationId: string) => request("commit_prepared_message", { operationId }),
-      listChatJobs: (phase: "submit", provider: "fixture" | "gemini") => request("list_chat_jobs", { phase, provider }),
-      completeChatJob: (target: ChatTarget, operationId: string, jobId: string, phase: "submit",
-        observation: FixtureDispatchResult | GeminiDispatchResult) => request("complete_chat_job", { target, operationId, jobId, phase, observation }),
+      listChatJobs: (phase: ChatJob["phase"], provider: "fixture" | "gemini") => request("list_chat_jobs", { phase, provider }),
+      completeChatJob: (target: ChatTarget, operationId: string, jobId: string, phase: ChatJob["phase"],
+        observation: ChatJobObservation) => request("complete_chat_job", { target, operationId, jobId, phase, observation }),
       listFixtureDispatchAttempts: () => request("list_fixture_dispatch_attempts", {}),
       completeFixtureDispatch: (target: FixtureTarget, operationId: string, attemptId: string,
         observation: FixtureDispatchResult) => request("complete_fixture_dispatch", { target, operationId, attemptId, observation }),

@@ -43,36 +43,44 @@ const request = {
   payload: {}
 };
 
-test("native neutral submit jobs validate phase, provider, exact target and one activation observation", () => {
+test("native neutral jobs validate phase, provider, exact target and phase-specific observations", () => {
   for (const target of [
     { provider: "fixture", origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-neutral" },
     { provider: "gemini", origin: "https://gemini.google.com", conversationId: "synthetic-neutral", tabId: 4,
       documentId: "synthetic-neutral", url: "https://gemini.google.com/app/synthetic-neutral?hl=en" }
   ]) {
-    const listing = { ...request, kind: "list_chat_jobs", payload: { phase: "submit", provider: target.provider } };
-    assert.deepEqual(parseNativeChatJobRequest(listing, now), listing);
-    const completion = { ...request, kind: "complete_chat_job", payload: { target, phase: "submit", operationId: request.requestId,
-      jobId: request.requestId, observation: { ok: true, editor: target.provider === "gemini" ? "contenteditable" : "textarea", activated: true } } };
-    assert.deepEqual(parseNativeChatJobRequest(completion, now), completion);
-    for (const message of [listing, completion]) {
-      for (const invalid of [
-        { ...message, deadlineMs: now }, { ...message, deadlineMs: now + 30_001 },
-        { ...message, payload: { ...message.payload, approved: true } },
-        { ...message, payload: { ...message.payload, phase: "fill" } },
-        { ...message, payload: { ...message.payload, selector: "button" } }
-      ]) assert.throws(() => parseNativeChatJobRequest(invalid, now), /Invalid native chat job request/);
-    }
-    assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
-      jobId: randomUUID() } }, now));
-    assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
-      observation: { ...completion.payload.observation, editor: target.provider === "gemini" ? "textarea" : "contenteditable" } } }, now));
-    assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
-      observation: { ...completion.payload.observation, delivered: true } } }, now));
-    if (target.provider === "gemini") {
-      for (const url of ["https://gemini.google.com/app/other", `${target.url}#fragment`,
-        "https://gemini.google.com/not-app/synthetic-neutral", "https://example.com/app/synthetic-neutral"]) {
-        assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
-          target: { ...target, url } } }, now));
+    for (const phase of ["fill", "proof", "submit"]) {
+      const listing = { ...request, kind: "list_chat_jobs", payload: { phase, provider: target.provider } };
+      assert.deepEqual(parseNativeChatJobRequest(listing, now), listing);
+      const editor = target.provider === "gemini" ? "contenteditable" : "textarea";
+      const observation = phase === "submit" ? { ok: true, editor, activated: true }
+        : phase === "proof" ? { ok: true, editor, draftText: "Synthetic neutral draft",
+          selected: true, writable: true, submitReady: true } : { ok: true, editor };
+      const completion = { ...request, kind: "complete_chat_job", payload: { target, phase, operationId: request.requestId,
+        jobId: phase === "submit" ? request.requestId : randomUUID(), observation } };
+      assert.deepEqual(parseNativeChatJobRequest(completion, now), completion);
+      for (const message of [listing, completion]) {
+        for (const invalid of [
+          { ...message, deadlineMs: now }, { ...message, deadlineMs: now + 30_001 },
+          { ...message, payload: { ...message.payload, approved: true } },
+          { ...message, payload: { ...message.payload, phase: "execute" } },
+          { ...message, payload: { ...message.payload, selector: "button" } }
+        ]) assert.throws(() => parseNativeChatJobRequest(invalid, now), /Invalid native chat job request/);
+      }
+      if (phase === "submit") assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+        jobId: randomUUID() } }, now));
+      assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+        observation: { ...observation, editor: target.provider === "gemini" ? "textarea" : "contenteditable" } } }, now));
+      assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+        observation: { ...observation, delivered: true } } }, now));
+      assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+        observation: phase === "fill" ? { ok: true, editor, activated: true } : { ok: true, editor } } }, now));
+      if (target.provider === "gemini") {
+        for (const url of ["https://gemini.google.com/app/other", `${target.url}#fragment`,
+          "https://gemini.google.com/not-app/synthetic-neutral", "https://example.com/app/synthetic-neutral"]) {
+          assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+            target: { ...target, url } } }, now));
+        }
       }
     }
   }
