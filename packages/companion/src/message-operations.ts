@@ -22,6 +22,7 @@ export const MAX_PENDING_FIXTURE_FILLS = 1;
 export const FIXTURE_DISPATCH_CHECK_TIMEOUT_MS = 4_000;
 export const MAX_PENDING_FIXTURE_DISPATCH_CHECKS = 16;
 export const MAX_PENDING_FIXTURE_DISPATCHES = 1;
+export const CHAT_SETTLE_TIMEOUT_MS = 5_000;
 export const DEFAULT_MAX_SENDS_PER_HOUR = 60;
 const SEND_RATE_WINDOW_MS = 60 * 60_000;
 export const fixtureDispatchResultSchema = z.discriminatedUnion("ok", [
@@ -1786,7 +1787,7 @@ export class PreparedMessageOperations {
         const dispatching = operation.target.origin === "https://gemini.google.com"
           ? this.requestGeminiDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt)
           : this.requestFixtureDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt);
-        return await dispatching.result;
+        return await this.settleAutonomousDispatch(owner, operationId, expiresAt, await dispatching.result);
       } finally {
         this.releaseComposer(owner, operationId);
       }
@@ -1796,6 +1797,21 @@ export class PreparedMessageOperations {
     });
     this.autonomousCommits.set(operationId, Object.freeze({ owner, result }));
     return result;
+  }
+
+  private async settleAutonomousDispatch(owner: symbol, operationId: string, deadlineMs: number, status: FixtureDispatchStatus) {
+    const expiresAt = Math.min(deadlineMs, Date.now() + CHAT_SETTLE_TIMEOUT_MS);
+    while (status.state === "dispatch_uncertain" && Date.now() < expiresAt) {
+      const authorization = this.getAutonomousAuthorization(owner, operationId);
+      if (!authorization) break;
+      const observed = authorization.target.origin === "https://gemini.google.com"
+        ? this.reconcileGeminiObservation(owner, operationId) : this.reconcileFixtureObservation(owner, operationId);
+      if (observed.state === "observed_in_ui" || observed.state === "resolved") return observed;
+      const remainingMs = expiresAt - Date.now();
+      if (remainingMs <= 0) break;
+      await new Promise<void>(done => setTimeout(done, Math.min(25, remainingMs)));
+    }
+    return status;
   }
 
   async commitPreparedMessage(owner: symbol, operationId: string, deadlineMs: number) {

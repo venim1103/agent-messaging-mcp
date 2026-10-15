@@ -1635,6 +1635,7 @@ for (const provider of ["fixture", "gemini"]) {
 for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
   ["failure", "lifetime", "reload", "reload-failure"].map(scenario => ({ provider, scenario })))) {
   test(`${provider} popup autonomous admission (${scenario}) is per agent and preserves other owners`, { timeout: 20000 }, async (testContext) => {
+    const setPhase = trackTestPhase(testContext, `${provider} admission ${scenario}`);
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-autonomous-test-"));
     const unpacked = join(profile, "unpacked-extension");
     await cp(extensionDirectory, unpacked, { recursive: true });
@@ -1687,6 +1688,7 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
       const options = { command: process.execPath, args: [mcpEntry],
         env: { ...process.env, HOME: profile, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
       delete options.env.BROWSER_CHAT_AGENT_LABEL;
+      setPhase("MCP startup");
       await Promise.all(clients.map(client => client.connect(new StdioClientTransport(options))));
       for (const client of clients) {
         assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
@@ -1764,6 +1766,7 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
         { connections: [], timedOut: true });
       const key = `${provider}-grant-${selected.tabId}`;
       assert.equal(await worker.evaluate(async key => (await chrome.storage.session.get(key))[key].expiresAt, key), null);
+      setPhase("approved owner reads");
       const firstRead = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: first.connectionId } });
       assert.equal(firstRead.isError, undefined);
       await row("Autonomous two").getByRole("button", { name: "Connect this chat" }).click();
@@ -1773,6 +1776,7 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
       const otherRead = await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } });
       assert.equal(otherRead.isError, undefined);
       assert.notDeepEqual(otherRead.structuredContent.cursor, firstRead.structuredContent.cursor);
+      setPhase("owner removal and lifecycle");
       if (scenario === "failure") {
         await popup.locator("#agent-panel").screenshot({ path: join(tmpdir(), `agent-messaging-${provider}-autonomous.png`) });
       }
@@ -1875,20 +1879,37 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
         assert.deepEqual((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).structuredContent.cursor,
           otherRead.structuredContent.cursor);
       } else {
+        setPhase("first MCP close");
         await clients[0].close();
+        setPhase("replacement MCP startup");
         later = new Client({ name: "Autonomous later", version: "0.0.1" });
         clients.push(later);
         await later.connect(new StdioClientTransport(options));
         assert.deepEqual((await later.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
           { connections: [], timedOut: true });
-        await popup.getByRole("button", { name: "Refresh agents" }).click();
+        setPhase("replacement owner approval");
+        const replacementRefresh = popup.getByRole("button", { name: "Refresh agents" });
+        assert.equal(await replacementRefresh.isVisible(), true);
+        assert.equal(await replacementRefresh.isEnabled(), true);
+        await replacementRefresh.press("Enter");
         await waitCount(1);
-        await row("Autonomous later").getByRole("button", { name: "Connect this chat" }).click();
+        setPhase("replacement approval click");
+        const replacementApproval = row("Autonomous later").getByRole("button", { name: "Connect this chat" });
+        assert.equal(await replacementApproval.isVisible(), true);
+        assert.equal(await replacementApproval.isEnabled(), true);
+        await replacementApproval.press("Enter");
+        setPhase("replacement approval result");
         await waitCount(2);
+        setPhase("replacement connection pickup");
         const latePickup = await later.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
         const late = latePickup.structuredContent.connections[0];
         assert.notEqual(late.connectionId, first.connectionId);
+        const laterPermissions = await popup.evaluate(() => globalThis.agentPermissionRequests);
+        assert.equal(laterPermissions.length, 4);
+        assert.ok(laterPermissions.every(request => request.gesture === true
+          && JSON.stringify(request.origins) === JSON.stringify([`${new URL(url).origin}/*`])));
       }
+      setPhase("tab-close revocation");
       await page.close();
       let ended = false;
       for (let attempt = 0; attempt < 80; attempt++) {
@@ -1904,11 +1925,13 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
           { connections: [], timedOut: true });
       }
     } finally {
+      setPhase("cleanup");
       await Promise.all(clients.map(client => client.close().catch(() => {})));
       await context?.close();
       broker?.kill("SIGTERM");
       if (brokerExit) await brokerExit;
       await rm(profile, { recursive: true, force: true });
+      setPhase("complete");
     }
   });
 }
@@ -1957,20 +1980,22 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
     if (outcome === "lost_native_completion") {
-      await worker.evaluate(provider => {
+      await worker.evaluate(({ provider, autonomous }) => {
         const connect = chrome.runtime.connectNative.bind(chrome.runtime);
         chrome.runtime.connectNative = (...args) => {
           const port = connect(...args);
           const post = port.postMessage.bind(port);
           port.postMessage = message => {
-            if (message.kind === (provider === "gemini" ? "complete_chat_job" : "complete_fixture_dispatch")) {
+            if (message.kind === (autonomous || provider === "gemini" ? "complete_chat_job" : "complete_fixture_dispatch")
+              && (!autonomous || message.payload?.phase === "submit")) {
+              globalThis.fixtureDroppedCompletionCount = (globalThis.fixtureDroppedCompletionCount ?? 0) + 1;
               globalThis.fixtureDroppedCompletion = true; return;
             }
             post(message);
           };
           return port;
         };
-      }, provider);
+      }, { provider, autonomous });
     }
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     facade = await connectBroker("facade", directory, undefined, undefined,
@@ -2008,6 +2033,21 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       globalThis.fixtureSubmitCount = 0;
       document.querySelector("#composer").addEventListener("submit", () => { globalThis.fixtureSubmitCount++; });
     });
+    if (autonomous && outcome === "delayed") await fixture.evaluate(provider => {
+      const timeline = document.querySelector(provider === "gemini" ? "infinite-scroller" : "#messages");
+      const append = timeline.append.bind(timeline);
+      const appendChild = timeline.appendChild.bind(timeline);
+      globalThis.fixtureDeferredAppends = 0;
+      timeline.append = (...nodes) => {
+        globalThis.fixtureDeferredAppends++;
+        setTimeout(() => append(...nodes), 150);
+      };
+      timeline.appendChild = node => {
+        globalThis.fixtureDeferredAppends++;
+        setTimeout(() => appendChild(node), 150);
+        return node;
+      };
+    }, provider);
     const selected = await worker.evaluate(async provider => {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const [identity] = await chrome.scripting.executeScript({ target: { tabId: tab.id },
@@ -2040,12 +2080,27 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       assert.match(prepared.recoveryToken, /^[0-9a-f]{64}$/);
       assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 0);
       await fixture.bringToFront();
+      if (outcome === "lost_script") await worker.evaluate(operationId => {
+        const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+        globalThis.autonomousLostSubmitResults = 0;
+        chrome.scripting.executeScript = async options => {
+          const result = await execute(options);
+          if (options.args?.[0]?.attemptId === operationId) {
+            globalThis.autonomousLostSubmitResults++;
+            throw new Error("Synthetic lost autonomous submit result");
+          }
+          return result;
+        };
+      }, prepared.operationId);
       const dispatch = await facade.commitPreparedMessage(prepared.operationId, deadlineMs);
       setPhase("autonomous status and replay");
       assert.equal(dispatch.kind, "chat_dispatch");
       assert.equal(dispatch.deadlineMs, deadlineMs);
       assert.equal(dispatch.payload.state, provider === "gemini" ? "resolved" : "observed_in_ui");
       assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
+      if (outcome === "delayed") assert.equal(await fixture.evaluate(() => globalThis.fixtureDeferredAppends), 1);
+      if (outcome === "lost_script") assert.equal(await worker.evaluate(() => globalThis.autonomousLostSubmitResults), 1);
+      if (outcome === "lost_native_completion") assert.equal(await worker.evaluate(() => globalThis.fixtureDroppedCompletionCount), 1);
       assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
         (provider === "gemini" ? 1 : 2) + 1);
       assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
@@ -2292,10 +2347,12 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
 }
 
 for (const provider of ["fixture", "gemini"]) {
-  test(`autonomous ${provider} worker sends once after one popup connection approval`, { timeout: 15000 }, async testContext => {
-    testContext.signal.throwIfAborted();
-    await exerciseChatDispatch("observed", provider, testContext, true);
-  });
+  for (const outcome of ["observed", "delayed", "lost_script", "lost_native_completion"]) {
+    test(`autonomous ${provider} worker sends once after one popup connection approval (${outcome})`, { timeout: 15000 }, async testContext => {
+      testContext.signal.throwIfAborted();
+      await exerciseChatDispatch(outcome, provider, testContext, true);
+    });
+  }
 }
 
 test("private fixture submit activates once and stays uncertain after lost results or changed controls", { timeout: 30000 }, async testContext => {
