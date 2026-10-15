@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
 import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget,
-  type GeminiSnapshot } from "./pending-connections.js";
+  type FixtureSnapshot, type GeminiSnapshot } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
 export const FIXTURE_REVIEW_APPROVAL_TTL_MS = 2 * 60_000;
@@ -71,7 +71,7 @@ export const chatTargetSchema = z.discriminatedUnion("provider", [
 ]);
 export type ChatTarget = z.infer<typeof chatTargetSchema>;
 export const chatSubmitResultSchema = z.union([fixtureDispatchResultSchema, geminiDispatchResultSchema]);
-export const chatJobSchema = z.strictObject({ operationId: z.uuid(), jobId: z.uuid(), phase: z.enum(["fill", "proof", "submit"]),
+export const chatJobSchema = z.strictObject({ operationId: z.uuid(), jobId: z.uuid(), phase: z.enum(["fill", "proof", "submit", "settle"]),
   target: chatTargetSchema, text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES)
     .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES), expiresAt: z.number().int().safe() })
   .refine(job => (job.phase !== "submit" || job.jobId === job.operationId) && (job.target.provider !== "gemini"
@@ -105,6 +105,8 @@ const chatCompletionIdentity = { target: chatTargetSchema, operationId: z.uuid()
 export const chatJobCompletionSchema = z.discriminatedUnion("phase", [
   z.strictObject({ ...chatCompletionIdentity, phase: z.literal("fill"), observation: z.union([fixtureFillResultSchema, geminiFillResultSchema]) }),
   z.strictObject({ ...chatCompletionIdentity, phase: z.literal("proof"),
+    observation: z.union([fixtureDispatchCheckResultSchema, geminiDispatchCheckResultSchema]) }),
+  z.strictObject({ ...chatCompletionIdentity, phase: z.literal("settle"),
     observation: z.union([fixtureDispatchCheckResultSchema, geminiDispatchCheckResultSchema]) }),
   z.strictObject({ ...chatCompletionIdentity, phase: z.literal("submit"), observation: chatSubmitResultSchema })
 ]).refine(payload => (payload.phase !== "submit" || payload.operationId === payload.jobId)
@@ -176,6 +178,7 @@ type FixtureDispatchBaseline = Readonly<{
   capturedAt: number;
   cursor: Readonly<{ epoch: string; sequence: number }>;
   messageIds: ReadonlyArray<string>;
+  messages: FixtureSnapshot["messages"];
   omittedBefore: boolean;
 }>;
 type FixtureDispatchCheck = Readonly<{
@@ -226,6 +229,9 @@ export class PreparedMessageOperations {
   private readonly composerWaits = new Map<string, PendingComposerWait>();
   private readonly neutralJobOffers = new Map<string, Set<string>>();
   private readonly autonomousCommits = new Map<string, Readonly<{ owner: symbol; result: Promise<FixtureDispatchStatus> }>>();
+  private readonly settlementChecks = new Map<string, {
+    owner: symbol; job: Readonly<ChatJob>; createdAt: number; issued: boolean; completedAt: number | null; ready: boolean
+  }>();
   private readonly contents = new Map<string, Readonly<{
     owner: symbol; connectionId: string; target: FixtureTarget; text: string; expiresAt: number; autonomous?: true
   }>>();
@@ -447,6 +453,7 @@ export class PreparedMessageOperations {
     this.ambiguousEvidence.delete(operationId);
     this.neutralJobOffers.delete(operationId);
     this.autonomousCommits.delete(operationId);
+    this.settlementChecks.delete(operationId);
     this.composerReservations.delete(operationId);
     this.finishComposerWait(operationId, false);
     for (const waitingId of this.composerWaits.keys()) this.checkComposerWait(waitingId);
@@ -1278,7 +1285,8 @@ export class PreparedMessageOperations {
     const snapshot = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
     if (!snapshot || snapshot === "not_ready" || snapshot.capturedAt > now) throw new Error("OBSERVATION_UNAVAILABLE");
     const baseline = Object.freeze({ capturedAt: snapshot.capturedAt, cursor: snapshot.cursor,
-      messageIds: Object.freeze(snapshot.messages.map((message) => message.id)), omittedBefore: snapshot.omittedBefore });
+      messageIds: Object.freeze(snapshot.messages.map((message) => message.id)), messages: snapshot.messages,
+      omittedBefore: snapshot.omittedBefore });
     this.dispatchBaselines.set(operationId, baseline);
     this.discardFixtureDispatchCheck(operationId);
     return Object.freeze({ operationId, capturedAt: baseline.capturedAt, cursor: baseline.cursor });
@@ -1789,6 +1797,7 @@ export class PreparedMessageOperations {
           : this.requestFixtureDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt);
         return await this.settleAutonomousDispatch(owner, operationId, expiresAt, await dispatching.result);
       } finally {
+        this.settlementChecks.delete(operationId);
         this.releaseComposer(owner, operationId);
       }
     })().then(completed => {
@@ -1801,17 +1810,70 @@ export class PreparedMessageOperations {
 
   private async settleAutonomousDispatch(owner: symbol, operationId: string, deadlineMs: number, status: FixtureDispatchStatus) {
     const expiresAt = Math.min(deadlineMs, Date.now() + CHAT_SETTLE_TIMEOUT_MS);
+    const inspectAfter = status.state === "dispatch_uncertain"
+      ? Math.max(status.startedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS, expiresAt - FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) : expiresAt;
     while (status.state === "dispatch_uncertain" && Date.now() < expiresAt) {
       const authorization = this.getAutonomousAuthorization(owner, operationId);
-      if (!authorization) break;
+      const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
+      if (!authorization || !operation) break;
       const observed = authorization.target.origin === "https://gemini.google.com"
         ? this.reconcileGeminiObservation(owner, operationId) : this.reconcileFixtureObservation(owner, operationId);
       if (observed.state === "observed_in_ui" || observed.state === "resolved") return observed;
+      if (Date.now() >= inspectAfter) this.requestChatSettlement(owner, operationId, expiresAt);
+      const terminal = this.settlementChecks.get(operationId);
+      if (terminal?.ready && terminal.completedAt !== null && terminal.createdAt >= inspectAfter && terminal.job.expiresAt > Date.now()) {
+        terminal.ready = false;
+        const reading = authorization.target.origin === "https://gemini.google.com"
+          ? this.requests.requestFreshGeminiRead(owner, operation.connectionId, Date.now(), terminal.job.expiresAt)
+          : this.requests.requestFreshFixtureRead(owner, operation.connectionId, Date.now(), terminal.job.expiresAt);
+        const snapshot = reading && reading !== "busy" ? await reading.result : null;
+        const now = Date.now();
+        if (snapshot && snapshot !== "not_ready" && snapshot.capturedAt >= terminal.completedAt && now < terminal.job.expiresAt
+          && this.getAutonomousAuthorization(owner, operationId, now)) {
+          const evidenced = authorization.target.origin === "https://gemini.google.com"
+            ? this.reconcileGeminiObservation(owner, operationId, now) : this.reconcileFixtureObservation(owner, operationId, now);
+          if (evidenced.state === "observed_in_ui" || evidenced.state === "resolved") return evidenced;
+          const unchangedAt = authorization.target.origin === "https://gemini.google.com"
+            ? this.geminiDispatchEvidence(owner, operationId, now) : this.fixtureUnchangedDispatchEvidence(owner, operationId, now);
+          if (unchangedAt?.outcome === "unchanged" && unchangedAt.observedAt >= terminal.completedAt) {
+            this.database.prepare(`INSERT INTO message_dispatch_resolutions (operation_id, resolved_at, outcome, source)
+              VALUES (?, ?, 'not_sent', 'page') ON CONFLICT (operation_id) DO NOTHING`).run(operationId, unchangedAt.observedAt);
+            return this.dispatchStatus(operationId) ?? status;
+          }
+        }
+      }
       const remainingMs = expiresAt - Date.now();
       if (remainingMs <= 0) break;
       await new Promise<void>(done => setTimeout(done, Math.min(25, remainingMs)));
     }
     return status;
+  }
+
+  private fixtureUnchangedDispatchEvidence(owner: symbol, operationId: string, now: number) {
+    const operation = this.contents.get(operationId);
+    const baseline = this.dispatchBaselines.get(operationId);
+    const status = this.dispatchStatus(operationId);
+    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    if (!operation || operation.owner !== owner || !baseline || baseline.omittedBefore
+      || baseline.messages.some(message => message.truncated) || !live || !this.sameComposerTarget(operation.target, live)
+      || status?.state !== "dispatch_uncertain" || this.ambiguousEvidence.has(operationId)) return null;
+    const snapshot = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+    if (!snapshot || snapshot === "not_ready" || snapshot.omittedBefore || snapshot.capturedAt < status.startedAt
+      || snapshot.capturedAt > now || snapshot.cursor.epoch !== baseline.cursor.epoch
+      || snapshot.cursor.sequence < baseline.cursor.sequence) return null;
+    const events = this.requests.readFixtureEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
+    if (!events || events === "not_ready" || events.state !== "ok" || events.cursor.sequence !== snapshot.cursor.sequence) return null;
+    for (const capture of [...events.events.map(event => fixtureObservationSchema.safeParse(event.payload)),
+      fixtureObservationSchema.safeParse({ kind: "fixture_snapshot", omittedBefore: snapshot.omittedBefore, messages: snapshot.messages })]) {
+      if (!capture.success || capture.data.omittedBefore || capture.data.messages.some(message => message.truncated)
+        || capture.data.messages.length !== baseline.messages.length
+        || baseline.messages.some((message, index) => message.id !== capture.data.messages[index]?.id
+          || message.direction !== capture.data.messages[index]?.direction || message.text !== capture.data.messages[index]?.text)) {
+        this.ambiguousEvidence.add(operationId);
+        return null;
+      }
+    }
+    return Object.freeze({ outcome: "unchanged" as const, observedAt: snapshot.capturedAt });
   }
 
   async commitPreparedMessage(owner: symbol, operationId: string, deadlineMs: number) {
@@ -1866,7 +1928,37 @@ export class PreparedMessageOperations {
       : this.requestFixtureDispatchInspection(owner, operationId, now, deadlineMs);
   }
 
+  requestChatSettlement(owner: symbol, operationId: string, deadlineMs: number, now = Date.now()) {
+    const authorization = this.getAutonomousAuthorization(owner, operationId, now);
+    const reservation = this.composerReservations.get(operationId);
+    if (!authorization || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now || reservation?.owner !== owner
+      || reservation.expiresAt <= now || this.dispatchStatus(operationId)?.state !== "dispatch_uncertain") return null;
+    const existing = this.settlementChecks.get(operationId);
+    if (existing) return existing.job.expiresAt > now ? existing.job : null;
+    if (this.settlementChecks.size >= MAX_PENDING_FIXTURE_DISPATCH_CHECKS) return null;
+    const provider = authorization.target.origin === "https://gemini.google.com" ? "gemini" : "fixture";
+    const parsed = chatJobSchema.parse({ operationId, jobId: randomUUID(), phase: "settle",
+      target: { ...authorization.target, provider }, text: authorization.text,
+      expiresAt: Math.min(deadlineMs, authorization.expiresAt, reservation.expiresAt, now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) });
+    const job = Object.freeze({ ...parsed, target: Object.freeze(parsed.target) });
+    this.settlementChecks.set(operationId, { owner, job, createdAt: now, issued: false, completedAt: null, ready: false });
+    return job;
+  }
+
   listChatJobs(phase: ChatJob["phase"], provider: "fixture" | "gemini", now = Date.now()) {
+    if (phase === "settle") {
+      this.discardExpired(now);
+      for (const [operationId, pending] of this.settlementChecks) {
+        const reservation = this.composerReservations.get(operationId);
+        if (pending.issued || pending.job.target.provider !== provider || pending.job.expiresAt <= now
+          || !this.getAutonomousAuthorization(pending.owner, operationId, now)
+          || reservation?.owner !== pending.owner || reservation.expiresAt <= now
+          || this.dispatchStatus(operationId)?.state !== "dispatch_uncertain") continue;
+        pending.issued = true;
+        return Object.freeze([pending.job]);
+      }
+      return Object.freeze([] as ChatJob[]);
+    }
     if (phase === "submit") return this.listChatSubmitJobs(provider, now);
     const checks = phase === "fill" ? provider === "gemini" ? this.listGeminiFillChallenges(now, true) : this.listFixtureFillChallenges(now, true)
       : provider === "gemini" ? this.listGeminiDispatchChecks(now, true) : this.listFixtureDispatchChecks(now, true);
@@ -1889,6 +1981,20 @@ export class PreparedMessageOperations {
     observation: ChatJobObservation, now = Date.now()): boolean {
     const parsed = chatJobCompletionSchema.safeParse({ target, operationId, jobId, phase, observation });
     if (!parsed.success) return false;
+    if (parsed.data.phase === "settle") {
+      const pending = this.settlementChecks.get(operationId);
+      const authorization = pending && this.getAutonomousAuthorization(pending.owner, operationId, now);
+      const reservation = this.composerReservations.get(operationId);
+      if (!pending || !authorization || !pending.issued || pending.completedAt !== null || pending.createdAt > now
+        || pending.job.jobId !== jobId || pending.job.expiresAt <= now
+        || reservation?.owner !== pending.owner || reservation.expiresAt <= now
+        || !this.sameComposerTarget(pending.job.target, target) || pending.job.target.provider !== target.provider
+        || (pending.job.target.provider === "gemini" && (target.provider !== "gemini" || pending.job.target.url !== target.url))
+        || this.dispatchStatus(operationId)?.state !== "dispatch_uncertain") return false;
+      pending.completedAt = now;
+      pending.ready = parsed.data.observation.ok && parsed.data.observation.draftText === authorization.text;
+      return true;
+    }
     if (parsed.data.phase === "submit") return this.completeChatSubmitJob(target, operationId, jobId, parsed.data.observation, now);
     if (!this.neutralJobOffers.get(operationId)?.has(`${phase}:${jobId}`)) return false;
     if (parsed.data.phase === "fill") return target.provider === "gemini"

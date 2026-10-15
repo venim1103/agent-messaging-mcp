@@ -1938,6 +1938,7 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
 
 async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
   const setPhase = trackTestPhase(testContext, `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
+  const retainedDraft = ["not_sent", "not_sent_changed", "lost_settle"].includes(outcome);
   let mcpClient;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
   const unpacked = join(profile, "unpacked-extension");
@@ -1979,15 +1980,15 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
     let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
-    if (outcome === "lost_native_completion") {
-      await worker.evaluate(({ provider, autonomous }) => {
+    if (outcome === "lost_native_completion" || outcome === "lost_settle") {
+      await worker.evaluate(({ provider, autonomous, outcome }) => {
         const connect = chrome.runtime.connectNative.bind(chrome.runtime);
         chrome.runtime.connectNative = (...args) => {
           const port = connect(...args);
           const post = port.postMessage.bind(port);
           port.postMessage = message => {
             if (message.kind === (autonomous || provider === "gemini" ? "complete_chat_job" : "complete_fixture_dispatch")
-              && (!autonomous || message.payload?.phase === "submit")) {
+              && (!autonomous || message.payload?.phase === (outcome === "lost_settle" ? "settle" : "submit"))) {
               globalThis.fixtureDroppedCompletionCount = (globalThis.fixtureDroppedCompletionCount ?? 0) + 1;
               globalThis.fixtureDroppedCompletion = true; return;
             }
@@ -1995,7 +1996,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           };
           return port;
         };
-      }, { provider, autonomous });
+      }, { provider, autonomous, outcome });
     }
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     facade = await connectBroker("facade", directory, undefined, undefined,
@@ -2048,6 +2049,16 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         return node;
       };
     }, provider);
+    if (autonomous && retainedDraft) await fixture.evaluate(({ provider, outcome }) => {
+      const control = document.querySelector(provider === "gemini" ? 'button[type="submit"]' : "#composer");
+      control.addEventListener(provider === "gemini" ? "click" : "submit", event => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        globalThis.fixtureSubmitCount++;
+        if (outcome === "not_sent_changed") document.querySelector(provider === "gemini"
+          ? "user-query-content p" : "#messages li p").textContent = "Synthetic changed dispatch baseline";
+      }, true);
+    }, { provider, outcome });
     const selected = await worker.evaluate(async provider => {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const [identity] = await chrome.scripting.executeScript({ target: { tabId: tab.id },
@@ -2096,17 +2107,24 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       setPhase("autonomous status and replay");
       assert.equal(dispatch.kind, "chat_dispatch");
       assert.equal(dispatch.deadlineMs, deadlineMs);
-      assert.equal(dispatch.payload.state, provider === "gemini" ? "resolved" : "observed_in_ui");
+      assert.equal(dispatch.payload.state, retainedDraft ? outcome === "not_sent" ? "resolved" : "dispatch_uncertain"
+        : provider === "gemini" ? "resolved" : "observed_in_ui");
+      if (outcome === "not_sent") {
+        assert.equal(dispatch.payload.resolution.outcome, "not_sent");
+        assert.equal(dispatch.payload.resolution.source, "page");
+      }
       assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
       if (outcome === "delayed") assert.equal(await fixture.evaluate(() => globalThis.fixtureDeferredAppends), 1);
       if (outcome === "lost_script") assert.equal(await worker.evaluate(() => globalThis.autonomousLostSubmitResults), 1);
-      if (outcome === "lost_native_completion") assert.equal(await worker.evaluate(() => globalThis.fixtureDroppedCompletionCount), 1);
+      if (outcome === "lost_native_completion" || outcome === "lost_settle") {
+        assert.equal(await worker.evaluate(() => globalThis.fixtureDroppedCompletionCount), 1);
+      }
       assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
-        (provider === "gemini" ? 1 : 2) + 1);
+        (provider === "gemini" ? 1 : 2) + (retainedDraft ? 0 : 1));
       assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
-        editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), "");
+        editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), retainedDraft ? prepared.preview.text : "");
       assert.deepEqual((await facade.commitPreparedMessage(prepared.operationId, deadlineMs)).payload, dispatch.payload);
-      for (const phase of ["fill", "proof", "submit"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
+      for (const phase of ["fill", "proof", "submit", "settle"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
       assert.equal((await facade.getPreparedOperation(prepared.operationId, prepared.recoveryToken)).payload.state, dispatch.payload.state);
       assert.equal(await worker.evaluate(async ({ operationId, provider }) =>
         (await chrome.storage.local.get(`${provider}-submit-attempt-${operationId}`))[`${provider}-submit-attempt-${operationId}`],
@@ -2347,7 +2365,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
 }
 
 for (const provider of ["fixture", "gemini"]) {
-  for (const outcome of ["observed", "delayed", "lost_script", "lost_native_completion"]) {
+  for (const outcome of ["observed", "delayed", "lost_script", "lost_native_completion", "not_sent", "not_sent_changed", "lost_settle"]) {
     test(`autonomous ${provider} worker sends once after one popup connection approval (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();
       await exerciseChatDispatch(outcome, provider, testContext, true);

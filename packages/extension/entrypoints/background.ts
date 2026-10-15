@@ -45,7 +45,7 @@ type FixtureDispatchChallenge = Omit<FixturePreflightChallenge, "challengeId"> &
 type FixtureSubmitChallenge = FixtureFillChallenge & { dispatch: true };
 type BrowserJobTarget = (Extract<ChatTarget, { origin: "http://127.0.0.1:8787" }> & { provider: "fixture" })
   | (Extract<ChatTarget, { origin: "https://gemini.google.com" }> & { provider: "gemini" });
-type ChatBrowserJob = { operationId: string; jobId: string; phase: "fill" | "proof" | "submit"; target: BrowserJobTarget; text: string; expiresAt: number };
+type ChatBrowserJob = { operationId: string; jobId: string; phase: "fill" | "proof" | "submit" | "settle"; target: BrowserJobTarget; text: string; expiresAt: number };
 type ChatJobObservation = ReturnType<typeof fillFixtureDraft> | ReturnType<typeof fillGeminiDraft>
   | FixtureDispatchObservation | GeminiDispatchObservation | ChatSubmitObservation;
 type ChatSubmitObservation = ReturnType<typeof submitFixtureDraft> | ReturnType<typeof submitGeminiDraft>;
@@ -735,16 +735,17 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
     const binding = await chatJobBinding(check);
     if (binding) {
       const args = { expectedUrl: binding.expectedUrl, text: check.text };
+      const provePrepared = check.phase !== "fill";
       const result = check.target.provider === "gemini"
         ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
-          func: inspectGeminiDraft, args: [{ ...args, draftMode: check.phase === "proof" ? "prepared" : "empty",
-            checkSubmit: check.phase === "proof" }] })
+          func: inspectGeminiDraft, args: [{ ...args, draftMode: provePrepared ? "prepared" : "empty",
+            checkSubmit: provePrepared }] })
         : await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
-          func: inspectFixturePreflight, args: [{ ...args, draftState: check.phase === "proof" ? "prepared" : "empty" }] });
+          func: inspectFixturePreflight, args: [{ ...args, draftState: provePrepared ? "prepared" : "empty" }] });
       const checked = result[0];
       if (checked?.frameId === 0 && checked.documentId === check.target.documentId && checked.result
         && await chatJobBinding(check)) {
-        if (check.phase === "proof") {
+        if (provePrepared) {
           observation = checked.result.ok
             ? { ...checked.result, draftText: check.text, selected: true, writable: true, submitReady: true }
             : { ok: false, code: checked.result.code === "DRAFT_PRESENT" ? "DRAFT_CHANGED"
@@ -1064,7 +1065,7 @@ function startFixtureReadWatch(): boolean {
   let deadlineMs = 0;
   let responseTimer: ReturnType<typeof setTimeout> | undefined;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
-  let phase: "read" | "proof" | "submit" | "chat_fill" | "chat_proof" | "chat_submit" = "read";
+  let phase: "read" | "proof" | "submit" | "chat_fill" | "chat_proof" | "chat_submit" | "chat_settle" = "read";
 
   function stop() {
     if (fixtureReadWatch !== port) return;
@@ -1084,7 +1085,8 @@ function startFixtureReadWatch(): boolean {
       requestId = crypto.randomUUID();
       deadlineMs = Date.now() + 5_000;
       responseTimer = setTimeout(stop, 5_000);
-      const chatPhase = phase === "chat_fill" ? "fill" : phase === "chat_proof" ? "proof" : phase === "chat_submit" ? "submit" : null;
+      const chatPhase = phase === "chat_fill" ? "fill" : phase === "chat_proof" ? "proof"
+        : phase === "chat_submit" ? "submit" : phase === "chat_settle" ? "settle" : null;
       port.postMessage({ kind: chatPhase ? "list_chat_jobs" : "list_fixture_read_challenges", protocolVersion,
         requestId, connectionGeneration: 0, deadlineMs, payload: chatPhase ? { phase: chatPhase, provider: "fixture" } : {} });
     } catch {
@@ -1097,9 +1099,9 @@ function startFixtureReadWatch(): boolean {
     if (!requestId) return stop();
     clearTimeout(responseTimer);
     const listing = (() => {
-      try { return phase === "chat_fill" || phase === "chat_proof" || phase === "chat_submit"
+      try { return phase === "chat_fill" || phase === "chat_proof" || phase === "chat_submit" || phase === "chat_settle"
         ? { kind: "chat" as const, jobs: parseChatJobs(value, requestId, deadlineMs, "fixture",
-          phase === "chat_fill" ? "fill" : phase === "chat_proof" ? "proof" : "submit") }
+          phase === "chat_fill" ? "fill" : phase === "chat_proof" ? "proof" : phase === "chat_settle" ? "settle" : "submit") }
         : phase === "submit"
         ? { kind: "submit" as const, attempts: parseFixtureDispatchAttempts(value, requestId, deadlineMs) }
         : phase === "proof" ? { kind: "dispatch" as const, checks: parseFixtureDispatchChecks(value, requestId, deadlineMs) }
@@ -1112,7 +1114,8 @@ function startFixtureReadWatch(): boolean {
     void (async () => {
       if (listing.kind === "chat") {
         for (const check of listing.jobs) await executeTrackedChatJob(check);
-        phase = phase === "chat_fill" ? "chat_proof" : phase === "chat_proof" ? "chat_submit" : "read";
+        phase = phase === "chat_fill" ? "chat_proof" : phase === "chat_proof" ? "chat_submit"
+          : phase === "chat_submit" ? "chat_settle" : "read";
         if (fixtureReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, phase === "read" ? 250 : 0);
         return;
       }
@@ -1210,7 +1213,7 @@ function startGeminiReadWatch(): boolean {
   }
   geminiReadWatch = port;
   let listedGrants: Record<string, unknown> = {};
-  let phase: "read" | "fill" | "proof" | "submit" | "chat_fill" | "chat_proof" = "read";
+  let phase: "read" | "fill" | "proof" | "submit" | "chat_fill" | "chat_proof" | "chat_settle" = "read";
   let requestId: string | null = null;
   let deadlineMs = 0;
   let responseTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1234,7 +1237,8 @@ function startGeminiReadWatch(): boolean {
       requestId = crypto.randomUUID();
       deadlineMs = Date.now() + 5_000;
       responseTimer = setTimeout(stop, 5_000);
-      const chatPhase = phase === "chat_fill" ? "fill" : phase === "chat_proof" ? "proof" : phase === "submit" ? "submit" : null;
+      const chatPhase = phase === "chat_fill" ? "fill" : phase === "chat_proof" ? "proof"
+        : phase === "submit" ? "submit" : phase === "chat_settle" ? "settle" : null;
       port.postMessage({ kind: chatPhase ? "list_chat_jobs" : phase === "proof" ? "list_gemini_dispatch_checks"
         : phase === "fill" ? "list_gemini_fill_challenges" : "list_gemini_read_challenges", protocolVersion,
         requestId, connectionGeneration: 0, deadlineMs, payload: chatPhase ? { phase: chatPhase, provider: "gemini" } : {} });
@@ -1249,8 +1253,9 @@ function startGeminiReadWatch(): boolean {
     clearTimeout(responseTimer);
     if (phase !== "read") {
       const checks = (() => {
-        try { return phase === "submit" || phase === "chat_fill" || phase === "chat_proof"
-          ? parseChatJobs(value, requestId, deadlineMs, "gemini", phase === "chat_fill" ? "fill" : phase === "chat_proof" ? "proof" : "submit")
+        try { return phase === "submit" || phase === "chat_fill" || phase === "chat_proof" || phase === "chat_settle"
+          ? parseChatJobs(value, requestId, deadlineMs, "gemini",
+            phase === "chat_fill" ? "fill" : phase === "chat_proof" ? "proof" : phase === "chat_settle" ? "settle" : "submit")
           : parseGeminiBrowserChecks(value, requestId, deadlineMs, phase === "proof" ? "checkId" : "attemptId"); }
         catch { stop(); return null; }
       })();
@@ -1264,7 +1269,8 @@ function startGeminiReadWatch(): boolean {
           else await fillTrackedGeminiDraft(check);
         }
         phase = phase === "fill" ? "proof" : phase === "proof" ? hasListedAutonomousGrant(listedGrants, "gemini") ? "chat_fill" : "submit"
-          : phase === "chat_fill" ? "chat_proof" : phase === "chat_proof" ? "submit" : "read";
+          : phase === "chat_fill" ? "chat_proof" : phase === "chat_proof" ? "submit"
+            : phase === "submit" && hasListedAutonomousGrant(listedGrants, "gemini") ? "chat_settle" : "read";
         if (geminiReadWatch === port) pollTimer = setTimeout(() => { void poll(); }, phase === "read" ? 250 : 0);
       })().catch(stop);
       return;

@@ -320,7 +320,7 @@ Fixture evidence relies on stable row IDs. Gemini rows have none, so the staged 
 
 ### Unconfirmed sends (decided, D10)
 
-The original prototype had a global permanent barrier. T3a scopes new keyed attempts to the conversation shared by every approved owner (D13a); old unkeyed attempts block globally. T3c/T3d connect immutable person-attributed resolution/status after the old activation lease through relay-only commands and trusted selected-chat popup **Sent** / **Not sent** choices. They never restore authority or drop hourly counts. Metadata refresh is on demand, pins the exact document and cannot read message text, approve an agent or change the composer. Automatic page resolution remains unconnected.
+The original prototype had a global permanent barrier. New keyed attempts pause the conversation shared by every approved owner (D13a); old unkeyed attempts block globally. Person-attributed resolution/status after the old activation lease uses relay-only commands and trusted selected-chat popup **Sent** / **Not sent** choices. Metadata refresh is on demand, pins the exact document and cannot read message text, approve an agent or change the composer. Page and person assessments use the same immutable resolution journal; neither restores authority, drops hourly counts or proves provider delivery.
 
 The decided page-reconciliation target follows: after activation, watch for a bounded settle window. The exact new outgoing row (D9) means sent. Exact text still in the composer, Send available and no new row means not sent; a new operation may follow. Otherwise that chat pauses, and the popup offers **Sent** / **Not sent** resolution. Nothing is resent automatically; receipts recover status only, and declared outcomes never prove provider delivery.
 

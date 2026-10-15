@@ -49,12 +49,12 @@ test("native neutral jobs validate phase, provider, exact target and phase-speci
     { provider: "gemini", origin: "https://gemini.google.com", conversationId: "synthetic-neutral", tabId: 4,
       documentId: "synthetic-neutral", url: "https://gemini.google.com/app/synthetic-neutral?hl=en" }
   ]) {
-    for (const phase of ["fill", "proof", "submit"]) {
+    for (const phase of ["fill", "proof", "submit", "settle"]) {
       const listing = { ...request, kind: "list_chat_jobs", payload: { phase, provider: target.provider } };
       assert.deepEqual(parseNativeChatJobRequest(listing, now), listing);
       const editor = target.provider === "gemini" ? "contenteditable" : "textarea";
       const observation = phase === "submit" ? { ok: true, editor, activated: true }
-        : phase === "proof" ? { ok: true, editor, draftText: "Synthetic neutral draft",
+        : phase === "proof" || phase === "settle" ? { ok: true, editor, draftText: "Synthetic neutral draft",
           selected: true, writable: true, submitReady: true } : { ok: true, editor };
       const completion = { ...request, kind: "complete_chat_job", payload: { target, phase, operationId: request.requestId,
         jobId: phase === "submit" ? request.requestId : randomUUID(), observation } };

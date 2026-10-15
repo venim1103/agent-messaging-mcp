@@ -14,7 +14,7 @@ import { MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
   fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureDispatchStatusSchema,
   geminiDispatchCheckResultSchema, geminiDispatchResultSchema }
   from "./message-operations.js";
-import { PendingConnectionRequests, type FixtureTarget, type GeminiTarget } from "./pending-connections.js";
+import { PendingConnectionRequests, type FixtureSnapshot, type FixtureTarget, type GeminiTarget } from "./pending-connections.js";
 
 function approveSyntheticSend(ledger: PreparedMessageOperations, owner: symbol, operationId: string,
   target: FixtureTarget, now: number) {
@@ -996,6 +996,20 @@ test("autonomous settlement is capped at five seconds and never restores consume
       const submit = ledger.listChatJobs("submit", provider)[0]!;
       assert.equal(ledger.completeChatJob(submit.target, submit.operationId, submit.jobId, "submit", { ok: false, code: "DISPATCH_UNCERTAIN" }), true);
       await Promise.resolve();
+      assert.equal(ledger.requestChatSettlement(Symbol("foreign terminal proof"), prepared.operationId, prepared.expiresAt), null);
+      const terminal = ledger.requestChatSettlement(owner, prepared.operationId, prepared.expiresAt)!;
+      assert.equal(terminal.phase, "settle");
+      assert.equal(terminal.expiresAt, 14_000);
+      assert.deepEqual(ledger.listChatJobs("settle", provider), [terminal]);
+      assert.deepEqual(ledger.listChatJobs("settle", provider), []);
+      const terminalObservation = provider === "gemini"
+        ? { ...observation, editor: "contenteditable" as const } : { ...observation, editor: "textarea" as const };
+      assert.equal(ledger.completeChatJob({ ...terminal.target, documentId: "foreign-terminal" }, terminal.operationId,
+        terminal.jobId, "settle", terminalObservation), false);
+      assert.equal(ledger.completeChatJob(terminal.target, terminal.operationId, terminal.jobId, "settle", terminalObservation), true);
+      assert.equal(ledger.completeChatJob(terminal.target, terminal.operationId, terminal.jobId, "settle", terminalObservation), false);
+      assert.equal(ledger.getOperation(owner, prepared.operationId).state, "dispatch_uncertain");
+      assert.throws(() => ledger.requestChatProof(owner, prepared.operationId), /DISPATCH_CHECK_UNAVAILABLE/);
       testContext.mock.timers.tick(4_999);
       await Promise.resolve();
       assert.equal(finished, false);
@@ -1029,6 +1043,109 @@ test("autonomous settlement is capped at five seconds and never restores consume
       requests.disconnect(waitingOwner);
       database.close();
       testContext.mock.timers.reset();
+    }
+  }
+});
+
+test("autonomous page-not-sent requires fresh terminal proof and continuous unchanged evidence", async testContext => {
+  for (const provider of ["fixture", "gemini"] as const) {
+    for (const outcome of ["unchanged", "gap", "prefix-edit", "omitted", "truncated", "no-proof", "draft-changed", "send-unavailable",
+      "mismatched-draft", "proof-expired", "no-read", "owner-revoked"] as const) {
+      testContext.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 10_000 });
+      const requests = new PendingConnectionRequests();
+      const database = new DatabaseSync(":memory:");
+      const ledger = new PreparedMessageOperations(requests, database);
+      const owner = Symbol("terminal settlement owner");
+      const agent = requests.registerAgent(owner, "Synthetic terminal settlement agent");
+      const target = provider === "gemini"
+        ? { origin: "https://gemini.google.com" as const, conversationId: "synthetic-terminal-settlement",
+          url: "https://gemini.google.com/app/synthetic-terminal-settlement", tabId: 8, documentId: "terminal-settlement" }
+        : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+          tabId: 8, documentId: "terminal-settlement" };
+      const baseline = [{ id: "terminal-baseline", direction: "incoming" as const, text: "Synthetic terminal baseline" }];
+      const publish = (challengeId?: string, messages: FixtureSnapshot["messages"] = baseline, omittedBefore = false) => target.origin === "https://gemini.google.com"
+        ? requests.publishGeminiSnapshot(target, messages.map(message => ({ direction: message.direction, text: message.text,
+          ...(message.truncated ? { truncated: true as const } : {}) })), Date.now(), challengeId, omittedBefore)
+        : requests.publishFixtureSnapshot(target, messages, Date.now(), challengeId, omittedBefore);
+      try {
+        const connection = requests.approveAgent(agent.agentId, target)!;
+        const prepared = ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic terminal draft", randomUUID(), Date.now() + 30_000);
+        const committing = ledger.commitAutonomousMessage(owner, prepared.operationId, prepared.expiresAt);
+        await Promise.resolve();
+        const fill = ledger.listChatJobs("fill", provider)[0]!;
+        ledger.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", provider === "gemini"
+          ? { ok: true, editor: "contenteditable" } : { ok: true, editor: "textarea" });
+        await Promise.resolve();
+        const challenge = provider === "gemini" ? requests.listGeminiReadChallenges()[0]! : requests.listFixtureReadChallenges()[0]!;
+        publish(challenge.challengeId);
+        await Promise.resolve();
+        const proof = ledger.listChatJobs("proof", provider)[0]!;
+        const checkedDraft = { ok: true as const, draftText: prepared.preview.text, selected: true as const,
+          writable: true as const, submitReady: true as const };
+        const observation = provider === "gemini" ? { ...checkedDraft, editor: "contenteditable" as const }
+          : { ...checkedDraft, editor: "textarea" as const };
+        ledger.completeChatJob(proof.target, proof.operationId, proof.jobId, "proof", observation);
+        await Promise.resolve();
+        const submit = ledger.listChatJobs("submit", provider)[0]!;
+        ledger.completeChatJob(submit.target, submit.operationId, submit.jobId, "submit", { ok: false, code: "DISPATCH_UNCERTAIN" });
+        await Promise.resolve();
+        testContext.mock.timers.tick(3_999);
+        await Promise.resolve();
+        assert.deepEqual(ledger.listChatJobs("settle", provider), []);
+        testContext.mock.timers.tick(25);
+        await Promise.resolve();
+        const terminal = ledger.listChatJobs("settle", provider)[0]!;
+        assert.equal(terminal.expiresAt, 15_000);
+        assert.deepEqual(ledger.listChatJobs("settle", provider), []);
+        if (outcome === "proof-expired") {
+          testContext.mock.timers.tick(1_000);
+          await Promise.resolve();
+        }
+        if (outcome !== "no-proof") {
+          assert.equal(ledger.completeChatJob(terminal.target, terminal.operationId, terminal.jobId, "settle",
+            outcome === "draft-changed" ? { ok: false, code: "DRAFT_CHANGED" }
+              : outcome === "send-unavailable" ? { ok: false, code: "SUBMIT_UNAVAILABLE" }
+                : outcome === "mismatched-draft" ? { ...observation, draftText: "Synthetic different draft" } : observation), outcome !== "proof-expired");
+        }
+        testContext.mock.timers.tick(25);
+        await Promise.resolve();
+        const terminalRead = provider === "gemini" ? requests.listGeminiReadChallenges()[0] : requests.listFixtureReadChallenges()[0];
+        if (outcome === "no-proof" || outcome === "draft-changed" || outcome === "send-unavailable"
+          || outcome === "mismatched-draft" || outcome === "proof-expired") assert.equal(terminalRead, undefined);
+        else {
+          assert.ok(terminalRead);
+          assert.equal(terminalRead.expiresAt, terminal.expiresAt);
+          if (outcome === "gap") {
+            if (target.origin === "https://gemini.google.com") requests.markGeminiObservationGap(target);
+            else requests.markFixtureObservationGap(target);
+          }
+          if (outcome === "prefix-edit") publish(undefined, [{ ...baseline[0]!, text: "Synthetic changed baseline" }]);
+          if (outcome === "truncated") publish(undefined, [{ ...baseline[0]!, truncated: true }]);
+          if (outcome === "owner-revoked") {
+            requests.disconnect(owner);
+            assert.equal(publish(terminalRead.challengeId), 0);
+          } else if (outcome !== "no-read") publish(terminalRead.challengeId, baseline, outcome === "omitted");
+          await Promise.resolve();
+        }
+        if (outcome !== "unchanged") testContext.mock.timers.tick(1_000);
+        const result = await committing;
+        if (outcome === "unchanged") {
+          assert.equal(result.state, "resolved");
+          if (result.state === "resolved") assert.deepEqual(result.resolution,
+            { outcome: "not_sent", source: "page", resolvedAt: Date.now() });
+        } else assert.equal(result.state, "dispatch_uncertain");
+        assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, prepared.recoveryToken), result);
+        assert.deepEqual(await ledger.commitAutonomousMessage(owner, prepared.operationId, prepared.expiresAt), result);
+        for (const phase of ["fill", "proof", "submit", "settle"] as const) assert.deepEqual(ledger.listChatJobs(phase, provider), []);
+        assert.equal(ledger.requestChatFill(owner, prepared.operationId), null);
+        assert.throws(() => ledger.requestChatProof(owner, prepared.operationId), /DISPATCH_CHECK_UNAVAILABLE/);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      } finally {
+        ledger.disconnect(owner);
+        requests.disconnect(owner);
+        database.close();
+        testContext.mock.timers.reset();
+      }
     }
   }
 });

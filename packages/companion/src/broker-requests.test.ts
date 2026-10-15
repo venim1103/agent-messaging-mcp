@@ -67,10 +67,10 @@ test("neutral jobs are strict relay-only phase commands and commits stay facade-
   const target = { provider: "gemini", origin: "https://gemini.google.com", conversationId: "synthetic-neutral-phase",
     url: "https://gemini.google.com/app/synthetic-neutral-phase", tabId: 4, documentId: "synthetic-neutral-phase" } as const;
   try {
-    for (const phase of ["fill", "proof", "submit"]) {
+    for (const phase of ["fill", "proof", "submit", "settle"]) {
       const listing = { ...envelope, kind: "list_chat_jobs", payload: { phase, provider: "gemini" } };
       const observation = phase === "submit" ? { ok: true, editor: "contenteditable", activated: true }
-        : phase === "proof" ? { ok: true, editor: "contenteditable", draftText: "Synthetic neutral draft",
+        : phase === "proof" || phase === "settle" ? { ok: true, editor: "contenteditable", draftText: "Synthetic neutral draft",
           selected: true, writable: true, submitReady: true } : { ok: true, editor: "contenteditable" };
       const completion = { ...envelope, kind: "complete_chat_job", payload: { target, phase,
         operationId: envelope.requestId, jobId: envelope.requestId, observation } };
