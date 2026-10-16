@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-16 (T4b positive streaming detection is gated with all units and 79 browser scenarios; authorized manual live metadata capture and visual completion confirmation received; explicit terminal-completion evidence remains missing).
+Updated: 2026-10-16 (T4b `10465f5` is gated with all units and 79 browser scenarios; manual capture and visual finish confirmation received; follow-up metadata probe passes 11 synthetic checks but needs fresh live authorization).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,7 +16,7 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest gated source checkpoint: T4b (the commit containing [the entry below](#t4b-reviewed-positive-streaming-evidence-2026-10-16)), after T4a `b0aa0aa`. Its first exact gate passed build, both typechecks, all units and **all 79 named E2E scenarios**, zero failures/cancellations; E2E was **266,028 ms**. Positive Gemini streaming now blocks heuristic settling. Public completion remains heuristic only; installed acceptance and explicit terminal-completion evidence remain missing. Earlier failed checks are preserved below.
+- Latest gated source checkpoint: T4b `10465f5` ([evidence below](#t4b-reviewed-positive-streaming-evidence-2026-10-16)), after T4a `b0aa0aa`. Its first exact gate passed build, both typechecks, all units and **all 79 named E2E scenarios**, zero failures/cancellations; E2E was **266,028 ms**. Positive Gemini streaming now blocks heuristic settling. Public completion remains heuristic only; installed acceptance and explicit terminal-completion evidence remain missing. Earlier failed checks are preserved below.
 - The person's earlier eleven-change audit is complete: the ten pending T3h files were retained, and the eleventh was the bounded native-channel helper. Later checkpoints connect neutral orchestration and public sending. Earlier cancellations, baseline comparison and diagnostic evidence remain in their dated entries.
 - T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Installed Gemini single-owner approval/pickup, fresh reads, same-chat events and removal now passed (entry below). Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3d's installed fixture empty-status check passed after coordinated reload; installed outcome buttons remain untested.
 - Latest installed write evidence: one supervised fixture textarea message passed separate trusted draft, fill and Send approvals, one MCP fill and one submit, `observed_in_ui`, fresh read/status and the person's visual confirmation of one outgoing row with an empty editor. An earlier fill refusal/expiry is preserved below. This is not autonomous sending, Gemini writing or installed T3e coordination evidence.
@@ -140,7 +140,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-T4b is gated. Before D3 can report `complete`, prepare a narrower metadata probe that distinguishes explicit `aria-busy="false"` from absent markers on the newest response, then obtain fresh authorization for one further manual capture. The old probe cannot establish that distinction; do not ask the person to rerun it unchanged. No live read, fill/send, general browser bridge or installed reload is authorized by the supplied result. Keep D10a and other safety boundaries unchanged.
+T4b is committed and gated. The [updated manual probe](DEVELOPMENT.md#manual-completion-metadata-review) now distinguishes explicit `aria-busy="false"` from absent markers and passes 11 synthetic checks. Ask for fresh bounded authorization before one further person-run capture on the exact disposable chat, then request only emitted JSON and observed finish. The old capture cannot establish this distinction. No agent live read, fill/send, general browser bridge or installed reload is authorized by the supplied result. Keep D10a and other safety boundaries unchanged.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -207,6 +207,12 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T4 Busy-Attribute Follow-Up Preparation (2026-10-16)
+
+- After source checkpoint `10465f5`, changed only documentation: the manual probe adds fixed `replyBusy` metadata for root attribute absent/true/false/other and up to eight visible descendant values with an overflow flag. Unexpected values are sanitized; no selector, text, URL, ID or raw attribute is emitted. An additional capture explicitly requires fresh authorization; none has run.
+- The extracted JavaScript compiles and passes 11 fake-clock scenarios in disposable sandboxed Chromium: absent, true, false, unexpected, nested, hidden, overflow, true-to-false transition, navigation, visibility and unsupported route. Body-read/click/focus traps and private-value/URL output checks pass. Fake time is confined to synthetic pages; the live 60-second duration and 32-change bound are unchanged.
+- This prepares the next human step only. Source gate remains T4b and is not rerun for documentation; no browser account access, installed reload, settings change, remote push or branch action. Safety boundaries remain in AGENTS.md.
 
 ## T4b Reviewed Positive Streaming Evidence (2026-10-16)
 

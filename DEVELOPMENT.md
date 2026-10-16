@@ -361,6 +361,8 @@ Use only disposable chats in the development profile, with fresh human authoriza
 
 After explicit read-only authorization and confirmation of the exact selected disposable saved chat, run this in that chat's DevTools Console. Start it before manually submitting one non-sensitive prompt. It samples for 60 seconds, stops on a URL/visibility change, and prints only fixed control metadata. It never clicks, focuses, fills, sends or reads message bodies; the selected URL stays local for the identity guard and is never printed. Use an existing chat with a stable saved route, not a new blank chat. Do not bypass paste protection or change security settings if the console blocks it; report the block.
 
+The follow-up version below distinguishes an absent busy attribute from explicit `false` on the newest response and its visible descendants. Obtain fresh bounded authorization before any additional capture; do not rerun automatically. Missing state, overflow or an unexpected value remains inconclusive.
+
 ```js
 (async () => {
    const emit = (code, samples) => console.log(JSON.stringify({ code, samples }));
@@ -368,6 +370,10 @@ After explicit read-only authorization and confirmation of the exact selected di
       || !/^\/app\/[A-Za-z0-9_-]{1,128}\/?$/.test(location.pathname)) return emit("UNSUPPORTED_CHAT", []);
    const selected = location.href;
    const visible = element => element.getClientRects().length > 0 && getComputedStyle(element).visibility === "visible";
+   const busyValue = element => {
+      const value = element.getAttribute("aria-busy");
+      return value === null ? "absent" : value === "true" || value === "false" ? value : "other";
+   };
    const labels = new Map([["Send message", "send-message"], ["Send", "send"], ["Stop response", "stop-response"],
       ["Stop generating", "stop-generating"], ["Stop", "stop"], ["Copy response", "copy-response"],
       ["Copy", "copy"], ["Good response", "good-response"], ["Bad response", "bad-response"]]);
@@ -390,11 +396,13 @@ After explicit read-only authorization and confirmation of the exact selected di
       if (timelines.length !== 1) { code = "AMBIGUOUS_TIMELINE"; break; }
       const rows = [...timelines[0].querySelectorAll("user-query, model-response")].filter(visible);
       const reply = rows.filter(row => row.localName === "model-response").at(-1);
+      const busyNodes = reply ? [...reply.querySelectorAll("[aria-busy]")].filter(visible) : [];
       const composer = [...regions[0].querySelectorAll('button.send-button, button[aria-label="Send message"], button[aria-label="Send"], button[aria-label*="Stop" i]')].filter(visible);
       const actions = reply ? [...reply.querySelectorAll("button, [role=button]")].filter(visible) : [];
       const state = { rows: rows.length, tail: rows.at(-1)?.localName === "model-response" ? "incoming" : rows.length ? "outgoing" : "none",
          composer: composer.slice(0, 8).map(describe), composerOverflow: composer.length > 8,
          replyActions: actions.slice(0, 8).map(describe), replyActionsOverflow: actions.length > 8,
+         replyBusy: { row: reply ? busyValue(reply) : "no-reply", descendants: busyNodes.slice(0, 8).map(busyValue), overflow: busyNodes.length > 8 },
          busy: Boolean(reply && (reply.matches('[aria-busy="true"]') || [...reply.querySelectorAll('[aria-busy="true"]')].some(visible))),
          progress: [...regions[0].querySelectorAll('mat-progress-spinner, [role="progressbar"]')].filter(visible).length };
       const fingerprint = JSON.stringify(state);
