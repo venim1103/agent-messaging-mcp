@@ -239,7 +239,6 @@ server.registerTool("chat_send_message", {
   const deadlineMs = Date.now() + 30_000;
   let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
   let prepared: { operationId: string; expiresAt: number; recoveryToken: string } | undefined;
-  let commitStarted = false;
   const cancel = () => client?.close();
   extra.mcpReq.signal.addEventListener("abort", cancel, { once: true });
   try {
@@ -255,7 +254,6 @@ server.registerTool("chat_send_message", {
     prepared = { operationId, expiresAt, recoveryToken };
     if (extra.mcpReq.signal.aborted || expiresAt <= Date.now()) return sendResult("not_sent",
       extra.mcpReq.signal.aborted ? "CANCELLED" : "OPERATION_EXPIRED", { operationId, recoveryToken });
-    commitStarted = true;
     const result = await client.commitPreparedMessage(operationId, Math.min(deadlineMs, expiresAt));
     if (result.kind === "error") return sendResult(result.payload.code === "DISPATCH_UNAVAILABLE" ? "not_sent" : "unresolved",
       result.payload.code, { operationId, recoveryToken });
@@ -264,7 +262,7 @@ server.registerTool("chat_send_message", {
   } catch {
     client?.close();
     if (broker === client) broker = undefined;
-    return sendResult(commitStarted ? "unresolved" : "not_sent", commitStarted ? "DISPATCH_UNCERTAIN" : "BROKER_UNAVAILABLE",
+    return sendResult("unresolved", "DISPATCH_UNCERTAIN",
       prepared ? { operationId: prepared.operationId, recoveryToken: prepared.recoveryToken } : {});
   } finally {
     extra.mcpReq.signal.removeEventListener("abort", cancel);

@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-15 (T3o bounded own-leftover replacement is gated with all units and 67 end-to-end checks; paused at the person's request).
+Updated: 2026-10-16 (autonomous work resumed; T3p conservative concurrent-cancellation results are gated with all units and 67 end-to-end checks).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,14 +16,14 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest gated source checkpoint: T3o (the commit containing the [checkpoint entry below](#t3o-bounded-own-leftover-replacement-2026-10-15)), after provenance T3n `bd40500` and public sending T3m `5e30519`. The exact gate passed build, both typechecks, **all units and 67/67 e2e checks**, zero failures/cancellations. A fresh independently keyed send can replace this owner's known resolved unsent draft only with retained prior metadata and fresh document provenance. Installed/live autonomous acceptance remains missing.
+- Latest gated source checkpoint: T3p (the commit containing the [checkpoint entry below](#t3p-conservative-concurrent-cancellation-results-2026-10-16)), after bounded own-leftover replacement T3o `c573a3f`. The exact gate passed build, both typechecks, **all units and 67/67 e2e checks**, zero failures/cancellations. A queued duplicate send no longer mislabels transport loss as definite non-send while another call has durable intent. Installed/live autonomous acceptance remains missing.
 - The person's earlier eleven-change audit is complete: the ten pending T3h files were retained, and the eleventh was the bounded native-channel helper. Later checkpoints connect neutral orchestration and public sending. Earlier cancellations, baseline comparison and diagnostic evidence remain in their dated entries.
 - T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Installed Gemini single-owner approval/pickup, fresh reads, same-chat events and removal now passed (entry below). Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3d's installed fixture empty-status check passed after coordinated reload; installed outcome buttons remain untested.
 - Latest installed write evidence: one supervised fixture textarea message passed separate trusted draft, fill and Send approvals, one MCP fill and one submit, `observed_in_ui`, fresh read/status and the person's visual confirmation of one outgoing row with an empty editor. An earlier fill refusal/expiry is preserved below. This is not autonomous sending, Gemini writing or installed T3e coordination evidence.
-- This resumption began at clean `main` / T3m `5e30519`, aligned with tracked `origin/main`; provenance was committed as `bd40500`. The person's newest request pauses work after the current T3o checkpoint. Earlier resume baselines and resumption requests are historical. The assistant made no push or new branch.
+- This resumption began at clean `main` / T3o `c573a3f`, aligned with tracked `origin/main`. The person explicitly resumed autonomous implementation and periodic local checkpoints on 2026-10-16; the prior pause is historical. The assistant made no push or new branch.
 - Current coordination: builds, browser checks and timing traces used disposable test processes; the baseline source snapshot and diagnostic trace/build artifacts were removed. A read-only process check found no leftover matching test broker/native relay. The person freshly authorized the clock check below; no clock/security setting was changed, installed service restarted or live chat accessed. Earlier test grants remain ended; do not transfer old handles to a new owner or treat prior evidence as fresh permission.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
-- Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e-T3o have synthetic/source-gate evidence only. A future reload ends current grants; do not assume installed code contains these newer changes.
+- Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e-T3p have synthetic/source-gate evidence only. A future reload ends current grants; do not assume installed code contains these newer changes.
 
 ### Capability matrix
 
@@ -63,6 +63,8 @@ T3n records successful neutral fills in one document-local isolated-world tracke
 
 T3o adds bounded D10a replacement inside a fresh operation's existing one-shot fill, not a retry or separate clear command. The broker alone selects a newest eligible filled, resolved-not-sent prior autonomous operation owned by the same facade and connection on the exact composer/URL, while original metadata remains unexpired. The worker repeats read-only preflight and the page function rechecks ownership after focus/selection, then consumes the old marker for one selected native insertion. Human/unknown drafts and unresolved or expired prior metadata are never replacement authority. No new durable text, consent, job phase or lease extension is added.
 
+T3p makes public send transport failures conservative even during preparation: a same-key duplicate may be waiting behind another invocation's durable commit. The SDK/broker regression covers both providers, one intent, no invented not-sent resolution, no re-offered jobs and fresh approval required after cancellation closes the owning connection. Explicit broker refusals and successful status replies retain their existing meanings.
+
 Autonomous same-chat reload preserves existing handles after fresh new-document identity verification, invalidates observation cursors and reinstalls observers. Old-document reads/publications are blocked during suspension; removal/disconnect still work. Only the exact URL/chat/tab may rebind; legacy reload still revokes. Failure or uncertainty disconnects pinned targets, without new approval, automatic readmission or job replay. Installed fixture reload retained the same handle and produced a fresh cursor epoch; failure/race coverage and Gemini reload evidence remain synthetic.
 
 ### Gemini send chain
@@ -91,7 +93,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 1. **T1 Read robustness: done.** Stopped native watches restart with bounded backoff (R2). D8 captures the newest 32 visible rows with `omittedBefore`, per-message truncation at 16,000 UTF-16 units and a 96 KiB capture cap. Identity-preserving failures skip publication; changed targets still revoke (R1). Synthetic evidence only for these changes.
 2. **T2 Connection model: synthetic implementation done.** Startup (T2a), roster/removal (T2b), popup-first per-agent admission/pickup/no-expiry grants (T2c) and same-chat reload/rebind/gaps/observer reattachment (T2d) are gated. No automatic admission/re-admission (D13b). Individual disconnect/restart ends that owner's grant; tab/chat/browser changes end matching grants. Installed fixture pickup/read/reload/removal and Gemini single-owner approval/pickup/read/events/removal passed. Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3 connects autonomous sending below.
-3. **T3 Autonomous send: in progress.** T3a-T3o are gated, including public sending, status-only replay, original send budgets, bounded page evidence and D10a replacement while prior metadata remains unexpired. Still missing: broader authority-loss/concurrent-cancellation browser cases and explicit own-window acceptance (D11). Expired/restarted prior operations cannot authorize replacement. Retain original deadlines, one-offer jobs, browser reservation and one activation.
+3. **T3 Autonomous send: in progress.** T3a-T3p are gated, including public sending, status-only replay, original send budgets, bounded page evidence, bounded D10a replacement and concurrent-cancellation SDK coverage. Still missing: broader authority-loss/concurrent-cancellation browser cases and explicit own-window acceptance (D11). Expired/restarted prior operations cannot authorize replacement. Retain original deadlines, one-offer jobs, browser reservation and one activation.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
 5. **T5 Live acceptance.** Coordinated reload, then one human-authorized session on a disposable chat: connect once, the agent sends a few neutral messages and reads the complete replies without further clicks, then the tab is closed.
 6. **T6 Later.** Hidden-tab operation (D11, possibly debugger input per D6), a second chat site on the provider-neutral pipeline, calibration and packaging.
@@ -126,7 +128,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-Paused at the person's newest request after gated T3o. Finish only this checkpoint's documentation/commit, then stop; do not start another slice or rerun the successful gate. Next when asked to resume: broader authority-loss/concurrent-cancellation cases and explicit own-window acceptance. D10a replacement remains limited to retained unexpired prior metadata; provenance alone is not authority. Retain original deadlines, four-second browser leases, bounded settlement and no failed-write replay. Installed acceptance, live access, further clock probes and host/security/settings work still need fresh authorization.
+Continue autonomous implementation at the person's request. Next: browser authority-loss/concurrent-cancellation cases and explicit own-window acceptance. D10a replacement remains limited to retained unexpired prior metadata; provenance alone is not authority. Retain original deadlines, four-second browser leases, bounded settlement and no failed-write replay. Installed acceptance, live access, further clock probes and host/security/settings work still need fresh authorization.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -193,6 +195,13 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T3p Conservative Concurrent-Cancellation Results (2026-10-16)
+
+- A two-provider SDK/broker regression reproduced a queued same-key send returning `not_sent / BROKER_UNAVAILABLE` after another invocation had already created durable intent. Cancelling the first call closes their shared owning broker connection; the duplicate's local preparation state cannot prove that the message was not sent.
+- Public send transport exceptions now return `unresolved / DISPATCH_UNCERTAIN`, retaining operation/receipt metadata when known. Explicit broker refusals and durable status replies are unchanged. No new attempt, retry, recovered write authority, deadline or approval is created.
+- The regression asserts one durable intent, zero invented resolutions, no fill/proof/submit/settle re-offer, and no inherited approval after reconnect. Initial harness failures came from unsynchronized owner registration and a fixture-only ID in Gemini rows; existing handshake and provider schemas repaired them. The same focused check then passed for both providers. No source gate failed.
+- Exact gate: `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e` passed build, both typechecks, all units and **67/67 e2e**, zero failures/cancellations. Numeric unit summary was host-elided; chained E2E execution confirms unit success. This is SDK/synthetic evidence, not installed/live acceptance. Next: browser authority-loss and own-window coverage. Safety boundaries remain in AGENTS.md.
 
 ## T3o Bounded Own-Leftover Replacement (2026-10-15)
 

@@ -119,6 +119,8 @@ Results always have `retryAllowed: false` and `state: "sent" | "not_sent" | "unr
 
 The first prepared response includes `operationId` and a private `recoveryToken`; keep the token private. `chat_get_operation { operationId, recoveryToken }` can recover dispatch metadata without chat access or write authority. Same key and arguments return the existing status without another activation; a status-only replay need not repeat the token. Changed arguments conflict. New work requires a new key and valid authority, and still refuses an existing draft. Cancellation closes the owning broker connection; it cannot undo an already activated send.
 
+Transport failure returns `unresolved / DISPATCH_UNCERTAIN` even while awaiting preparation: a same-key concurrent or earlier invocation may already have durable intent. Local call progress is not proof of non-send. Cancellation cannot restore approval on a replacement broker connection; receipt recovery stays status-only.
+
 This public path works for the fixture and routed synthetic Gemini pages, including bounded own-leftover replacement (D10a) and human-draft preservation. Installed/live autonomous acceptance, explicit own-window acceptance and broader authority-loss/concurrent-cancellation browser cases remain pending. Do not infer live test authorization from synthetic coverage.
 
 ### Supervised send (fixture only)

@@ -207,6 +207,102 @@ for (const target of [
   });
 }
 
+test("concurrent SDK send cancellation never labels an existing durable attempt not sent", { timeout: 5000 }, async () => {
+  for (const provider of ["fixture", "gemini"] as const) {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-send-cancel-"));
+    const directory = join(home, ".config/agent-messaging-mcp/broker");
+    const client = new Client({ name: "Synthetic cancelled send owner", version: "0.0.1" });
+    const controller = new AbortController();
+    let broker: Awaited<ReturnType<typeof startBrokerSocket>> | undefined;
+    let database: ReturnType<typeof openPrivateOperationDatabase> | undefined;
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    try {
+      await mkdir(join(home, ".config/agent-messaging-mcp"), { recursive: true, mode: 0o700 });
+      database = openPrivateOperationDatabase(join(home, ".config/agent-messaging-mcp"));
+      broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+      await client.connect(new StdioClientTransport({ command: process.execPath,
+        args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+        env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "0", BROWSER_CHAT_AGENT_LABEL: "Synthetic cancelled send owner" } }));
+      assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        { connections: [], timedOut: true });
+      relay = await connectBroker("relay", directory);
+      const target = provider === "gemini"
+        ? { origin: "https://gemini.google.com" as const, conversationId: "synthetic-cancelled-send",
+          url: "https://gemini.google.com/app/synthetic-cancelled-send", tabId: 3, documentId: "cancelled-send" }
+        : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const, tabId: 3, documentId: "cancelled-send" };
+      const roster = await relay.listChatAgents(target);
+      assert.equal(roster.kind, "chat_agents");
+      if (roster.kind !== "chat_agents") throw new Error("Expected SDK owner");
+      const agent = roster.payload.agents.find(agent => agent.label === "Synthetic cancelled send owner");
+      assert.ok(agent);
+      assert.equal((await relay.approveChatAgent(target, agent.agentId)).kind, "chat_agent_approved");
+      const picked = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      const connection = (picked.structuredContent as { connections: { connectionId: string }[] }).connections[0]!;
+      const argumentsValue = { connectionId: connection.connectionId, text: "Synthetic concurrent cancellation draft",
+        idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
+      const sending = client.callTool({ name: "chat_send_message", arguments: argumentsValue }, { signal: controller.signal });
+      const cancelled = sending.then(result => ({ result, error: undefined }), (error: unknown) => ({ error }));
+      const nextJob = async (phase: "fill" | "proof" | "submit") => {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          const listing = await relay!.listChatJobs(phase, provider);
+          if (listing.kind === "chat_jobs" && listing.payload.jobs[0]) return listing.payload.jobs[0];
+          await setTimeout(10);
+        }
+        throw new Error(`Expected one ${phase} job`);
+      };
+      const fill = await nextJob("fill");
+      await relay.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", provider === "gemini"
+        ? { ok: true, editor: "contenteditable" } : { ok: true, editor: "textarea" });
+      let challenged = false;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const listed = provider === "gemini" ? await relay.listGeminiReadChallenges() : await relay.listFixtureReadChallenges();
+        if (listed.kind !== "gemini_read_challenges" && listed.kind !== "fixture_read_challenges") throw new Error("Expected challenged read");
+        const challenge = listed.payload.challenges[0];
+        if (challenge) {
+          const messages = [{ id: "cancel-baseline", direction: "incoming" as const, text: "Synthetic cancellation baseline" }];
+          const published = target.origin === "https://gemini.google.com"
+            ? await relay.publishGeminiSnapshot(target, messages.map(({ direction, text }) => ({ direction, text })), challenge.challengeId)
+            : await relay.publishFixtureSnapshot(target, messages, challenge.challengeId);
+          assert.deepEqual(published.payload, { count: 1 });
+          challenged = true;
+          break;
+        }
+        await setTimeout(10);
+      }
+      assert.equal(challenged, true);
+      const proof = await nextJob("proof");
+      const observation = { ok: true as const, draftText: argumentsValue.text, selected: true as const, writable: true as const, submitReady: true as const };
+      await relay.completeChatJob(proof.target, proof.operationId, proof.jobId, "proof", provider === "gemini"
+        ? { ...observation, editor: "contenteditable" } : { ...observation, editor: "textarea" });
+      const submit = await nextJob("submit");
+      assert.equal(submit.operationId, fill.operationId);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      const duplicate = client.callTool({ name: "chat_send_message", arguments: argumentsValue });
+      await setTimeout(25);
+      controller.abort();
+      const cancellation = await cancelled;
+      assert.ok(cancellation.error instanceof Error);
+      assert.equal(cancellation.error.name, "SdkError");
+      assert.match(cancellation.error.message, /AbortError/);
+      const result = await duplicate;
+      assert.equal(result.isError, true);
+      assert.deepEqual(result.structuredContent, { state: "unresolved", code: "DISPATCH_UNCERTAIN", retryAllowed: false });
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()?.count, 0);
+      for (const phase of ["fill", "proof", "submit", "settle"] as const) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
+      assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        { connections: [], timedOut: true });
+    } finally {
+      controller.abort();
+      relay?.close();
+      await client.close();
+      await broker?.close();
+      database?.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+
 test("two MCP facades auto-start one private broker before any tool call", { timeout: 10000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-auto-start-"));
   const runtimeDirectory = join(home, ".config/agent-messaging-mcp/broker");
