@@ -66,7 +66,7 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
       "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_wait_for_connection", "chat_read_messages",
-      "chat_wait_for_events", "chat_send_message", "chat_prepare_message", "chat_fill_draft", "chat_commit_message", "chat_get_operation", "chat_disconnect"
+      "chat_wait_for_events", "chat_wait_for_reply", "chat_send_message", "chat_prepare_message", "chat_fill_draft", "chat_commit_message", "chat_get_operation", "chat_disconnect"
     ]);
     assert.ok(tools.every((tool) => /^[a-z0-9_-]+$/.test(tool.name)));
     const fillTool = tools.find((tool) => tool.name === "chat_fill_draft");
@@ -82,6 +82,9 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     assert.equal(sendTool?.annotations?.destructiveHint, true);
     assert.equal(sendTool?.annotations?.idempotentHint, true);
     assert.equal(sendTool?.inputSchema.additionalProperties, false);
+    const replyTool = tools.find(tool => tool.name === "chat_wait_for_reply");
+    assert.equal(replyTool?.annotations?.readOnlyHint, true);
+    assert.equal(replyTool?.inputSchema.additionalProperties, false);
 
     const result = await client.callTool({ name: "browser_chat_feasibility", arguments: {} });
     assert.equal(result.isError, undefined);
@@ -99,6 +102,111 @@ for (const target of [
   { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
     documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" }
 ] as const) {
+  test(`${target.origin} SDK reply wait is bounded, owned and conservative`, { timeout: 10000 }, async context => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-reply-"));
+    const directory = join(home, ".config/agent-messaging-mcp/broker");
+    await mkdir(join(home, ".config/agent-messaging-mcp"), { recursive: true, mode: 0o700 });
+    const broker = await startBrokerSocket(directory, createBrokerCredentials());
+    const client = new Client({ name: "Synthetic reply wait owner", version: "0.0.1" });
+    const controller = new AbortController();
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let mode: "steady" | "outgoing" | "truncated" | "held" | "unavailable" = "steady";
+    let reads = 0;
+    let releaseCapture: (() => void) | undefined;
+    context.mock.method(PendingConnectionRequests.prototype,
+      target.origin === "https://gemini.google.com" ? "requestFreshGeminiRead" : "requestFreshFixtureRead", () => {
+        reads++;
+        if (mode === "unavailable") return { result: Promise.resolve("not_ready") } as never;
+        const message = { direction: mode === "outgoing" ? "outgoing" : "incoming", text: "Synthetic bounded reply",
+          ...(mode === "truncated" ? { truncated: true } : {}),
+          ...(target.origin === "https://gemini.google.com" ? { identityQuality: "uncertain", generationState: "unknown" } : { id: "synthetic-reply" }) };
+        const snapshot = { coverage: "rendered_only", generation: 1, capturedAt: Date.now(),
+          cursor: { epoch: "c66b3997-9d43-4554-8399-267d1fe9f75c", sequence: mode === "steady" ? 1 : 2 },
+          omittedBefore: false, messages: [message] };
+        return { result: mode === "held" ? new Promise(resolve => { releaseCapture = () => resolve(snapshot); })
+          : Promise.resolve(snapshot) } as never;
+      });
+    try {
+      await client.connect(new StdioClientTransport({ command: process.execPath,
+        args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+        env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "0" } }));
+      assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        { connections: [], timedOut: true });
+      relay = await connectBroker("relay", directory);
+      const roster = await relay.listChatAgents(target);
+      if (roster.kind !== "chat_agents") throw new Error("Expected reply owner roster");
+      const agent = roster.payload.agents.find(agent => agent.label === "Synthetic reply wait owner");
+      assert.ok(agent);
+      await relay.approveChatAgent(target, agent.agentId);
+      const picked = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      const connectionId = (picked.structuredContent as { connections: { connectionId: string }[] }).connections[0]!.connectionId;
+      const wait = (argumentsValue: Record<string, unknown>) => client.callTool({ name: "chat_wait_for_reply", arguments: argumentsValue });
+      const foreign = await wait({ connectionId: "a66b3997-9d43-4554-8399-267d1fe9f75c", timeoutMs: 1000 });
+      assert.equal(foreign.isError, true);
+      assert.deepEqual(foreign.structuredContent, { code: "CONNECTION_NOT_FOUND" });
+      for (const extra of [{ timeoutMs: 20001 }, { timeoutMs: -1 }, { approved: true }]) {
+        assert.equal((await wait({ connectionId, ...extra })).isError, true);
+      }
+      assert.deepEqual((await wait({ connectionId, timeoutMs: 0 })).structuredContent, { timedOut: true });
+      assert.equal(reads, 0);
+      const settled = await wait({ connectionId, timeoutMs: 4000 });
+      assert.equal(settled.isError, undefined);
+      const payload = settled.structuredContent as { timedOut: boolean; reply: { text: string; generationState: string } };
+      assert.equal(payload.timedOut, false);
+      assert.equal(payload.reply.text, "Synthetic bounded reply");
+      assert.equal(payload.reply.generationState, "settled_heuristic");
+      for (const next of ["truncated", "outgoing", "unavailable"] as const) {
+        mode = next;
+        const started = performance.now();
+        assert.deepEqual((await wait({ connectionId, timeoutMs: 150 })).structuredContent, { timedOut: true });
+        assert.ok(performance.now() - started < 1000, "Short wait exceeded its bounded response allowance");
+      }
+      mode = "held";
+      const held = client.callTool({ name: "chat_read_messages", arguments: { connectionId } })
+        .then(result => ({ result, error: undefined }), (error: unknown) => ({ error }));
+      for (let attempt = 0; attempt < 40 && !releaseCapture; attempt++) await setTimeout(10);
+      assert.ok(releaseCapture);
+      const beforeQueuedRead = reads;
+      const queuedAt = performance.now();
+      assert.deepEqual((await wait({ connectionId, timeoutMs: 150 })).structuredContent, { timedOut: true });
+      assert.ok(performance.now() - queuedAt < 1000, "Queued wait exceeded its bounded response allowance");
+      releaseCapture();
+      assert.equal((await held).error, undefined);
+      const stillOwned = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      assert.equal((stillOwned.structuredContent as { connections: { connectionId: string }[] }).connections[0]?.connectionId, connectionId);
+      assert.equal(reads, beforeQueuedRead, "Expired queued read must never create a browser challenge");
+      mode = "outgoing";
+      const beforeRemoval = reads;
+      const revoked = wait({ connectionId, timeoutMs: 5000 });
+      for (let attempt = 0; attempt < 40 && reads === beforeRemoval; attempt++) await setTimeout(10);
+      assert.ok(reads > beforeRemoval);
+      await relay.removeChatAgent(target, agent.agentId);
+      assert.deepEqual((await revoked).structuredContent, { code: "CONNECTION_NOT_FOUND" });
+      await relay.approveChatAgent(target, agent.agentId);
+      const replacement = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      const replacementId = (replacement.structuredContent as { connections: { connectionId: string }[] }).connections[0]!.connectionId;
+      const beforeCancellation = reads;
+      const cancelled = client.callTool({ name: "chat_wait_for_reply", arguments: { connectionId: replacementId, timeoutMs: 5000 } },
+        { signal: controller.signal }).then(result => ({ result, error: undefined }), (error: unknown) => ({ error }));
+      for (let attempt = 0; attempt < 40 && reads === beforeCancellation; attempt++) await setTimeout(10);
+      assert.ok(reads > beforeCancellation);
+      controller.abort();
+      const cancellation = await cancelled;
+      assert.ok(cancellation.error instanceof Error);
+      assert.equal(cancellation.error.name, "SdkError");
+      assert.match(cancellation.error.message, /AbortError/);
+      assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+        { connections: [], timedOut: true });
+    } finally {
+      controller.abort();
+      releaseCapture?.();
+      relay?.close();
+      await client.close();
+      await broker.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   test(`${target.origin} SDK picks up only its individually approved autonomous connection`, { timeout: 5000 }, async () => {
     const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-pickup-"));
     const directory = join(home, ".config/agent-messaging-mcp/broker");

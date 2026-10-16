@@ -87,6 +87,37 @@ export type GeminiSnapshot = Readonly<{
   }>>;
 }>;
 
+export const REPLY_QUIET_PERIOD_MS = 2_000;
+type ReplySnapshot = Omit<FixtureSnapshot, "messages"> & {
+  messages: ReadonlyArray<FixtureMessage | GeminiSnapshot["messages"][number]>;
+};
+type SettledReply = Readonly<(FixtureMessage | Omit<GeminiSnapshot["messages"][number], "generationState">)
+  & { direction: "incoming"; generationState: "settled_heuristic" }>;
+
+export class ReplyObservation {
+  private previous?: { epoch: string; sequence: number; fingerprint: string; since: number; capturedAt: number; checkedAt: number };
+
+  observe(snapshot: ReplySnapshot, now = Date.now()): SettledReply | null {
+    const message = snapshot.messages.at(-1);
+    const previous = this.previous;
+    if (!message || message.direction !== "incoming" || !message.text || message.truncated
+      || !Number.isSafeInteger(now) || !Number.isSafeInteger(snapshot.capturedAt)
+      || snapshot.capturedAt < 0 || snapshot.capturedAt > now
+      || (previous && (now < previous.checkedAt || snapshot.capturedAt <= previous.capturedAt))) {
+      this.previous = undefined;
+      return null;
+    }
+    const fingerprint = JSON.stringify({ messages: snapshot.messages, omittedBefore: snapshot.omittedBefore });
+    const unchanged = previous?.epoch === snapshot.cursor.epoch && previous.sequence === snapshot.cursor.sequence
+      && previous.fingerprint === fingerprint;
+    const since = unchanged ? previous.since : now;
+    this.previous = { epoch: snapshot.cursor.epoch, sequence: snapshot.cursor.sequence, fingerprint,
+      since, capturedAt: snapshot.capturedAt, checkedAt: now };
+    return snapshot.capturedAt - since >= REPLY_QUIET_PERIOD_MS
+      ? Object.freeze({ ...message, direction: "incoming", generationState: "settled_heuristic" }) : null;
+  }
+}
+
 type FixtureGrant = {
   connection: ApprovedConnection;
   target: ApprovedTarget;

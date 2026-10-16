@@ -190,9 +190,15 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                 await writeBrokerResponse(socket, reply);
                 return;
               }
+              const readNow = Date.now();
+              const readDeadline = reply.deadlineMs - 25;
+              if (readDeadline <= readNow) {
+                await writeBrokerResponse(socket, { ...reply, kind: "error", payload: { code: "OBSERVATION_UNAVAILABLE" } });
+                return;
+              }
               const pending = reply.kind === "fixture_read_authorized"
-                ? requests.requestFreshFixtureRead(owner, reply.payload.connectionId)
-                : requests.requestFreshGeminiRead(owner, reply.payload.connectionId);
+                ? requests.requestFreshFixtureRead(owner, reply.payload.connectionId, readNow, readDeadline)
+                : requests.requestFreshGeminiRead(owner, reply.payload.connectionId, readNow, readDeadline);
               if (!pending || pending === "busy") {
                 await writeBrokerResponse(socket, { ...reply, kind: "error",
                   payload: { code: pending === "busy" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } });

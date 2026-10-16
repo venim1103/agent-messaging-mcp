@@ -604,7 +604,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         ? role !== "relay" : role !== "facade") {
         throw new Error("Broker role cannot perform this operation");
       }
-      if (originalDeadlineMs !== undefined && ((kind !== "prepare_chat_message" && kind !== "commit_prepared_message")
+      if (originalDeadlineMs !== undefined && kind === "read_approved_snapshot"
+        && (!Number.isSafeInteger(originalDeadlineMs) || originalDeadlineMs <= Date.now() || originalDeadlineMs > Date.now() + 5000)) {
+        return Promise.reject(new Error("Invalid read request deadline"));
+      }
+      if (originalDeadlineMs !== undefined && kind !== "read_approved_snapshot" && ((kind !== "prepare_chat_message" && kind !== "commit_prepared_message")
         || !Number.isSafeInteger(originalDeadlineMs) || originalDeadlineMs <= Date.now() || originalDeadlineMs > Date.now() + 30_000)) {
         return Promise.reject(new Error("Invalid autonomous request deadline"));
       }
@@ -695,8 +699,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         request("read_fixture_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
       readGeminiSnapshot: (connectionId: string, limit?: number) =>
         request("read_gemini_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
-      readApprovedSnapshot: (connectionId: string, limit?: number) =>
-        request("read_approved_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }),
+      readApprovedSnapshot: (connectionId: string, limit?: number, deadlineMs?: number) =>
+        request("read_approved_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }, deadlineMs),
       readFixtureEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>
         request("read_fixture_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }) }),
       readApprovedEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import * as z from "zod/v4";
 import { connectBroker } from "./broker-client.js";
 import { fixtureDispatchStatusSchema, MAX_PREPARED_MESSAGE_BYTES } from "./message-operations.js";
+import { ReplyObservation } from "./pending-connections.js";
 
 const server = new McpServer({ name: "browser-chat-feasibility", version: "0.0.1" });
 const runtimeDirectory = join(homedir(), ".config/agent-messaging-mcp/broker");
@@ -227,6 +228,69 @@ server.registerTool("chat_wait_for_events", {
     }
   } catch {
     return unavailable();
+  }
+});
+
+server.registerTool("chat_wait_for_reply", {
+  description: "Wait up to 20 seconds for the newest rendered incoming fixture or Gemini reply to remain unchanged for a two-second quiet period under fresh exact-document observations. Returns settled_heuristic, never confirmed completion or delivery. An existing newest reply may qualify; an outgoing or truncated newest row cannot. Timeout returns no reply. Only a live owned connection permits reads; cancellation ends the owning broker connection.",
+  inputSchema: z.object({ connectionId: z.uuid(), timeoutMs: z.number().int().min(0).max(20_000).optional() }).strict(),
+  annotations: { readOnlyHint: true }
+}, async ({ connectionId, timeoutMs }, extra) => {
+  const budgetMs = timeoutMs ?? 20_000;
+  const startedAt = performance.now();
+  const deadlineMs = Date.now() + budgetMs;
+  const remaining = () => Math.min(deadlineMs - Date.now(), budgetMs - (performance.now() - startedAt));
+  const output = (payload: Record<string, unknown>, isError = false) => ({
+    ...(isError ? { isError: true } : {}), content: [{ type: "text" as const, text: JSON.stringify(payload) }], structuredContent: payload
+  });
+  const timedOut = () => output({ timedOut: true });
+  const bounded = async <Value>(pending: Promise<Value>): Promise<Value | null> => {
+    const finished = new AbortController();
+    try {
+      return await Promise.race([pending, waitForPoll(Math.max(0, remaining()),
+        AbortSignal.any([extra.mcpReq.signal, finished.signal])).then(() => null)]);
+    } finally { finished.abort(); }
+  };
+  let client: Awaited<ReturnType<typeof connectBroker>> | null = null;
+  const cancel = () => client?.close();
+  extra.mcpReq.signal.addEventListener("abort", cancel, { once: true });
+  try {
+    if (extra.mcpReq.signal.aborted) return output({ code: "CANCELLED" }, true);
+    if (remaining() <= 0) return timedOut();
+    client = await bounded(pendingBroker());
+    if (extra.mcpReq.signal.aborted) { cancel(); return output({ code: "CANCELLED" }, true); }
+    if (!client || remaining() <= 1) return timedOut();
+    let observation = new ReplyObservation();
+    while (remaining() > 1) {
+      const readDeadline = Math.min(deadlineMs, Date.now() + Math.min(5000, Math.floor(remaining())));
+      const read = await bounded(client.readApprovedSnapshot(connectionId, 32, readDeadline));
+      if (extra.mcpReq.signal.aborted) return output({ code: "CANCELLED" }, true);
+      if (!read || remaining() <= 0) return timedOut();
+      if (read.kind === "error") {
+        if (read.payload.code === "OBSERVATION_UNAVAILABLE") {
+          observation = new ReplyObservation();
+          await waitForPoll(Math.min(500, Math.max(0, remaining())), extra.mcpReq.signal);
+          continue;
+        }
+        return output({ code: read.payload.code }, true);
+      }
+      if (read.kind !== "fixture_snapshot" && read.kind !== "gemini_snapshot") throw new Error("Unexpected reply observation");
+      const reply = observation.observe(read.payload);
+      if (reply) {
+        const { coverage, generation, capturedAt, cursor, omittedBefore } = read.payload;
+        return output({ timedOut: false, coverage, generation, capturedAt, cursor, omittedBefore, reply });
+      }
+      await waitForPoll(Math.min(500, Math.max(0, remaining())), extra.mcpReq.signal);
+    }
+    return timedOut();
+  } catch {
+    if (extra.mcpReq.signal.aborted) return output({ code: "CANCELLED" }, true);
+    if (remaining() <= 0) return timedOut();
+    client?.close();
+    if (broker === client) broker = undefined;
+    return output({ code: "BROKER_UNAVAILABLE" }, true);
+  } finally {
+    extra.mcpReq.signal.removeEventListener("abort", cancel);
   }
 });
 

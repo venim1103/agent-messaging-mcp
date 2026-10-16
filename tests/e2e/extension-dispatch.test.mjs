@@ -394,6 +394,44 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           }
         }
         finally { journal.close(); }
+        if (outcome === "observed") {
+          setPhase("public reply wait and streaming revision");
+          assert.deepEqual((await mcpClient.callTool({ name: "chat_wait_for_reply", arguments: {
+            connectionId: connection.connectionId, timeoutMs: 150
+          } })).structuredContent, { timedOut: true });
+          await fixture.evaluate(provider => {
+            const row = document.createElement(provider === "gemini" ? "model-response" : "li");
+            const content = document.createElement(provider === "gemini" ? "model-response-content" : "p");
+            if (provider === "fixture") {
+              row.dataset.messageId = "synthetic-streaming-reply";
+              row.dataset.direction = "incoming";
+            }
+            content.textContent = "Synthetic partial reply";
+            row.append(content);
+            document.querySelector(provider === "gemini" ? "infinite-scroller" : "#messages").append(row);
+          }, provider);
+          const partial = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+          assert.equal(partial.structuredContent.messages.at(-1).text, "Synthetic partial reply");
+          await fixture.evaluate(provider => {
+            globalThis.replyRevisionCount = 0;
+            setTimeout(() => {
+              document.querySelector(provider === "gemini" ? "model-response:last-child model-response-content" : "#messages li:last-child p")
+                .textContent = "Synthetic final reply";
+              globalThis.replyRevisionCount++;
+              globalThis.replyRevisionAt = performance.now();
+            }, 500);
+          }, provider);
+          const reply = await mcpClient.callTool({ name: "chat_wait_for_reply", arguments: {
+            connectionId: connection.connectionId, timeoutMs: 4000
+          } });
+          assert.equal(reply.isError, undefined);
+          assert.equal(reply.structuredContent.timedOut, false);
+          assert.equal(reply.structuredContent.reply.text, "Synthetic final reply");
+          assert.equal(reply.structuredContent.reply.generationState, "settled_heuristic");
+          assert.equal(await fixture.evaluate(() => globalThis.replyRevisionCount), 1);
+          assert.ok(await fixture.evaluate(() => performance.now() - globalThis.replyRevisionAt) >= 2000);
+          assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
+        }
         return;
       }
       setPhase("autonomous prepare and commit");

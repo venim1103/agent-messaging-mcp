@@ -3,7 +3,7 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const serialPattern = "^(private fixture submit activates once|worker and broker crashes after fixture activation|test-only Gemini host access|read-only Gemini draft inspection)";
+const serialPattern = "^(private fixture submit activates once|worker and broker crashes after fixture activation|test-only Gemini host access|read-only Gemini draft inspection|(?:fixture|gemini) popup roster removes one agent)";
 
 export const testGroups = [
   { name: "Independent browser cases", concurrency: 2, filter: `--test-skip-pattern=${serialPattern}` },

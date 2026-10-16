@@ -2,8 +2,47 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FIXTURE_READ_TIMEOUT_MS, GEMINI_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_GEMINI_SNAPSHOT_AGE_MS,
   MAX_AUTONOMOUS_CONNECTIONS, MAX_CONNECTION_WAIT_MS, MAX_CONNECTED_AGENTS, MAX_PENDING_REQUESTS, PendingConnectionRequests,
-  PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS, type ApprovedTarget }
+  PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS, ReplyObservation, type ApprovedTarget }
   from "./pending-connections.js";
+
+for (const provider of ["fixture", "gemini"]) {
+  const messages = provider === "fixture"
+    ? [{ id: "synthetic-reply", direction: "incoming" as const, text: "Synthetic reply" }]
+    : [{ direction: "incoming" as const, text: "Synthetic reply", identityQuality: "uncertain" as const, generationState: "unknown" as const }];
+  const snapshot = (capturedAt: number, sequence = 1, epoch = "synthetic-epoch") => ({
+    coverage: "rendered_only" as const, generation: 1 as const, capturedAt, cursor: { epoch, sequence }, omittedBefore: false, messages
+  });
+  test(`${provider} reply quiet period needs fresh unchanged observations and never confirms completion`, () => {
+    const observation = new ReplyObservation();
+    assert.equal(observation.observe(snapshot(1000), 1000), null);
+    assert.equal(observation.observe(snapshot(2999), 2999), null);
+    const settled = observation.observe(snapshot(3000), 3000);
+    assert.equal(settled?.generationState, "settled_heuristic");
+    assert.equal(settled?.text, "Synthetic reply");
+    assert.equal(Object.isFrozen(settled), true);
+    assert.equal(observation.observe(snapshot(3000), 5000), null);
+    assert.equal(observation.observe(snapshot(6000), 6000), null);
+    assert.equal(observation.observe(snapshot(8000), 8000)?.generationState, "settled_heuristic");
+    const delayed = new ReplyObservation();
+    assert.equal(delayed.observe(snapshot(1000), 1000), null);
+    assert.equal(delayed.observe(snapshot(1001), 3000), null);
+    assert.equal(delayed.observe(snapshot(3000), 3000)?.generationState, "settled_heuristic");
+  });
+  test(`${provider} reply quiet period resets on revisions, restored text, gaps and unsafe newest rows`, () => {
+    const observation = new ReplyObservation();
+    assert.equal(observation.observe(snapshot(1000), 1000), null);
+    assert.equal(observation.observe(snapshot(3000, 3), 3000), null);
+    assert.equal(observation.observe(snapshot(5000, 3, "reloaded-epoch"), 5000), null);
+    assert.equal(observation.observe(snapshot(7000, 3, "reloaded-epoch"), 7000)?.generationState, "settled_heuristic");
+    assert.equal(observation.observe({ ...snapshot(8000), messages: messages.map(message => ({ ...message, truncated: true as const })) }, 8000), null);
+    assert.equal(observation.observe(snapshot(10000), 10000), null);
+    assert.equal(observation.observe({ ...snapshot(12000), messages: [{ id: "later-outgoing", direction: "outgoing", text: "Synthetic new question" }] }, 12000), null);
+    assert.equal(observation.observe(snapshot(14000), 14000), null);
+    assert.equal(observation.observe(snapshot(16001), 16000), null);
+    assert.equal(observation.observe(snapshot(18000), 18000), null);
+    assert.equal(observation.observe(snapshot(17000), 17000), null);
+  });
+}
 
 for (const target of [
   { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },

@@ -435,6 +435,42 @@ test("broker client validates bounded purpose-specific Gemini consent replies", 
   }
 });
 
+test("short fresh-read deadlines expire without disconnecting the approved owner", { timeout: 5000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-short-read-"));
+  const directory = join(home, "broker");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials());
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  try {
+    facade = await connectBroker("facade", directory);
+    relay = await connectBroker("relay", directory);
+    for (const provider of ["fixture", "gemini"] as const) {
+      const pending = await facade.requestConnection();
+      if (pending.kind !== "connection_requested") throw new Error("Expected read request");
+      if (provider === "fixture") await relay.approveFixture(pending.payload.requestId, {
+        origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "short-read"
+      });
+      else await relay.approveGemini(pending.payload.requestId, { origin: "https://gemini.google.com",
+        conversationId: "short-read", url: "https://gemini.google.com/app/short-read", tabId: 4, documentId: "short-read" });
+      const grant = await facade.getConnection(pending.payload.requestId);
+      if (grant.kind !== "connection_state" || grant.payload.state !== "ready_readonly") throw new Error("Expected read grant");
+      const read = await facade.readApprovedSnapshot(grant.payload.connectionId, undefined, Date.now() + 150);
+      assert.equal(read.kind, "error");
+      assert.deepEqual(read.payload, { code: "OBSERVATION_UNAVAILABLE" });
+      assert.equal(facade.closed, false);
+      assert.deepEqual((await facade.getConnection(pending.payload.requestId)).payload, grant.payload);
+      if (provider === "fixture") assert.deepEqual((await relay.listFixtureReadChallenges()).payload,
+        { challenges: [], activeTabIds: [3], preflightChecks: [], draftFills: [] });
+      else assert.deepEqual((await relay.listGeminiReadChallenges()).payload, { challenges: [], activeTabIds: [4] });
+    }
+  } finally {
+    facade?.close();
+    relay?.close();
+    await broker.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("broker observation replies preserve bounded flags and refuse extra fields", { timeout: 5000 }, async (context) => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-observation-replies-"));
   const directory = join(home, "broker");
@@ -473,6 +509,12 @@ test("broker observation replies preserve bounded flags and refuse extra fields"
       observed = snapshot;
       const read = await facade.readApprovedSnapshot(grant.payload.connectionId);
       assert.deepEqual(read.payload, snapshot, "Capture omissions must survive when the caller limit omits nothing");
+      const readDeadline = Date.now() + 500;
+      const bounded = await facade.readApprovedSnapshot(grant.payload.connectionId, undefined, readDeadline);
+      assert.equal(bounded.deadlineMs, readDeadline);
+      for (const invalidDeadline of [Date.now() - 1, Date.now() + 6000, NaN, 1.5]) {
+        await assert.rejects(facade.readApprovedSnapshot(grant.payload.connectionId, undefined, invalidDeadline), /Invalid read request deadline/);
+      }
       observed = { ...snapshot, omittedBefore: false };
       const complete = await facade.readApprovedSnapshot(grant.payload.connectionId);
       if (complete.kind !== "fixture_snapshot" && complete.kind !== "gemini_snapshot") throw new Error("Expected a snapshot");

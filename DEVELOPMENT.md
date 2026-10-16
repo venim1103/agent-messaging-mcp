@@ -107,9 +107,17 @@ Toolbar clicks, extension reloads and profile unlocks are human steps. Ask for t
 5. `chat_wait_for_events { connectionId, cursor, timeoutMs?, limit? }` waits up to 20 seconds and returns `{ state: "ok", events, cursor, timedOut }`. Each event holds a full rendered snapshot, not a delta. On `CURSOR_EXPIRED`, call `chat_read_messages` again.
 6. `chat_disconnect { connectionId }` returns `{ disconnected }` and leaves the tab open.
 
-For Gemini, treat events as change hints. A streaming reply produces many snapshots; the 128-event/4 MiB buffer can still expire a cursor, and completion is unknown, so wait until events stop for a while and then read again. Captures keep the newest 32 visible rows, cap each message at 16,000 UTF-16 units and drop oldest rows until the capture fits 96 KiB. Snapshot events carry the same omission and truncation flags.
+For Gemini, treat events as change hints. A streaming reply produces many snapshots; the 128-event/4 MiB buffer can still expire a cursor. Raw rows retain completion `unknown`; use the heuristic reply wait below when appropriate. Captures keep the newest 32 visible rows, cap each message at 16,000 UTF-16 units and drop oldest rows until the capture fits 96 KiB. Snapshot events carry the same omission and truncation flags.
 
 A missing or ambiguous message element skips publication when URL, document and conversation are unchanged. A challenged read then returns `OBSERVATION_UNAVAILABLE` after its original four-second budget; a later read can recover without reapproval. Identity changes still revoke the grant. No snapshot omission or truncation proves a complete history.
+
+### Waiting For Replies
+
+`chat_wait_for_reply { connectionId, timeoutMs? }` waits at most 20 seconds (default 20 seconds) using existing fresh exact-document reads. Zero returns `{ timedOut: true }` without reading. Success returns `{ timedOut: false, coverage, generation, capturedAt, cursor, omittedBefore, reply }`; only the newest rendered row may qualify, and it must be incoming, nonempty and untruncated. A previously existing newest reply can qualify; this is not correlation to a particular send.
+
+The tracker requires a two-second span of advancing fresh captures with the same observation epoch/sequence and entire rendered window. Revisions, changed-restored text reflected in the cursor, gaps, reloads, truncation, outgoing tails, backward time and unavailable captures reset the evidence. Result `reply.generationState` is only `settled_heuristic`, never `complete`: network stalls can look quiet. Missing earlier rows stay disclosed; no heuristic proves complete history, provider acceptance or delivery.
+
+Timeout returns no reply and does not intentionally disconnect the owner. Reads remain at most four seconds and are clipped to the original wait budget with a transport-reply allowance. An expired queued read cannot reach the browser. Cancellation ends the owning broker connection; reconnect requires fresh approval. Errors use structured `code`, including `CONNECTION_NOT_FOUND`, `CANCELLED` and `BROKER_UNAVAILABLE`. Synthetic SDK/browser coverage exists for both providers; installed/live acceptance and a reviewed Gemini completion indicator remain pending.
 
 ### Autonomous send
 
@@ -153,6 +161,7 @@ Each human approval lasts at most two minutes and ends with the preparation or c
 | `chat_wait_for_connection` | Optional `timeoutMs` 0-20000, default 20000 | Owned `connections`, `timedOut` | Popup-first grants only; no approval creation; cancellation ends owner grants |
 | `chat_read_messages` | `connectionId`, `limit` 1-32 | Fresh snapshot and cursor | Exact-document challenge, four seconds |
 | `chat_wait_for_events` | `connectionId`, `cursor`, `timeoutMs` 0-20000, `limit` 1-2 | `events`, `cursor`, `timedOut` | `CURSOR_EXPIRED` needs a new read; cancellation returns `CANCELLED` |
+| `chat_wait_for_reply` | `connectionId`, optional `timeoutMs` 0-20000 | `timedOut`; on success, latest `reply` and observation metadata | Two-second `settled_heuristic` only; existing newest reply may qualify; timeout has no reply |
 | `chat_send_message` | `connectionId`, `text`, UUID `idempotencyKey` | `sent`, `not_sent` or `unresolved`, `code`, `retryAllowed: false`; operation/receipt when prepared | Autonomous fixture/Gemini only; one original deadline; exact-key replay is status only |
 | `chat_prepare_message` | `connectionId`, `expectedGeneration: 1`, `text`, `idempotencyKey` | Operation, exact preview, `recoveryToken` | Fixture only; the same key and text replay, changed text conflicts |
 | `chat_fill_draft` | `operationId` | `ok` with `editor` and `completedAt`, or `code`; `retryAllowed: false` | Needs fill consent; refuses existing drafts; never clicks Send |
@@ -328,7 +337,7 @@ npm run build:extension && npm run test:e2e:focus -- --test-name-pattern='<regex
 
 Use `extension-dispatch.test.mjs` for public sends and private submit/loss cases, and `extension-probe.test.mjs` for popup admission/read/fill cases. A focused public send took about five seconds in the initial benchmark; timing depends on the machine and power state.
 
-`tests/e2e/run.mjs` discovers every E2E test file. Independent cases run with two isolated file workers. Four existing composite cases (fixture private-submit matrix, fixture crash matrix, Gemini read workflow and Gemini inspector matrix) run serially through complementary name filters; their aggregate deadlines made all-parallel execution unreliable. Profiles, brokers and authority are never shared. New unmatched tests enter the parallel group; update the serial pattern when adding a composite case. A failed group stops the gate without an automatic retry. Keep the original case deadlines, polling, sandbox and assertions.
+`tests/e2e/run.mjs` discovers every E2E test file. Independent cases run with two isolated file workers. Six composite cases (fixture private-submit matrix, fixture crash matrix, both provider roster-race matrices, Gemini read workflow and Gemini inspector matrix) run serially through complementary name filters; their aggregate deadlines made all-parallel execution unreliable. Profiles, brokers and authority are never shared. New unmatched tests enter the parallel group; update the serial pattern when adding a composite case. A failed group stops the gate without an automatic retry. Keep the original case deadlines, polling, sandbox and assertions.
 
 Browser-test rules: launch Chromium with `chromiumSandbox: true`, because Playwright otherwise adds `--no-sandbox`; use disposable profiles and an isolated HOME broker; wait for the current-user, owner-only socket before connecting; keep the original timeouts and assertions. Test copies of the extension may get temporary host permissions, and automated popup navigation does not grant `activeTab`, so these tests do not prove real toolbar approval. Installed-toolbar and live checks are separate, human-assisted evidence.
 

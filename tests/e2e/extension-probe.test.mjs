@@ -1420,6 +1420,7 @@ for (const provider of ["fixture", "gemini"]) {
   });
 
   test(`${provider} popup roster removes one agent and preserves a newer approval`, { timeout: 20000 }, async (testContext) => {
+    const setPhase = trackTestPhase(testContext, `${provider} roster races`);
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-roster-test-"));
     const unpacked = join(profile, "unpacked-extension");
     await cp(extensionDirectory, unpacked, { recursive: true });
@@ -1453,6 +1454,25 @@ for (const provider of ["fixture", "gemini"]) {
         await setTimeout(25);
       }
       assert.equal(ready, true, "Roster broker did not start");
+      await worker.evaluate(() => {
+        globalThis.holdNextAgentRemoval = false;
+        globalThis.agentRemovalHeldCount = 0;
+        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+        chrome.runtime.connectNative = (...args) => {
+          const port = connect(...args);
+          const listen = port.onMessage.addListener.bind(port.onMessage);
+          port.onMessage.addListener = listener => listen(reply => {
+            if (globalThis.holdNextAgentRemoval && reply.kind === "chat_agent_removed" && reply.payload.remainingAgents === 0) {
+              globalThis.holdNextAgentRemoval = false;
+              globalThis.agentRemovalHeldCount++;
+              globalThis.releaseAgentRemoval = () => listener(reply);
+              globalThis.agentRemovalHeld = true;
+            } else listener(reply);
+          });
+          return port;
+        };
+      });
+      setPhase("MCP startup and initial approvals");
       const options = { command: process.execPath, args: [mcpEntry],
         env: { ...process.env, HOME: profile, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
       delete options.env.BROWSER_CHAT_AGENT_LABEL;
@@ -1497,6 +1517,7 @@ for (const provider of ["fixture", "gemini"]) {
         arguments: { requestId: requested[index].structuredContent.requestId } })));
       const snapshots = await Promise.all(clients.map((client, index) => client.callTool({ name: "chat_read_messages",
         arguments: { connectionId: connections[index].structuredContent.connectionId } })));
+      setPhase("initial reads and first-owner removal");
       assert.ok(snapshots.every(reply => reply.isError === undefined));
       assert.notDeepEqual(snapshots[0].structuredContent.cursor, snapshots[1].structuredContent.cursor);
       const forged = await worker.evaluate(async ({ tabId, expectedUrl }) => {
@@ -1516,22 +1537,8 @@ for (const provider of ["fixture", "gemini"]) {
       assert.deepEqual(survivor.structuredContent.cursor, snapshots[1].structuredContent.cursor);
       const fresh = await clients[0].callTool({ name: "chat_request_connection", arguments: {} });
       assert.equal(fresh.structuredContent.state, "pending");
-      await worker.evaluate(() => {
-        globalThis.holdNextAgentRemoval = true;
-        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
-        chrome.runtime.connectNative = (...args) => {
-          const port = connect(...args);
-          const listen = port.onMessage.addListener.bind(port.onMessage);
-          port.onMessage.addListener = listener => listen(reply => {
-            if (globalThis.holdNextAgentRemoval && reply.kind === "chat_agent_removed" && reply.payload.remainingAgents === 0) {
-              globalThis.holdNextAgentRemoval = false;
-              globalThis.releaseAgentRemoval = () => listener(reply);
-              globalThis.agentRemovalHeld = true;
-            } else listener(reply);
-          });
-          return port;
-        };
-      });
+      setPhase("held last-owner removal and newer approval");
+      await worker.evaluate(() => { globalThis.holdNextAgentRemoval = true; });
       await secondRow.getByRole("button", { name: "Remove access" }).click();
       let held = false;
       for (let attempt = 0; attempt < 80; attempt++) {
@@ -1541,6 +1548,7 @@ for (const provider of ["fixture", "gemini"]) {
         await setTimeout(25);
       }
       assert.equal(held, true, "Last-agent removal reply was not held");
+      assert.equal(await worker.evaluate(() => globalThis.agentRemovalHeldCount), 1);
       await approve(fresh.structuredContent.requestId);
       const key = `${provider}-grant-${selected.tabId}`;
       const newRevision = await worker.evaluate(async key => (await chrome.storage.session.get(key))[key].revision, key);
@@ -1554,6 +1562,7 @@ for (const provider of ["fixture", "gemini"]) {
       const otherFresh = await clients[1].callTool({ name: "chat_request_connection", arguments: {} });
       await approve(otherFresh.structuredContent.requestId);
       await waitCount(2);
+      setPhase("held storage deletion and newest approval");
       await worker.evaluate(key => {
         const remove = chrome.storage.session.remove.bind(chrome.storage.session);
         chrome.storage.session.remove = keys => {
@@ -1599,11 +1608,13 @@ for (const provider of ["fixture", "gemini"]) {
       assert.equal((await clients[0].callTool({ name: "chat_read_messages",
         arguments: { connectionId: newestConnection.connectionId } })).isError, true);
     } finally {
+      setPhase("cleanup");
       await Promise.all(clients.map(client => client.close().catch(() => {})));
       await context?.close();
       broker?.kill("SIGTERM");
       if (brokerExit) await brokerExit;
       await rm(profile, { recursive: true, force: true });
+      setPhase("complete");
     }
   });
 }
