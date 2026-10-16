@@ -115,13 +115,15 @@ A missing or ambiguous message element skips publication when URL, document and 
 
 After **Connect this chat** and `chat_wait_for_connection`, call `chat_send_message { connectionId, text, idempotencyKey }` with a UUID key. Only the live owned autonomous grant authorizes a new attempt. The broker runs preparation, fill, challenged read, exact proof, durable intent, one reserved activation and bounded evidence inside one original 30-second deadline. Each browser lease remains at most four seconds.
 
+The chat must be active and visible in its own window; that window need not be focused. A genuinely hidden/inactive tab refuses without changing an existing draft, creating durable intent or activating Send. Both cases are covered for fixture and routed synthetic Gemini without browser focus emulation. Hidden-tab sending remains a later phase (D11).
+
 Results always have `retryAllowed: false` and `state: "sent" | "not_sent" | "unresolved"` with a code. `sent` is a page/person assessment, not acceptance or delivery. `not_sent` means a definite refusal before durable intent or a page/person assessment; returning it does not clear any draft. A fresh independently keyed message may replace only this owner's known resolved unsent leftover under the bounded D10a checks below. `unresolved` may mean the send happened and must not trigger an automatic replacement. An unresolved durable attempt pauses the conversation across owners.
 
 The first prepared response includes `operationId` and a private `recoveryToken`; keep the token private. `chat_get_operation { operationId, recoveryToken }` can recover dispatch metadata without chat access or write authority. Same key and arguments return the existing status without another activation; a status-only replay need not repeat the token. Changed arguments conflict. New work requires a new key and valid authority, and still refuses an existing draft. Cancellation closes the owning broker connection; it cannot undo an already activated send.
 
 Transport failure returns `unresolved / DISPATCH_UNCERTAIN` even while awaiting preparation: a same-key concurrent or earlier invocation may already have durable intent. Local call progress is not proof of non-send. Cancellation cannot restore approval on a replacement broker connection; receipt recovery stays status-only.
 
-This public path works for the fixture and routed synthetic Gemini pages, including bounded own-leftover replacement (D10a) and human-draft preservation. Installed/live autonomous acceptance, explicit own-window acceptance and broader authority-loss/concurrent-cancellation browser cases remain pending. Do not infer live test authorization from synthetic coverage.
+This public path works for the fixture and routed synthetic Gemini pages, including own-window sending, hidden-tab refusal, bounded own-leftover replacement (D10a) and human-draft preservation. Installed/live autonomous acceptance and broader authority-loss/concurrent-cancellation browser cases remain pending. Do not infer live test authorization from synthetic coverage.
 
 ### Supervised send (fixture only)
 

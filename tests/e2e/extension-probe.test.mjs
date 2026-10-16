@@ -1950,6 +1950,9 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
   const directory = join(profile, ".config/agent-messaging-mcp/broker");
   const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
   let context;
+  let visibilityBrowser;
+  let visibilityBrowserExit;
+  let visibilityBrowserControl;
   let broker;
   let brokerExit;
   let facade;
@@ -1975,7 +1978,27 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       signalCode: broker.signalCode, stderr: brokerStderr
     })}`);
     setPhase("browser startup");
-    context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
+    if (outcome === "own_window" || outcome === "hidden") {
+      visibilityBrowser = spawn("/usr/bin/chromium", ["--headless=new", "--remote-debugging-address=127.0.0.1",
+        "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check",
+        "--disable-background-networking", `--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`, "about:blank"],
+      { env: { ...process.env, HOME: profile }, stdio: ["ignore", "ignore", "pipe"] });
+      visibilityBrowserExit = once(visibilityBrowser, "exit");
+      const endpoint = await new Promise((resolve, reject) => {
+        const timer = globalThis.setTimeout(() => reject(new Error("Disposable visibility browser did not start")), 5000);
+        visibilityBrowser.once("error", error => { clearTimeout(timer); reject(error); });
+        visibilityBrowser.once("exit", () => { clearTimeout(timer); reject(new Error("Visibility browser exited during startup")); });
+        let output = "";
+        visibilityBrowser.stderr.on("data", chunk => {
+          output = `${output}${chunk}`.slice(-4096);
+          const match = output.match(/DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[^\s]+)/);
+          if (match) { clearTimeout(timer); resolve(match[1]); }
+        });
+      });
+      const browser = await chromium.connectOverCDP(endpoint, { noDefaults: true });
+      visibilityBrowserControl = await browser.newBrowserCDPSession();
+      context = browser.contexts()[0];
+    } else context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
       executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
     let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
@@ -2072,9 +2095,19 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       const popup = await context.newPage();
       await fixture.bringToFront();
       await popup.goto(`chrome-extension://${extensionId}/popup.html`);
-      await popup.locator("#agent-list li").filter({ hasText: "Synthetic autonomous browser owner" })
-        .getByRole("button", { name: "Connect this chat" }).click({ timeout: 4000 });
-      await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("1 connected"), null, { timeout: 4000 });
+      const connect = popup.locator("#agent-list li").filter({ hasText: "Synthetic autonomous browser owner" })
+        .getByRole("button", { name: "Connect this chat" });
+      if (outcome === "own_window" || outcome === "hidden") {
+        await connect.waitFor({ state: "visible", timeout: 4000 });
+        assert.equal(await connect.isEnabled(), true);
+        await connect.evaluate(button => button.addEventListener("click", event => {
+          globalThis.visibilityApprovalGesture = { trusted: event.isTrusted, active: navigator.userActivation.isActive };
+        }, { once: true }));
+        await connect.press("Enter", { timeout: 4000 });
+        assert.deepEqual(await popup.evaluate(() => globalThis.visibilityApprovalGesture), { trusted: true, active: true });
+      } else await connect.click({ timeout: 4000 });
+      await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("1 connected"), null,
+        { timeout: 4000, polling: outcome === "own_window" || outcome === "hidden" ? 100 : "raf" });
       const pickup = autonomous === "public"
         ? (await mcpClient.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent
         : (await facade.waitForConnection(0)).payload;
@@ -2088,46 +2121,74 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         const argumentsValue = { connectionId: connection.connectionId, text: "Synthetic public autonomous message",
           idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
         await fixture.bringToFront();
+        const hidden = outcome === "hidden";
+        const hiddenDraft = "Synthetic hidden-tab human draft must remain";
+        if (hidden) {
+          await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").fill(hiddenDraft);
+        }
+        if (outcome === "own_window" || hidden) {
+          const windows = await worker.evaluate(async ({ tabId, hidden }) => {
+            const chat = await chrome.tabs.get(tabId);
+            if (hidden) await chrome.tabs.create({ windowId: chat.windowId, url: "about:blank", active: true });
+            else await chrome.windows.create({ url: "about:blank", focused: true });
+            const current = await chrome.windows.getLastFocused();
+            const [selected] = await chrome.tabs.query({ active: true, currentWindow: true });
+            return { chatWindowId: chat.windowId, currentWindowId: current.id, selectedTabId: selected.id,
+              chatActive: (await chrome.tabs.get(tabId)).active };
+          }, { tabId: selected.tabId, hidden });
+          assert.equal(windows.chatActive, !hidden);
+          assert.notEqual(windows.selectedTabId, selected.tabId);
+          if (!hidden) assert.notEqual(windows.currentWindowId, windows.chatWindowId);
+          if (hidden) await fixture.waitForFunction(() => document.visibilityState === "hidden", null, { timeout: 4000, polling: 100 });
+          assert.equal(await fixture.evaluate(() => document.visibilityState), hidden ? "hidden" : "visible");
+        }
         const result = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
         const status = result.structuredContent;
-        const expectedState = outcome === "observed" ? "sent" : outcome === "lost_settle" ? "unresolved" : "not_sent";
+        const expectedState = outcome === "observed" || outcome === "own_window" ? "sent" : outcome === "lost_settle" ? "unresolved" : "not_sent";
         assert.equal(result.isError, expectedState !== "sent");
         assert.equal(status.state, expectedState);
         assert.equal(status.retryAllowed, false);
+        if (hidden) assert.equal(status.code, "DISPATCH_UNAVAILABLE");
         assert.match(status.recoveryToken, /^[0-9a-f]{64}$/);
         if (outcome === "not_sent") assert.equal(status.resolution.source, "page");
         if (outcome === "lost_settle") assert.equal(await worker.evaluate(() => globalThis.fixtureDroppedCompletionCount), 1);
         setPhase("public status and replay");
         const replay = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
         const { recoveryToken, ...withoutReceipt } = status;
-        assert.deepEqual(replay.structuredContent, withoutReceipt);
+        assert.deepEqual(replay.structuredContent, hidden ? status : withoutReceipt);
         assert.deepEqual((await facade.getPreparedOperation(status.operationId, recoveryToken)).payload.state,
-          expectedState === "unresolved" ? "dispatch_uncertain" : provider === "gemini" || expectedState === "not_sent" ? "resolved" : "observed_in_ui");
+          hidden ? "unknown" : expectedState === "unresolved" ? "dispatch_uncertain"
+            : provider === "gemini" || expectedState === "not_sent" ? "resolved" : "observed_in_ui");
+        if (hidden) assert.equal((await mcpClient.callTool({ name: "chat_get_operation", arguments: {
+          operationId: status.operationId
+        } })).structuredContent.state, "prepared");
         const conflict = await mcpClient.callTool({ name: "chat_send_message", arguments: { ...argumentsValue, text: "Synthetic conflicting public text" } });
         assert.equal(conflict.structuredContent.code, "IDEMPOTENCY_CONFLICT");
         assert.equal(conflict.structuredContent.retryAllowed, false);
-        assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
+        assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), hidden ? 0 : 1);
         assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
-          (provider === "gemini" ? 1 : 2) + (retainedDraft ? 0 : 1));
+          (provider === "gemini" ? 1 : 2) + (retainedDraft || hidden ? 0 : 1));
         assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
-          editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), retainedDraft ? argumentsValue.text : "");
+          editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), hidden ? hiddenDraft : retainedDraft ? argumentsValue.text : "");
         for (const phase of ["fill", "proof", "submit", "settle"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
         assert.equal(await worker.evaluate(async ({ operationId, provider }) =>
           (await chrome.storage.local.get(`${provider}-submit-attempt-${operationId}`))[`${provider}-submit-attempt-${operationId}`],
-        { operationId: status.operationId, provider }), true);
+        { operationId: status.operationId, provider }), hidden ? undefined : true);
         const checkOwnership = () => worker.evaluate(async ({ selected, operationId, text, url, provider }) => {
           const [result] = await chrome.scripting.executeScript({ target: { tabId: selected.tabId, documentIds: [selected.documentId] },
-            func: ({ operationId, text, url, provider }) => globalThis.agentDraftOwnership?.matches(operationId, text, url,
-              document.querySelector(provider === "gemini" ? "[contenteditable]" : "#message"), document.querySelector("main")),
+            func: ({ operationId, text, url, provider }) => globalThis.agentDraftOwnership
+              ? { installed: true, owned: globalThis.agentDraftOwnership.matches(operationId, text, url,
+                document.querySelector(provider === "gemini" ? "[contenteditable]" : "#message"), document.querySelector("main")) }
+              : { installed: false },
             args: [{ operationId, text, url, provider }] });
           return result.result;
         }, { selected, operationId: status.operationId, text: argumentsValue.text, url, provider });
-        assert.equal(await checkOwnership(), retainedDraft);
+        assert.deepEqual(await checkOwnership(), hidden ? { installed: false } : { installed: true, owned: retainedDraft });
         if (outcome === "not_sent") {
           const editor = fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message");
           await editor.fill("");
           await editor.fill(argumentsValue.text);
-          assert.equal(await checkOwnership(), false);
+          assert.deepEqual(await checkOwnership(), { installed: true, owned: false });
           const refused = await mcpClient.callTool({ name: "chat_send_message", arguments: {
             ...argumentsValue, idempotencyKey: crypto.randomUUID(), text: "Synthetic new message must preserve the retyped draft"
           } });
@@ -2141,7 +2202,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         const { DatabaseSync } = await import("node:sqlite");
         const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
         try {
-          assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, 1);
+          assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, hidden ? 0 : 1);
           if (outcome === "owned_leftover") {
             setPhase("fresh send replacing known own leftover");
             const next = { ...argumentsValue, idempotencyKey: crypto.randomUUID(), text: "Synthetic independently requested next message" };
@@ -2442,14 +2503,28 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     relay?.close();
     broker?.kill("SIGTERM");
     if (brokerExit) await brokerExit;
-    await context?.close();
-    await rm(profile, { recursive: true, force: true });
-    setPhase("complete");
+    try {
+      if (visibilityBrowserControl) {
+        await visibilityBrowserControl.send("Browser.close").catch(() => {});
+        let closeTimer;
+        try {
+          await Promise.race([visibilityBrowserExit, new Promise((_, reject) => {
+            closeTimer = globalThis.setTimeout(() => reject(new Error("Disposable visibility browser did not close")), 5000);
+          })]);
+        } finally { clearTimeout(closeTimer); }
+      } else await context?.close();
+    }
+    finally {
+      if (visibilityBrowser?.exitCode === null && visibilityBrowser.signalCode === null) visibilityBrowser.kill("SIGTERM");
+      if (visibilityBrowserExit) await visibilityBrowserExit;
+      await rm(profile, { recursive: true, force: true });
+      setPhase("complete");
+    }
   }
 }
 
 for (const provider of ["fixture", "gemini"]) {
-  for (const outcome of ["observed", "not_sent", "lost_settle", "owned_leftover"]) {
+  for (const outcome of ["observed", "own_window", "hidden", "not_sent", "lost_settle", "owned_leftover"]) {
     test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();
       await exerciseChatDispatch(outcome, provider, testContext, "public");
