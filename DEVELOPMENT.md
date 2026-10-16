@@ -365,7 +365,7 @@ Use only disposable chats in the development profile, with fresh human authoriza
 
 ### Manual Post-Fill Control Review
 
-Use only after fresh authorization for the exact selected disposable Gemini chat. This one-shot read-only Console probe mirrors existing composer/Send checks and emits only fixed metadata. It does not read draft/message text, click, focus, fill, send or clear anything. Leave the existing draft untouched. Do not bypass paste protection or rerun automatically; return only its JSON, never other logs, URLs or screenshots.
+Use only after fresh authorization for the exact selected disposable Gemini chat. This one-shot read-only Console probe mirrors composer/Send checks and snapshot row selectors, emitting only fixed metadata. `readShape` describes at most the newest 32 rendered row structures, never their text; overflow and wrapper/query-line counts can reveal unsupported structure but do not prove capture or publication succeeded. It does not read draft/message text, click, focus, fill, send or clear anything. Leave the existing draft untouched. Do not bypass paste protection or rerun automatically; return only its JSON, never other logs, URLs or screenshots.
 
 ```js
 (() => {
@@ -392,12 +392,25 @@ Use only after fresh authorization for the exact selected disposable Gemini chat
    const editors = [...document.querySelectorAll("[contenteditable=true]")].filter(element => visible(element)
       && (element.getAttribute("aria-label") === "Enter a prompt for Gemini" || element.getAttribute("placeholder") === "Enter a prompt for Gemini"));
    const controls = [...document.querySelectorAll('button[aria-label="Send message"]')].filter(visible);
+   const rendered = element => element.getClientRects().length > 0;
+   const readRegions = [...document.querySelectorAll("main, [role=main]")].filter(rendered);
+   const readTimelines = readRegions.length === 1 ? [...readRegions[0].querySelectorAll("infinite-scroller")]
+      .filter(element => rendered(element) && element.querySelector("user-query, model-response")) : [];
+   const rows = readTimelines.length === 1 ? [...readTimelines[0].querySelectorAll("user-query, model-response")].filter(rendered) : [];
+   const readShape = { regions: readRegions.length, timelines: readTimelines.length, totalRows: rows.length,
+      rowsOverflow: rows.length > 32, rows: rows.slice(-32).map(row => {
+         const outgoing = row.localName === "user-query";
+         const blocks = row.querySelectorAll(outgoing ? "user-query-content" : "model-response-content");
+         return { direction: outgoing ? "outgoing" : "incoming", visible: visible(row),
+            directTimeline: row.closest("infinite-scroller") === readTimelines[0], contentBlocks: blocks.length,
+            queryLines: outgoing && blocks.length === 1 ? [...blocks[0].querySelectorAll("p.query-text-line")].filter(rendered).length : null };
+      }) };
    emit({ code: "CAPTURED", visible: document.visibilityState === "visible", regions: regions.length, timelines: timelines.length,
       editors: editors.slice(0, 8).map(element => ({ ...describe(element), editable: element.isContentEditable,
          nested: Boolean(element.parentElement?.closest("[contenteditable]")),
          embedded: Boolean(element.querySelector("[contenteditable], input, textarea, [role=textbox]")) })), editorsOverflow: editors.length > 8,
       controls: controls.slice(0, 8).map(element => ({ ...describe(element), type: ["submit", "button", "reset"].includes(element.type) ? element.type : "other",
-         disabled: element.matches(":disabled") })), controlsOverflow: controls.length > 8 });
+         disabled: element.matches(":disabled") })), controlsOverflow: controls.length > 8, readShape });
 })();
 ```
 
