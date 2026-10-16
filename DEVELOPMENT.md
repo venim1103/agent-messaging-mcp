@@ -354,3 +354,54 @@ Browser-test rules: launch Chromium with `chromiumSandbox: true`, because Playwr
 ## Live-Chat Rules
 
 Use only disposable chats in the development profile, with fresh human authorization for each live read. A live connector fill needs explicit approval of the exact chat and text, and a live send needs a separate approval. Never clear or submit a draft the person typed. Do not store chat text, full URLs, IDs or recovery tokens in documents, logs or memory. Details are in AGENTS.md.
+
+### Manual Completion-Metadata Review
+
+After explicit read-only authorization and confirmation of the exact selected disposable saved chat, run this in that chat's DevTools Console. Start it before manually submitting one non-sensitive prompt. It samples for 60 seconds, stops on a URL/visibility change, and prints only fixed control metadata. It never clicks, focuses, fills, sends or reads message bodies; the selected URL stays local for the identity guard and is never printed. Use an existing chat with a stable saved route, not a new blank chat. Do not bypass paste protection or change security settings if the console blocks it; report the block.
+
+```js
+(async () => {
+   const emit = (code, samples) => console.log(JSON.stringify({ code, samples }));
+   if (window.top !== window || location.origin !== "https://gemini.google.com"
+      || !/^\/app\/[A-Za-z0-9_-]{1,128}\/?$/.test(location.pathname)) return emit("UNSUPPORTED_CHAT", []);
+   const selected = location.href;
+   const visible = element => element.getClientRects().length > 0 && getComputedStyle(element).visibility === "visible";
+   const labels = new Map([["Send message", "send-message"], ["Send", "send"], ["Stop response", "stop-response"],
+      ["Stop generating", "stop-generating"], ["Stop", "stop"], ["Copy response", "copy-response"],
+      ["Copy", "copy"], ["Good response", "good-response"], ["Bad response", "bad-response"]]);
+   const describe = control => {
+      const icons = [...control.querySelectorAll("mat-icon, [data-mat-icon-name], .google-symbols, .material-symbols-outlined, .material-icons")];
+      const hasIcon = name => icons.some(icon => icon.getAttribute("data-mat-icon-name") === name || icon.textContent?.trim() === name);
+      return { label: labels.get(control.getAttribute("aria-label")) ?? "other", sendClass: control.classList.contains("send-button"),
+         disabled: control.matches(":disabled"), ariaDisabled: control.getAttribute("aria-disabled") === "true",
+         sendIcon: hasIcon("send"), stopIcon: hasIcon("stop") };
+   };
+   const samples = [];
+   const started = performance.now();
+   let previous;
+   let code = "CAPTURED";
+   while (performance.now() - started < 60_000) {
+      if (location.href !== selected) { code = "CHAT_CHANGED"; break; }
+      if (document.visibilityState !== "visible") { code = "NOT_VISIBLE"; break; }
+      const regions = [...document.querySelectorAll("main, [role=main]")].filter(visible);
+      const timelines = regions.length === 1 ? [...regions[0].querySelectorAll("infinite-scroller")].filter(visible) : [];
+      if (timelines.length !== 1) { code = "AMBIGUOUS_TIMELINE"; break; }
+      const rows = [...timelines[0].querySelectorAll("user-query, model-response")].filter(visible);
+      const reply = rows.filter(row => row.localName === "model-response").at(-1);
+      const composer = [...regions[0].querySelectorAll('button.send-button, button[aria-label="Send message"], button[aria-label="Send"], button[aria-label*="Stop" i]')].filter(visible);
+      const actions = reply ? [...reply.querySelectorAll("button, [role=button]")].filter(visible) : [];
+      const state = { rows: rows.length, tail: rows.at(-1)?.localName === "model-response" ? "incoming" : rows.length ? "outgoing" : "none",
+         composer: composer.slice(0, 8).map(describe), composerOverflow: composer.length > 8,
+         replyActions: actions.slice(0, 8).map(describe), replyActionsOverflow: actions.length > 8,
+         busy: Boolean(reply && (reply.matches('[aria-busy="true"]') || [...reply.querySelectorAll('[aria-busy="true"]')].some(visible))),
+         progress: [...regions[0].querySelectorAll('mat-progress-spinner, [role="progressbar"]')].filter(visible).length };
+      const fingerprint = JSON.stringify(state);
+      if (fingerprint !== previous) { samples.push({ elapsedMs: Math.round(performance.now() - started), ...state }); previous = fingerprint; }
+      if (samples.length >= 32) { code = "CHANGE_LIMIT"; break; }
+      await new Promise(resolve => setTimeout(resolve, 250));
+   }
+   emit(code, samples);
+})();
+```
+
+Report only the emitted JSON and whether the reply visibly finished during the capture. Do not paste other console logs, raw HTML, screenshots, chat text or URLs. These samples identify candidates for review, not a completion claim; missing/unrecognized controls, overflow or an interrupted capture remain inconclusive. No product authority, general browser-control bridge or automatic retry is created.
