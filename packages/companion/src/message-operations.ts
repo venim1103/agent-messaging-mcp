@@ -142,7 +142,7 @@ const fixtureObservationSchema = z.strictObject({
 const geminiObservationSchema = z.strictObject({
   kind: z.literal("gemini_snapshot"), omittedBefore: z.boolean(),
   messages: z.array(z.strictObject({ direction: z.enum(["incoming", "outgoing"]), text: z.string().max(16_000),
-    truncated: z.literal(true).optional(), identityQuality: z.literal("uncertain"), generationState: z.enum(["unknown", "streaming"])
+    truncated: z.literal(true).optional(), identityQuality: z.literal("uncertain"), generationState: z.enum(["unknown", "streaming", "complete"])
   }).refine(message => message.direction === "incoming" || message.generationState === "unknown")).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
 });
 

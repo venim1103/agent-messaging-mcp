@@ -623,6 +623,9 @@ test("native Gemini snapshots accept bounded synthetic rows only for an exact sa
   const streaming = { ...snapshot, payload: { ...snapshot.payload,
     messages: [{ direction: "incoming", text: "Synthetic partial reply", generationState: "streaming" }] } };
   assert.deepEqual(parseNativeGeminiSnapshot(streaming, now), streaming);
+  const complete = { ...streaming, payload: { ...streaming.payload,
+    messages: [{ direction: "incoming", text: "Synthetic completed reply", generationState: "complete" }] } };
+  assert.deepEqual(parseNativeGeminiSnapshot(complete, now), complete);
   assert.deepEqual(parseNativeGeminiSnapshot({ ...windowed, payload: { ...windowed.payload, omittedBefore: false } }, now).payload.omittedBefore, false);
   for (const invalid of [
     { ...snapshot, kind: "evaluate" },
@@ -640,9 +643,10 @@ test("native Gemini snapshots accept bounded synthetic rows only for an exact sa
     { ...snapshot, payload: { ...snapshot.payload, omittedBefore: "true" } },
     { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x", truncated: false }] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x", extra: true }] } },
-    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x", generationState: "complete" }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x", generationState: "settled_heuristic" }] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x", generationState: "unknown" }] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "outgoing", text: "x", generationState: "streaming" }] } },
+    { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "outgoing", text: "x", generationState: "complete" }] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: [{ direction: "incoming", text: "x".repeat(16001) }] } },
     { ...snapshot, payload: { ...snapshot.payload, messages: Array.from({ length: 32 }, () => ({
       direction: "incoming", text: "é".repeat(2048)

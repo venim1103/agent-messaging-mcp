@@ -85,6 +85,8 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     const replyTool = tools.find(tool => tool.name === "chat_wait_for_reply");
     assert.equal(replyTool?.annotations?.readOnlyHint, true);
     assert.equal(replyTool?.inputSchema.additionalProperties, false);
+    assert.match(replyTool?.description ?? "", /UI signal may yield complete/);
+    assert.match(replyTool?.description ?? "", /settled_heuristic/);
 
     const result = await client.callTool({ name: "browser_chat_feasibility", arguments: {} });
     assert.equal(result.isError, undefined);
@@ -110,7 +112,7 @@ for (const target of [
     const client = new Client({ name: "Synthetic reply wait owner", version: "0.0.1" });
     const controller = new AbortController();
     let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
-    let mode: "steady" | "outgoing" | "truncated" | "held" | "unavailable" | "streaming" = "steady";
+    let mode: "steady" | "outgoing" | "truncated" | "held" | "unavailable" | "streaming" | "complete" | "complete_truncated" = "steady";
     let reads = 0;
     let releaseCapture: (() => void) | undefined;
     context.mock.method(PendingConnectionRequests.prototype,
@@ -118,9 +120,10 @@ for (const target of [
         reads++;
         if (mode === "unavailable") return { result: Promise.resolve("not_ready") } as never;
         const message = { direction: mode === "outgoing" ? "outgoing" : "incoming", text: "Synthetic bounded reply",
-          ...(mode === "truncated" ? { truncated: true } : {}),
+          ...(mode === "truncated" || mode === "complete_truncated" ? { truncated: true } : {}),
           ...(target.origin === "https://gemini.google.com" ? { identityQuality: "uncertain",
-            generationState: mode === "streaming" ? "streaming" : "unknown" } : { id: "synthetic-reply" }) };
+            generationState: mode === "streaming" ? "streaming" : mode === "complete" || mode === "complete_truncated" ? "complete" : "unknown" }
+            : { id: "synthetic-reply" }) };
         const snapshot = { coverage: "rendered_only", generation: 1, capturedAt: Date.now(),
           cursor: { epoch: "c66b3997-9d43-4554-8399-267d1fe9f75c", sequence: mode === "steady" ? 1 : 2 },
           omittedBefore: false, messages: [message] };
@@ -161,8 +164,15 @@ for (const target of [
         const beforeStreaming = reads;
         assert.deepEqual((await wait({ connectionId, timeoutMs: 2200 })).structuredContent, { timedOut: true });
         assert.ok(reads - beforeStreaming >= 4, "Flat streaming reply needs repeated fresh reads, never heuristic completion");
+        mode = "complete";
+        const completed = await wait({ connectionId, timeoutMs: 1500 });
+        assert.equal(completed.isError, undefined);
+        const terminal = completed.structuredContent as { timedOut: boolean; reply: { text: string; generationState: string } };
+        assert.equal(terminal.timedOut, false);
+        assert.equal(terminal.reply.text, "Synthetic bounded reply");
+        assert.equal(terminal.reply.generationState, "complete");
       }
-      for (const next of ["truncated", "outgoing", "unavailable"] as const) {
+      for (const next of ["truncated", "complete_truncated", "outgoing", "unavailable"] as const) {
         mode = next;
         const started = performance.now();
         assert.deepEqual((await wait({ connectionId, timeoutMs: 150 })).structuredContent, { timedOut: true });

@@ -4,7 +4,7 @@ Connect an AI assistant to a browser chat you explicitly select and approve, usi
 
 You choose the conversation and approve each assistant once. That assistant can then read and send in that chat until its connection ends. Your login stays in your browser: no provider API keys or exported credentials are needed.
 
-Reply waiting uses a quiet-period estimate, not confirmed completion.
+Reply waiting uses page completion indicators where available and quiet-period estimates otherwise.
 
 > **Experimental prototype.** Not ready for everyday use or personal conversations. Sending is tested with local and simulated chats; sending in the actual Google Gemini web app is not yet verified. Messages observed on the page are not proof of delivery.
 

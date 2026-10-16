@@ -484,6 +484,57 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
       button.querySelector("mat-icon").textContent = "send";
     });
     assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.locator('button[aria-label="Stop response"]').evaluate(button => button.remove());
+    await page.locator("model-response").last().evaluate(row => {
+      row.removeAttribute("aria-busy");
+      for (let index = 0; index < 2; index++) {
+        const marker = document.createElement("div");
+        marker.textContent = "Synthetic completion marker";
+        marker.setAttribute("aria-busy", index === 0 ? "false" : "true");
+        row.append(marker);
+      }
+    });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, "streaming");
+    await page.locator('model-response [aria-busy="true"]').last().evaluate(marker => marker.setAttribute("aria-busy", "false"));
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, "complete");
+    const markers = page.locator('model-response:last-child [aria-busy="false"]');
+    await markers.last().evaluate(marker => marker.removeAttribute("aria-busy"));
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.locator("model-response").last().evaluate(row => row.lastElementChild.setAttribute("aria-busy", "false"));
+    const copy = page.locator('model-response:last-child button[aria-label="Copy"]');
+    await copy.evaluate(button => button.disabled = true);
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await copy.evaluate(button => { button.disabled = false; button.setAttribute("aria-disabled", "true"); });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await copy.evaluate(button => { button.removeAttribute("aria-disabled"); button.hidden = true; });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await copy.evaluate(button => { button.hidden = false; button.after(button.cloneNode(true)); });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await copy.last().evaluate(button => button.remove());
+    await page.locator("main").evaluate(main => {
+      const stop = document.createElement("button");
+      stop.setAttribute("aria-label", "Stop unknown activity");
+      main.append(stop);
+    });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.locator('button[aria-label="Stop unknown activity"]').evaluate(button => button.remove());
+    await page.locator("main").evaluate(main => {
+      const progress = document.createElement("div");
+      progress.setAttribute("role", "progressbar");
+      progress.textContent = "Synthetic progress";
+      main.append(progress);
+    });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.locator('[role="progressbar"]').evaluate(progress => progress.remove());
+    await page.locator("model-response").last().evaluate(row => row.setAttribute("aria-busy", "false"));
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.locator("model-response").last().evaluate(row => row.removeAttribute("aria-busy"));
+    await markers.last().evaluate(marker => { marker.hidden = true; });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await markers.last().evaluate(marker => { marker.hidden = false; marker.after(marker.cloneNode(true)); });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await markers.last().evaluate(marker => marker.remove());
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, "complete");
     await page.goto("https://gemini.google.com/app/disposable-chat");
     await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = ""; });
     assert.deepEqual(await page.evaluate(captureGeminiSnapshot), { omittedBefore: false, messages: [

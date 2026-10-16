@@ -198,7 +198,7 @@ server.registerTool("chat_read_messages", {
 });
 
 server.registerTool("chat_wait_for_events", {
-  description: "Wait for later rendered-only fixture or Gemini snapshots from an owned cursor, with a bounded timeout and explicit resnapshot on cursor expiry. Gemini row identity and completion remain uncertain.",
+  description: "Wait for later rendered-only fixture or Gemini snapshots from an owned cursor, with a bounded timeout and explicit resnapshot on cursor expiry. Gemini row identity remains uncertain; generation state describes observed page UI, not provider acceptance or delivery.",
   inputSchema: z.object({
     connectionId: z.uuid(),
     cursor: z.object({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() }).strict(),
@@ -232,7 +232,7 @@ server.registerTool("chat_wait_for_events", {
 });
 
 server.registerTool("chat_wait_for_reply", {
-  description: "Wait up to 20 seconds for the newest rendered incoming fixture or Gemini reply to remain unchanged for a two-second quiet period under fresh exact-document observations. Returns settled_heuristic, never confirmed completion or delivery. An existing newest reply may qualify; an outgoing or truncated newest row cannot. Timeout returns no reply. Only a live owned connection permits reads; cancellation ends the owning broker connection.",
+  description: "Wait up to 20 seconds for the newest rendered incoming fixture or Gemini reply under fresh exact-document observations. A reviewed Gemini UI signal may yield complete; otherwise two seconds of unchanged captures yield settled_heuristic. Positive streaming blocks settling. Neither result proves provider acceptance or delivery. An existing newest reply may qualify; an outgoing or truncated newest row cannot. Timeout returns no reply. Only a live owned connection permits reads; cancellation ends the owning broker connection.",
   inputSchema: z.object({ connectionId: z.uuid(), timeoutMs: z.number().int().min(0).max(20_000).optional() }).strict(),
   annotations: { readOnlyHint: true }
 }, async ({ connectionId, timeoutMs }, extra) => {

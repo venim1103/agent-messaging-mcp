@@ -438,6 +438,29 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           assert.equal(reply.structuredContent.reply.generationState, "settled_heuristic");
           assert.equal(await fixture.evaluate(() => globalThis.replyRevisionCount), 1);
           assert.ok(await fixture.evaluate(() => performance.now() - globalThis.replyRevisionAt) >= 2000);
+          if (provider === "gemini") {
+            await fixture.locator("model-response").last().evaluate(row => {
+              row.removeAttribute("aria-busy");
+              for (let index = 0; index < 2; index++) {
+                const marker = document.createElement("div");
+                marker.setAttribute("aria-busy", "false");
+                marker.textContent = "Synthetic UI marker";
+                row.append(marker);
+              }
+              const copy = document.createElement("button");
+              copy.setAttribute("aria-label", "Copy");
+              copy.textContent = "Copy";
+              row.append(copy);
+            });
+            const completed = await mcpClient.callTool({ name: "chat_wait_for_reply", arguments: {
+              connectionId: connection.connectionId, timeoutMs: 1500
+            } });
+            assert.equal(completed.isError, undefined, JSON.stringify(completed));
+            assert.equal(completed.structuredContent.timedOut, false);
+            assert.equal(completed.structuredContent.reply.text, "Synthetic final reply");
+            assert.equal(completed.structuredContent.reply.generationState, "complete");
+            assert.ok(completed.structuredContent.cursor.sequence > reply.structuredContent.cursor.sequence);
+          }
           assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
         }
         return;

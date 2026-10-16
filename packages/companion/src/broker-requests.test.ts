@@ -1017,7 +1017,15 @@ test("generic event reads follow the owned Gemini grant and not a caller-selecte
   if (streaming.kind !== "gemini_events" || streaming.payload.state !== "ok") throw new Error("Expected streaming event");
   assert.deepEqual(streaming.payload.events[0]?.payload, { kind: "gemini_snapshot", omittedBefore: false,
     messages: [{ direction: "incoming", text: "Synthetic reply", identityQuality: "uncertain", generationState: "streaming" }] });
-  for (const message of [{ direction: "incoming", text: "Reply", generationState: "complete" },
+  const completed = { ...publish, payload: { ...publish.payload,
+    messages: [{ direction: "incoming", text: "Synthetic reply", generationState: "complete" }] } };
+  assert.deepEqual(handleBrokerRequest(completed, "relay", Symbol("relay"), requests, 2002).payload, { count: 1 });
+  const complete = handleBrokerRequest({ ...read, payload: { ...read.payload, cursor: streaming.payload.cursor } }, "facade", owner, requests, 2002);
+  if (complete.kind !== "gemini_events" || complete.payload.state !== "ok") throw new Error("Expected UI-complete event");
+  assert.deepEqual(complete.payload.events[0]?.payload, { kind: "gemini_snapshot", omittedBefore: false,
+    messages: [{ direction: "incoming", text: "Synthetic reply", identityQuality: "uncertain", generationState: "complete" }] });
+  for (const message of [{ direction: "incoming", text: "Reply", generationState: "settled_heuristic" },
+    { direction: "outgoing", text: "Question", generationState: "complete" },
     { direction: "outgoing", text: "Question", generationState: "streaming" }]) {
     assert.throws(() => handleBrokerRequest({ ...publish, payload: { ...publish.payload, messages: [message] } },
       "relay", Symbol("relay"), requests, 2002));

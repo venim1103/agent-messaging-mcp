@@ -56,6 +56,23 @@ for (const provider of ["fixture", "gemini"]) {
   });
 }
 
+test("Gemini explicit UI completion is fresh, incoming and untruncated without a heuristic delay", () => {
+  const observation = new ReplyObservation();
+  const message = { direction: "incoming" as const, text: "Synthetic completed reply", identityQuality: "uncertain" as const,
+    generationState: "complete" as const };
+  const snapshot = (capturedAt: number) => ({ coverage: "rendered_only" as const, generation: 1 as const, capturedAt,
+    cursor: { epoch: "synthetic-epoch", sequence: 1 }, omittedBefore: false, messages: [message] });
+  const complete = observation.observe(snapshot(1000), 1000);
+  assert.equal(complete?.generationState, "complete");
+  assert.equal(Object.isFrozen(complete), true);
+  assert.equal(observation.observe(snapshot(1000), 1001), null);
+  assert.equal(observation.observe({ ...snapshot(2000), messages: [{ ...message, truncated: true }] }, 2000), null);
+  assert.equal(observation.observe({ ...snapshot(3000), messages: [{ ...message, direction: "outgoing" }] }, 3000), null);
+  assert.equal(observation.observe({ ...snapshot(4000), messages: [{ ...message, text: "" }] }, 4000), null);
+  assert.equal(observation.observe(snapshot(5001), 5000), null);
+  assert.equal(observation.observe(snapshot(6000), 6000)?.generationState, "complete");
+});
+
 for (const target of [
   { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
   { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
@@ -791,7 +808,15 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   if (!quiet || quiet === "not_ready") throw new Error("Expected unknown capture after streaming");
   assert.equal(quiet.messages.at(-1)?.generationState, "unknown");
   assert.equal(quiet.cursor.sequence, busy.cursor.sequence + 1);
-  assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Reply", generationState: "complete" as never }], 2007),
+  const completed = later.map((message, index) => index === later.length - 1 ? { ...message, generationState: "complete" as const } : message);
+  assert.equal(requests.publishGeminiSnapshot(target, completed, 2007), 1);
+  const terminal = requests.getGeminiSnapshot(owner, granted!.connectionId, 2007);
+  if (!terminal || terminal === "not_ready") throw new Error("Expected UI-complete capture");
+  assert.equal(terminal.messages.at(-1)?.generationState, "complete");
+  assert.equal(terminal.cursor.sequence, quiet.cursor.sequence + 1);
+  assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Reply", generationState: "settled_heuristic" as never }], 2007),
+    /Invalid Gemini snapshot/);
+  assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "outgoing", text: "Question", generationState: "complete" }], 2007),
     /Invalid Gemini snapshot/);
   assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "outgoing", text: "Question", generationState: "streaming" }], 2007),
     /Invalid Gemini snapshot/);

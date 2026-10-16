@@ -76,7 +76,7 @@ export type FixtureSnapshot = Readonly<{
   messages: ReadonlyArray<FixtureMessage>;
 }>;
 export type GeminiRenderedMessage = Readonly<{ direction: "incoming" | "outgoing"; text: string; truncated?: true;
-  generationState?: "streaming" }>;
+  generationState?: "streaming" | "complete" }>;
 export type GeminiSnapshot = Readonly<{
   coverage: "rendered_only";
   generation: 1;
@@ -84,7 +84,7 @@ export type GeminiSnapshot = Readonly<{
   cursor: Readonly<{ epoch: string; sequence: number }>;
   omittedBefore: boolean;
   messages: ReadonlyArray<Readonly<Omit<GeminiRenderedMessage, "generationState"> & {
-    identityQuality: "uncertain"; generationState: "unknown" | "streaming"
+    identityQuality: "uncertain"; generationState: "unknown" | "streaming" | "complete"
   }>>;
 }>;
 
@@ -93,7 +93,7 @@ type ReplySnapshot = Omit<FixtureSnapshot, "messages"> & {
   messages: ReadonlyArray<FixtureMessage | GeminiSnapshot["messages"][number]>;
 };
 type SettledReply = Readonly<(FixtureMessage | Omit<GeminiSnapshot["messages"][number], "generationState">)
-  & { direction: "incoming"; generationState: "settled_heuristic" }>;
+  & { direction: "incoming"; generationState: "settled_heuristic" | "complete" }>;
 
 export class ReplyObservation {
   private previous?: { epoch: string; sequence: number; fingerprint: string; since: number; capturedAt: number; checkedAt: number };
@@ -115,8 +115,10 @@ export class ReplyObservation {
     const since = unchanged ? previous.since : now;
     this.previous = { epoch: snapshot.cursor.epoch, sequence: snapshot.cursor.sequence, fingerprint,
       since, capturedAt: snapshot.capturedAt, checkedAt: now };
-    return snapshot.capturedAt - since >= REPLY_QUIET_PERIOD_MS
-      ? Object.freeze({ ...message, direction: "incoming", generationState: "settled_heuristic" }) : null;
+    const generationState = "generationState" in message && message.generationState === "complete"
+      ? "complete" as const : "settled_heuristic" as const;
+    return generationState === "complete" || snapshot.capturedAt - since >= REPLY_QUIET_PERIOD_MS
+      ? Object.freeze({ ...message, direction: "incoming", generationState }) : null;
   }
 }
 
@@ -468,7 +470,7 @@ export class PendingConnectionRequests {
       || messages.some((message) => typeof message !== "object" || message === null
         || Object.keys(message).some((key) => !["direction", "text", "truncated", "generationState"].includes(key))
         || ("truncated" in message && message.truncated !== true)
-        || ("generationState" in message && (message.generationState !== "streaming" || message.direction !== "incoming"))
+        || ("generationState" in message && (!["streaming", "complete"].includes(message.generationState ?? "") || message.direction !== "incoming"))
         || (message.direction !== "incoming" && message.direction !== "outgoing")
         || typeof message.text !== "string" || !message.text || message.text.length > 16_000)
       || Buffer.byteLength(JSON.stringify({ messages, omittedBefore }), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
