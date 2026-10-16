@@ -1667,6 +1667,25 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
         await setTimeout(25);
       }
       assert.equal(ready, true, "Autonomous broker did not start");
+      if (scenario === "failure") {
+        await worker.evaluate(() => {
+          globalThis.syntheticInvalidApprovalAgent = null;
+          globalThis.syntheticInvalidApprovals = 0;
+          const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+          chrome.runtime.connectNative = (...args) => {
+            const port = connect(...args);
+            const listen = port.onMessage.addListener.bind(port.onMessage);
+            port.onMessage.addListener = listener => listen(reply => {
+              if (reply.kind === "chat_agent_approved" && reply.payload.agentId === globalThis.syntheticInvalidApprovalAgent) {
+                globalThis.syntheticInvalidApprovals++;
+                return listener({ ...reply, payload: { ...reply.payload, approved: true } });
+              }
+              listener(reply);
+            });
+            return port;
+          };
+        });
+      }
       if (scenario === "reload-failure") {
         await worker.evaluate(() => {
           globalThis.syntheticRebindCorruptions = 0;
@@ -1861,18 +1880,10 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
         await page.route(`${url}?changed`, route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
         await page.goto(`${url}?changed`);
       } else if (scenario === "failure") {
-        await worker.evaluate(agentId => {
-          const connect = chrome.runtime.connectNative.bind(chrome.runtime);
-          chrome.runtime.connectNative = (...args) => {
-            const port = connect(...args);
-            const listen = port.onMessage.addListener.bind(port.onMessage);
-            port.onMessage.addListener = listener => listen(reply => listener(reply.kind === "chat_agent_approved" && reply.payload.agentId === agentId
-              ? { ...reply, payload: { ...reply.payload, approved: true } } : reply));
-            return port;
-          };
-        }, firstAgentId);
+        await worker.evaluate(agentId => { globalThis.syntheticInvalidApprovalAgent = agentId; }, firstAgentId);
         await row("Autonomous one").getByRole("button", { name: "Connect this chat" }).click();
         await popup.getByText("Agent management invalid, unavailable or selected chat changed", { exact: true }).waitFor({ timeout: 4000 });
+        assert.equal(await worker.evaluate(() => globalThis.syntheticInvalidApprovals), 1);
         await waitCount(1);
         assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
           { connections: [], timedOut: true });
@@ -2141,6 +2152,74 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           if (!hidden) assert.notEqual(windows.currentWindowId, windows.chatWindowId);
           if (hidden) await fixture.waitForFunction(() => document.visibilityState === "hidden", null, { timeout: 4000, polling: 100 });
           assert.equal(await fixture.evaluate(() => document.visibilityState), hidden ? "hidden" : "visible");
+        }
+        if (outcome === "revoked_after_fill" || outcome === "revoked_after_submit") {
+          const afterSubmit = outcome === "revoked_after_submit";
+          await worker.evaluate(({ afterSubmit, tabId }) => {
+            globalThis.revocationBoundaryCount = 0;
+            globalThis.revocationBoundaryReached = new Promise(resolve => { globalThis.confirmRevocationBoundary = resolve; });
+            const released = new Promise(resolve => { globalThis.releaseRevocationBoundary = resolve; });
+            const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+            chrome.scripting.executeScript = async details => {
+              const result = await execute(details);
+              const input = details.args?.[0];
+              if (details.target.tabId === tabId && input?.operationId && input.attemptId
+                && (input.operationId === input.attemptId) === afterSubmit && result[0]?.result?.ok) {
+                globalThis.revocationBoundaryCount++;
+                if (globalThis.revocationBoundaryCount === 1) {
+                  globalThis.revocationBoundaryExpiresAt = input.expiresAt;
+                  globalThis.confirmRevocationBoundary();
+                  await released;
+                }
+              }
+              return result;
+            };
+          }, { afterSubmit, tabId: selected.tabId });
+          const sending = mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue })
+            .then(result => ({ result }), error => ({ error }));
+          await worker.evaluate(() => globalThis.revocationBoundaryReached);
+          setPhase(afterSubmit ? "revoking after submit activation" : "revoking after fill readback");
+          assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), afterSubmit ? 1 : 0);
+          await popup.locator("#agent-list li").filter({ hasText: "Synthetic autonomous browser owner" })
+            .getByRole("button", { name: "Remove access" }).click({ timeout: 4000 });
+          await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("0 connected"), null, { timeout: 4000 });
+          setPhase("revocation acknowledged before lease expiry");
+          assert.equal(await worker.evaluate(() => Date.now() < globalThis.revocationBoundaryExpiresAt), true);
+          await worker.evaluate(() => globalThis.releaseRevocationBoundary());
+          const completion = await sending;
+          assert.equal(completion.error, undefined);
+          const status = completion.result.structuredContent;
+          assert.equal(status.state, afterSubmit ? "unresolved" : "not_sent");
+          assert.equal(status.retryAllowed, false);
+          assert.match(status.recoveryToken, /^[0-9a-f]{64}$/);
+          assert.equal(await worker.evaluate(() => globalThis.revocationBoundaryCount), 1);
+          assert.equal(await worker.evaluate(async ({ provider, tabId }) =>
+            Object.hasOwn(await chrome.storage.session.get(`${provider}-grant-${tabId}`), `${provider}-grant-${tabId}`),
+          { provider, tabId: selected.tabId }), false);
+          assert.deepEqual((await mcpClient.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+            { connections: [], timedOut: true });
+          const fresh = await mcpClient.callTool({ name: "chat_send_message", arguments: {
+            ...argumentsValue, idempotencyKey: crypto.randomUUID(), text: "Synthetic new send must require fresh approval"
+          } });
+          assert.deepEqual(fresh.structuredContent, { state: "not_sent", code: "CONNECTION_NOT_FOUND", retryAllowed: false });
+          assert.equal((await facade.getPreparedOperation(status.operationId, status.recoveryToken)).payload.state,
+            afterSubmit ? "dispatch_uncertain" : "unknown");
+          assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), afterSubmit ? 1 : 0);
+          assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
+            (provider === "gemini" ? 1 : 2) + (afterSubmit ? 1 : 0));
+          assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
+            editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), afterSubmit ? "" : argumentsValue.text);
+          for (const phase of ["fill", "proof", "submit", "settle"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
+          assert.equal(await worker.evaluate(async ({ provider, operationId }) =>
+            (await chrome.storage.local.get(`${provider}-submit-attempt-${operationId}`))[`${provider}-submit-attempt-${operationId}`],
+          { provider, operationId: status.operationId }), afterSubmit ? true : undefined);
+          const { DatabaseSync } = await import("node:sqlite");
+          const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
+          try {
+            assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, afterSubmit ? 1 : 0);
+            assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get().count, 0);
+          } finally { journal.close(); }
+          return;
         }
         const result = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
         const status = result.structuredContent;
@@ -2524,7 +2603,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
 }
 
 for (const provider of ["fixture", "gemini"]) {
-  for (const outcome of ["observed", "own_window", "hidden", "not_sent", "lost_settle", "owned_leftover"]) {
+  for (const outcome of ["observed", "own_window", "hidden", "revoked_after_fill", "revoked_after_submit", "not_sent", "lost_settle", "owned_leftover"]) {
     test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();
       await exerciseChatDispatch(outcome, provider, testContext, "public");

@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-16 (T3q genuine own-window and hidden-tab refusal acceptance is gated with all units and 71 end-to-end checks; autonomous work continues).
+Updated: 2026-10-16 (T3r trusted-popup revocation boundaries are gated with all units and 75 end-to-end checks; autonomous work continues).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,14 +16,14 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest gated source checkpoint: T3q (the commit containing the [checkpoint entry below](#t3q-genuine-window-and-visibility-acceptance-2026-10-16)), after cancellation fix T3p `f367bc3` and bounded own-leftover replacement T3o `c573a3f`. The exact gate passed build, both typechecks, **all units and 71/71 e2e checks**, zero failures/cancellations. Both providers send in a visible active chat in its own unfocused window; genuinely hidden tabs refuse without draft changes or durable intent. Installed/live autonomous acceptance remains missing.
+- Latest gated source checkpoint: T3r (the commit containing the [checkpoint entry below](#t3r-trusted-popup-revocation-boundaries-2026-10-16)), after visibility acceptance T3q `c76b1f7` and cancellation fix T3p `f367bc3`. The repaired exact gate passed build, both typechecks, **all units and 75/75 e2e checks**, zero failures/cancellations. Both providers refuse submit after popup removal following fill; removal after activation remains unresolved with one durable intent. The first gate's admission failures are preserved below. Installed/live autonomous acceptance remains missing.
 - The person's earlier eleven-change audit is complete: the ten pending T3h files were retained, and the eleventh was the bounded native-channel helper. Later checkpoints connect neutral orchestration and public sending. Earlier cancellations, baseline comparison and diagnostic evidence remain in their dated entries.
 - T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Installed Gemini single-owner approval/pickup, fresh reads, same-chat events and removal now passed (entry below). Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3d's installed fixture empty-status check passed after coordinated reload; installed outcome buttons remain untested.
 - Latest installed write evidence: one supervised fixture textarea message passed separate trusted draft, fill and Send approvals, one MCP fill and one submit, `observed_in_ui`, fresh read/status and the person's visual confirmation of one outgoing row with an empty editor. An earlier fill refusal/expiry is preserved below. This is not autonomous sending, Gemini writing or installed T3e coordination evidence.
 - This resumption began at clean `main` / T3o `c573a3f`, aligned with tracked `origin/main`. The person explicitly resumed autonomous implementation and periodic local checkpoints on 2026-10-16; the prior pause is historical. The assistant made no push or new branch.
 - Current coordination: builds, browser checks and timing traces used disposable test processes; the baseline source snapshot and diagnostic trace/build artifacts were removed. A read-only process check found no leftover matching test broker/native relay. The person freshly authorized the clock check below; no clock/security setting was changed, installed service restarted or live chat accessed. Earlier test grants remain ended; do not transfer old handles to a new owner or treat prior evidence as fresh permission.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
-- Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e-T3q have synthetic/source-gate evidence only. A future reload ends current grants; do not assume installed code contains these newer changes.
+- Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e-T3r have synthetic/source-gate evidence only. A future reload ends current grants; do not assume installed code contains these newer changes.
 
 ### Capability matrix
 
@@ -33,7 +33,7 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 | `chat_wait_for_connection` and popup **Connect this chat** | Works; installed single-owner pickup/removal verified | Works; installed single-owner approval/pickup/removal verified |
 | `chat_read_messages` | Works; installed verified; T1 robustness synthetic-tested | Works; newest installed fresh reads passed; T1 robustness stress coverage synthetic; identity uncertain and completion unknown |
 | `chat_wait_for_events` | Works; installed verified | Works; newest installed same-chat events/fresh-read check passed; two earlier live trials passed and two failed (`stale` and `unknown` before keepalive) |
-| `chat_send_message` | Sandboxed public flows cover own-window send, hidden-tab refusal, bounded own-leftover replacement and human-draft preservation; installed unverified | Same on routed synthetic pages; real-site sending unverified |
+| `chat_send_message` | Sandboxed public flows cover own-window send, hidden-tab refusal, popup removal after fill/activation, bounded own-leftover replacement and human-draft preservation; installed unverified | Same on routed synthetic pages; real-site sending unverified |
 | `chat_prepare_message` | Works | Public tool refuses with `CONNECTION_NOT_FOUND`; private `prepare_gemini_message` works |
 | `chat_fill_draft` | Works; installed textarea verified | Not public; private fill and worker connected, synthetic tests only |
 | `chat_commit_message` | Works; installed textarea verified (`observed_in_ui`) | Not public; private neutral supervised commit/submit connected, synthetic only |
@@ -67,6 +67,8 @@ T3p makes public send transport failures conservative even during preparation: a
 
 T3q verifies the existing visible-tab boundary without Playwright's focus emulation. Disposable sandboxed Chromium and the public `noDefaults` CDP attachment prove a visible active chat can send while another window is focused. An inactive genuinely hidden chat preserves a human draft and creates no intent, browser submit reservation or activation. This is test-only infrastructure; no product permission, browser-control surface or hidden-tab sending is added.
 
+T3r holds a successful browser fill or submit result, removes access through the trusted popup before that job's lease expires, then releases the result. After fill, the exact draft remains and no intent/reservation/activation exists. After activation, the one durable intent remains unresolved, without an invented resolution. Both providers lose the stored grant, refuse independently keyed new work and offer no further jobs. Recovery remains status only.
+
 Autonomous same-chat reload preserves existing handles after fresh new-document identity verification, invalidates observation cursors and reinstalls observers. Old-document reads/publications are blocked during suspension; removal/disconnect still work. Only the exact URL/chat/tab may rebind; legacy reload still revokes. Failure or uncertainty disconnects pinned targets, without new approval, automatic readmission or job replay. Installed fixture reload retained the same handle and produced a fresh cursor epoch; failure/race coverage and Gemini reload evidence remain synthetic.
 
 ### Gemini send chain
@@ -95,7 +97,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 1. **T1 Read robustness: done.** Stopped native watches restart with bounded backoff (R2). D8 captures the newest 32 visible rows with `omittedBefore`, per-message truncation at 16,000 UTF-16 units and a 96 KiB capture cap. Identity-preserving failures skip publication; changed targets still revoke (R1). Synthetic evidence only for these changes.
 2. **T2 Connection model: synthetic implementation done.** Startup (T2a), roster/removal (T2b), popup-first per-agent admission/pickup/no-expiry grants (T2c) and same-chat reload/rebind/gaps/observer reattachment (T2d) are gated. No automatic admission/re-admission (D13b). Individual disconnect/restart ends that owner's grant; tab/chat/browser changes end matching grants. Installed fixture pickup/read/reload/removal and Gemini single-owner approval/pickup/read/events/removal passed. Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3 connects autonomous sending below.
-3. **T3 Autonomous send: in progress.** T3a-T3q are gated, including public sending, status-only replay, original send budgets, bounded page evidence, bounded D10a replacement, concurrent-cancellation SDK coverage and explicit synthetic own-window/hidden-refusal acceptance (D11). Broader authority-loss/concurrent-cancellation browser cases remain. Expired/restarted prior operations cannot authorize replacement. Retain original deadlines, one-offer jobs, browser reservation and one activation.
+3. **T3 Autonomous send: in progress.** T3a-T3r are gated, including public sending, status-only replay, original send budgets, bounded page evidence, bounded D10a replacement, concurrent-cancellation SDK coverage, synthetic own-window/hidden-refusal acceptance (D11) and popup removal after fill/activation. Browser-level concurrent cancellation remains. Expired/restarted prior operations cannot authorize replacement. Retain original deadlines, one-offer jobs, browser reservation and one activation.
 4. **T4 Reply completion.** A `settled_heuristic` plus a reviewed Gemini indicator, exposed through a wait-for-reply tool (D3). The indicator needs a fresh human-authorized read-only review of a disposable chat.
 5. **T5 Live acceptance.** Coordinated reload, then one human-authorized session on a disposable chat: connect once, the agent sends a few neutral messages and reads the complete replies without further clicks, then the tab is closed.
 6. **T6 Later.** Hidden-tab operation (D11, possibly debugger input per D6), a second chat site on the provider-neutral pipeline, calibration and packaging.
@@ -130,7 +132,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-Continue autonomous implementation at the person's request. Next: browser authority-loss/concurrent-cancellation cases, then T4 completion work that does not require unapproved live inspection. D10a replacement remains limited to retained unexpired prior metadata; provenance alone is not authority. Retain original deadlines, four-second browser leases, bounded settlement and no failed-write replay. Installed acceptance, live access, further clock probes and host/security/settings work still need fresh authorization.
+Continue autonomous implementation at the person's request. Next: browser-level concurrent cancellation, then T4 completion work that does not require unapproved live inspection. D10a replacement remains limited to retained unexpired prior metadata; provenance alone is not authority. Retain original deadlines, four-second browser leases, bounded settlement and no failed-write replay. Installed acceptance, live access, further clock probes and host/security/settings work still need fresh authorization.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -197,6 +199,14 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## T3r Trusted-Popup Revocation Boundaries (2026-10-16)
+
+- Four public MCP browser cases hold successful fill/submit readback, remove the exact owner's access through the trusted popup and assert acknowledgement before the original browser lease expires. Both fixture and routed synthetic Gemini preserve the filled draft with zero intent/reservation/activation before submit; after activation they retain one durable unresolved intent, one outgoing row and zero invented resolutions. No product source changes.
+- Each case verifies stored grant removal, empty owned pickup, refusal of an independently keyed new message, no fill/proof/submit/settle re-offer, and receipt privacy/status without write authority. Original 15-second cases, four-second leases, sandbox, polling and authority assertions are unchanged.
+- Focused four-case checks passed twice, the second with explicit live-lease and fresh-send refusal assertions. The first exact gate passed build/types/all units; E2E had **72 passes, one failure and two cancellations out of 75**. Older Gemini admission failure/lifetime timed out at 20 seconds and reload failed its existing broker-startup assertion; all new cases passed.
+- Nearby inspection found the older malformed-approval injector was installed after a reused native control port could already exist. It now wraps port creation before popup traffic, arms only the selected owner and asserts exactly one malformed reply. Both providers' counted failure checks and the implicated Gemini lifetime/reload cases pass under original limits. The earlier startup and lifetime causes were not reproduced and remain unproven; no unchanged failed gate was blindly rerun.
+- Repaired exact gate `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e` passed build, both typechecks, all units and **75/75 e2e**, zero failures/cancellations. Numeric unit summary was host-elided; chained E2E execution confirms unit success. Editor diagnostics are clear. Next: browser-level concurrent cancellation, then T4. Installed/live acceptance remains missing; safety boundaries remain in AGENTS.md.
 
 ## T3q Genuine Window And Visibility Acceptance (2026-10-16)
 
