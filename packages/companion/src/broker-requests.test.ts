@@ -1009,6 +1009,19 @@ test("generic event reads follow the owned Gemini grant and not a caller-selecte
   assert.deepEqual(later.payload.events[0]?.payload, { kind: "gemini_snapshot", omittedBefore: false, messages: laterRows.map((row) => ({
     ...row, identityQuality: "uncertain", generationState: "unknown"
   })) });
+  const publish = { ...envelope, kind: "publish_gemini_snapshot", payload: { target,
+    messages: [{ direction: "incoming", text: "Synthetic reply", generationState: "streaming" }] } };
+  assert.deepEqual(handleBrokerRequest(publish, "facade", owner, requests, 2002).payload, { code: "PERMISSION_DENIED" });
+  assert.deepEqual(handleBrokerRequest(publish, "relay", Symbol("relay"), requests, 2002).payload, { count: 1 });
+  const streaming = handleBrokerRequest({ ...read, payload: { ...read.payload, cursor: later.payload.cursor } }, "facade", owner, requests, 2002);
+  if (streaming.kind !== "gemini_events" || streaming.payload.state !== "ok") throw new Error("Expected streaming event");
+  assert.deepEqual(streaming.payload.events[0]?.payload, { kind: "gemini_snapshot", omittedBefore: false,
+    messages: [{ direction: "incoming", text: "Synthetic reply", identityQuality: "uncertain", generationState: "streaming" }] });
+  for (const message of [{ direction: "incoming", text: "Reply", generationState: "complete" },
+    { direction: "outgoing", text: "Question", generationState: "streaming" }]) {
+    assert.throws(() => handleBrokerRequest({ ...publish, payload: { ...publish.payload, messages: [message] } },
+      "relay", Symbol("relay"), requests, 2002));
+  }
   assert.deepEqual(handleBrokerRequest({ ...read, payload: { ...read.payload,
     cursor: { epoch: "a66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 } } },
   "facade", owner, requests, 2002).payload, { state: "expired", resnapshot: true });

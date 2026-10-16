@@ -31,8 +31,8 @@ const fixtureMessage = z.strictObject({
 });
 const geminiMessage = z.strictObject({
   direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(16_000),
-  truncated: z.literal(true).optional()
-});
+  truncated: z.literal(true).optional(), generationState: z.literal("streaming").optional()
+}).refine(message => !message.generationState || message.direction === "incoming");
 
 const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("keep_alive"), payload: z.strictObject({}) }),

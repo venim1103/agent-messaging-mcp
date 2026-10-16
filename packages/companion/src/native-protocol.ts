@@ -442,8 +442,8 @@ const geminiSnapshotSchema = z.strictObject({
     target: geminiTargetSchema,
     messages: z.array(z.strictObject({
       direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(16_000),
-      truncated: z.literal(true).optional()
-    })).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES),
+      truncated: z.literal(true).optional(), generationState: z.literal("streaming").optional()
+    }).refine(message => !message.generationState || message.direction === "incoming")).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES),
     challengeId: z.uuid().optional(), omittedBefore: z.boolean().optional()
   })
 });

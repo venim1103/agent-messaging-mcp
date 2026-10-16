@@ -75,15 +75,16 @@ export type FixtureSnapshot = Readonly<{
   omittedBefore: boolean;
   messages: ReadonlyArray<FixtureMessage>;
 }>;
-export type GeminiRenderedMessage = Readonly<{ direction: "incoming" | "outgoing"; text: string; truncated?: true }>;
+export type GeminiRenderedMessage = Readonly<{ direction: "incoming" | "outgoing"; text: string; truncated?: true;
+  generationState?: "streaming" }>;
 export type GeminiSnapshot = Readonly<{
   coverage: "rendered_only";
   generation: 1;
   capturedAt: number;
   cursor: Readonly<{ epoch: string; sequence: number }>;
   omittedBefore: boolean;
-  messages: ReadonlyArray<Readonly<GeminiRenderedMessage & {
-    identityQuality: "uncertain"; generationState: "unknown"
+  messages: ReadonlyArray<Readonly<Omit<GeminiRenderedMessage, "generationState"> & {
+    identityQuality: "uncertain"; generationState: "unknown" | "streaming"
   }>>;
 }>;
 
@@ -101,6 +102,7 @@ export class ReplyObservation {
     const message = snapshot.messages.at(-1);
     const previous = this.previous;
     if (!message || message.direction !== "incoming" || !message.text || message.truncated
+      || ("generationState" in message && message.generationState === "streaming")
       || !Number.isSafeInteger(now) || !Number.isSafeInteger(snapshot.capturedAt)
       || snapshot.capturedAt < 0 || snapshot.capturedAt > now
       || (previous && (now < previous.checkedAt || snapshot.capturedAt <= previous.capturedAt))) {
@@ -464,8 +466,9 @@ export class PendingConnectionRequests {
     if (!messages.length || messages.length > MAX_GEMINI_SNAPSHOT_MESSAGES
       || typeof omittedBefore !== "boolean"
       || messages.some((message) => typeof message !== "object" || message === null
-        || Object.keys(message).some((key) => !["direction", "text", "truncated"].includes(key))
+        || Object.keys(message).some((key) => !["direction", "text", "truncated", "generationState"].includes(key))
         || ("truncated" in message && message.truncated !== true)
+        || ("generationState" in message && (message.generationState !== "streaming" || message.direction !== "incoming"))
         || (message.direction !== "incoming" && message.direction !== "outgoing")
         || typeof message.text !== "string" || !message.text || message.text.length > 16_000)
       || Buffer.byteLength(JSON.stringify({ messages, omittedBefore }), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
@@ -479,7 +482,7 @@ export class PendingConnectionRequests {
       || !this.liveGrant(pending.owner, pending.connectionId, now))) return 0;
     const normalized = messages.map((message) => Object.freeze({ direction: message.direction, text: message.text,
       ...(message.truncated ? { truncated: true as const } : {}),
-      identityQuality: "uncertain" as const, generationState: "unknown" as const }));
+      identityQuality: "uncertain" as const, generationState: message.generationState ?? "unknown" as const }));
     let published = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
@@ -492,7 +495,7 @@ export class PendingConnectionRequests {
       if (!previous || grant.geminiSnapshot?.omittedBefore !== omittedBefore
         || previous.length !== normalized.length || normalized.some((message, index) =>
         message.direction !== previous[index]?.direction || message.text !== previous[index]?.text
-          || message.truncated !== previous[index]?.truncated)) {
+          || message.truncated !== previous[index]?.truncated || message.generationState !== previous[index]?.generationState)) {
         grant.geminiObservations.append({ kind: "gemini_snapshot", messages: normalized, omittedBefore });
       }
       grant.geminiSnapshot = Object.freeze({ coverage: "rendered_only", generation: 1, capturedAt: now,

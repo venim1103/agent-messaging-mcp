@@ -1,4 +1,4 @@
-export type GeminiRenderedMessage = { direction: "incoming" | "outgoing"; text: string; truncated?: true };
+export type GeminiRenderedMessage = { direction: "incoming" | "outgoing"; text: string; truncated?: true; generationState?: "streaming" };
 
 export function inspectGeminiDraft(input: { expectedUrl: string; text: string; draftMode?: "empty" | "prepared"; checkSubmit?: boolean }):
   { ok: true; editor: "contenteditable" } | { ok: false;
@@ -384,7 +384,7 @@ export function observeGeminiMessages(expectedUrl: string): boolean {
     }, 200);
   });
   observer.observe(timeline, { childList: true, characterData: true, subtree: true,
-    attributes: true, attributeFilter: ["hidden", "class", "style"] });
+    attributes: true, attributeFilter: ["hidden", "class", "style", "aria-busy"] });
   scope.geminiMessagesObserver = observer;
   scope.geminiMessagesObserverUrl = expectedUrl;
   return true;
@@ -408,6 +408,11 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
   const rows = [...timeline.querySelectorAll<HTMLElement>("user-query, model-response")].filter(visible);
   if (!rows.length) return null;
 
+  const signalVisible = (element: HTMLElement) => visible(element) && getComputedStyle(element).visibility === "visible";
+  const stopping = [...regions[0]!.querySelectorAll<HTMLElement>('button[aria-label="Stop response"]')]
+    .some(control => signalVisible(control) && !timeline.contains(control)
+      && [...control.querySelectorAll<HTMLElement>('mat-icon, [data-mat-icon-name], .google-symbols, .material-symbols-outlined, .material-icons')]
+        .some(icon => icon.getAttribute("data-mat-icon-name") === "stop" || icon.textContent?.trim() === "stop"));
   const messages: GeminiRenderedMessage[] = [];
   let omittedBefore = rows.length > 32;
   for (const [index, row] of rows.entries()) {
@@ -427,8 +432,12 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
     if (!text && row.localName === "model-response") continue;
     if (!text) return null;
     if (index < rows.length - 32) continue;
+    const streaming = row.localName === "model-response" && index === rows.length - 1
+      && signalVisible(row) && (stopping || row.matches('[aria-busy="true"]')
+        || [...row.querySelectorAll<HTMLElement>('[aria-busy="true"]')].some(signalVisible));
     messages.push({ direction: row.localName === "user-query" ? "outgoing" : "incoming",
-      text: text.slice(0, 16_000), ...(text.length > 16_000 ? { truncated: true as const } : {}) });
+      text: text.slice(0, 16_000), ...(text.length > 16_000 ? { truncated: true as const } : {}),
+      ...(streaming ? { generationState: "streaming" as const } : {}) });
   }
   if (!messages.length) return null;
   const size = () => new TextEncoder().encode(JSON.stringify({ messages, omittedBefore })).length;

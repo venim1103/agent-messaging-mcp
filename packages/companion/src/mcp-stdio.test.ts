@@ -110,7 +110,7 @@ for (const target of [
     const client = new Client({ name: "Synthetic reply wait owner", version: "0.0.1" });
     const controller = new AbortController();
     let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
-    let mode: "steady" | "outgoing" | "truncated" | "held" | "unavailable" = "steady";
+    let mode: "steady" | "outgoing" | "truncated" | "held" | "unavailable" | "streaming" = "steady";
     let reads = 0;
     let releaseCapture: (() => void) | undefined;
     context.mock.method(PendingConnectionRequests.prototype,
@@ -119,7 +119,8 @@ for (const target of [
         if (mode === "unavailable") return { result: Promise.resolve("not_ready") } as never;
         const message = { direction: mode === "outgoing" ? "outgoing" : "incoming", text: "Synthetic bounded reply",
           ...(mode === "truncated" ? { truncated: true } : {}),
-          ...(target.origin === "https://gemini.google.com" ? { identityQuality: "uncertain", generationState: "unknown" } : { id: "synthetic-reply" }) };
+          ...(target.origin === "https://gemini.google.com" ? { identityQuality: "uncertain",
+            generationState: mode === "streaming" ? "streaming" : "unknown" } : { id: "synthetic-reply" }) };
         const snapshot = { coverage: "rendered_only", generation: 1, capturedAt: Date.now(),
           cursor: { epoch: "c66b3997-9d43-4554-8399-267d1fe9f75c", sequence: mode === "steady" ? 1 : 2 },
           omittedBefore: false, messages: [message] };
@@ -155,6 +156,12 @@ for (const target of [
       assert.equal(payload.timedOut, false);
       assert.equal(payload.reply.text, "Synthetic bounded reply");
       assert.equal(payload.reply.generationState, "settled_heuristic");
+      if (target.origin === "https://gemini.google.com") {
+        mode = "streaming";
+        const beforeStreaming = reads;
+        assert.deepEqual((await wait({ connectionId, timeoutMs: 2200 })).structuredContent, { timedOut: true });
+        assert.ok(reads - beforeStreaming >= 4, "Flat streaming reply needs repeated fresh reads, never heuristic completion");
+      }
       for (const next of ["truncated", "outgoing", "unavailable"] as const) {
         mode = next;
         const started = performance.now();

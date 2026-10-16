@@ -42,6 +42,18 @@ for (const provider of ["fixture", "gemini"]) {
     assert.equal(observation.observe(snapshot(18000), 18000), null);
     assert.equal(observation.observe(snapshot(17000), 17000), null);
   });
+  if (provider === "gemini") test("Gemini streaming evidence resets quiet time even when text and cursor stay unchanged", () => {
+    const observation = new ReplyObservation();
+    const streaming = (capturedAt: number) => ({ ...snapshot(capturedAt), messages: [{
+      direction: "incoming" as const, text: "Synthetic reply", identityQuality: "uncertain" as const, generationState: "streaming" as const
+    }] });
+    assert.equal(observation.observe(snapshot(1000), 1000), null);
+    assert.equal(observation.observe(streaming(3000), 3000), null);
+    assert.equal(observation.observe(streaming(8000), 8000), null);
+    assert.equal(observation.observe(snapshot(9000), 9000), null);
+    assert.equal(observation.observe(snapshot(10999), 10999), null);
+    assert.equal(observation.observe(snapshot(11000), 11000)?.generationState, "settled_heuristic");
+  });
 }
 
 for (const target of [
@@ -767,6 +779,22 @@ test("one exact Gemini conversation grants only its MCP owner without enabling f
   })) });
   assert.deepEqual(requests.readGeminiEvents(owner, granted!.connectionId, { epoch: "other", sequence: 1 }, 1, 2003),
     { state: "expired", resnapshot: true });
+  const streaming = later.map((message, index) => index === later.length - 1 ? { ...message, generationState: "streaming" as const } : message);
+  assert.equal(requests.publishGeminiSnapshot(target, streaming, 2004), 1);
+  const busy = requests.getGeminiSnapshot(owner, granted!.connectionId, 2004);
+  if (!busy || busy === "not_ready") throw new Error("Expected streaming capture");
+  assert.equal(busy.messages.at(-1)?.generationState, "streaming");
+  assert.equal(busy.cursor.sequence, events.cursor.sequence + 1);
+  assert.equal(requests.publishGeminiSnapshot(target, streaming, 2005), 1);
+  assert.equal(requests.publishGeminiSnapshot(target, later, 2006), 1);
+  const quiet = requests.getGeminiSnapshot(owner, granted!.connectionId, 2006);
+  if (!quiet || quiet === "not_ready") throw new Error("Expected unknown capture after streaming");
+  assert.equal(quiet.messages.at(-1)?.generationState, "unknown");
+  assert.equal(quiet.cursor.sequence, busy.cursor.sequence + 1);
+  assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Reply", generationState: "complete" as never }], 2007),
+    /Invalid Gemini snapshot/);
+  assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "outgoing", text: "Question", generationState: "streaming" }], 2007),
+    /Invalid Gemini snapshot/);
   assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "x".repeat(16001) }], 2002),
     /Invalid Gemini snapshot/);
   assert.throws(() => requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: 0 as never }], 2002),

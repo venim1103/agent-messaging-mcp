@@ -444,6 +444,47 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
       { direction: "incoming", text: "OK" },
       { direction: "outgoing", text: "OK" }
     ] });
+    await page.locator("model-response").evaluate(row => row.setAttribute("aria-busy", "true"));
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages[1].generationState, undefined);
+    await page.locator("infinite-scroller").evaluate(timeline => {
+      const reply = document.createElement("model-response");
+      reply.innerHTML = '<model-response-content>Partial synthetic reply</model-response-content><button aria-label="Copy">Copy</button>';
+      timeline.append(reply);
+      window.signalNotifications = 0;
+      window.chrome = { runtime: { sendMessage: () => { window.signalNotifications++; return Promise.resolve(); } } };
+    });
+    assert.equal(await page.evaluate(observeGeminiMessages, "https://gemini.google.com/app/disposable-chat"), true);
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.locator("model-response").last().evaluate(row => row.setAttribute("aria-busy", "true"));
+    await page.waitForFunction(() => window.signalNotifications === 1);
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, "streaming");
+    await page.locator("model-response").last().evaluate(row => row.setAttribute("aria-busy", "false"));
+    await page.waitForFunction(() => window.signalNotifications === 2);
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.locator("model-response").last().evaluate(row => {
+      const busy = document.createElement("div");
+      busy.setAttribute("aria-busy", "true");
+      busy.textContent = "Synthetic indicator";
+      row.append(busy);
+    });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, "streaming");
+    await page.locator('model-response [aria-busy="true"]').evaluate(indicator => indicator.hidden = true);
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.locator("main").evaluate(main => {
+      const stop = document.createElement("button");
+      stop.setAttribute("aria-label", "Stop response");
+      stop.innerHTML = '<mat-icon>stop</mat-icon>';
+      main.append(stop);
+    });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, "streaming");
+    await page.locator('button[aria-label="Stop response"]').evaluate(button => button.style.visibility = "hidden");
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.locator('button[aria-label="Stop response"]').evaluate(button => {
+      button.style.visibility = "visible";
+      button.querySelector("mat-icon").textContent = "send";
+    });
+    assert.equal((await page.evaluate(captureGeminiSnapshot)).messages.at(-1).generationState, undefined);
+    await page.goto("https://gemini.google.com/app/disposable-chat");
     await page.locator("model-response-content p").evaluate((paragraph) => { paragraph.textContent = ""; });
     assert.deepEqual(await page.evaluate(captureGeminiSnapshot), { omittedBefore: false, messages: [
       { direction: "outgoing", text: "First line\nSecond line \u00e9" },

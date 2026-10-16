@@ -405,13 +405,21 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             if (provider === "fixture") {
               row.dataset.messageId = "synthetic-streaming-reply";
               row.dataset.direction = "incoming";
-            }
+            } else row.setAttribute("aria-busy", "true");
             content.textContent = "Synthetic partial reply";
             row.append(content);
             document.querySelector(provider === "gemini" ? "infinite-scroller" : "#messages").append(row);
           }, provider);
           const partial = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+          assert.equal(partial.isError, undefined, JSON.stringify(partial));
           assert.equal(partial.structuredContent.messages.at(-1).text, "Synthetic partial reply");
+          if (provider === "gemini") {
+            assert.equal(partial.structuredContent.messages.at(-1).generationState, "streaming");
+            assert.deepEqual((await mcpClient.callTool({ name: "chat_wait_for_reply", arguments: {
+              connectionId: connection.connectionId, timeoutMs: 2200
+            } })).structuredContent, { timedOut: true });
+            await fixture.locator("model-response").last().evaluate(row => row.setAttribute("aria-busy", "false"));
+          }
           await fixture.evaluate(provider => {
             globalThis.replyRevisionCount = 0;
             setTimeout(() => {

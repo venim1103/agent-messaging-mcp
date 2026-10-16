@@ -46,8 +46,8 @@ const geminiTarget = z.strictObject({
 const geminiMessage = z.strictObject({
   direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(16_000),
   truncated: z.literal(true).optional(),
-  identityQuality: z.literal("uncertain"), generationState: z.literal("unknown")
-});
+  identityQuality: z.literal("uncertain"), generationState: z.enum(["unknown", "streaming"])
+}).refine(message => message.direction === "incoming" || message.generationState === "unknown");
 const fixtureCursor = z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() });
 const geminiReview = z.strictObject({
   operationId: z.uuid(), reviewId: z.uuid(), expiresAt: z.number().int().safe(),
