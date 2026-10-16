@@ -1696,6 +1696,15 @@ async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agen
             && typeof agent.label === "string" && /^[ -~]{1,80}$/.test(agent.label) && agent.label.trim() === agent.label
             && typeof agent.connectionCount === "number" && Number.isSafeInteger(agent.connectionCount) && agent.connectionCount >= 0;
         }) || new Set(agents.map(item => item.agentId)).size !== agents.length) throw new Error();
+      if (target && grantKey && stored?.expiresAt === null && stored.documentId === target.documentId
+        && stored.url === expectedUrl && agents.every(agent => agent.connectionCount === 0)) {
+        await mutateStoredGrant(grantKey, async () => {
+          const latest = (await browser.storage.session.get(grantKey))[grantKey] as StoredFixtureGrant | StoredGeminiGrant | undefined;
+          if (Date.now() >= deadlineMs) throw new Error();
+          if (latest?.documentId === stored.documentId && latest.expiresAt === null && latest.revision === stored.revision
+            && latest.url === expectedUrl) await browser.storage.session.remove(grantKey);
+        });
+      }
       return { ok: true, agents: agents as ChatAgent[], countsKnown: target !== null };
     }
     if (action === "approve") {

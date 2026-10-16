@@ -125,7 +125,9 @@ Transport failure returns `unresolved / DISPATCH_UNCERTAIN` even while awaiting 
 
 Trusted-popup removal after fill leaves the draft unsent without durable intent or activation. Removal after activation cannot undo it and stays unresolved when evidence has not reached the broker. Both refuse new work without fresh approval; receipt recovery creates no authority. Synthetic browser checks remove access before the original lease expires.
 
-This public path works for the fixture and routed synthetic Gemini pages, including own-window sending, hidden-tab refusal, popup removal after fill/activation, bounded own-leftover replacement (D10a) and human-draft preservation. Installed/live autonomous acceptance and browser-level concurrent cancellation remain pending. Do not infer live test authorization from synthetic coverage.
+Actual SDK cancellation with a queued same-key call is browser-tested after fill and after activation for both providers. The duplicate stays unresolved, jobs are not re-offered, and the replacement owner has no inherited approval or operation access. A trusted roster refresh removes the unchanged autonomous local grant only after a validated exact-chat zero-owner reply; other connected owners and newer approvals remain intact.
+
+This public path works for the fixture and routed synthetic Gemini pages, including own-window sending, hidden-tab refusal, popup removal/cancellation after fill/activation, bounded own-leftover replacement (D10a) and human-draft preservation. Installed/live autonomous acceptance remains pending. Do not infer live test authorization from synthetic coverage.
 
 ### Supervised send (fixture only)
 
