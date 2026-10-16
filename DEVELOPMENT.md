@@ -361,6 +361,44 @@ Browser-test rules: launch Chromium with `chromiumSandbox: true`, because Playwr
 
 Use only disposable chats in the development profile, with fresh human authorization for each live read. A live connector fill needs explicit approval of the exact chat and text, and a live send needs a separate approval. Never clear or submit a draft the person typed. Do not store chat text, full URLs, IDs or recovery tokens in documents, logs or memory. Details are in AGENTS.md.
 
+### Manual Post-Fill Control Review
+
+Use only after fresh authorization for the exact selected disposable Gemini chat. This one-shot read-only Console probe mirrors existing composer/Send checks and emits only fixed metadata. It does not read draft/message text, click, focus, fill, send or clear anything. Leave the existing draft untouched. Do not bypass paste protection or rerun automatically; return only its JSON, never other logs, URLs or screenshots.
+
+```js
+(() => {
+   const emit = value => console.log(JSON.stringify(value));
+   if (window.top !== window || location.origin !== "https://gemini.google.com"
+      || !/^\/app\/[A-Za-z0-9_-]{1,128}\/?$/.test(location.pathname)) return emit({ code: "UNSUPPORTED_CHAT" });
+   const visible = element => element.getClientRects().length > 0 && getComputedStyle(element).visibility === "visible";
+   const regions = [...document.querySelectorAll("main, [role=main]")].filter(visible);
+   const timelines = regions.length === 1 ? [...regions[0].querySelectorAll("infinite-scroller")].filter(visible) : [];
+   const describe = element => {
+      const rect = element.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const hit = document.elementFromPoint(centerX, centerY);
+      const clearAncestors = ![element, ...function* () {
+         for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) yield ancestor;
+      }()].some(ancestor => getComputedStyle(ancestor).visibility !== "visible" || Number(getComputedStyle(ancestor).opacity) === 0);
+      return { insideMain: regions.length === 1 && regions[0].contains(element),
+         insideTimeline: timelines.some(timeline => timeline.contains(element)),
+         blocked: Boolean(element.closest("[inert], [aria-hidden=true], [aria-disabled=true], [aria-readonly=true]")),
+         centerInViewport: centerX >= 0 && centerY >= 0 && centerX < innerWidth && centerY < innerHeight,
+         unobstructed: clearAncestors && Boolean(hit && (hit === element || element.contains(hit))) };
+   };
+   const editors = [...document.querySelectorAll("[contenteditable=true]")].filter(element => visible(element)
+      && (element.getAttribute("aria-label") === "Enter a prompt for Gemini" || element.getAttribute("placeholder") === "Enter a prompt for Gemini"));
+   const controls = [...document.querySelectorAll('button[aria-label="Send message"]')].filter(visible);
+   emit({ code: "CAPTURED", visible: document.visibilityState === "visible", regions: regions.length, timelines: timelines.length,
+      editors: editors.slice(0, 8).map(element => ({ ...describe(element), editable: element.isContentEditable,
+         nested: Boolean(element.parentElement?.closest("[contenteditable]")),
+         embedded: Boolean(element.querySelector("[contenteditable], input, textarea, [role=textbox]")) })), editorsOverflow: editors.length > 8,
+      controls: controls.slice(0, 8).map(element => ({ ...describe(element), type: ["submit", "button", "reset"].includes(element.type) ? element.type : "other",
+         disabled: element.matches(":disabled") })), controlsOverflow: controls.length > 8 });
+})();
+```
+
 ### Manual Completion-Metadata Review
 
 After explicit read-only authorization and confirmation of the exact selected disposable saved chat, run this in that chat's DevTools Console. Start it before manually submitting one non-sensitive prompt. It samples for 60 seconds, stops on a URL/visibility change, and prints only fixed control metadata. It never clicks, focuses, fills, sends or reads message bodies; the selected URL stays local for the identity guard and is never printed. Use an existing chat with a stable saved route, not a new blank chat. Do not bypass paste protection or change security settings if the console blocks it; report the block.
