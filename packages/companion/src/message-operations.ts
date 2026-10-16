@@ -25,6 +25,12 @@ export const MAX_PENDING_FIXTURE_DISPATCHES = 1;
 export const CHAT_SETTLE_TIMEOUT_MS = 5_000;
 export const DEFAULT_MAX_SENDS_PER_HOUR = 60;
 const SEND_RATE_WINDOW_MS = 60 * 60_000;
+export const autonomousFailureStageSchema = z.enum(["composer", "fill", "read", "proof", "dispatch"]);
+export class AutonomousCommitFailure extends Error {
+  constructor(message: string, readonly failureStage: z.infer<typeof autonomousFailureStageSchema>) {
+    super(message);
+  }
+}
 export const fixtureDispatchResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ok: z.literal(true), editor: z.enum(["textarea", "rich"]), activated: z.literal(true) }),
   z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "COMPOSER_UNAVAILABLE",
@@ -1800,21 +1806,26 @@ export class PreparedMessageOperations {
     const authorization = this.getAutonomousAuthorization(owner, operationId, now);
     if (!authorization) throw new Error("DISPATCH_UNAVAILABLE");
     const expiresAt = Math.min(deadlineMs, authorization.expiresAt);
+    let failureStage: z.infer<typeof autonomousFailureStageSchema> = "composer";
     const result = (async () => {
       if (!await this.acquireComposer(owner, operationId, expiresAt)) throw new Error("DISPATCH_UNAVAILABLE");
       try {
+        failureStage = "fill";
         const filling = this.requestChatFill(owner, operationId, Date.now(), expiresAt);
         if (!filling || filling === "busy" || !(await filling.result)?.ok || expiresAt <= Date.now()) {
           throw new Error("DISPATCH_UNAVAILABLE");
         }
+        failureStage = "read";
         const reading = operation.target.origin === "https://gemini.google.com"
           ? this.requests.requestFreshGeminiRead(owner, operation.connectionId, Date.now(), expiresAt)
           : this.requests.requestFreshFixtureRead(owner, operation.connectionId, Date.now(), expiresAt);
         if (!reading || reading === "busy") throw new Error("DISPATCH_UNAVAILABLE");
         const snapshot = await reading.result;
         if (!snapshot || snapshot === "not_ready" || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
+        failureStage = "proof";
         const inspecting = this.requestChatProof(owner, operationId, Date.now(), expiresAt);
         if (inspecting === "busy" || !await inspecting.result || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
+        failureStage = "dispatch";
         const dispatching = operation.target.origin === "https://gemini.google.com"
           ? this.requestGeminiDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt)
           : this.requestFixtureDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt);
@@ -1823,7 +1834,10 @@ export class PreparedMessageOperations {
         this.settlementChecks.delete(operationId);
         this.releaseComposer(owner, operationId);
       }
-    })().then(completed => {
+    })().catch(error => {
+      if (error instanceof Error) throw new AutonomousCommitFailure(error.message, failureStage);
+      throw error;
+    }).then(completed => {
       this.autonomousCommits.delete(operationId);
       return completed;
     });

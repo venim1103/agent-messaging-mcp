@@ -8,9 +8,9 @@ Reusable setup, operating instructions, tool contracts and code map for people a
 
 Dated test reports that used to fill this file were removed in the 2026-10-09 review. HANDOFF.md keeps that evidence, and the previous text is available with `git show 002d600:DEVELOPMENT.md`.
 
-> **Experimental.** The local fixture supports reads, events and supervised fill and send. A selected saved Gemini chat supports reads and events; Gemini writing is private, incomplete and refused by the public tools. Never connect personal conversations.
+> **Experimental.** The local fixture supports reads, events and supervised fill and send. Public autonomous reads/sends and reply waiting are synthetic-tested for the fixture and selected saved Gemini chats. Successful live autonomous sending remains unverified. Never connect personal conversations.
 
-The decided target is one **Connect this chat** approval per agent, after which each approved agent chats on its own until its connection ends. Several agents may share a chat (DESIGN.md sections 2 and 17). Popup-first admission, owned pickup, no-expiry grants and exact same-chat reload support reads/events and are synthetic-tested. Autonomous sending is not implemented. This file describes today's tools, not the completed target.
+The decided target is one **Connect this chat** approval per agent, after which each approved agent chats on its own until its connection ends. Several agents may share a chat (DESIGN.md sections 2 and 17). Popup-first admission, owned pickup, no-expiry grants, exact same-chat reload and autonomous sending are implemented and synthetic-tested. This is not completed installed/live acceptance; see HANDOFF.md for current evidence.
 
 ## Architecture in Brief
 
@@ -34,7 +34,7 @@ Private state, never committed:
 - `~/.config/agent-messaging-mcp/native-host` is the native launcher script.
 - `~/.local/share/agent-messaging-mcp/chromium-dev` is the Chromium profile (a Podman volume) with logins and the native host manifest. Treat it as sensitive.
 
-New dispatch attempts carry a conversation HMAC under a persistent 32-byte key in the private database. Unresolved attempts block new intents and fills in that chat for every owner, including after restart, not unrelated chats. Old unkeyed attempts retain global blocking. Missing/corrupt keys with keyed attempts fail startup; do not delete or regenerate the key/database to bypass uncertainty. The ledger supports immutable attributed resolution/status through the trusted selected-chat popup controls below; automatic page resolution and autonomous sending remain unimplemented.
+New dispatch attempts carry a conversation HMAC under a persistent 32-byte key in the private database. Unresolved attempts block new intents and fills in that chat for every owner, including after restart, not unrelated chats. Old unkeyed attempts retain global blocking. Missing/corrupt keys with keyed attempts fail startup; do not delete or regenerate the key/database to bypass uncertainty. The ledger supports immutable attributed resolution/status through the trusted selected-chat popup controls and bounded autonomous page-sent/not-sent reconciliation described below.
 
 `BROWSER_CHAT_MAX_SENDS_PER_HOUR` sets the broker's positive safe-integer limit (default 60). Restart the broker to change it; this ends current grants. All keyed journal attempts count within the rolling hour for that conversation across owners/restarts, including evidenced attempts; future timestamps remain counted after a backward clock shift. Fill admission and durable intent insertion refuse at the limit without restoring or consuming extra authority. Invalid configuration fails startup. No MCP argument can configure the limit.
 
@@ -125,6 +125,8 @@ A fresh reviewed UI-complete newest row returns `reply.generationState: "complet
 
 Timeout returns no reply and does not intentionally disconnect the owner. Reads remain at most four seconds and are clipped to the original wait budget with a transport-reply allowance. An expired queued read cannot reach the browser. Cancellation ends the owning broker connection; reconnect requires fresh approval. Errors use structured `code`, including `CONNECTION_NOT_FOUND`, `CANCELLED` and `BROKER_UNAVAILABLE`. Synthetic SDK/browser coverage exists for both providers; acceptance of the updated installed extension and live autonomous sending remain pending.
 
+Both extension read watches forward each challenge's original expiry into the snapshot queue. The existing publisher checks it after queued work drains and before page capture/publication; late reads are skipped without expiring the connection or touching its draft. Integer transport deadlines round the remaining fractional budget up, still clipped to the original wall deadline and five-second transport cap; the enclosing wait retains its original monotonic budget.
+
 ### Autonomous send
 
 After **Connect this chat** and `chat_wait_for_connection`, call `chat_send_message { connectionId, text, idempotencyKey }` with a UUID key. Only the live owned autonomous grant authorizes a new attempt. The broker runs preparation, fill, challenged read, exact proof, durable intent, one reserved activation and bounded evidence inside one original 30-second deadline. Each browser lease remains at most four seconds.
@@ -133,7 +135,7 @@ The chat must be active and visible in its own window; that window need not be f
 
 Results always have `retryAllowed: false` and `state: "sent" | "not_sent" | "unresolved"` with a code. `sent` is a page/person assessment, not acceptance or delivery. `not_sent` means a definite refusal before durable intent or a page/person assessment; returning it does not clear any draft. A fresh independently keyed message may replace only this owner's known resolved unsent leftover under the bounded D10a checks below. `unresolved` may mean the send happened and must not trigger an automatic replacement. An unresolved durable attempt pauses the conversation across owners.
 
-Pending local diagnostic changes add optional `failureStage` to autonomous `DISPATCH_UNAVAILABLE` results: `composer`, `fill`, `read`, `proof` or `dispatch`. This fixed metadata names the last attempted phase, not a proven root cause or new authority. Existing codes, no-retry behavior and durable-status precedence remain unchanged; transport loss still yields unresolved without an invented stage. The source checkpoint gate is currently blocked; see [HANDOFF.md](HANDOFF.md#t5-control-metadata-and-pending-refusal-diagnostics-2026-10-16) before relying on deployment.
+Autonomous `DISPATCH_UNAVAILABLE` results may include optional `failureStage`: `composer`, `fill`, `read`, `proof` or `dispatch`. This fixed metadata names the last attempted phase, not a proven root cause or new authority. Existing codes, no-retry behavior and durable-status precedence remain unchanged; transport loss still yields unresolved without an invented stage. Source coverage does not establish deployment; use the coordinated restart procedure above and the [current checkpoint evidence](HANDOFF.md#t5-gated-read-deadlines-and-refusal-diagnostics-2026-10-16).
 
 The first prepared response includes `operationId` and a private `recoveryToken`; keep the token private. `chat_get_operation { operationId, recoveryToken }` can recover dispatch metadata without chat access or write authority. Same key and arguments return the existing status without another activation; a status-only replay need not repeat the token. Changed arguments conflict. New work requires a new key and valid authority, and still refuses an existing draft. Cancellation closes the owning broker connection; it cannot undo an already activated send.
 
@@ -223,7 +225,7 @@ Open this small panel from the extension icon in container Chromium's toolbar, u
 
 - **Inspect this chat**: a read-only diagnostic. On the fixture it lists rows and checks the native bridge. On Gemini it shows only structure metadata (regions, editors, row lengths, **Send controls**, **Prompt state** and **Nearby prompt controls**), never chat text.
 - **View pending requests**, then **Approve read-only fixture** or **Approve read-only Gemini chat**.
-- Agent roster: **Connect this chat** per agent, **Remove access**, **Disconnect all** and **Refresh agents**. The consent text discloses read/send authority and influence from chat content, and states that autonomous sending is not yet available.
+- Agent roster: **Connect this chat** per agent, **Remove access**, **Disconnect all** and **Refresh agents**. The consent text discloses read/send authority and influence from chat content, and warns that live-site sending is unverified.
 - **Unconfirmed Sends**: **Refresh status** loads eligible selected-chat operation IDs/timestamps; **Sent** / **Not sent** record an immutable person assessment, never activate Send or touch the composer. It does not automatically check on ordinary popup opens.
 - **Review fixture drafts** or **Review Gemini drafts**, then **Approve draft (no send)**.
 - **Review fixture draft fill** or **Review Gemini fill consent**, then **Allow draft fill (no send)**.

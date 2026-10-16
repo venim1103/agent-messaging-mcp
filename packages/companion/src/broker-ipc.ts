@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { authenticateBrokerRole, MAX_BROKER_PENDING_REQUESTS, type BrokerCredentials } from "./broker-roles.js";
 import { handleBrokerRequest } from "./broker-requests.js";
-import { PreparedMessageOperations } from "./message-operations.js";
+import { AutonomousCommitFailure, PreparedMessageOperations } from "./message-operations.js";
 import { NativeFrameDecoder, writeNativeFrame as writeBrokerResponse } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
@@ -123,7 +123,9 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                     }
                   }
                   if (!socket.destroyed) await writeBrokerResponse(socket, { ...reply, kind: "error",
-                    payload: { code: error.message === "DISPATCH_UNCERTAIN" ? "DISPATCH_UNCERTAIN" : "DISPATCH_UNAVAILABLE" } });
+                    payload: { code: error.message === "DISPATCH_UNCERTAIN" ? "DISPATCH_UNCERTAIN" : "DISPATCH_UNAVAILABLE",
+                      ...(reply.kind === "chat_autonomous_commit_authorized" && error instanceof AutonomousCommitFailure
+                        && error.message !== "DISPATCH_UNCERTAIN" ? { failureStage: error.failureStage } : {}) } });
                 }
                 return;
               }

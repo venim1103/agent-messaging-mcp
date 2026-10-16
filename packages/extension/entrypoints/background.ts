@@ -1168,7 +1168,7 @@ function startFixtureReadWatch(): boolean {
         const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | undefined;
         if (!grant || grant.documentId !== challenge.documentId || grant.reloadPending || chatTabUpdates.has(challenge.tabId)
           || !isLiveStoredExpiry(grant.expiresAt)) continue;
-        if (!await queueFixtureSnapshot(challenge.tabId, challenge.documentId, challenge.challengeId)) {
+        if (!await queueFixtureSnapshot(challenge.tabId, challenge.documentId, challenge.challengeId, challenge.expiresAt)) {
           if (await classifyFixturePublicationFailure(challenge.tabId, challenge.documentId, grant.url) === "target_changed") {
             await revokeChangedChatGrant(key, challenge.tabId, challenge.documentId);
           }
@@ -1313,7 +1313,7 @@ function startGeminiReadWatch(): boolean {
         if (!grant || grant.documentId !== challenge.documentId || grant.url !== challenge.url
           || grant.reloadPending || chatTabUpdates.has(challenge.tabId) || !isLiveStoredExpiry(grant.expiresAt)) continue;
         if (!await queueGeminiSnapshot(challenge.tabId, challenge.url,
-          challenge.documentId, challenge.challengeId)) {
+          challenge.documentId, challenge.challengeId, challenge.expiresAt)) {
           if (await classifyGeminiPublicationFailure(challenge.tabId, challenge.url, challenge.documentId) === "target_changed") {
             await revokeChangedChatGrant(key, challenge.tabId, challenge.documentId);
           }

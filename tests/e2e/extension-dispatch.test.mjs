@@ -15,7 +15,8 @@ import { planNativeRegistration, registerNative } from "../../packages/companion
 import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase } from "./extension-harness.mjs";
 
 async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
-  const setPhase = trackTestPhase(testContext, `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
+  const setPhase = trackTestPhase(testContext, outcome === "expired_read" ? `${provider} read expiry`
+    : `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
   const retainedDraft = ["not_sent", "not_sent_changed", "lost_settle", "owned_leftover"].includes(outcome);
   let mcpClient;
   let publicSendCancellation;
@@ -82,6 +83,23 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
     let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
+    if (outcome === "expired_read") await worker.evaluate(() => {
+      const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+      let confirmPort;
+      globalThis.deadlineReadPortReady = new Promise(resolve => { confirmPort = resolve; });
+      chrome.runtime.connectNative = (...args) => {
+        const port = connect(...args);
+        const post = port.postMessage.bind(port);
+        port.postMessage = message => {
+          if (message.kind === "list_fixture_read_challenges" || message.kind === "list_gemini_read_challenges") {
+            globalThis.deadlineReadPort = port;
+            confirmPort();
+          }
+          post(message);
+        };
+        return port;
+      };
+    });
     if (outcome === "lost_native_completion" || outcome === "lost_settle") {
       await worker.evaluate(({ provider, autonomous, outcome }) => {
         const connect = chrome.runtime.connectNative.bind(chrome.runtime);
@@ -196,7 +214,106 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       assert.equal(connection.expiresAt, null);
       assert.deepEqual(connection.capabilities, ["read", "send"]);
       if (autonomous === "public") {
-        setPhase("public autonomous send");
+        setPhase(outcome === "expired_read" ? "public read expiry" : "public autonomous send");
+        assert.match(await popup.locator("#connection-consent").textContent(), /live-site sending is unverified/);
+        assert.equal(await popup.locator("#status").textContent(), "Agent connected. Live-site sending is unverified.");
+        if (outcome === "expired_read") {
+          setPhase("expired queued read");
+          await fixture.bringToFront();
+          const editor = fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message");
+          const draft = "Synthetic human draft must remain through read expiry";
+          await editor.fill(draft);
+          await worker.evaluate(() => globalThis.deadlineReadPortReady);
+          await worker.evaluate(provider => {
+            const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+            const port = globalThis.deadlineReadPort;
+            const post = port.postMessage.bind(port);
+            let release;
+            const held = new Promise(resolve => { release = resolve; });
+            let confirmCapture;
+            let confirmChallenge;
+            let confirmDrained;
+            globalThis.queuedReadCaptureStarted = new Promise(resolve => { confirmCapture = resolve; });
+            globalThis.queuedReadChallengeListed = new Promise(resolve => { confirmChallenge = resolve; });
+            globalThis.queuedReadDrained = new Promise(resolve => { confirmDrained = resolve; });
+            globalThis.queuedReadCaptureCount = 0;
+            let released = false;
+            const onMessage = reply => {
+              if (reply.kind === `${provider}_read_challenges` && reply.payload.challenges.length) {
+                globalThis.queuedReadExpiresAt = Math.max(...reply.payload.challenges.map(challenge => challenge.expiresAt));
+                confirmChallenge();
+              }
+            };
+            port.onMessage.addListener(onMessage);
+            port.postMessage = message => {
+              if (released && (provider === "gemini" ? message.kind === "list_gemini_fill_challenges"
+                : message.kind === "list_chat_jobs" && message.payload.phase === "fill")) confirmDrained();
+              post(message);
+            };
+            chrome.scripting.executeScript = async details => {
+              const source = details.func?.toString() ?? "";
+              const snapshot = provider === "gemini" ? source.includes("query-text-line") && source.includes("model-response-content")
+                : source.includes("data-message-id") && source.includes("ol#messages[role=log]");
+              if (!snapshot) return execute(details);
+              globalThis.queuedReadCaptureCount++;
+              const result = await execute(details);
+              if (globalThis.queuedReadCaptureCount === 1) { confirmCapture(); await held; }
+              return result;
+            };
+            globalThis.releaseQueuedRead = () => { released = true; release(); };
+            globalThis.restoreQueuedRead = () => {
+              release();
+              chrome.scripting.executeScript = execute;
+              port.postMessage = post;
+              port.onMessage.removeListener(onMessage);
+            };
+          }, provider);
+          await fixture.locator(provider === "gemini" ? "infinite-scroller" : "#messages").evaluate(timeline => {
+            const marker = document.createElement("span");
+            timeline.append(marker);
+            marker.remove();
+          });
+          await worker.evaluate(() => globalThis.queuedReadCaptureStarted);
+          const reading = mcpClient.callTool({ name: "chat_wait_for_reply",
+            arguments: { connectionId: connection.connectionId, timeoutMs: 1000 } });
+          await worker.evaluate(() => globalThis.queuedReadChallengeListed);
+          assert.deepEqual((await reading).structuredContent, { timedOut: true });
+          assert.equal(await worker.evaluate(() => globalThis.queuedReadExpiresAt <= Date.now()), true);
+          await worker.evaluate(() => globalThis.releaseQueuedRead());
+          await worker.evaluate(() => globalThis.queuedReadDrained);
+          assert.equal(await worker.evaluate(() => globalThis.queuedReadCaptureCount), 1,
+            "An expired queued read invoked another page capture");
+          await worker.evaluate(() => globalThis.restoreQueuedRead());
+          const fresh = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+          assert.equal(fresh.isError, undefined);
+          assert.equal(fresh.structuredContent.coverage, "rendered_only");
+          assert.equal(await editor.evaluate(element => element instanceof HTMLTextAreaElement ? element.value : element.innerText), draft);
+          assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 0);
+          return;
+        }
+        if (provider === "gemini" && outcome === "observed") {
+          await fixture.evaluate(() => {
+            const response = document.createElement("model-response");
+            response.style.display = "block";
+            const content = document.createElement("model-response-content");
+            content.textContent = "Synthetic completed baseline reply";
+            response.append(content);
+            document.querySelector("infinite-scroller").append(response);
+            for (const name of ["section", "div"]) {
+              const marker = document.createElement(name);
+              marker.setAttribute("aria-busy", "false");
+              marker.textContent = "Synthetic completion marker";
+              response.append(marker);
+            }
+            const copy = document.createElement("button");
+            copy.setAttribute("aria-label", "Copy");
+            copy.textContent = "Copy";
+            response.append(copy);
+          });
+          const beforeSend = (await mcpClient.callTool({ name: "chat_read_messages",
+            arguments: { connectionId: connection.connectionId } })).structuredContent;
+          assert.equal(beforeSend.messages.at(-1).generationState, "complete");
+        }
         const argumentsValue = { connectionId: connection.connectionId, text: "Synthetic public autonomous message",
           idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
         await fixture.bringToFront();
@@ -765,6 +882,10 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
 }
 
 for (const provider of ["fixture", "gemini"]) {
+  test(`public ${provider} read expiry skips queued captures and preserves its draft`, { timeout: 15000 }, async testContext => {
+    testContext.signal.throwIfAborted();
+    await exerciseChatDispatch("expired_read", provider, testContext, "public");
+  });
   for (const outcome of ["observed", "own_window", "hidden", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover"]) {
     test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();

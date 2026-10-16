@@ -262,7 +262,7 @@ server.registerTool("chat_wait_for_reply", {
     if (!client || remaining() <= 1) return timedOut();
     let observation = new ReplyObservation();
     while (remaining() > 1) {
-      const readDeadline = Math.min(deadlineMs, Date.now() + Math.min(5000, Math.floor(remaining())));
+      const readDeadline = Math.min(deadlineMs, Date.now() + Math.min(5000, Math.ceil(remaining())));
       const read = await bounded(client.readApprovedSnapshot(connectionId, 32, readDeadline));
       if (extra.mcpReq.signal.aborted) return output({ code: "CANCELLED" }, true);
       if (!read || remaining() <= 0) return timedOut();
@@ -320,7 +320,8 @@ server.registerTool("chat_send_message", {
       extra.mcpReq.signal.aborted ? "CANCELLED" : "OPERATION_EXPIRED", { operationId, recoveryToken });
     const result = await client.commitPreparedMessage(operationId, Math.min(deadlineMs, expiresAt));
     if (result.kind === "error") return sendResult(result.payload.code === "DISPATCH_UNAVAILABLE" ? "not_sent" : "unresolved",
-      result.payload.code, { operationId, recoveryToken });
+      result.payload.code, { operationId, recoveryToken,
+        ...(result.payload.failureStage ? { failureStage: result.payload.failureStage } : {}) });
     if (result.kind !== "chat_dispatch") throw new Error("Unexpected autonomous commit reply");
     return sendStatus(result.payload, recoveryToken);
   } catch {

@@ -5,7 +5,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
-import { fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
+import { autonomousFailureStageSchema, fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
   geminiFillStatusSchema, chatJobSchema, type ChatJob, type ChatTarget, type ChatJobObservation,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
@@ -475,7 +475,9 @@ const replySchema = z.discriminatedUnion("kind", [
       "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED", "REVIEW_UNAVAILABLE", "FILL_REVIEW_UNAVAILABLE",
       "SEND_REVIEW_UNAVAILABLE",
       "DISPATCH_CHECK_UNAVAILABLE", "DISPATCH_UNAVAILABLE",
-      "DISPATCH_UNCERTAIN", "DISPATCH_RESOLUTION_UNAVAILABLE", "PREFLIGHT_UNAVAILABLE", "FILL_UNAVAILABLE"]) })
+      "DISPATCH_UNCERTAIN", "DISPATCH_RESOLUTION_UNAVAILABLE", "PREFLIGHT_UNAVAILABLE", "FILL_UNAVAILABLE"]),
+      failureStage: autonomousFailureStageSchema.optional()
+    }).refine(payload => payload.failureStage === undefined || payload.code === "DISPATCH_UNAVAILABLE")
   })
 ]);
 

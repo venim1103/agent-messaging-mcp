@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
+import { AutonomousCommitFailure, MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
   MAX_PREPARED_REVIEWS, MAX_RECORDED_PREPARED_MESSAGES, openPrivateOperationDatabase, PreparedMessageOperations,
   PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS, FIXTURE_REVIEW_APPROVAL_TTL_MS,
   FIXTURE_PREFLIGHT_TIMEOUT_MS, FIXTURE_FILL_TIMEOUT_MS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
@@ -946,6 +946,65 @@ test("autonomous commits share one owned deadline across neutral fill, proof, in
       ledger.disconnect(waitingOwner);
       requests.disconnect(owner);
       requests.disconnect(waitingOwner);
+      database.close();
+    }
+  }
+});
+
+test("autonomous pre-intent refusals retain bounded failure stages without submit authority", async () => {
+  for (const provider of ["fixture", "gemini"] as const) for (const stage of ["fill", "read", "proof"] as const) {
+    const requests = new PendingConnectionRequests();
+    const database = new DatabaseSync(":memory:");
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("synthetic refusal stage owner");
+    const agent = requests.registerAgent(owner, "Synthetic refusal stage agent");
+    const target = provider === "gemini"
+      ? { origin: "https://gemini.google.com" as const, conversationId: "synthetic-refusal-stage",
+        url: "https://gemini.google.com/app/synthetic-refusal-stage", tabId: 8, documentId: "refusal-stage-document" }
+      : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 8, documentId: "refusal-stage-document" };
+    try {
+      const connection = requests.approveAgent(agent.agentId, target)!;
+      const deadlineMs = Date.now() + 1000;
+      const prepared = ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic refusal stage draft", randomUUID(), deadlineMs);
+      const committing = ledger.commitAutonomousMessage(owner, prepared.operationId, deadlineMs);
+      const checkFailure = (error: unknown) => {
+        assert.ok(error instanceof AutonomousCommitFailure);
+        assert.equal(error.message, "DISPATCH_UNAVAILABLE");
+        assert.equal(error.failureStage, stage);
+        return true;
+      };
+      const rejected = assert.rejects(committing, checkFailure);
+      await Promise.resolve();
+      const fill = ledger.listChatJobs("fill", provider)[0]!;
+      assert.ok(fill);
+      assert.equal(ledger.completeChatJob(fill.target, prepared.operationId, fill.jobId, "fill", stage === "fill"
+        ? { ok: false, code: "FILL_UNAVAILABLE" }
+        : provider === "gemini" ? { ok: true, editor: "contenteditable" } : { ok: true, editor: "textarea" }), true);
+      if (stage === "read") requests.disconnect(owner);
+      if (stage === "proof") {
+        await Promise.resolve();
+        if (target.origin === "https://gemini.google.com") {
+          const challenge = requests.listGeminiReadChallenges()[0]!;
+          requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic completed baseline", generationState: "complete" }],
+            Date.now(), challenge.challengeId);
+        } else {
+          const challenge = requests.listFixtureReadChallenges()[0]!;
+          requests.publishFixtureSnapshot(target, [], Date.now(), challenge.challengeId);
+        }
+        await Promise.resolve();
+        const proof = ledger.listChatJobs("proof", provider)[0]!;
+        assert.ok(proof);
+        assert.equal(ledger.completeChatJob(proof.target, prepared.operationId, proof.jobId, "proof",
+          { ok: false, code: "DRAFT_CHANGED" }), false);
+      }
+      await rejected;
+      await assert.rejects(ledger.commitAutonomousMessage(owner, prepared.operationId, deadlineMs), checkFailure);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+      for (const phase of ["fill", "proof", "submit"] as const) assert.deepEqual(ledger.listChatJobs(phase, provider), []);
+    } finally {
+      ledger.disconnect(owner);
+      requests.disconnect(owner);
       database.close();
     }
   }

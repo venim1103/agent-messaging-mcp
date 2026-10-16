@@ -175,7 +175,7 @@ for (const target of [
       for (const next of ["truncated", "complete_truncated", "outgoing", "unavailable"] as const) {
         mode = next;
         const started = performance.now();
-        assert.deepEqual((await wait({ connectionId, timeoutMs: 150 })).structuredContent, { timedOut: true });
+        assert.deepEqual((await wait({ connectionId, timeoutMs: 150 })).structuredContent, { timedOut: true }, `Short reply wait: ${next}`);
         assert.ok(performance.now() - started < 1000, "Short wait exceeded its bounded response allowance");
       }
       mode = "held";
@@ -298,11 +298,13 @@ for (const target of [
       assert.equal((await relay.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", { ok: false, code: "FILL_UNAVAILABLE" })).kind,
         "chat_job_recorded");
       const refused = await sending;
-      const refusedStatus = refused.structuredContent as { operationId: string; state: string; code: string; recoveryToken: string; retryAllowed: boolean };
+      const refusedStatus = refused.structuredContent as { operationId: string; state: string; code: string;
+        recoveryToken: string; retryAllowed: boolean; failureStage: string };
       assert.equal(refused.isError, true);
       assert.equal(refusedStatus.operationId, fill.operationId);
       assert.equal(refusedStatus.state, "not_sent");
       assert.equal(refusedStatus.code, "DISPATCH_UNAVAILABLE");
+      assert.equal(refusedStatus.failureStage, "fill");
       assert.equal(refusedStatus.retryAllowed, false);
       assert.match(refusedStatus.recoveryToken, /^[0-9a-f]{64}$/);
       assert.deepEqual((await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments })).structuredContent, refusedStatus);

@@ -247,7 +247,7 @@ async function refreshChatAgents(): Promise<void> {
             if (!allowed) { status.textContent = "Site access denied; no connection created."; return; }
             const approval = await browser.runtime.sendMessage({ kind: "approve_chat_agent", tabId: selected.id,
               expectedUrl: selected.url, agentId: agent.agentId }) as ChatAgentApprovalResult;
-            status.textContent = approval?.ok ? "Agent connected. Autonomous sending is not yet available."
+            status.textContent = approval?.ok ? "Agent connected. Live-site sending is unverified."
               : approval?.error ?? "Connection unavailable; refresh status.";
           } catch {
             status.textContent = "Connection unavailable; refresh status.";
