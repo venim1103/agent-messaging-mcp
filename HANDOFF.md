@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Updated: 2026-10-16 (T3s browser SDK cancellation is gated with all units and 79 end-to-end checks; testing-speed improvements are next, then T4).
+Updated: 2026-10-16 (P1 focused feedback and bounded E2E scheduling are gated; all 79 original browser scenarios pass, observed E2E 4m21s; autonomous T4 work is next).
 
 Start with the dashboard and the implementation plan below. Everything after them is dated checkpoint history, newest first, followed by the original 2026-10-01 onboarding plan. Words such as "Current" or "Latest" in older headings refer to their own date; when an older entry disagrees with the dashboard, the dashboard wins. Workflow and safety rules are in [AGENTS.md](AGENTS.md); setup, tools and the code map in [DEVELOPMENT.md](DEVELOPMENT.md); architecture, the target experience and decisions D1-D13 in [DESIGN.md](DESIGN.md) (sections 2 and 17).
 
@@ -16,14 +16,14 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Latest gated source checkpoint: T3s (the commit containing the [checkpoint entry below](#t3s-browser-sdk-cancellation-2026-10-16)), after popup revocation T3r `14598eb`, visibility T3q `c76b1f7` and transport fix T3p `f367bc3`. The first exact gate passed build, both typechecks, **all units and 79/79 e2e checks**, zero failures/cancellations. Actual SDK cancellation before intent and after activation leaves queued same-key calls unresolved, no replay or inherited approval. A validated zero-owner roster now removes the unchanged local autonomous grant. Installed/live autonomous acceptance remains missing.
+- Latest gated source checkpoint: P1 (the commit containing the [checkpoint entry below](#p1-faster-test-feedback-2026-10-16)), after browser cancellation T3s `e2c3a92`. The revised exact gate passed build, both typechecks, all units and **all 79 original E2E scenarios**, zero failures/cancellations. Independent E2E cases use two workers; four composite cases stay serial. Observed E2E was **260,630 ms**, versus T3s **531,807 ms**, with a laptop charger change as a confounder. The initial all-parallel failure is preserved below. Installed/live autonomous acceptance remains missing.
 - The person's earlier eleven-change audit is complete: the ten pending T3h files were retained, and the eleventh was the bounded native-channel helper. Later checkpoints connect neutral orchestration and public sending. Earlier cancellations, baseline comparison and diagnostic evidence remain in their dated entries.
 - T2 is complete synthetically; installed single-owner fixture pickup/read/reload/removal passed on T2d. Installed Gemini single-owner approval/pickup, fresh reads, same-chat events and removal now passed (entry below). Fresh permission-prompt appearance, installed multi-owner/tab-close behavior and Gemini reload remain unverified. T3d's installed fixture empty-status check passed after coordinated reload; installed outcome buttons remain untested.
 - Latest installed write evidence: one supervised fixture textarea message passed separate trusted draft, fill and Send approvals, one MCP fill and one submit, `observed_in_ui`, fresh read/status and the person's visual confirmation of one outgoing row with an empty editor. An earlier fill refusal/expiry is preserved below. This is not autonomous sending, Gemini writing or installed T3e coordination evidence.
 - This resumption began at clean `main` / T3o `c573a3f`, aligned with tracked `origin/main`. The person explicitly resumed autonomous implementation and periodic local checkpoints on 2026-10-16; the prior pause is historical. The assistant made no push or new branch.
 - Current coordination: builds, browser checks and timing traces used disposable test processes; the baseline source snapshot and diagnostic trace/build artifacts were removed. A read-only process check found no leftover matching test broker/native relay. The person freshly authorized the clock check below; no clock/security setting was changed, installed service restarted or live chat accessed. Earlier test grants remain ended; do not transfer old handles to a new owner or treat prior evidence as fresh permission.
 - Assume no broker, fixture, browser, grant or approval is alive. Check processes before starting anything (DEVELOPMENT.md, Coordinated Restart).
-- Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e-T3s have synthetic/source-gate evidence only. A future reload ends current grants; do not assume installed code contains these newer changes.
+- Installed services were last explicitly reloaded at T3d `f8dc3f1`; T3e-T3s and P1 have synthetic/source-gate evidence only. A future reload ends current grants; do not assume installed code contains these newer changes.
 
 ### Capability matrix
 
@@ -127,6 +127,7 @@ Done: G1, the dispatch-job slice (`11dec64`), and T1 (R1/R2 read robustness). St
 
 - Earlier review snapshot, not a current repository count: 139 commits in 15 days. Each boundary (ledger, private transport, trusted UI, worker, public tool) was a separate gated checkpoint with a long handoff entry (D7).
 - This file is about 260 KB. Before the review, two documentation lines exceeded the 2,000-character limit of agent file readers, and DEVELOPMENT.md was mostly dated history. The review added this dashboard, split those lines, rewrote DEVELOPMENT.md as a reference and added readability rules to AGENTS.md.
+- P1 keeps focused per-edit feedback and the unchanged full checkpoint gate. The companion now builds once per gate; standalone build-and-unit use is `test:unit:build`. A parser-checked E2E split preserves every original test/helper body. Bounded scheduling and failed benchmark evidence are below; power state affects timing, so do not attribute the whole observed improvement to code.
 
 ### Decisions
 
@@ -134,7 +135,7 @@ Decided on 2026-10-09: D1-D5 and D7-D13 (DESIGN.md section 17). Revised D13a all
 
 ### Next step
 
-Continue autonomous implementation at the person's request. First implement the authorized testing-speed improvements: focused per-edit feedback, benchmark bounded two-worker E2E groups and remove duplicate compilation without weakening the checkpoint gate. Then continue T4 completion work that does not require unapproved live inspection. D10a replacement remains limited to retained unexpired prior metadata; provenance alone is not authority. Installed acceptance, live access, further clock probes and host/security/settings work still need fresh authorization.
+Continue autonomous implementation at the person's request with T4's synthetic/provider-neutral quiet-period completion and bounded wait tool. Testing-speed improvements are gated; use focused runs per edit and retain the exact checkpoint gate. D10a replacement remains limited to retained unexpired prior metadata; provenance alone is not authority. Gemini completion-indicator review, installed acceptance, live access, further clock probes and host/security/settings work still need fresh authorization.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -201,6 +202,15 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; first check whether the existing page functions work in a hidden tab before considering debugger input, D6), removing the legacy debugger probes, a second chat site on the provider-neutral pipeline, calibration and packaging.
+
+## P1 Faster Test Feedback (2026-10-16)
+
+- The person authorized faster testing followed by continued autonomous implementation and periodic commits. Root `test:unit` now uses the existing build; `test:unit:build` preserves standalone build-and-test convenience. The required exact gate is unchanged. All **219 units** passed the no-rebuild command; focused E2E npm invocation passed in **4,924 ms**.
+- A TypeScript-parser-checked mechanical move puts dispatch in `extension-dispatch.test.mjs` and four shared readiness/timing declarations in `extension-harness.mjs`. All **22** original top-level test/helper declarations remain byte-identical across the split; rechecked after a reported external file edit. No assertion, scenario, deadline, polling or isolated profile was changed. Two-worker dispatch/admission smoke passed.
+- First all-parallel exact gate passed build/types/all units; E2E had **76 passes and three cancellations out of 79**, **392,546 ms**. Aggregate fixture submit, Gemini read workflow and Gemini inspector cases exceeded their original deadlines under overlapping browser work. No synthetic process remained; cgroup metadata showed no quota/throttling. The full cause is not established; no clock, host or security setting was changed.
+- Repair: `run.mjs` uses complementary filters, two workers for independent cases and one for four composite cases, including the aggregate fixture crash matrix. Unmatched future tests stay included. Syntax/group checks passed. No failed test is automatically retried, deadline extended or authority/profile shared.
+- Revised exact gate `npm run build && npm run typecheck && npm run test:unit && npm run test:e2e` passed build, both typechecks, all units and all **79 original E2E scenarios**, zero failures/cancellations. Parallel output reports 75 named cases; serial output reports four named cases plus one empty filtered-file result, not an additional scenario. Total E2E was **260,630 ms** (4m21s), versus T3s **531,807 ms** (8m52s). The person connected their laptop charger during this work; this is observed timing, not an isolated code-only speedup claim.
+- Editor diagnostics and mechanical preservation/whitespace checks pass. Development reference documents build prerequisites, focused commands and bounded scheduling. Next: T4 quiet-period completion without live inspection. Installed/live evidence and safety boundaries remain as stated in AGENTS.md.
 
 ## T3s Browser SDK Cancellation (2026-10-16)
 

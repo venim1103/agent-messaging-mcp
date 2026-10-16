@@ -298,7 +298,7 @@ Extension (`packages/extension`):
 - `lib/approved-probe.ts`: fixed text for the legacy Gemini probe.
 - `wxt.config.ts`: manifest and permissions (`activeTab`, `scripting`, `nativeMessaging`, `debugger`, `storage`).
 
-Tests: `tests/fixtures/` holds the synthetic chat page and server. `tests/e2e/extension-probe.test.mjs` runs the full stack with disposable Chromium, broker and native host, including loss and crash cases. `tests/e2e/fixture-editor.test.mjs` and `tests/e2e/gemini-observation.test.mjs` test page functions on synthetic pages. `tests/diagnostics/clock-probe.c` is optional and must not run without explicit authorization.
+Tests: `tests/fixtures/` holds the synthetic chat page and server. `tests/e2e/extension-probe.test.mjs` covers full-stack admission, reads and fills; `tests/e2e/extension-dispatch.test.mjs` covers autonomous/supervised dispatch, loss and crashes. Both use disposable Chromium, broker and native host through shared `extension-harness.mjs` readiness/timing helpers. `tests/e2e/fixture-editor.test.mjs` and `tests/e2e/gemini-observation.test.mjs` test page functions on synthetic pages. `tests/diagnostics/clock-probe.c` is optional and must not run without explicit authorization.
 
 ## Testing
 
@@ -306,8 +306,10 @@ Tests: `tests/fixtures/` holds the synthetic chat page and server. `tests/e2e/ex
 | --- | --- |
 | `npm run build` | Companion `tsc` and extension `wxt build` |
 | `npm run typecheck` | Both packages |
-| `npm run test:unit` | Builds the companion, then runs `node --test` on the fixture tests and `packages/companion/dist/*.test.js` |
-| `npm run test:e2e` | `node --test tests/e2e/*.test.mjs` with sandboxed disposable Chromium; build first |
+| `npm run test:unit` | Runs fixture and compiled companion tests; build first, reuses the gate's existing build |
+| `npm run test:unit:build` | Builds the companion, then runs all units; standalone convenience |
+| `npm run test:e2e` | Runs all E2E files through bounded parallel/serial groups; build first |
+| `npm run test:e2e:focus -- <node-test-options> <file>` | Single-worker focused E2E run against existing built artifacts |
 
 The exact gate before every source commit (AGENTS.md):
 
@@ -315,12 +317,18 @@ The exact gate before every source commit (AGENTS.md):
 npm run build && npm run typecheck && npm run test:unit && npm run test:e2e
 ```
 
-Focused runs:
+Fast edit loop: build once after checkout, then rebuild only the package whose source changed. Run a behavior-scoped test immediately after each edit; run the full gate at meaningful source checkpoints, not after every probe. Never use stale build output. Documentation-only edits need scoped content/link/whitespace checks instead of a source gate.
+
+Focused runs (both packages must already be built for E2E):
 
 ```bash
 npm run build:companion && node --test --test-name-pattern='<regex>' packages/companion/dist/<module>.test.js
-npm run build && node --test --test-name-pattern='<regex>' tests/e2e/<file>.test.mjs
+npm run build:extension && npm run test:e2e:focus -- --test-name-pattern='<regex>' tests/e2e/<file>.test.mjs
 ```
+
+Use `extension-dispatch.test.mjs` for public sends and private submit/loss cases, and `extension-probe.test.mjs` for popup admission/read/fill cases. A focused public send took about five seconds in the initial benchmark; timing depends on the machine and power state.
+
+`tests/e2e/run.mjs` discovers every E2E test file. Independent cases run with two isolated file workers. Four existing composite cases (fixture private-submit matrix, fixture crash matrix, Gemini read workflow and Gemini inspector matrix) run serially through complementary name filters; their aggregate deadlines made all-parallel execution unreliable. Profiles, brokers and authority are never shared. New unmatched tests enter the parallel group; update the serial pattern when adding a composite case. A failed group stops the gate without an automatic retry. Keep the original case deadlines, polling, sandbox and assertions.
 
 Browser-test rules: launch Chromium with `chromiumSandbox: true`, because Playwright otherwise adds `--no-sandbox`; use disposable profiles and an isolated HOME broker; wait for the current-user, owner-only socket before connecting; keep the original timeouts and assertions. Test copies of the extension may get temporary host permissions, and automated popup navigation does not grant `activeTab`, so these tests do not prove real toolbar approval. Installed-toolbar and live checks are separate, human-assisted evidence.
 
