@@ -19,10 +19,12 @@ import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase,
 async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
   const setPhase = trackTestPhase(testContext, outcome === "expired_read" ? `${provider} read expiry`
     : outcome === "removed_probes" ? `${provider} removed probes` : `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
-  const retainedDraft = ["not_sent", "not_sent_changed", "lost_settle", "owned_leftover"].includes(outcome);
+  const hiddenSettlement = outcome === "hidden_not_sent" || outcome === "hidden_lost_settle";
+  const lostSettle = outcome === "lost_settle" || outcome === "hidden_lost_settle";
+  const retainedDraft = hiddenSettlement || ["not_sent", "not_sent_changed", "lost_settle", "owned_leftover"].includes(outcome);
   const hiddenSend = outcome === "hidden_send" || outcome === "hidden_send_rich";
   const hiddenDisconnect = outcome === "hidden_disconnect_after_fill" || outcome === "hidden_disconnect_after_submit";
-  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect;
+  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect || hiddenSettlement;
   let mcpClient;
   let publicSendCancellation;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
@@ -106,15 +108,15 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         return port;
       };
     });
-    if (outcome === "lost_native_completion" || outcome === "lost_settle") {
-      await worker.evaluate(({ provider, autonomous, outcome }) => {
+    if (outcome === "lost_native_completion" || lostSettle) {
+      await worker.evaluate(({ provider, autonomous, lostSettle }) => {
         const connect = chrome.runtime.connectNative.bind(chrome.runtime);
         chrome.runtime.connectNative = (...args) => {
           const port = connect(...args);
           const post = port.postMessage.bind(port);
           port.postMessage = message => {
             if (message.kind === (autonomous || provider === "gemini" ? "complete_chat_job" : "complete_fixture_dispatch")
-              && (!autonomous || message.payload?.phase === (outcome === "lost_settle" ? "settle" : "submit"))) {
+              && (!autonomous || message.payload?.phase === (lostSettle ? "settle" : "submit"))) {
               globalThis.fixtureDroppedCompletionCount = (globalThis.fixtureDroppedCompletionCount ?? 0) + 1;
               globalThis.fixtureDroppedCompletion = true; return;
             }
@@ -122,7 +124,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           };
           return port;
         };
-      }, { provider, autonomous, outcome });
+      }, { provider, autonomous, lostSettle });
     }
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     facade = await connectBroker("facade", directory, undefined, undefined,
@@ -346,7 +348,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
         await fixture.bringToFront();
         const hidden = outcome === "hidden";
-        const inactive = hidden || hiddenSend || hiddenDisconnect;
+        const inactive = hidden || hiddenSend || hiddenDisconnect || hiddenSettlement;
         let foregroundTabId;
         const hiddenDraft = "Synthetic hidden-tab human draft must remain";
         if (hidden) {
@@ -501,7 +503,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             foregroundTabId: (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id }), selected.tabId),
           { active: false, foregroundTabId });
         }
-        const expectedState = outcome === "observed" || outcome === "own_window" || hiddenSend ? "sent" : outcome === "lost_settle" ? "unresolved" : "not_sent";
+        const expectedState = outcome === "observed" || outcome === "own_window" || hiddenSend ? "sent" : lostSettle ? "unresolved" : "not_sent";
         const sendDiagnostic = result.isError !== (expectedState !== "sent") || status.failureStage
           ? JSON.stringify({ provider, outcome, state: status.state, code: status.code, failureStage: status.failureStage,
             jobs: await worker.evaluate(() => globalThis.browserJobTrace) }) : undefined;
@@ -517,8 +519,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         assert.equal(status.retryAllowed, false);
         if (hidden) assert.equal(status.code, "DISPATCH_UNAVAILABLE");
         assert.match(status.recoveryToken, /^[0-9a-f]{64}$/);
-        if (outcome === "not_sent") assert.equal(status.resolution.source, "page");
-        if (outcome === "lost_settle") assert.equal(await worker.evaluate(() => globalThis.fixtureDroppedCompletionCount), 1);
+        if (outcome === "not_sent" || outcome === "hidden_not_sent") assert.equal(status.resolution.source, "page");
+        if (lostSettle) assert.equal(await worker.evaluate(() => globalThis.fixtureDroppedCompletionCount), 1);
         setPhase("public status and replay");
         const replay = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
         const { recoveryToken, ...withoutReceipt } = status;
@@ -550,7 +552,26 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             args: [{ operationId, text, url, provider }] });
           return result.result;
         }, { selected, operationId: status.operationId, text: argumentsValue.text, url, provider });
-        assert.deepEqual(await checkOwnership(), hidden ? { installed: false } : { installed: true, owned: retainedDraft });
+        assert.deepEqual(await checkOwnership(), hidden ? { installed: false } : { installed: true, owned: retainedDraft && !inactive });
+        if (hiddenSettlement) {
+          for (const visible of [false, true]) {
+            if (visible) await fixture.bringToFront();
+            const refused = await mcpClient.callTool({ name: "chat_send_message", arguments: {
+              ...argumentsValue, idempotencyKey: crypto.randomUUID(), text: "Synthetic new message must not replace a hidden fill"
+            } });
+            assert.equal(refused.structuredContent.state, "not_sent");
+            assert.equal(refused.structuredContent.retryAllowed, false);
+            assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
+              editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), argumentsValue.text);
+            assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 1);
+            assert.deepEqual(await checkOwnership(), { installed: true, owned: false });
+            assert.equal(await fixture.evaluate(() => document.visibilityState), visible ? "visible" : "hidden");
+            if (!visible) assert.equal(await worker.evaluate(async () =>
+              (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id), foregroundTabId);
+          }
+          assert.deepEqual((await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue })).structuredContent, withoutReceipt);
+          for (const phase of ["fill", "proof", "submit", "settle"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
+        }
         if (outcome === "not_sent") {
           const editor = fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message");
           await editor.fill("");
@@ -570,6 +591,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
         try {
           assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, hidden ? 0 : 1);
+          if (hiddenSettlement) assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get().count, lostSettle ? 0 : 1);
           if (outcome === "owned_leftover") {
             setPhase("fresh send replacing known own leftover");
             const next = { ...argumentsValue, idempotencyKey: crypto.randomUUID(), text: "Synthetic independently requested next message" };
@@ -979,7 +1001,7 @@ for (const provider of ["fixture", "gemini"]) {
     testContext.signal.throwIfAborted();
     await exerciseChatDispatch("expired_read", provider, testContext, "public");
   });
-  for (const outcome of ["observed", "own_window", "hidden", "hidden_disconnect_after_fill", "hidden_disconnect_after_submit", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover"]) {
+  for (const outcome of ["observed", "own_window", "hidden", "hidden_disconnect_after_fill", "hidden_disconnect_after_submit", "hidden_not_sent", "hidden_lost_settle", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover"]) {
     test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();
       await exerciseChatDispatch(outcome, provider, testContext, "public");
