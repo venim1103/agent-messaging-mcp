@@ -625,3 +625,55 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
     await browser.close();
   }
 });
+
+test("Gemini capture reads auto-contained offscreen messages in a visible chat", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("https://gemini.google.com/**", route => route.fulfill({
+      contentType: "text/html; charset=utf-8", body: `<!doctype html><html><head><style>
+        main, infinite-scroller, user-query, user-query-content, model-response, model-response-content { display:block }
+        user-query, model-response { content-visibility:auto; contain-intrinsic-size:auto 100px }
+      </style></head><body><main><infinite-scroller>
+        <div style="height:20000px"></div>
+        <user-query><user-query-content><p class="query-text-line">Synthetic offscreen question<span hidden>Excluded hidden query text</span></p></user-query-content></user-query>
+        <model-response><model-response-content><p>Synthetic offscreen reply</p>
+          <div style="display:none">Excluded display-hidden text</div>
+          <div style="visibility:hidden">Excluded visibility-hidden text</div>
+          <div style="content-visibility:hidden">Excluded content-hidden text</div>
+          <script type="application/json">{"excluded":"Excluded script text"}</script>
+        </model-response-content></model-response>
+      </infinite-scroller></main></body></html>`
+    }));
+    await page.goto("https://gemini.google.com/app/synthetic-offscreen");
+    const geometry = await page.evaluate(() => ({ visibility: document.visibilityState,
+      queryOffscreen: document.querySelector("user-query").getBoundingClientRect().top > innerHeight,
+      responseOffscreen: document.querySelector("model-response").getBoundingClientRect().top > innerHeight }));
+    assert.deepEqual(geometry, { visibility: "visible", queryOffscreen: true, responseOffscreen: true });
+    const expected = { omittedBefore: false, messages: [
+      { direction: "outgoing", text: "Synthetic offscreen question" },
+      { direction: "incoming", text: "Synthetic offscreen reply" }
+    ] };
+    const before = await page.evaluate(() => document.body.innerHTML);
+    assert.deepEqual(await page.evaluate(captureGeminiSnapshot, page.url()), expected);
+    assert.equal(await page.evaluate(() => document.body.innerHTML), before);
+    await page.evaluate(async () => {
+      const timeline = document.querySelector("infinite-scroller");
+      timeline.prepend(timeline.querySelector("user-query"));
+      scrollTo(0, document.body.scrollHeight);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    assert.deepEqual(await page.evaluate(() => ({ visibility: document.visibilityState,
+      oldQueryAboveViewport: document.querySelector("user-query").getBoundingClientRect().bottom < 0,
+      latestReplyInViewport: document.querySelector("model-response").getBoundingClientRect().top < innerHeight })),
+    { visibility: "visible", oldQueryAboveViewport: true, latestReplyInViewport: true });
+    assert.deepEqual(await page.evaluate(captureGeminiSnapshot, page.url()), expected);
+    await page.evaluate(async () => {
+      scrollTo(0, 0);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    assert.deepEqual(await page.evaluate(captureGeminiSnapshot, page.url()), expected);
+  } finally {
+    await browser.close();
+  }
+});

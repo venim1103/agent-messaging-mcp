@@ -420,7 +420,7 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
     .some(signalVisible);
   const readText = (element: HTMLElement): string | null => {
     const rendered = element.innerText;
-    if (rendered.trim() || document.visibilityState !== "hidden") return rendered;
+    if (rendered.trim()) return rendered;
     let autoContent = false;
     for (let ancestor: HTMLElement | null = element; ancestor; ancestor = ancestor.parentElement) {
       const style = getComputedStyle(ancestor);
