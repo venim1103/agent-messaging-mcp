@@ -28,7 +28,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
   const hiddenClosed = outcome === "hidden_close_after_fill" || outcome === "hidden_close_after_submit";
   const hiddenNavigated = outcome === "hidden_navigate_after_fill" || outcome === "hidden_navigate_after_submit";
   const hiddenTargetEnded = hiddenClosed || hiddenNavigated;
-  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenTargetEnded;
+  const hiddenWorkerRestart = outcome === "hidden_worker_after_fill" || outcome === "hidden_worker_after_submit";
+  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenTargetEnded || hiddenWorkerRestart;
   let mcpClient;
   let publicSendCancellation;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
@@ -352,7 +353,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
         await fixture.bringToFront();
         const hidden = outcome === "hidden";
-        const inactive = hidden || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenTargetEnded;
+        const inactive = hidden || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenTargetEnded || hiddenWorkerRestart;
         let foregroundTabId;
         const hiddenDraft = "Synthetic hidden-tab human draft must remain";
         if (hidden) {
@@ -465,7 +466,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           await lifecycle.detach();
           return;
         }
-        if (hiddenDisconnect || hiddenTargetEnded || ["revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit"].includes(outcome)) {
+        if (hiddenDisconnect || hiddenTargetEnded || hiddenWorkerRestart || ["revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit"].includes(outcome)) {
           const cancelled = outcome.startsWith("cancel_");
           const afterSubmit = outcome.endsWith("_submit");
           await worker.evaluate(({ afterSubmit, tabId }) => {
@@ -495,6 +496,68 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           await worker.evaluate(() => globalThis.revocationBoundaryReached);
           setPhase(afterSubmit ? "revoking after submit activation" : "revoking after fill readback");
           assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), afterSubmit ? 1 : 0);
+          if (hiddenWorkerRestart) {
+            const before = await worker.evaluate(async ({ provider, tabId }) => {
+              globalThis.hiddenWorkerSentinel = true;
+              const key = `${provider}-grant-${tabId}`;
+              return { operationId: globalThis.revocationBoundaryOperationId,
+                expiresAt: globalThis.revocationBoundaryExpiresAt, grant: (await chrome.storage.session.get(key))[key] };
+            }, { provider, tabId: selected.tabId });
+            const workerUrl = worker.url();
+            const session = await context.newCDPSession(fixture);
+            let confirmStopped;
+            const stopped = new Promise(resolve => { confirmStopped = resolve; });
+            const version = new Promise(resolve => session.on("ServiceWorker.workerVersionUpdated", event => {
+              const match = event.versions.find(entry => entry.scriptURL === workerUrl);
+              if (match) resolve(match.versionId);
+              if (match?.runningStatus === "stopped") confirmStopped();
+            }));
+            setPhase("stopping hidden worker with a consumed write result");
+            await session.send("ServiceWorker.enable");
+            const versionId = await Promise.race([version, setTimeout(3000).then(() => { throw new Error("Hidden worker version not found"); })]);
+            await session.send("ServiceWorker.stopWorker", { versionId });
+            await Promise.race([stopped, setTimeout(5000).then(() => { throw new Error("Hidden worker did not stop"); })]);
+            assert.equal(Date.now() < before.expiresAt, true);
+            await session.detach();
+            setPhase("waking worker without selecting or approving the hidden chat");
+            await popup.evaluate(tabId => chrome.runtime.sendMessage({ kind: "list_fixture_pending", tabId }), selected.tabId);
+            worker = context.serviceWorkers().find(candidate => candidate.url() === workerUrl)
+              ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+            assert.equal(await worker.evaluate(() => globalThis.hiddenWorkerSentinel === undefined), true);
+            const completion = await sending;
+            assert.equal(completion.error, undefined);
+            const status = completion.result.structuredContent;
+            assert.equal(status.state, afterSubmit ? "unresolved" : "not_sent");
+            assert.equal(status.operationId, before.operationId);
+            assert.equal(status.retryAllowed, false);
+            const { recoveryToken, ...withoutReceipt } = status;
+            assert.match(recoveryToken, /^[0-9a-f]{64}$/);
+            assert.deepEqual((await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue })).structuredContent,
+              afterSubmit ? withoutReceipt : status);
+            const snapshot = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+            assert.equal(snapshot.isError, undefined);
+            assert.equal(snapshot.structuredContent.messages.filter(message => message.text === argumentsValue.text).length, afterSubmit ? 1 : 0);
+            assert.deepEqual(await worker.evaluate(async ({ provider, tabId }) =>
+              (await chrome.storage.session.get(`${provider}-grant-${tabId}`))[`${provider}-grant-${tabId}`],
+            { provider, tabId: selected.tabId }), before.grant);
+            assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), afterSubmit ? 1 : 0);
+            assert.equal(await fixture.locator("[contenteditable]").innerText(), afterSubmit ? "" : argumentsValue.text);
+            assert.equal(await fixture.evaluate(() => document.visibilityState), "hidden");
+            assert.deepEqual(await worker.evaluate(async tabId => ({ active: (await chrome.tabs.get(tabId)).active,
+              foregroundTabId: (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id }), selected.tabId),
+            { active: false, foregroundTabId });
+            for (const phase of ["fill", "proof", "submit", "settle"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
+            assert.equal(await worker.evaluate(async ({ provider, operationId }) =>
+              (await chrome.storage.local.get(`${provider}-submit-attempt-${operationId}`))[`${provider}-submit-attempt-${operationId}`],
+            { provider, operationId: before.operationId }), afterSubmit ? true : undefined);
+            const { DatabaseSync } = await import("node:sqlite");
+            const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
+            try {
+              assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, afterSubmit ? 1 : 0);
+              assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get().count, 0);
+            } finally { journal.close(); }
+            return;
+          }
           let completion;
           if (hiddenDisconnect) {
             const disconnected = await mcpClient.callTool({ name: "chat_disconnect", arguments: { connectionId: connection.connectionId } });
@@ -1136,7 +1199,8 @@ for (const provider of ["fixture", "gemini"]) {
     testContext.signal.throwIfAborted();
     await exerciseChatDispatch("expired_read", provider, testContext, "public");
   });
-  for (const outcome of ["observed", "own_window", "hidden", "hidden_disconnect_after_fill", "hidden_disconnect_after_submit", "hidden_not_sent", "hidden_lost_settle", "hidden_expired_fill", "hidden_expired_submit", "hidden_close_after_fill", "hidden_close_after_submit", "hidden_navigate_after_fill", "hidden_navigate_after_submit", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover"]) {
+  for (const outcome of ["observed", "own_window", "hidden", "hidden_disconnect_after_fill", "hidden_disconnect_after_submit", "hidden_not_sent", "hidden_lost_settle", "hidden_expired_fill", "hidden_expired_submit", "hidden_close_after_fill", "hidden_close_after_submit", "hidden_navigate_after_fill", "hidden_navigate_after_submit", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover",
+    ...(provider === "gemini" ? ["hidden_worker_after_fill", "hidden_worker_after_submit"] : [])]) {
     test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();
       await exerciseChatDispatch(outcome, provider, testContext, "public");
