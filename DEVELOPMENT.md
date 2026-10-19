@@ -8,9 +8,9 @@ Reusable setup, operating instructions, tool contracts and code map for people a
 
 Dated test reports that used to fill this file were removed in the 2026-10-09 review. HANDOFF.md keeps that evidence, and the previous text is available with `git show 002d600:DEVELOPMENT.md`.
 
-> **Experimental.** The local fixture supports reads, events and supervised fill and send. Public autonomous reads/sends and reply waiting are synthetic-tested for the fixture and selected saved Gemini chats. Successful live autonomous sending remains unverified. Never connect personal conversations.
+> **Experimental.** The local fixture supports reads, events and supervised fill and send. Public autonomous reads/sends and reply waiting are implemented with synthetic coverage for the fixture and selected saved Gemini chats. Live use remains experimental; consult HANDOFF.md for installed evidence and limits. Never connect personal conversations.
 
-The decided target is one **Connect this chat** approval per agent, after which each approved agent chats on its own until its connection ends. Several agents may share a chat (DESIGN.md sections 2 and 17). Popup-first admission, owned pickup, no-expiry grants, exact same-chat reload and autonomous sending are implemented and synthetic-tested. This is not completed installed/live acceptance; see HANDOFF.md for current evidence.
+The decided target is one **Connect this chat** approval per agent, after which each approved agent chats on its own until its connection ends. Several agents may share a chat (DESIGN.md sections 2 and 17). Popup-first admission, owned pickup, no-expiry grants, exact same-chat reload and autonomous sending are implemented and synthetic-tested. Implementation and synthetic coverage do not substitute for installed/live acceptance; see HANDOFF.md for current evidence.
 
 ## Architecture in Brief
 
@@ -123,7 +123,7 @@ Without a reviewed complete signal, the tracker requires a two-second span of ad
 
 A fresh reviewed UI-complete newest row returns `reply.generationState: "complete"` without that heuristic delay, retaining ownership, timestamp, nonempty and truncation checks. Both result types disclose missing earlier rows and neither proves complete history, provider acceptance or delivery.
 
-Timeout returns no reply and does not intentionally disconnect the owner. Reads remain at most four seconds and are clipped to the original wait budget with a transport-reply allowance. An expired queued read cannot reach the browser. Cancellation ends the owning broker connection; reconnect requires fresh approval. Errors use structured `code`, including `CONNECTION_NOT_FOUND`, `CANCELLED` and `BROKER_UNAVAILABLE`. Synthetic SDK/browser coverage exists for both providers; acceptance of the updated installed extension and live autonomous sending remain pending.
+Timeout returns no reply and does not intentionally disconnect the owner. Reads remain at most four seconds and are clipped to the original wait budget with a transport-reply allowance. An expired queued read cannot reach the browser. Cancellation ends the owning broker connection; reconnect requires fresh approval. Errors use structured `code`, including `CONNECTION_NOT_FOUND`, `CANCELLED` and `BROKER_UNAVAILABLE`. Synthetic SDK/browser coverage exists for both providers; installed/live evidence is tracked separately in HANDOFF.md.
 
 Both extension read watches forward each challenge's original expiry into the snapshot queue. The existing publisher checks it after queued work drains and before page capture/publication; late reads are skipped without expiring the connection or touching its draft. Integer transport deadlines round the remaining fractional budget up, still clipped to the original wall deadline and five-second transport cap; the enclosing wait retains its original monotonic budget.
 
@@ -145,7 +145,7 @@ Trusted-popup removal after fill leaves the draft unsent without durable intent 
 
 Actual SDK cancellation with a queued same-key call is browser-tested after fill and after activation for both providers. The duplicate stays unresolved, jobs are not re-offered, and the replacement owner has no inherited approval or operation access. A trusted roster refresh removes the unchanged autonomous local grant only after a validated exact-chat zero-owner reply; other connected owners and newer approvals remain intact.
 
-This public path works for the fixture and routed synthetic Gemini pages, including own-window sending, hidden-tab refusal, popup removal/cancellation after fill/activation, bounded own-leftover replacement (D10a) and human-draft preservation. Installed/live autonomous acceptance remains pending. Do not infer live test authorization from synthetic coverage.
+This public path works for the fixture and routed synthetic Gemini pages, including own-window sending, hidden-tab refusal, popup removal/cancellation after fill/activation, bounded own-leftover replacement (D10a) and human-draft preservation. Installed/live evidence and remaining limits are tracked in HANDOFF.md. Do not infer live test authorization from synthetic coverage.
 
 ### Supervised send (fixture only)
 
@@ -198,7 +198,7 @@ These are development transport contracts, not new public MCP tools. Private Gem
 
 ### Internal Autonomous Ledger Primitives
 
-These primitives back public `chat_send_message`. Authenticated neutral preparation/commit, broker/native/worker phases and bounded page-sent/not-sent settlement are connected. Disposable fixture and routed-synthetic Gemini browser flows cover delayed rows, retained drafts, changed baseline evidence and lost submit/terminal-proof results. Installed/live autonomous acceptance is not established.
+These primitives back public `chat_send_message`. Authenticated neutral preparation/commit, broker/native/worker phases and bounded page-sent/not-sent settlement are connected. Disposable fixture and routed-synthetic Gemini browser flows cover delayed rows, retained drafts, changed baseline evidence and lost submit/terminal-proof results. Consult HANDOFF.md for installed/live evidence.
 
 - `prepareAutonomous(owner, connectionId, text, idempotencyKey, deadlineMs)` requires an owned live autonomous `ready` grant, validates provider text limits and separates autonomous/supervised idempotency. It returns `prepared` plus a status receipt; the original request expiry is at most 30 seconds and replay cannot renew it. No supervised approval is created or offered for ordinary review.
 - Private facade-only `prepare_chat_message` carries only `connectionId`, `text` and `idempotencyKey`; `prepareChatMessage` returns `chat_message_prepared` with the original expiry and recovery receipt before any job or intent. Exact owned durable replay instead returns `chat_dispatch` without preparation or renewed authority, even after grant removal while original target metadata remains. New work derives provider from the live grant, refuses legacy read-only handles and rejects extras. Existing `commit_prepared_message` derives autonomous/supervised routing from the owned operation; a late expected error returns durable status if one exists, never a false pre-intent refusal.
