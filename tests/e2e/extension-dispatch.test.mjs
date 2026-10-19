@@ -25,7 +25,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
   const hiddenSend = outcome === "hidden_send" || outcome === "hidden_send_rich";
   const hiddenDisconnect = outcome === "hidden_disconnect_after_fill" || outcome === "hidden_disconnect_after_submit";
   const hiddenSuspension = outcome === "hidden_expired_fill" || outcome === "hidden_expired_submit";
-  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension;
+  const hiddenClosed = outcome === "hidden_close_after_fill" || outcome === "hidden_close_after_submit";
+  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenClosed;
   let mcpClient;
   let publicSendCancellation;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
@@ -349,7 +350,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
         await fixture.bringToFront();
         const hidden = outcome === "hidden";
-        const inactive = hidden || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension;
+        const inactive = hidden || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenClosed;
         let foregroundTabId;
         const hiddenDraft = "Synthetic hidden-tab human draft must remain";
         if (hidden) {
@@ -462,7 +463,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           await lifecycle.detach();
           return;
         }
-        if (hiddenDisconnect || ["revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit"].includes(outcome)) {
+        if (hiddenDisconnect || hiddenClosed || ["revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit"].includes(outcome)) {
           const cancelled = outcome.startsWith("cancel_");
           const afterSubmit = outcome.endsWith("_submit");
           await worker.evaluate(({ afterSubmit, tabId }) => {
@@ -496,6 +497,29 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           if (hiddenDisconnect) {
             const disconnected = await mcpClient.callTool({ name: "chat_disconnect", arguments: { connectionId: connection.connectionId } });
             assert.deepEqual(disconnected.structuredContent, { disconnected: true });
+          } else if (hiddenClosed) {
+            assert.equal(await fixture.evaluate(() => document.visibilityState), "hidden");
+            assert.deepEqual(await worker.evaluate(async tabId => ({ active: (await chrome.tabs.get(tabId)).active,
+              foregroundTabId: (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id }), selected.tabId),
+            { active: false, foregroundTabId });
+            assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
+              (provider === "gemini" ? 1 : 2) + (afterSubmit ? 1 : 0));
+            assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
+              editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), afterSubmit ? "" : argumentsValue.text);
+            await worker.evaluate(({ provider, tabId }) => {
+              const key = `${provider}-grant-${tabId}`;
+              globalThis.hiddenTabRevoked = new Promise(resolve => {
+                const changed = (changes, area) => {
+                  if (area !== "session" || !Object.hasOwn(changes, key) || changes[key].newValue !== undefined) return;
+                  chrome.storage.onChanged.removeListener(changed);
+                  resolve();
+                };
+                chrome.storage.onChanged.addListener(changed);
+              });
+            }, { provider, tabId: selected.tabId });
+            setPhase("closing hidden tab before releasing write result");
+            await fixture.close();
+            await worker.evaluate(() => globalThis.hiddenTabRevoked);
           } else if (cancelled) {
             setPhase("same-key duplicate queued before SDK cancellation");
             const duplicate = mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue })
@@ -511,7 +535,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             await popup.locator("#agent-list li").filter({ hasText: "Synthetic autonomous browser owner" })
               .getByRole("button", { name: "Remove access" }).click({ timeout: 4000 });
           }
-          if (!hiddenDisconnect) await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("0 connected"), null, { timeout: 4000 });
+          if (!hiddenDisconnect && !hiddenClosed) await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("0 connected"), null, { timeout: 4000 });
           setPhase("revocation acknowledged before lease expiry");
           assert.equal(await worker.evaluate(() => Date.now() < globalThis.revocationBoundaryExpiresAt), true);
           await worker.evaluate(() => globalThis.releaseRevocationBoundary());
@@ -554,11 +578,24 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           assert.deepEqual(fresh.structuredContent, { state: "not_sent", code: "CONNECTION_NOT_FOUND", retryAllowed: false });
           if (!cancelled) assert.equal((await facade.getPreparedOperation(operationId, status.recoveryToken)).payload.state,
             afterSubmit ? "dispatch_uncertain" : "unknown");
-          assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), afterSubmit ? 1 : 0);
-          assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
-            (provider === "gemini" ? 1 : 2) + (afterSubmit ? 1 : 0));
-          assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
-            editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), afterSubmit ? "" : argumentsValue.text);
+          if (hiddenClosed) {
+            assert.equal(fixture.isClosed(), true);
+            assert.equal(await worker.evaluate(async () =>
+              (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id), foregroundTabId);
+            assert.equal(await worker.evaluate(async tabId => {
+              try { await chrome.tabs.get(tabId); return true; } catch { return false; }
+            }, selected.tabId), false);
+            const { recoveryToken, ...withoutReceipt } = status;
+            assert.deepEqual((await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue })).structuredContent,
+              afterSubmit ? withoutReceipt : { state: "not_sent", code: "CONNECTION_NOT_FOUND", retryAllowed: false });
+            assert.equal(await worker.evaluate(() => globalThis.revocationBoundaryCount), 1);
+          } else {
+            assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), afterSubmit ? 1 : 0);
+            assert.equal(await fixture.locator(provider === "gemini" ? "infinite-scroller user-query" : "ol[role=log] li").count(),
+              (provider === "gemini" ? 1 : 2) + (afterSubmit ? 1 : 0));
+            assert.equal(await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").evaluate(editor =>
+              editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText), afterSubmit ? "" : argumentsValue.text);
+          }
           for (const phase of ["fill", "proof", "submit", "settle"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
           assert.equal(await worker.evaluate(async ({ provider, operationId }) =>
             (await chrome.storage.local.get(`${provider}-submit-attempt-${operationId}`))[`${provider}-submit-attempt-${operationId}`],
@@ -1077,7 +1114,7 @@ for (const provider of ["fixture", "gemini"]) {
     testContext.signal.throwIfAborted();
     await exerciseChatDispatch("expired_read", provider, testContext, "public");
   });
-  for (const outcome of ["observed", "own_window", "hidden", "hidden_disconnect_after_fill", "hidden_disconnect_after_submit", "hidden_not_sent", "hidden_lost_settle", "hidden_expired_fill", "hidden_expired_submit", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover"]) {
+  for (const outcome of ["observed", "own_window", "hidden", "hidden_disconnect_after_fill", "hidden_disconnect_after_submit", "hidden_not_sent", "hidden_lost_settle", "hidden_expired_fill", "hidden_expired_submit", "hidden_close_after_fill", "hidden_close_after_submit", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover"]) {
     test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();
       await exerciseChatDispatch(outcome, provider, testContext, "public");
