@@ -554,6 +554,35 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
     }
     let nextRequest: Promise<void> = Promise.resolve();
     let pendingRequests = 0;
+    const replies = new Map<string, { deadlineMs: number; timer: ReturnType<typeof setTimeout>;
+      resolve: (reply: unknown) => void; reject: (error: Error) => void }>();
+    const responseDecoder = new NativeFrameDecoder();
+    const rejectReplies = (error: Error) => {
+      for (const pending of replies.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(error);
+      }
+      replies.clear();
+    };
+    socket.on("error", rejectReplies);
+    socket.once("close", () => rejectReplies(new Error("Broker disconnected during request")));
+    socket.on("data", (chunk: Buffer) => {
+      try {
+        for (const message of responseDecoder.frames(chunk)) {
+          const reply = z.object({ requestId: z.uuid(), deadlineMs: z.number().int().safe() }).parse(message);
+          const pending = replies.get(reply.requestId);
+          if (!pending || reply.deadlineMs !== pending.deadlineMs) throw new Error("Mismatched broker reply");
+          if (reply.deadlineMs <= Date.now()) throw new Error("Broker reply expired");
+          replies.delete(reply.requestId);
+          clearTimeout(pending.timer);
+          pending.resolve(message);
+        }
+      } catch (error) {
+        const failure = error instanceof Error ? error : new Error("Invalid broker reply");
+        rejectReplies(failure);
+        socket.destroy(failure);
+      }
+    });
     const request = (kind: "keep_alive" | "list_chat_agents" | "remove_chat_agent" | "disconnect_chat"
       | "list_unconfirmed_dispatches" | "resolve_unconfirmed_dispatch"
       | "approve_chat_agent" | "wait_for_connection" | "list_available_agents" | "begin_chat_reload" | "rebind_chat"
@@ -616,7 +645,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       }
       if (pendingRequests >= MAX_BROKER_PENDING_REQUESTS) return Promise.reject(new Error("Broker request queue is full"));
       pendingRequests++;
-      const operation = nextRequest.then(async () => {
+      const operation = (kind === "disconnect_fixture" ? Promise.resolve() : nextRequest).then(async () => {
         if (socket.destroyed) throw new Error("Broker connection closed");
         const requestId = randomUUID();
         const startedAt = Date.now();
@@ -630,30 +659,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         const responseTimeoutMs = (originalDeadlineMs === undefined ? brokerRequestDeadline(responseStartedAt, deadlineMs, budgetMs)
           : deadlineMs) - responseStartedAt;
         if (responseTimeoutMs <= 0) throw new Error("Invalid autonomous request deadline");
-        const decoder = new NativeFrameDecoder();
         const response = new Promise<unknown>((resolve, reject) => {
           const timer = setTimeout(() => socket.destroy(new Error("Broker request timed out")), responseTimeoutMs);
-          const cleanup = () => {
-            clearTimeout(timer);
-            socket.off("data", onData);
-            socket.off("error", onError);
-            socket.off("close", onClose);
-          };
-          const onData = (chunk: Buffer) => {
-            try {
-              const messages = decoder.push(chunk);
-              if (messages.length > 1) throw new Error("Unexpected broker frames");
-              if (messages.length === 1) { cleanup(); resolve(messages[0]); }
-            } catch (error) {
-              cleanup();
-              reject(error);
-            }
-          };
-          const onError = (error: Error) => { cleanup(); reject(error); };
-          const onClose = () => { cleanup(); reject(new Error("Broker disconnected during request")); };
-          socket.on("data", onData);
-          socket.once("error", onError);
-          socket.once("close", onClose);
+          replies.set(requestId, { deadlineMs, timer, resolve, reject });
         });
         socket.write(frame);
         const reply = replySchema.parse(await response);
@@ -662,7 +670,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         return reply;
       });
       const completed = operation.finally(() => { pendingRequests--; });
-      nextRequest = completed.then(() => {}, () => {});
+      if (kind !== "disconnect_fixture") nextRequest = completed.then(() => {}, () => {});
       return completed;
     };
     let keepAlive: ReturnType<typeof setInterval> | undefined;

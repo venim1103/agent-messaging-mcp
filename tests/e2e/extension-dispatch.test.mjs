@@ -21,7 +21,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     : outcome === "removed_probes" ? `${provider} removed probes` : `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
   const retainedDraft = ["not_sent", "not_sent_changed", "lost_settle", "owned_leftover"].includes(outcome);
   const hiddenSend = outcome === "hidden_send" || outcome === "hidden_send_rich";
-  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend;
+  const hiddenDisconnect = outcome === "hidden_disconnect_after_fill" || outcome === "hidden_disconnect_after_submit";
+  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect;
   let mcpClient;
   let publicSendCancellation;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
@@ -345,7 +346,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
         await fixture.bringToFront();
         const hidden = outcome === "hidden";
-        const inactive = hidden || hiddenSend;
+        const inactive = hidden || hiddenSend || hiddenDisconnect;
         let foregroundTabId;
         const hiddenDraft = "Synthetic hidden-tab human draft must remain";
         if (hidden) {
@@ -383,7 +384,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             : await fixture.evaluate(submitFixtureDraft, { ...input, attemptId: operationId }), { ok: false, code: "TARGET_CHANGED" });
           assert.deepEqual(await fixture.evaluate(() => ({ html: document.body.innerHTML, focus: document.activeElement?.outerHTML })), before);
         }
-        if (["revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit"].includes(outcome)) {
+        if (hiddenDisconnect || ["revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit"].includes(outcome)) {
           const cancelled = outcome.startsWith("cancel_");
           const afterSubmit = outcome.endsWith("_submit");
           await worker.evaluate(({ afterSubmit, tabId }) => {
@@ -414,7 +415,10 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           setPhase(afterSubmit ? "revoking after submit activation" : "revoking after fill readback");
           assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), afterSubmit ? 1 : 0);
           let completion;
-          if (cancelled) {
+          if (hiddenDisconnect) {
+            const disconnected = await mcpClient.callTool({ name: "chat_disconnect", arguments: { connectionId: connection.connectionId } });
+            assert.deepEqual(disconnected.structuredContent, { disconnected: true });
+          } else if (cancelled) {
             setPhase("same-key duplicate queued before SDK cancellation");
             const duplicate = mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue })
               .then(result => ({ result }), error => ({ error }));
@@ -429,11 +433,25 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             await popup.locator("#agent-list li").filter({ hasText: "Synthetic autonomous browser owner" })
               .getByRole("button", { name: "Remove access" }).click({ timeout: 4000 });
           }
-          await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("0 connected"), null, { timeout: 4000 });
+          if (!hiddenDisconnect) await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("0 connected"), null, { timeout: 4000 });
           setPhase("revocation acknowledged before lease expiry");
           assert.equal(await worker.evaluate(() => Date.now() < globalThis.revocationBoundaryExpiresAt), true);
           await worker.evaluate(() => globalThis.releaseRevocationBoundary());
           completion ??= await sending;
+          if (hiddenDisconnect) {
+            assert.equal(await fixture.evaluate(() => document.visibilityState), "hidden");
+            assert.deepEqual(await worker.evaluate(async tabId => ({ active: (await chrome.tabs.get(tabId)).active,
+              foregroundTabId: (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id }), selected.tabId),
+            { active: false, foregroundTabId });
+            await fixture.bringToFront();
+            const refresh = popup.getByRole("button", { name: "Refresh agents" });
+            assert.equal(await refresh.isVisible(), true);
+            assert.equal(await refresh.isEnabled(), true);
+            await refresh.focus();
+            await refresh.press("Enter", { timeout: 4000 });
+            await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("0 connected"), null,
+              { timeout: 4000, polling: 100 });
+          }
           assert.equal(completion.error, undefined);
           const status = completion.result.structuredContent;
           assert.equal(status.state, afterSubmit || cancelled ? "unresolved" : "not_sent");
@@ -961,7 +979,7 @@ for (const provider of ["fixture", "gemini"]) {
     testContext.signal.throwIfAborted();
     await exerciseChatDispatch("expired_read", provider, testContext, "public");
   });
-  for (const outcome of ["observed", "own_window", "hidden", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover"]) {
+  for (const outcome of ["observed", "own_window", "hidden", "hidden_disconnect_after_fill", "hidden_disconnect_after_submit", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover"]) {
     test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();
       await exerciseChatDispatch(outcome, provider, testContext, "public");

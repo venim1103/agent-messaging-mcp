@@ -51,7 +51,9 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
             }
             pendingRequests++;
             const authenticatedRole = role;
-            responses = responses.then(async () => {
+            const disconnect = authenticatedRole === "facade" && typeof message === "object" && message !== null
+              && "kind" in message && message.kind === "disconnect_fixture";
+            const response = (disconnect ? Promise.resolve() : responses).then(async () => {
               if (socket.destroyed) return;
               const reply = handleBrokerRequest(message, authenticatedRole, owner, requests, Date.now(), operations);
               if (reply.kind === "gemini_fill_authorized") {
@@ -217,6 +219,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                   code: snapshot === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND"
                 } });
             }).catch(() => { socket.destroy(); }).finally(() => { pendingRequests--; });
+            if (!disconnect) responses = response;
             continue;
           }
           const hello = authenticateBrokerRole(message, credentials);

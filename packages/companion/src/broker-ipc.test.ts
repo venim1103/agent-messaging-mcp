@@ -159,6 +159,70 @@ for (const target of [
     }
   });
 
+  test(`${target.origin} owned disconnect overtakes a held read without revoking another connection`, { timeout: 5000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-priority-disconnect-"));
+    const directory = join(home, "broker");
+    const broker = await startBrokerSocket(directory, createBrokerCredentials());
+    let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let foreign: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    try {
+      facade = await connectBroker("facade", directory, undefined, undefined, "Synthetic disconnect owner");
+      foreign = await connectBroker("facade", directory);
+      relay = await connectBroker("relay", directory);
+      const roster = await relay.listChatAgents(target);
+      assert.ok(roster.kind === "chat_agents");
+      const agent = roster.payload.agents.find(candidate => candidate.label === "Synthetic disconnect owner");
+      assert.ok(agent);
+      const otherTarget = target.origin === "https://gemini.google.com"
+        ? { ...target, conversationId: "synthetic-other", url: "https://gemini.google.com/app/synthetic-other", tabId: 4 } as const
+        : { ...target, tabId: 4, documentId: "synthetic-other-document" } as const;
+      await relay.approveChatAgent(target, agent.agentId);
+      await relay.approveChatAgent(otherTarget, agent.agentId);
+      const pickup = await facade.waitForConnection(0);
+      assert.ok(pickup.kind === "connection_pickup");
+      const connection = pickup.payload.connections.find(candidate => candidate.conversationId === target.conversationId);
+      const otherConnection = pickup.payload.connections.find(candidate => candidate.connectionId !== connection?.connectionId);
+      assert.ok(connection && otherConnection);
+      const reading = facade.readApprovedSnapshot(connection.connectionId);
+      void reading.catch(() => {});
+      let ordinaryCompleted = false;
+      const ordinary = facade.getConnection(otherConnection.requestId);
+      void ordinary.then(() => { ordinaryCompleted = true; }, () => { ordinaryCompleted = true; });
+      let challengeExpiresAt: number | undefined;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const listing = target.origin === "https://gemini.google.com"
+          ? await relay.listGeminiReadChallenges() : await relay.listFixtureReadChallenges();
+        assert.ok(listing.kind === "gemini_read_challenges" || listing.kind === "fixture_read_challenges");
+        challengeExpiresAt = listing.payload.challenges[0]?.expiresAt;
+        if (challengeExpiresAt !== undefined) break;
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      assert.ok(challengeExpiresAt !== undefined);
+      assert.equal(ordinaryCompleted, false);
+      assert.throws(() => relay!.disconnectFixture(connection.connectionId), /Broker role cannot perform/);
+      assert.deepEqual((await foreign.disconnectFixture(connection.connectionId)).payload, { disconnected: false });
+      assert.equal(ordinaryCompleted, false);
+      assert.deepEqual((await facade.disconnectFixture(connection.connectionId)).payload, { disconnected: true });
+      assert.equal(Date.now() < challengeExpiresAt, true);
+      assert.deepEqual((await reading).payload, { code: "CONNECTION_NOT_FOUND" });
+      const remaining = await ordinary;
+      assert.ok(remaining.kind === "connection_state");
+      assert.equal(remaining.payload.state, "ready");
+      assert.deepEqual((await facade.getConnection(connection.requestId)).payload, { requestId: connection.requestId, state: "stale" });
+      const stillApproved = await facade.waitForConnection(0);
+      assert.ok(stillApproved.kind === "connection_pickup");
+      assert.deepEqual(stillApproved.payload.connections.map(candidate => candidate.connectionId), [otherConnection.connectionId]);
+      assert.deepEqual((await facade.disconnectFixture(connection.connectionId)).payload, { disconnected: false });
+    } finally {
+      facade?.close();
+      foreign?.close();
+      relay?.close();
+      await broker.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   test(`${target.origin} roster IPC is relay-only and removes one approved agent`, { timeout: 5000 }, async () => {
     const home = await mkdtemp(join(tmpdir(), "agent-messaging-agent-roster-"));
     const directory = join(home, "broker");
@@ -775,6 +839,47 @@ test("failed facade keepalive closes its socket without retrying", { timeout: 50
     await rm(home, { recursive: true, force: true });
   }
 });
+
+for (const fault of ["unknown_request", "changed_deadline", "duplicate_reply"]) {
+  test(`broker client rejects uncorrelated priority replies (${fault})`, { timeout: 5000 }, async context => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-priority-reply-"));
+    const directory = join(home, "broker");
+    const broker = await startBrokerSocket(directory, createBrokerCredentials());
+    let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    const write = Socket.prototype.write;
+    let injected = 0;
+    try {
+      facade = await connectBroker("facade", directory);
+      context.mock.method(Socket.prototype, "write", function(this: Socket, chunk: unknown, ...args: unknown[]) {
+        if (Buffer.isBuffer(chunk)) {
+          const [message] = new NativeFrameDecoder().push(chunk);
+          if (typeof message === "object" && message !== null && "kind" in message && message.kind === "fixture_disconnected") {
+            injected++;
+            assert.ok("requestId" in message && typeof message.requestId === "string"
+              && "deadlineMs" in message && typeof message.deadlineMs === "number");
+            const response = { ...message, requestId: message.requestId, deadlineMs: message.deadlineMs };
+            chunk = fault === "duplicate_reply" ? Buffer.concat([chunk, chunk]) : encodeNativeFrame({ ...response,
+              ...(fault === "unknown_request" ? { requestId: randomUUID() } : { deadlineMs: response.deadlineMs + 1 }) });
+          }
+        }
+        return Reflect.apply(write, this, [chunk, ...args]);
+      });
+      const waiting = facade.waitForConnection(2000);
+      const rejected = assert.rejects(waiting, /Mismatched broker reply/);
+      const disconnecting = facade.disconnectFixture(randomUUID());
+      if (fault === "duplicate_reply") assert.deepEqual((await disconnecting).payload, { disconnected: false });
+      else await assert.rejects(disconnecting, /Mismatched broker reply/);
+      await rejected;
+      assert.equal(injected, 1);
+      assert.equal(facade.closed, true);
+      await assert.rejects(facade.getConnection(randomUUID()), /Broker connection closed/);
+    } finally {
+      facade?.close();
+      await broker.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}
 
 test("broker client bounds pending requests and releases capacity after completion", { timeout: 5000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-client-queue-"));
