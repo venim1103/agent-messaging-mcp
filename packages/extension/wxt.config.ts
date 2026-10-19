@@ -2,9 +2,9 @@ import { defineConfig } from "wxt";
 
 export default defineConfig({
   manifest: {
-    name: "Browser Chat MCP (draft input test)",
-    description: "Inspect a selected chat read-only and fill only user-approved test drafts; does not invoke Send.",
-    permissions: ["activeTab", "scripting", "nativeMessaging", "debugger", "storage"],
+    name: "Browser Chat MCP",
+    description: "Connect an approved agent to one selected chat for reading and sending.",
+    permissions: ["activeTab", "scripting", "nativeMessaging", "storage"],
     optional_host_permissions: ["http://127.0.0.1:8787/*", "https://gemini.google.com/*"]
   }
 });

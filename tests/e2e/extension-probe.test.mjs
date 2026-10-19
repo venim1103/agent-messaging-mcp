@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { chromium } from "playwright-core";
@@ -16,7 +17,27 @@ import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 import { createNativeRequestChannel } from "../../packages/extension/lib/native-channel.ts";
-import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase } from "./extension-harness.mjs";
+import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
+
+test("synthetic Gemini proof faults stay bound to their starting invocation", { timeout: 1000 }, async () => {
+  for (const [startingMode, nextMode] of [["result-loss", "grant-loss"], ["positive", "result-loss"], ["grant-loss", "result-loss"]]) {
+    let finishExecution;
+    let removals = 0;
+    const scope = { chrome: {
+      scripting: { executeScript: () => new Promise(resolve => { finishExecution = resolve; }) },
+      storage: { session: { remove: async () => { removals++; } } }
+    } };
+    runInNewContext(`(${installSyntheticGeminiProof.toString()})()`, scope);
+    scope.syntheticGeminiProofMode = startingMode;
+    const pending = scope.chrome.scripting.executeScript({ target: { tabId: 17 }, func: request => request.checkSubmit });
+    scope.syntheticGeminiProofMode = nextMode;
+    finishExecution([{ result: { ok: true } }]);
+    const result = await pending;
+    assert.equal(result.length, startingMode === "result-loss" ? 0 : 1, `${startingMode} must not become ${nextMode}`);
+    assert.equal(removals, startingMode === "grant-loss" ? 1 : 0, startingMode);
+    assert.equal(scope.syntheticGeminiProofExecutions, 1);
+  }
+});
 
 async function createNativeWatchHarness(profile, requestKind) {
   const pidPath = join(profile, "native-watch.json");
@@ -1976,6 +1997,7 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
       relay = await connectBroker("relay", brokerDirectory);
       const page = await context.newPage();
       const url = "https://gemini.google.com/app/synthetic-worker-fill?hl=en";
+      if (outcome === "observed") await traceBrowserJobs(worker);
       await worker.evaluate(scenario => {
         globalThis.syntheticFillCompletionDrops = 0;
         const connect = chrome.runtime.connectNative.bind(chrome.runtime);
@@ -2208,22 +2230,7 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
         assert.equal((await popup.evaluate(args => chrome.runtime.sendMessage(args), approval)).ok, false);
         assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks: [] });
         testContext.diagnostic("Synthetic Gemini Send consent completed without activation");
-        await worker.evaluate(() => {
-          globalThis.syntheticGeminiProofMode = "positive";
-          globalThis.syntheticGeminiProofExecutions = 0;
-          const execute = chrome.scripting.executeScript.bind(chrome.scripting);
-          chrome.scripting.executeScript = async details => {
-            const result = await execute(details);
-            if (details.func.toString().includes(".checkSubmit")) {
-              globalThis.syntheticGeminiProofExecutions++;
-              if (globalThis.syntheticGeminiProofMode === "result-loss") return [];
-              if (globalThis.syntheticGeminiProofMode === "grant-loss") {
-                await chrome.storage.session.remove(`gemini-grant-${details.target.tabId}`);
-              }
-            }
-            return result;
-          };
-        });
+        await worker.evaluate(installSyntheticGeminiProof);
         await page.bringToFront();
         assert.equal(await page.evaluate(() => document.visibilityState), "visible");
         const bodyBeforeProof = await page.locator("body").innerHTML();
@@ -2231,7 +2238,8 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
         phase = `${outcome}:read-only-proof`;
         const proof = await facade.checkGeminiDispatch(prepared.payload.operationId);
         assert.equal(proof.kind, "gemini_dispatch_check");
-        assert.equal(proof.payload.ready, true);
+        assert.equal(proof.payload.ready, true, proof.payload.ready ? undefined
+          : JSON.stringify(await worker.evaluate(() => globalThis.browserJobTrace)));
         assert.deepEqual((await relay.listGeminiDispatchChecks()).payload, { checks: [] });
         assert.equal(await page.locator("body").innerHTML(), bodyBeforeProof);
         assert.equal(await page.evaluate(() => document.activeElement.outerHTML), focusBeforeProof);
@@ -2267,7 +2275,8 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
           assert.equal(refused.kind, "gemini_dispatch_check", mode);
           assert.equal(refused.payload.ready, false, mode);
           assert.equal(await worker.evaluate(() => globalThis.syntheticGeminiProofExecutions), executionsBefore + 1,
-            `The ${mode} boundary must execute its page inspector exactly once`);
+            JSON.stringify({ mode, expected: "page inspector executes exactly once",
+              jobs: await worker.evaluate(() => globalThis.browserJobTrace) }));
           assert.equal(proofIds.has(refused.payload.checkId), false);
           proofIds.add(refused.payload.checkId);
           assert.equal(await page.locator("body").innerHTML(), body, mode);

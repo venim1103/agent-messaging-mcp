@@ -1,1 +1,0 @@
-export const geminiDraftText = "Testing a browser chat connector in this disposable conversation. Please reply with OK.";

@@ -1,5 +1,4 @@
 import { browser } from "wxt/browser";
-import { geminiDraftText } from "../../lib/approved-probe";
 import { captureGeminiSnapshot, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl } from "../../lib/gemini-observation";
 
 type FixturePreview = {
@@ -14,7 +13,6 @@ type GeminiPreview = {
   rows: { tag: string; characters: number }[];
 };
 type ProbeResult = { ok: true; protocolVersion: number } | { ok: false; error: string };
-type FixtureInputResult = { ok: true; characters: number } | { ok: false; error: string };
 type PendingListResult = { ok: true; requests: { requestId: string; expiresAt: number }[] }
   | { ok: false; error: string };
 type ChatAgent = { agentId: string; label: string; connectionCount: number; autonomous?: true };
@@ -32,7 +30,6 @@ type FixtureReviewApprovalResult = { ok: true; operationId: string; expiresAt: n
   | { ok: false; error: string };
 
 const fixtureOrigin = "http://127.0.0.1:8787";
-const richFixtureUrl = `${fixtureOrigin}/?editor=rich`;
 const geminiOrigin = "https://gemini.google.com";
 const inspectButton = document.querySelector<HTMLButtonElement>("#inspect");
 const agentPanel = document.querySelector<HTMLElement>("#agent-panel");
@@ -48,10 +45,6 @@ const pendingButton = document.querySelector<HTMLButtonElement>("#view-pending")
 const fixtureReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-reviews");
 const fixtureFillReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-fill-reviews");
 const fixtureSendReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-send-reviews");
-const fixtureInputButton = document.querySelector<HTMLButtonElement>("#test-fixture-input");
-const geminiDraftReview = document.querySelector<HTMLElement>("#gemini-draft-review");
-const geminiDraftPreview = document.querySelector<HTMLElement>("#gemini-draft-text");
-const geminiDraftButton = document.querySelector<HTMLButtonElement>("#prepare-gemini-draft");
 const status = document.querySelector<HTMLElement>("#status");
 const result = document.querySelector<HTMLElement>("#result");
 const fixtureDocumentStatus = document.querySelector<HTMLElement>("#fixture-document-status");
@@ -118,8 +111,8 @@ function inspectGeminiStructure(): GeminiPreview | null {
 
 if (!inspectButton || !agentPanel || !agentCount || !agentList || !refreshAgentsButton || !disconnectChatButton
   || !unconfirmedPanel || !unconfirmedStatus || !unconfirmedList || !refreshUnconfirmedButton
-  || !pendingButton || !fixtureReviewButton || !fixtureFillReviewButton || !fixtureSendReviewButton || !fixtureInputButton || !geminiDraftReview
-  || !geminiDraftPreview || !geminiDraftButton || !status || !result || !fixtureDocumentStatus || !pendingResult
+  || !pendingButton || !fixtureReviewButton || !fixtureFillReviewButton || !fixtureSendReviewButton
+  || !status || !result || !fixtureDocumentStatus || !pendingResult
   || !pendingTarget || !pendingRequests || !fixtureReviewResult || !fixtureReviewHeading || !fixtureReviews || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
 }
@@ -247,7 +240,7 @@ async function refreshChatAgents(): Promise<void> {
             if (!allowed) { status.textContent = "Site access denied; no connection created."; return; }
             const approval = await browser.runtime.sendMessage({ kind: "approve_chat_agent", tabId: selected.id,
               expectedUrl: selected.url, agentId: agent.agentId }) as ChatAgentApprovalResult;
-            status.textContent = approval?.ok ? "Agent connected. Live-site sending is unverified."
+            status.textContent = approval?.ok ? "Agent connected."
               : approval?.error ?? "Connection unavailable; refresh status.";
           } catch {
             status.textContent = "Connection unavailable; refresh status.";
@@ -361,11 +354,8 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   }
   pendingTarget.textContent = selectedSavedGemini
     ? "Read-only target: selected Gemini conversation" : "Read-only target: local fixture / fixture-alpha";
-  fixtureInputButton.hidden = tab?.url !== richFixtureUrl;
   if (tab?.id != null && tab.url && selectedSavedGemini) {
     selectedGeminiTab = { id: tab.id, url: tab.url };
-    geminiDraftPreview.textContent = geminiDraftText;
-    geminiDraftReview.hidden = false;
   }
   agentPanel.hidden = !selectedFixtureTab && !selectedGeminiTab;
   unconfirmedPanel.hidden = agentPanel.hidden;
@@ -561,48 +551,6 @@ pendingButton.addEventListener("click", async () => {
     status.textContent = "Pending list unavailable.";
   } finally {
     pendingButton.disabled = false;
-  }
-});
-
-geminiDraftButton.addEventListener("click", async () => {
-  geminiDraftButton.disabled = true;
-  status.textContent = "Filling only the approved Gemini draft. Send will not be clicked...";
-  try {
-    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-    if (!selectedGeminiTab || tab?.id !== selectedGeminiTab.id || tab.url !== selectedGeminiTab.url) {
-      status.textContent = "The selected Gemini conversation changed. No draft filled.";
-      return;
-    }
-    const probe = await browser.runtime.sendMessage({
-      kind: "prepare_gemini_draft", tabId: selectedGeminiTab.id, expectedUrl: selectedGeminiTab.url
-    }) as FixtureInputResult;
-    status.textContent = probe.ok
-      ? `Gemini draft matched (${probe.characters} characters). Send was not clicked. Review it in the chat.`
-      : `${probe.error}. Send was not clicked. Review the composer before retrying.`;
-  } catch {
-    status.textContent = "Gemini draft probe unavailable. Inspect the composer before any retry. Send was not clicked.";
-  } finally {
-    geminiDraftButton.disabled = false;
-  }
-});
-
-fixtureInputButton.addEventListener("click", async () => {
-  fixtureInputButton.disabled = true;
-  status.textContent = "Checking debugger input on the local rich fixture...";
-  try {
-    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id == null || tab.url !== richFixtureUrl) {
-      status.textContent = "Open the local rich fixture to test input. Nothing sent.";
-      return;
-    }
-    const probe = await browser.runtime.sendMessage({ kind: "probe_fixture_input", tabId: tab.id }) as FixtureInputResult;
-    status.textContent = probe.ok
-      ? `Fixture input read back (${probe.characters} characters). Send was not clicked.`
-      : `${probe.error}. Send was not clicked.`;
-  } catch {
-    status.textContent = "Fixture debugger input unavailable. Inspect the draft before retrying.";
-  } finally {
-    fixtureInputButton.disabled = false;
   }
 });
 

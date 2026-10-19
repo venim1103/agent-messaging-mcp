@@ -28,4 +28,51 @@ function trackTestPhase(testContext, label) {
   };
 }
 
-export { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase };
+async function traceBrowserJobs(worker) {
+  await worker.evaluate(() => {
+    globalThis.browserJobTrace = [];
+    const started = performance.now();
+    const record = event => {
+      globalThis.browserJobTrace.push({ ...event, atMs: Math.round(performance.now() - started) });
+      if (globalThis.browserJobTrace.length > 32) globalThis.browserJobTrace.shift();
+    };
+    const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+    chrome.runtime.connectNative = (...args) => {
+      const port = connect(...args);
+      port.onMessage.addListener(reply => {
+        for (const job of reply.payload?.jobs ?? reply.payload?.checks ?? []) record({ event: "offer",
+          kind: reply.kind, remainingMs: job.expiresAt - Date.now() });
+      });
+      const post = port.postMessage.bind(port);
+      port.postMessage = message => {
+        const observation = message.payload?.observation ?? message.payload?.result;
+        if (message.kind.startsWith("complete_") && observation) record({ event: "completion", kind: message.kind,
+          phase: message.payload.phase, ok: observation.ok, code: observation.code, remainingMs: message.deadlineMs - Date.now() });
+        if (message.kind === "publish_fixture_snapshot" || message.kind === "publish_gemini_snapshot") record({ event: "snapshot",
+          challenged: !!message.payload.challengeId, rows: message.payload.messages?.length });
+        post(message);
+      };
+      return port;
+    };
+  });
+}
+
+function installSyntheticGeminiProof() {
+  globalThis.syntheticGeminiProofMode = "positive";
+  globalThis.syntheticGeminiProofExecutions = 0;
+  const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+  chrome.scripting.executeScript = async details => {
+    const mode = globalThis.syntheticGeminiProofMode;
+    const result = await execute(details);
+    if (details.func.toString().includes(".checkSubmit")) {
+      globalThis.syntheticGeminiProofExecutions++;
+      if (mode === "result-loss") return [];
+      if (mode === "grant-loss") {
+        await chrome.storage.session.remove(`gemini-grant-${details.target.tabId}`);
+      }
+    }
+    return result;
+  };
+}
+
+export { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof };

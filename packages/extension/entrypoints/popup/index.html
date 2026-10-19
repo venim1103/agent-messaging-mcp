@@ -156,7 +156,7 @@
       <button type="button" id="inspect">Inspect this chat</button>
       <section id="agent-panel" hidden>
         <h2>Agents</h2>
-        <p id="connection-consent">Approval lets that agent read and send in this chat until the connection ends. Chat content can influence what it sends. Experimental: live-site sending is unverified.</p>
+        <p id="connection-consent">Approval lets that agent read and send in this chat until the connection ends. Chat content can influence what it sends. Experimental: site changes may interrupt access.</p>
         <p id="agent-count" role="status">Checking...</p>
         <ol id="agent-list" aria-label="Chat agents"></ol>
         <button type="button" id="refresh-agents">Refresh agents</button>
@@ -172,13 +172,7 @@
       <button type="button" id="view-fixture-reviews" hidden>Review fixture drafts</button>
       <button type="button" id="view-fixture-fill-reviews" hidden>Review fixture draft fill</button>
       <button type="button" id="view-fixture-send-reviews" hidden>Review fixture sending</button>
-      <button type="button" id="test-fixture-input" hidden>Test fixture input</button>
-      <section id="gemini-draft-review" hidden>
-        <h2>Unsent Gemini draft</h2>
-        <p id="gemini-draft-text"></p>
-        <button type="button" id="prepare-gemini-draft">Fill test draft</button>
-      </section>
-      <p id="status" role="status">Inspect is read-only. Draft tests never click Send.</p>
+      <p id="status" role="status">Inspect is read-only.</p>
       <section id="result" hidden>
         <h2 id="conversation"></h2>
         <p id="fixture-document-status" hidden></p>

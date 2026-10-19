@@ -13,7 +13,7 @@ Build a **browser-chat integration**, not a general browser automation MCP serve
 - An MCP interface exposes a small set of chat operations with structured results.
 - A generic, user-configurable DOM adapter covers conventional chat layouts; reviewed site adapters handle applications such as Gemini and WhatsApp Web.
 - Use TypeScript throughout. Use the official MCP SDK, WXT for extension development, and Playwright for feasibility experiments and end-to-end testing.
-- For reliable rich-text input, use a narrowly implemented browser-debugger input driver inside the extension. Do not expose raw debugger commands or arbitrary JavaScript to the agent.
+- For current visible-chat input, use reviewed page functions with exact-document, draft and operation guards (D6). Do not expose raw browser commands or arbitrary JavaScript to the agent.
 
 **The important qualification:** generic discovery is achievable; universally reliable sending and complete history extraction from every chat website are not. The product should publish capabilities and refuse unsupported operations rather than guess.
 
@@ -108,7 +108,7 @@ The browser's `activeTab` grant requires a supported user gesture. It can surviv
 - Review exact outgoing text and the intended conversation in that panel; approvals never come from page content.
 - An injected highlight can help select elements, but it is not an authorization surface because the page can imitate or manipulate it.
 - Preserve existing user drafts. Pause writes when unexpected user interaction or a changed conversation is detected.
-- Disconnect revokes queued actions, stops observation, releases debugger attachment, and makes buffered content inaccessible through that connection. It does not close the user's tab or log them out.
+- Disconnect revokes queued actions, stops observation, and makes buffered content inaccessible through that connection. It does not close the user's tab or log them out.
 
 ## 5. Architecture
 
@@ -120,7 +120,7 @@ flowchart LR
     Native <-->|Native Messaging| Extension[Extension service worker and panel]
     Extension <-->|Typed messages| Content[Content script and chat adapter]
     Content <-->|Observe and inspect DOM| Chat[User-selected chat tab]
-    Extension -->|Guarded debugger input| Chat
+    Extension -->|Guarded page input| Chat
 ```
 
 ### Component responsibilities
@@ -150,23 +150,23 @@ Version the internal message protocol. Include request IDs, connection generatio
 
 ## 6. Browser Permissions and Input
 
-The control-capable extension requires `activeTab`, `scripting`, `storage`, `nativeMessaging`, and `debugger`, plus `sidePanel` if the Chrome side-panel API is used. Avoid blanket host permissions and browser-history/cookie permissions. Inject scripts only after the user selects a tab.
+The current extension requires only `activeTab`, `scripting`, `storage` and `nativeMessaging`. Fixture and Gemini origins are optional host permissions requested through trusted popup actions. Avoid blanket host permissions and browser-history/cookie permissions. Inject scripts only into the selected, approved document.
 
-**Important permission tradeoff:** Chrome does not allow `debugger` in `optional_permissions`. It must be declared as a required permission for the control-capable extension. A runtime checkbox cannot turn a low-permission extension into a debugger-enabled one. [6]
+**Decision (2026-10-19, D6):** Remove both legacy debugger input probes and the required `debugger` permission. The connected writer remains the visible-chat implementation; this change does not enable hidden-tab input.
 
-The debugger permission is powerful and is not technically restricted by `activeTab`. Selected-tab restrictions must therefore be enforced by trusted extension code. Read-only mode reduces what this application permits, not the installed extension's underlying maximum privilege. A separately packaged no-debugger edition is possible later, but is not necessary for the MVP.
+If a future reviewed input driver needs `debugger`, Chrome requires it at install time, not in `optional_permissions`. It is powerful and not technically restricted by `activeTab`; a runtime checkbox cannot add it or constrain its underlying privilege. Such a driver and permission change require a separate decision. [6]
 
 ### Sending through modern editors
 
 Do not assume assigning `textarea.value`, setting `innerHTML`, or dispatching a synthetic keyboard event reproduces user editing. Framework-controlled inputs and rich-text editors can reject these changes or keep different internal state. Script-dispatched events are not trusted browser input. [7]
 
-Use a small, typed input driver over `chrome.debugger`, limited to the selected tab and operations needed by the adapter: focus the verified composer, insert text, activate the verified send control, and inspect the resulting UI state. Prefer the actual send button; use Enter only when the adapter knows the site's configured submit behavior. Never paste through the user's clipboard.
+Use small, reviewed page functions limited to the approved document and operation: focus the verified composer, insert text, activate the verified Send control, and inspect the resulting UI state. Preserve original deadlines, exact draft checks, durable intent, browser reservation and one activation. Never paste through the user's clipboard.
 
 The agent cannot choose CDP methods, coordinates, selectors, or executable expressions. The extension resolves and checks targets itself. Do not expose network interception, cookie extraction, arbitrary navigation, or an unrestricted evaluate tool.
 
-Debugger access improves input reliability; it does not guarantee acceptance by every website or bypass browser/platform restrictions. Handle attachment rejection, user cancellation, and DevTools-triggered detachment explicitly. [8]
+Site changes can reject the input or invalidate guards; refuse conservatively rather than adding a fallback or retry. A future debugger driver would not guarantee website acceptance or bypass platform restrictions, and would need explicit attachment/detachment handling. [8]
 
-**Implementation note (2026-10-09):** The connected fill and submit paths do not use `chrome.debugger`. They run reviewed page functions in the approved document: one `document.execCommand("insertText")` call to fill, whose browser-generated input events tested as trusted in synthetic pages, and one script-initiated `click()` on the verified Send control, which is not trusted user input. Identity, focus, draft and lease checks surround both. Fixture tests and one installed fixture send passed; live Gemini acceptance of either step is unverified. `debugger` stays declared only for two legacy popup probes, one of which types a fixed sentence into a real Gemini composer outside the operation ledger. Decision D6 covers removing them and the permission.
+**Implementation note (2026-10-19):** Connected fill uses one `document.execCommand("insertText")` call, whose browser-generated input events tested as trusted in synthetic pages. Submit uses one script-initiated `click()` on the verified Send control, not trusted user input. Identity, focus, draft and lease checks surround both. The planned three-turn installed Gemini visible-chat acceptance passed on this writer; it is not broad reliability or delivery proof. D6 removes the two legacy popup probes, their fixed payload and debugger permission; native-bridge diagnostics remain. Current evidence and installed-build boundaries are in HANDOFF.md.
 
 ## 7. Connections and Authorization
 
@@ -433,7 +433,7 @@ With the agent and browser both inside this devcontainer, remote broker access i
 | Incoming message contains prompt injection | Treat all chat content as untrusted external data, never as system instructions or executable configuration |
 | Injection persuades agent to exfiltrate information | Per-message review by default, narrow recipient grants, message limits, and host-side instruction boundaries; sanitization alone is insufficient |
 | Misrouted or duplicated send | Fresh conversation/document guards, preserved drafts, one writer, durable operation journal, and explicit unknown outcomes |
-| Broad debugger capability is abused | Small reviewed command surface, selected-target enforcement, no raw browser tools, and visible browser/user revocation |
+| Broad extension capability is abused | No debugger permission in current mode, small reviewed command surface, selected-target enforcement, no raw browser tools, and visible browser/user revocation |
 | Local web page probes the companion | Native Messaging and private IPC by default; authenticated, origin-validated HTTP only when explicitly enabled |
 | Sensitive conversations persist unexpectedly | Bounded memory buffers, no transcript/screenshot logging by default, restrictive local file permissions, and explicit retention controls |
 
@@ -455,7 +455,7 @@ Respect each site's terms and account rules. Browser automation is not made comp
 | Extension build | WXT, Manifest V3, small TypeScript UI | Extension-specific development and packaging; no large UI framework required |
 | Validation | Zod v4 | Shared runtime validation for MCP, IPC, adapter profiles, and observations |
 | DOM semantics | Native DOM APIs and `dom-accessibility-api` | Incremental observation and standard accessible-name handling |
-| Browser input | `chrome.debugger`, with `devtools-protocol` types | Trusted browser input without exposing a general automation API |
+| Browser input | Reviewed page functions with guarded `insertText` and Send activation (D6) | Exact approved document and operation; no general automation API or debugger permission |
 | Operation journal | SQLite through `better-sqlite3` | Local transactional state; no database service |
 | Tests | Vitest and `@playwright/test` | Deterministic domain tests and real extension/browser workflows |
 
@@ -484,7 +484,7 @@ The earliest go/no-go is Phase 0. If the full-control extension's required permi
 
 ### Status (2026-10-09)
 
-The effort column above is the original planning estimate, not a schedule.
+The effort column above is the original planning estimate, not a schedule. D6 (2026-10-19) supersedes the original debugger-driver plan for current visible-chat input; hidden-tab input remains separately scoped.
 
 - **Phase 0:** done except a connector-driven live send. Container GUI, extension, native host, VS Code MCP, fixture input, live Gemini structure and read checks, and a debugger fill probe passed.
 - **Phase 1:** done for the fixture and one observed Gemini UI variant: installed-toolbar approval, reads, events and revocation. Read robustness gaps remain (HANDOFF findings R1 and R2).
@@ -525,7 +525,7 @@ Initially target observation-to-event latency under 500 ms at the 95th percentil
 - Local stdio MCP, private Unix-socket IPC and Native Messaging; no network control listener.
 - Trusted extension-owned approval, durable intent, one guarded activation and no automatic retry. The prototype implements the supervised three-consent form; D1 makes one connection approval the product default.
 - No transcript persistence: private SQLite stores operation metadata, keyed digests and receipt hashes only.
-- The development extension declares `debugger`; the user accepted it for fixture and Gemini input probes (see D6).
+- Current visible-chat input uses reviewed page functions; the two earlier debugger input probes and required permission are removed by D6 (2026-10-19).
 
 Still open from the original list: which second chat UI to validate. Installers beyond the devcontainer are not needed for now (D12). None of this ties the architecture to a particular model provider.
 
@@ -538,7 +538,7 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D3 Completion signal: decided.** A quiet-period `settled_heuristic` plus a reviewed Gemini indicator reporting `complete`. The indicator needs a fresh human-authorized read-only DOM review of a disposable chat.
 - **D4 Broker start: decided.** The MCP server starts a detached broker on demand and connects at startup; `npm run dev:broker` stays for debugging.
 - **D5 Provider-neutral pipeline: decided.** Build the autonomous send path provider-neutral (section 8), reusing today's primitives, and add no new provider-specific command families.
-- **D6 Debugger permission: open.** Decide after the first live test. If Gemini rejects `execCommand` input or the script-initiated Send click, or if hidden-tab operation (D11) needs it, add a reviewed debugger input step inside the operation chain rather than reviving the legacy probes.
+- **D6 Debugger permission: decided (2026-10-19).** The person chose to remove both legacy input probes and the required debugger permission after the planned visible-chat live test passed on the connected page writer. Retain that guarded writer and native-bridge diagnostics. Hidden-tab operation (D11) is not enabled by this change. If a future driver needs debugger input, review its permission and operation-chain integration separately; never revive the probes or expose raw browser commands.
 - **D7 Checkpoint size: decided.** One checkpoint per authority boundary when it follows an established pattern, with shorter handoff entries.
 - **D8 Observation window and failure policy: decided.** Publish the newest rows with `omittedBefore`, mark per-message truncation explicitly within the frame limit, and when URL, document and conversation are unchanged skip a failed capture instead of revoking; challenged reads then return `OBSERVATION_UNAVAILABLE`. Identity changes still revoke.
 - **D9 Gemini outcome evidence: decided.** The append-only rule in section 10.

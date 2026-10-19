@@ -12,11 +12,11 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { chromium } from "playwright-core";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
-import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase } from "./extension-harness.mjs";
+import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs } from "./extension-harness.mjs";
 
 async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
   const setPhase = trackTestPhase(testContext, outcome === "expired_read" ? `${provider} read expiry`
-    : `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
+    : outcome === "removed_probes" ? `${provider} removed probes` : `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
   const retainedDraft = ["not_sent", "not_sent_changed", "lost_settle", "owned_leftover"].includes(outcome);
   let mcpClient;
   let publicSendCancellation;
@@ -83,6 +83,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
     let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
+    if (autonomous === "public") await traceBrowserJobs(worker);
     if (outcome === "expired_read") await worker.evaluate(() => {
       const connect = chrome.runtime.connectNative.bind(chrome.runtime);
       let confirmPort;
@@ -146,7 +147,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       });</script></body></html>` : await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8");
     await fixture.route(provider === "gemini" ? "https://gemini.google.com/**" : "http://127.0.0.1:8787/**",
       route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
-    const rich = outcome === "lost_script" || outcome === "worker_crash";
+    const rich = outcome === "lost_script" || outcome === "worker_crash" || outcome === "removed_probes";
     const url = provider === "gemini" ? "https://gemini.google.com/app/synthetic-neutral-submit?hl=en"
       : `http://127.0.0.1:8787/${rich ? "?editor=rich" : ""}`;
     await fixture.goto(url);
@@ -194,15 +195,13 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       await popup.goto(`chrome-extension://${extensionId}/popup.html`);
       const connect = popup.locator("#agent-list li").filter({ hasText: "Synthetic autonomous browser owner" })
         .getByRole("button", { name: "Connect this chat" });
-      if (outcome === "own_window" || outcome === "hidden") {
-        await connect.waitFor({ state: "visible", timeout: 4000 });
-        assert.equal(await connect.isEnabled(), true);
-        await connect.evaluate(button => button.addEventListener("click", event => {
-          globalThis.visibilityApprovalGesture = { trusted: event.isTrusted, active: navigator.userActivation.isActive };
-        }, { once: true }));
-        await connect.press("Enter", { timeout: 4000 });
-        assert.deepEqual(await popup.evaluate(() => globalThis.visibilityApprovalGesture), { trusted: true, active: true });
-      } else await connect.click({ timeout: 4000 });
+      await connect.waitFor({ state: "visible", timeout: 4000 });
+      assert.equal(await connect.isEnabled(), true);
+      await connect.evaluate(button => button.addEventListener("click", event => {
+        globalThis.visibilityApprovalGesture = { trusted: event.isTrusted, active: navigator.userActivation.isActive };
+      }, { once: true }));
+      await connect.press("Enter", { timeout: 4000 });
+      assert.deepEqual(await popup.evaluate(() => globalThis.visibilityApprovalGesture), { trusted: true, active: true });
       await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("1 connected"), null,
         { timeout: 4000, polling: outcome === "own_window" || outcome === "hidden" ? 100 : "raf" });
       const pickup = autonomous === "public"
@@ -215,8 +214,32 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       assert.deepEqual(connection.capabilities, ["read", "send"]);
       if (autonomous === "public") {
         setPhase(outcome === "expired_read" ? "public read expiry" : "public autonomous send");
-        assert.match(await popup.locator("#connection-consent").textContent(), /live-site sending is unverified/);
-        assert.equal(await popup.locator("#status").textContent(), "Agent connected. Live-site sending is unverified.");
+        assert.match(await popup.locator("#connection-consent").textContent(), /site changes may interrupt access/);
+        assert.equal(await popup.locator("#status").textContent(), "Agent connected.");
+        if (outcome === "removed_probes") {
+          setPhase("removed probe refusal");
+          assert.deepEqual(manifest.permissions, ["activeTab", "scripting", "nativeMessaging", "storage"]);
+          assert.equal(manifest.optional_permissions?.includes("debugger") ?? false, false);
+          assert.equal(await popup.locator("#test-fixture-input, #prepare-gemini-draft, #gemini-draft-review").count(), 0);
+          await fixture.bringToFront();
+          const editor = fixture.locator(provider === "gemini" ? "[contenteditable]" : "#rich-message");
+          const draft = "Synthetic human draft stays untouched by removed probes";
+          await editor.fill(draft);
+          const before = await fixture.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML }));
+          const replies = await popup.evaluate(async expectedUrl => {
+            const tab = (await chrome.tabs.query({})).find(tab => tab.url === expectedUrl);
+            if (!tab?.id) throw new Error("Expected synthetic selected chat");
+            return [
+              await chrome.runtime.sendMessage({ kind: "probe_fixture_input", tabId: tab.id }) ?? null,
+              await chrome.runtime.sendMessage({ kind: "prepare_gemini_draft", tabId: tab.id, expectedUrl }) ?? null
+            ];
+          }, fixture.url());
+          assert.deepEqual(replies, [null, null]);
+          assert.deepEqual(await fixture.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML })), before);
+          assert.equal(await editor.innerText(), draft);
+          assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 0);
+          return;
+        }
         if (outcome === "expired_read") {
           setPhase("expired queued read");
           await fixture.bringToFront();
@@ -433,8 +456,11 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         const result = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
         const status = result.structuredContent;
         const expectedState = outcome === "observed" || outcome === "own_window" ? "sent" : outcome === "lost_settle" ? "unresolved" : "not_sent";
-        assert.equal(result.isError, expectedState !== "sent");
-        assert.equal(status.state, expectedState);
+        const sendDiagnostic = result.isError !== (expectedState !== "sent") || status.failureStage
+          ? JSON.stringify({ provider, outcome, state: status.state, code: status.code, failureStage: status.failureStage,
+            jobs: await worker.evaluate(() => globalThis.browserJobTrace) }) : undefined;
+        assert.equal(result.isError, expectedState !== "sent", sendDiagnostic);
+        assert.equal(status.state, expectedState, sendDiagnostic);
         assert.equal(status.retryAllowed, false);
         if (hidden) assert.equal(status.code, "DISPATCH_UNAVAILABLE");
         assert.match(status.recoveryToken, /^[0-9a-f]{64}$/);
@@ -443,7 +469,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         setPhase("public status and replay");
         const replay = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
         const { recoveryToken, ...withoutReceipt } = status;
-        assert.deepEqual(replay.structuredContent, hidden ? status : withoutReceipt);
+        assert.deepEqual(replay.structuredContent, hidden ? status : withoutReceipt, sendDiagnostic);
         assert.deepEqual((await facade.getPreparedOperation(status.operationId, recoveryToken)).payload.state,
           hidden ? "unknown" : expectedState === "unresolved" ? "dispatch_uncertain"
             : provider === "gemini" || expectedState === "not_sent" ? "resolved" : "observed_in_ui");
@@ -550,7 +576,9 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             connectionId: connection.connectionId, timeoutMs: 4000
           } });
           assert.equal(reply.isError, undefined);
-          assert.equal(reply.structuredContent.timedOut, false);
+          assert.equal(reply.structuredContent.timedOut, false, JSON.stringify({ provider,
+            revision: await fixture.evaluate(() => ({ count: globalThis.replyRevisionCount,
+              ageMs: performance.now() - globalThis.replyRevisionAt })) }));
           assert.equal(reply.structuredContent.reply.text, "Synthetic final reply");
           assert.equal(reply.structuredContent.reply.generationState, "settled_heuristic");
           assert.equal(await fixture.evaluate(() => globalThis.replyRevisionCount), 1);
@@ -882,6 +910,10 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
 }
 
 for (const provider of ["fixture", "gemini"]) {
+  test(`public ${provider} removed debugger probes cannot change a human draft`, { timeout: 15000 }, async testContext => {
+    testContext.signal.throwIfAborted();
+    await exerciseChatDispatch("removed_probes", provider, testContext, "public");
+  });
   test(`public ${provider} read expiry skips queued captures and preserves its draft`, { timeout: 15000 }, async testContext => {
     testContext.signal.throwIfAborted();
     await exerciseChatDispatch("expired_read", provider, testContext, "public");

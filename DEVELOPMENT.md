@@ -225,12 +225,13 @@ Open this small panel from the extension icon in container Chromium's toolbar, u
 
 - **Inspect this chat**: a read-only diagnostic. On the fixture it lists rows and checks the native bridge. On Gemini it shows only structure metadata (regions, editors, row lengths, **Send controls**, **Prompt state** and **Nearby prompt controls**), never chat text.
 - **View pending requests**, then **Approve read-only fixture** or **Approve read-only Gemini chat**.
-- Agent roster: **Connect this chat** per agent, **Remove access**, **Disconnect all** and **Refresh agents**. The consent text discloses read/send authority and influence from chat content, and warns that live-site sending is unverified.
+- Agent roster: **Connect this chat** per agent, **Remove access**, **Disconnect all** and **Refresh agents**. The consent text discloses read/send authority and influence from chat content, and warns that site changes may interrupt access. See HANDOFF.md for current acceptance evidence.
 - **Unconfirmed Sends**: **Refresh status** loads eligible selected-chat operation IDs/timestamps; **Sent** / **Not sent** record an immutable person assessment, never activate Send or touch the composer. It does not automatically check on ordinary popup opens.
 - **Review fixture drafts** or **Review Gemini drafts**, then **Approve draft (no send)**.
 - **Review fixture draft fill** or **Review Gemini fill consent**, then **Allow draft fill (no send)**.
 - **Review fixture sending** or **Review Gemini send consent**, then **Approve fixture send** or **Approve Gemini send**.
-- Legacy debugger probes: **Test fixture input** on the rich fixture and, on Gemini, **Fill test draft**, which types a fixed sentence into the real composer outside the operation ledger. Use them only with explicit authorization; decision D6 covers removing them.
+
+The legacy **Test fixture input** and **Fill test draft** controls and runtime routes are removed (D6). All connected writes stay inside the operation pipeline; native-bridge diagnostics remain. The extension no longer requests debugger permission. Hidden-tab sending remains unsupported.
 
 Review lists show at most eight exact previews and clear when the tab, document, grant or expiry changes.
 
@@ -310,12 +311,11 @@ Companion (`packages/companion/src`; tests sit beside modules as `*.test.ts` and
 
 Extension (`packages/extension`):
 
-- `entrypoints/background.ts`: service worker with native watches, approvals, consent handlers, fill, proof and submit executors, revocation and legacy probes.
+- `entrypoints/background.ts`: service worker with native watches, approvals, consent handlers, fill, proof and submit executors, revocation and native-bridge diagnostics.
 - `entrypoints/popup/`: trusted popup.
 - `lib/fixture-observation.ts`: fixture page functions and the persistent submit reservation (`reserveBrowserSubmitAttempt`).
 - `lib/gemini-observation.ts`: Gemini page functions for eligibility, identity, observation, capture, inspection, fill, submit and diagnostics.
-- `lib/approved-probe.ts`: fixed text for the legacy Gemini probe.
-- `wxt.config.ts`: manifest and permissions (`activeTab`, `scripting`, `nativeMessaging`, `debugger`, `storage`).
+- `wxt.config.ts`: manifest and required permissions (`activeTab`, `scripting`, `nativeMessaging`, `storage`); fixture/Gemini origins remain optional host permissions.
 
 Tests: `tests/fixtures/` holds the synthetic chat page and server. `tests/e2e/extension-probe.test.mjs` covers full-stack admission, reads and fills; `tests/e2e/extension-dispatch.test.mjs` covers autonomous/supervised dispatch, loss and crashes. Both use disposable Chromium, broker and native host through shared `extension-harness.mjs` readiness/timing helpers. `tests/e2e/fixture-editor.test.mjs` and `tests/e2e/gemini-observation.test.mjs` test page functions on synthetic pages. `tests/diagnostics/clock-probe.c` is optional and must not run without explicit authorization.
 
@@ -348,6 +348,8 @@ npm run build:extension && npm run test:e2e:focus -- --test-name-pattern='<regex
 Use `extension-dispatch.test.mjs` for public sends and private submit/loss cases, and `extension-probe.test.mjs` for popup admission/read/fill cases. A focused public send took about five seconds in the initial benchmark; timing depends on the machine and power state.
 
 `tests/e2e/run.mjs` discovers every E2E test file. Independent cases run with two isolated file workers. Six composite cases (fixture private-submit matrix, fixture crash matrix, both provider roster-race matrices, Gemini read workflow and Gemini inspector matrix) run serially through complementary name filters; their aggregate deadlines made all-parallel execution unreliable. Profiles, brokers and authority are never shared. New unmatched tests enter the parallel group; update the serial pattern when adding a composite case. A failed group stops the gate without an automatic retry. Keep the original case deadlines, polling, sandbox and assertions.
+
+Shared `extension-harness.mjs` helpers include a 32-event synthetic-only native-job trace with counts, fixed result codes and relative timing, never text/targets/receipts. The supervised Gemini fault injector captures its mode before awaiting browser execution; a fake deferred-call regression verifies later modes cannot alter an earlier invocation. Public connection tests use genuine Enter activation with visible/enabled and trusted-user-gesture assertions to avoid background-popup mouse stability waits; this is not installed-toolbar acceptance.
 
 Browser-test rules: launch Chromium with `chromiumSandbox: true`, because Playwright otherwise adds `--no-sandbox`; use disposable profiles and an isolated HOME broker; wait for the current-user, owner-only socket before connecting; keep the original timeouts and assertions. Test copies of the extension may get temporary host permissions, and automated popup navigation does not grant `activeTab`, so these tests do not prove real toolbar approval. Installed-toolbar and live checks are separate, human-assisted evidence.
 
