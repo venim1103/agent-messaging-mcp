@@ -695,7 +695,7 @@ async function chatJobBinding(check: ChatBrowserJob) {
   const tab = await browser.tabs.get(target.tabId);
   const expectedUrl = target.provider === "gemini" ? target.url : grant?.url ?? tab.url;
   if (!grant || grant.documentId !== target.documentId || grant.reloadPending || !isLiveStoredExpiry(grant.expiresAt)
-    || !tab.active || tab.url !== expectedUrl || !expectedUrl
+    || (!tab.active && grant.expiresAt !== null) || tab.url !== expectedUrl || !expectedUrl
     || (target.provider === "gemini" ? grant.url !== target.url
       : expectedUrl !== "http://127.0.0.1:8787/" && expectedUrl !== richFixtureUrl)) return null;
   const validIdentity = target.provider === "gemini"
@@ -706,10 +706,10 @@ async function chatJobBinding(check: ChatBrowserJob) {
       .then(([identity]) => identity?.frameId === 0 && identity.documentId === target.documentId && identity.result === "fixture-alpha");
   const current = await browser.tabs.get(target.tabId);
   const stillGranted = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
-  if (!validIdentity || !current.active || current.url !== expectedUrl || check.expiresAt <= Date.now()
+  if (!validIdentity || (!current.active && stillGranted?.expiresAt !== null) || current.url !== expectedUrl || check.expiresAt <= Date.now()
     || stillGranted?.documentId !== target.documentId || stillGranted.reloadPending || chatTabUpdates.has(target.tabId)
     || !isLiveStoredExpiry(stillGranted.expiresAt) || stillGranted.url !== grant.url) return null;
-  return { expectedUrl, expiresAt: Math.min(check.expiresAt, stillGranted.expiresAt ?? Infinity) };
+  return { expectedUrl, expiresAt: Math.min(check.expiresAt, stillGranted.expiresAt ?? Infinity), allowHidden: stillGranted.expiresAt === null };
 }
 
 async function completeChatBrowserJob(check: ChatBrowserJob, observation: ChatJobObservation): Promise<void> {
@@ -733,10 +733,7 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
   try {
     const binding = await chatJobBinding(check);
     if (binding) {
-      if (check.phase === "fill") await browser.scripting.executeScript({
-        target: { tabId: check.target.tabId, documentIds: [check.target.documentId] }, func: installDraftOwnershipTracker
-      });
-      const args = { expectedUrl: binding.expectedUrl, text: check.text };
+      const args = { expectedUrl: binding.expectedUrl, text: check.text, ...(binding.allowHidden ? { allowHidden: true as const } : {}) };
       const provePrepared = check.phase !== "fill";
       const result = check.target.provider === "gemini"
         ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
@@ -753,6 +750,11 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
           : await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
             func: inspectFixturePreflight, args: [{ expectedUrl: binding.expectedUrl, text: check.leftover.text, draftState: "prepared" }] });
         checked = previous[0];
+      }
+      if (check.phase === "fill" && checked?.frameId === 0 && checked.documentId === check.target.documentId && checked.result?.ok) {
+        await browser.scripting.executeScript({
+          target: { tabId: check.target.tabId, documentIds: [check.target.documentId] }, func: installDraftOwnershipTracker
+        });
       }
       if (checked?.frameId === 0 && checked.documentId === check.target.documentId && checked.result
         && await chatJobBinding(check)) {
@@ -801,7 +803,8 @@ async function submitTrackedChatDraft(check: ChatBrowserJob): Promise<void> {
         if (current && current.expectedUrl === binding.expectedUrl) {
           observation = { ok: false, code: "DISPATCH_UNCERTAIN" };
           const args = { expectedUrl: current.expectedUrl, text: check.text,
-            operationId: check.operationId, attemptId: check.jobId, expiresAt: current.expiresAt };
+            operationId: check.operationId, attemptId: check.jobId, expiresAt: current.expiresAt,
+            ...(current.allowHidden ? { allowHidden: true as const } : {}) };
           const result = check.target.provider === "gemini"
             ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
               func: submitGeminiDraft, args: [args] })

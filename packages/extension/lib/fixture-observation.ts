@@ -54,7 +54,7 @@ export function captureFixtureSnapshot(): { messages: FixtureMessage[]; omittedB
 }
 
 export function inspectFixturePreflight(input: {
-  expectedUrl: string; text: string; draftState?: "empty" | "prepared"
+  expectedUrl: string; text: string; draftState?: "empty" | "prepared"; allowHidden?: true
 }): FixturePreflight {
   const fixtureUrl = "http://127.0.0.1:8787/";
   const richUrl = `${fixtureUrl}?editor=rich`;
@@ -65,8 +65,10 @@ export function inspectFixturePreflight(input: {
     return { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" };
   }
   const draftState = input.draftState === undefined ? "empty" : input.draftState;
-  if (draftState !== "empty" && draftState !== "prepared") return { ok: false, code: "COMPOSER_UNAVAILABLE" };
-  if (draftState === "prepared" && document.visibilityState !== "visible") return { ok: false, code: "TARGET_CHANGED" };
+  if ((draftState !== "empty" && draftState !== "prepared") || (input.allowHidden !== undefined && input.allowHidden !== true)) {
+    return { ok: false, code: "COMPOSER_UNAVAILABLE" };
+  }
+  if (draftState === "prepared" && document.visibilityState !== "visible" && input.allowHidden !== true) return { ok: false, code: "TARGET_CHANGED" };
   const roots = document.querySelectorAll<HTMLElement>("main[data-conversation-id]");
   if (roots.length !== 1 || roots[0]?.dataset.conversationId !== "fixture-alpha") return { ok: false, code: "TARGET_CHANGED" };
   const visible = (element: HTMLElement) => element.getClientRects().length > 0
@@ -118,13 +120,14 @@ export function inspectFixturePreflight(input: {
 
 export function fillFixtureDraft(input: {
   expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number;
-  leftover?: { operationId: string; text: string }
+  leftover?: { operationId: string; text: string }; allowHidden?: true
 }): FixtureFill {
   const fixtureUrl = "http://127.0.0.1:8787/";
   const richUrl = `${fixtureUrl}?editor=rich`;
   const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
     || typeof input.attemptId !== "string" || !identifier.test(input.attemptId)
+    || (input.allowHidden !== undefined && input.allowHidden !== true)
     || !Number.isSafeInteger(input.expiresAt) || input.expiresAt <= Date.now()
     || input.expiresAt > Date.now() + 4_000) return { ok: false, code: "FILL_UNAVAILABLE" };
   if ((input.expectedUrl !== fixtureUrl && input.expectedUrl !== richUrl)
@@ -144,7 +147,7 @@ export function fillFixtureDraft(input: {
   if (attempts.has(input.attemptId) || attempts.size >= 100) return { ok: false, code: "FILL_UNAVAILABLE" };
   attempts.add(input.attemptId);
   const inspect = () => {
-    if (location.href !== input.expectedUrl || document.visibilityState !== "visible") {
+    if (location.href !== input.expectedUrl || (document.visibilityState !== "visible" && input.allowHidden !== true)) {
       return { ok: false as const, code: "TARGET_CHANGED" as const };
     }
     const roots = document.querySelectorAll<HTMLElement>("main[data-conversation-id]");
@@ -285,13 +288,14 @@ export async function reserveFixtureSubmitAttempt(input: { operationId: string; 
 export const reserveBrowserSubmitAttempt = reserveFixtureSubmitAttempt;
 
 export function submitFixtureDraft(input: {
-  expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number
+  expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number; allowHidden?: true
 }): FixtureSubmit {
   const fixtureUrl = "http://127.0.0.1:8787/";
   const richUrl = `${fixtureUrl}?editor=rich`;
   const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
-    || input.attemptId !== input.operationId || !Number.isSafeInteger(input.expiresAt)) {
+    || input.attemptId !== input.operationId || !Number.isSafeInteger(input.expiresAt)
+    || (input.allowHidden !== undefined && input.allowHidden !== true)) {
     return { ok: false, code: "DISPATCH_UNAVAILABLE" };
   }
   const scope = globalThis as typeof globalThis & { fixtureSubmitAttempts?: Set<string> };
@@ -302,7 +306,7 @@ export function submitFixtureDraft(input: {
     return { ok: false, code: "DISPATCH_UNAVAILABLE" };
   }
   if ((input.expectedUrl !== fixtureUrl && input.expectedUrl !== richUrl)
-    || location.href !== input.expectedUrl || window.top !== window || document.visibilityState !== "visible") {
+    || location.href !== input.expectedUrl || window.top !== window || (document.visibilityState !== "visible" && input.allowHidden !== true)) {
     return { ok: false, code: "TARGET_CHANGED" };
   }
   if (typeof input.text !== "string" || !input.text || input.text !== input.text.trim() || input.text.includes("\r")
@@ -310,7 +314,7 @@ export function submitFixtureDraft(input: {
     return { ok: false, code: "DISPATCH_UNAVAILABLE" };
   }
   const inspect = () => {
-    if (location.href !== input.expectedUrl || document.visibilityState !== "visible" || input.expiresAt <= Date.now()) {
+    if (location.href !== input.expectedUrl || (document.visibilityState !== "visible" && input.allowHidden !== true) || input.expiresAt <= Date.now()) {
       return { ok: false as const, code: "TARGET_CHANGED" as const };
     }
     const roots = document.querySelectorAll<HTMLElement>("main[data-conversation-id]");

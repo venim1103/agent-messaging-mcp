@@ -13,7 +13,7 @@ Build a **browser-chat integration**, not a general browser automation MCP serve
 - An MCP interface exposes a small set of chat operations with structured results.
 - A generic, user-configurable DOM adapter covers conventional chat layouts; reviewed site adapters handle applications such as Gemini and WhatsApp Web.
 - Use TypeScript throughout. Use the official MCP SDK, WXT for extension development, and Playwright for feasibility experiments and end-to-end testing.
-- For current visible-chat input, use reviewed page functions with exact-document, draft and operation guards (D6). Do not expose raw browser commands or arbitrary JavaScript to the agent.
+- For chat input, use reviewed page functions with exact-document, draft and operation guards (D6, D11a). Do not expose raw browser commands or arbitrary JavaScript to the agent.
 
 **The important qualification:** generic discovery is achievable; universally reliable sending and complete history extraction from every chat website are not. The product should publish capabilities and refuse unsupported operations rather than guess.
 
@@ -30,7 +30,7 @@ For the first supported AI-chat integration, use Gemini's browser interface. It 
 
 **Revision (2026-10-12, D13a, D13b):** Multiple agents may connect to the same chat, each with one trusted popup approval for its own autonomous access. The person must see the connected-agent count and a distinguishable entry for each agent, and be able to remove one agent's access without disconnecting the others. Each agent keeps its own grant and request/operation ownership; new or revoked agents cannot join automatically.
 
-For now everything runs in the Podman devcontainer (D12), and the chat tab must stay visible, though its own window is fine; later a hidden tab must work too (D11). Section 17 records the decisions behind this. The original scope below assumed per-message approval; where it differs, the target experience wins.
+For now everything runs in the Podman devcontainer (D12). Approval requires the selected visible chat; an already approved autonomous connection may operate in that exact chat while hidden without activating its tab (D11a). Supervised operations remain visible-only. Current synthetic/installed evidence and limits are in HANDOFF.md. Section 17 records the decisions behind this. The original scope below assumed per-message approval; where it differs, the target experience wins.
 
 ### Initial scope
 
@@ -152,7 +152,7 @@ Version the internal message protocol. Include request IDs, connection generatio
 
 The current extension requires only `activeTab`, `scripting`, `storage` and `nativeMessaging`. Fixture and Gemini origins are optional host permissions requested through trusted popup actions. Avoid blanket host permissions and browser-history/cookie permissions. Inject scripts only into the selected, approved document.
 
-**Decision (2026-10-19, D6):** Remove both legacy debugger input probes and the required `debugger` permission. The connected writer remains the visible-chat implementation; this change does not enable hidden-tab input.
+**Decision (2026-10-19, D6):** Remove both legacy debugger input probes and the required `debugger` permission. Retain the connected page writer; D6 itself does not enable hidden input. The separately approved D11a extends only autonomous operations to hidden tabs without new permissions.
 
 If a future reviewed input driver needs `debugger`, Chrome requires it at install time, not in `optional_permissions`. It is powerful and not technically restricted by `activeTab`; a runtime checkbox cannot add it or constrain its underlying privilege. Such a driver and permission change require a separate decision. [6]
 
@@ -544,8 +544,8 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D9 Gemini outcome evidence: decided.** The append-only rule in section 10.
 - **D10 Unconfirmed sends: decided.** Resolve from page evidence and pause only the affected conversation across all owners when still unclear, with a one-click popup resolution. New keyed attempts use the shared conversation barrier; legacy unkeyed attempts remain globally blocking (section 10, D13a).
 - **D10a Leftover draft: decided (2026-10-13).** The user permits clearing only the agent's own exactly matching unsent leftover draft, never a person's draft. Require fresh target/ownership evidence and resolve uncertainty first; no retry or restored authority. See section 10. This policy is not a live-test grant.
-- **D11 Hidden tab: decided, phased.** First the chat tab must stay visible; its own window is fine, so "active tab of the current window" relaxes to "visible tab". Later a hidden tab must work too, so that only closing the tab or the browser disconnects.
-- **D11a Hidden page-writer contract: open (2026-10-19).** Synthetic-only feasibility found native insertion/trusted input and one scripted submit work in genuinely hidden local textarea/rich fixtures without debugger permission. This is not Gemini or connected-operation acceptance. Proposed next phase: reuse reviewed page functions only for an already approved exact autonomous chat, without activating its tab or changing the foreground tab. Keep visible trusted-popup admission, owner/document/URL binding, original deadlines, composer serialization, fresh read/proof, durable intent, one activation and conservative outcomes. Retain supervised visible-only behavior and refuse unknown/nonempty drafts; do not relax D10a provenance on visibility loss. No new permission, driver or live test is authorized by feasibility. Ask before implementing this contract.
+- **D11 Hidden tab: decided, phased.** The first phase required a visible chat, including its own window. D11a approves the second autonomous hidden-tab phase; supervised operations remain visible-only. Hiding a tab does not itself create or renew a connection; closure, target change, revocation and the other connection-ending rules remain.
+- **D11a Hidden page-writer contract: decided (2026-10-19).** After synthetic feasibility, the person approved synthetic-first implementation. Reuse reviewed page functions only for an already approved exact autonomous chat, without activating its tab or changing the foreground tab. Keep visible trusted-popup admission, owner/document/URL binding, original deadlines, composer serialization, fresh read/proof, durable intent, persistent reservation, one activation and conservative outcomes. Derive the hidden allowance inside the extension from its stored autonomous grant, never agent input. Retain supervised visible-only defaults; refuse human/unknown drafts and do not relax D10a provenance on visibility loss. This decision authorizes no live test, new permission or general browser driver.
 - **D12 Target platform: decided.** Keep the devcontainer: container Chromium, native host, broker and MCP server in one container (section 12).
 - **D13 Connection start: decided.** The person clicks **Connect this chat** first and the agent picks the chat up (section 4).
 - **D13a Agent binding: revised and decided (2026-10-12).** Multiple agents may connect to the same chat. Show how many and which agents have access, with individual removal. Supersedes the earlier exclusive-recipient decision and the several-facade refusal proposal. Grants, requests and operations remain individually owned; writes to the shared composer must be serialized. Section 7 explains the facade identity limit.

@@ -12,12 +12,16 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { chromium } from "playwright-core";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
+import { fillFixtureDraft, inspectFixturePreflight, submitFixtureDraft } from "../../packages/extension/lib/fixture-observation.ts";
+import { fillGeminiDraft, inspectGeminiDraft, submitGeminiDraft } from "../../packages/extension/lib/gemini-observation.ts";
 import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs } from "./extension-harness.mjs";
 
 async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
   const setPhase = trackTestPhase(testContext, outcome === "expired_read" ? `${provider} read expiry`
     : outcome === "removed_probes" ? `${provider} removed probes` : `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
   const retainedDraft = ["not_sent", "not_sent_changed", "lost_settle", "owned_leftover"].includes(outcome);
+  const hiddenSend = outcome === "hidden_send" || outcome === "hidden_send_rich";
+  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend;
   let mcpClient;
   let publicSendCancellation;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
@@ -58,7 +62,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       signalCode: broker.signalCode, stderr: brokerStderr
     })}`);
     setPhase("browser startup");
-    if (outcome === "own_window" || outcome === "hidden") {
+    if (realVisibility) {
       visibilityBrowser = spawn("/usr/bin/chromium", ["--headless=new", "--remote-debugging-address=127.0.0.1",
         "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check",
         "--disable-background-networking", `--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`, "about:blank"],
@@ -147,7 +151,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       });</script></body></html>` : await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8");
     await fixture.route(provider === "gemini" ? "https://gemini.google.com/**" : "http://127.0.0.1:8787/**",
       route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
-    const rich = outcome === "lost_script" || outcome === "worker_crash" || outcome === "removed_probes";
+    const rich = outcome === "lost_script" || outcome === "worker_crash" || outcome === "removed_probes" || outcome === "hidden_send_rich";
     const url = provider === "gemini" ? "https://gemini.google.com/app/synthetic-neutral-submit?hl=en"
       : `http://127.0.0.1:8787/${rich ? "?editor=rich" : ""}`;
     await fixture.goto(url);
@@ -203,7 +207,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       await connect.press("Enter", { timeout: 4000 });
       assert.deepEqual(await popup.evaluate(() => globalThis.visibilityApprovalGesture), { trusted: true, active: true });
       await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("1 connected"), null,
-        { timeout: 4000, polling: outcome === "own_window" || outcome === "hidden" ? 100 : "raf" });
+        { timeout: 4000, polling: realVisibility ? 100 : "raf" });
       const pickup = autonomous === "public"
         ? (await mcpClient.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent
         : (await facade.waitForConnection(0)).payload;
@@ -341,11 +345,13 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
         await fixture.bringToFront();
         const hidden = outcome === "hidden";
+        const inactive = hidden || hiddenSend;
+        let foregroundTabId;
         const hiddenDraft = "Synthetic hidden-tab human draft must remain";
         if (hidden) {
           await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").fill(hiddenDraft);
         }
-        if (outcome === "own_window" || hidden) {
+        if (realVisibility) {
           const windows = await worker.evaluate(async ({ tabId, hidden }) => {
             const chat = await chrome.tabs.get(tabId);
             if (hidden) await chrome.tabs.create({ windowId: chat.windowId, url: "about:blank", active: true });
@@ -354,12 +360,28 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             const [selected] = await chrome.tabs.query({ active: true, currentWindow: true });
             return { chatWindowId: chat.windowId, currentWindowId: current.id, selectedTabId: selected.id,
               chatActive: (await chrome.tabs.get(tabId)).active };
-          }, { tabId: selected.tabId, hidden });
-          assert.equal(windows.chatActive, !hidden);
+          }, { tabId: selected.tabId, hidden: inactive });
+          foregroundTabId = windows.selectedTabId;
+          assert.equal(windows.chatActive, !inactive);
           assert.notEqual(windows.selectedTabId, selected.tabId);
-          if (!hidden) assert.notEqual(windows.currentWindowId, windows.chatWindowId);
-          if (hidden) await fixture.waitForFunction(() => document.visibilityState === "hidden", null, { timeout: 4000, polling: 100 });
-          assert.equal(await fixture.evaluate(() => document.visibilityState), hidden ? "hidden" : "visible");
+          if (!inactive) assert.notEqual(windows.currentWindowId, windows.chatWindowId);
+          if (inactive) await fixture.waitForFunction(() => document.visibilityState === "hidden", null, { timeout: 4000, polling: 100 });
+          assert.equal(await fixture.evaluate(() => document.visibilityState), inactive ? "hidden" : "visible");
+        }
+        if (hiddenSend) {
+          const before = await fixture.evaluate(() => ({ html: document.body.innerHTML, focus: document.activeElement?.outerHTML }));
+          const operationId = crypto.randomUUID();
+          const input = { expectedUrl: fixture.url(), text: argumentsValue.text, operationId,
+            attemptId: crypto.randomUUID(), expiresAt: Date.now() + 4000 };
+          const inspected = provider === "gemini"
+            ? await fixture.evaluate(inspectGeminiDraft, { ...input, draftMode: "prepared", checkSubmit: true })
+            : await fixture.evaluate(inspectFixturePreflight, { ...input, draftState: "prepared" });
+          assert.deepEqual(inspected, { ok: false, code: "TARGET_CHANGED" });
+          assert.deepEqual(provider === "gemini" ? await fixture.evaluate(fillGeminiDraft, input)
+            : await fixture.evaluate(fillFixtureDraft, input), { ok: false, code: "TARGET_CHANGED" });
+          assert.deepEqual(provider === "gemini" ? await fixture.evaluate(submitGeminiDraft, { ...input, attemptId: operationId })
+            : await fixture.evaluate(submitFixtureDraft, { ...input, attemptId: operationId }), { ok: false, code: "TARGET_CHANGED" });
+          assert.deepEqual(await fixture.evaluate(() => ({ html: document.body.innerHTML, focus: document.activeElement?.outerHTML })), before);
         }
         if (["revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit"].includes(outcome)) {
           const cancelled = outcome.startsWith("cancel_");
@@ -455,12 +477,25 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         }
         const result = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
         const status = result.structuredContent;
-        const expectedState = outcome === "observed" || outcome === "own_window" ? "sent" : outcome === "lost_settle" ? "unresolved" : "not_sent";
+        if (inactive) {
+          assert.equal(await fixture.evaluate(() => document.visibilityState), "hidden");
+          assert.deepEqual(await worker.evaluate(async tabId => ({ active: (await chrome.tabs.get(tabId)).active,
+            foregroundTabId: (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id }), selected.tabId),
+          { active: false, foregroundTabId });
+        }
+        const expectedState = outcome === "observed" || outcome === "own_window" || hiddenSend ? "sent" : outcome === "lost_settle" ? "unresolved" : "not_sent";
         const sendDiagnostic = result.isError !== (expectedState !== "sent") || status.failureStage
           ? JSON.stringify({ provider, outcome, state: status.state, code: status.code, failureStage: status.failureStage,
             jobs: await worker.evaluate(() => globalThis.browserJobTrace) }) : undefined;
         assert.equal(result.isError, expectedState !== "sent", sendDiagnostic);
         assert.equal(status.state, expectedState, sendDiagnostic);
+        if (hiddenSend) {
+          const snapshot = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+          assert.equal(snapshot.isError, undefined);
+          assert.equal(snapshot.structuredContent.messages.at(-1).text, argumentsValue.text);
+          assert.equal(await fixture.evaluate(() => document.visibilityState), "hidden");
+          assert.equal(await worker.evaluate(async () => (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id), foregroundTabId);
+        }
         assert.equal(status.retryAllowed, false);
         if (hidden) assert.equal(status.code, "DISPATCH_UNAVAILABLE");
         assert.match(status.recoveryToken, /^[0-9a-f]{64}$/);
@@ -910,6 +945,14 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
 }
 
 for (const provider of ["fixture", "gemini"]) {
+  if (provider === "fixture") test("public fixture sends from a hidden rich empty composer without activating its tab", { timeout: 15000 }, async testContext => {
+    testContext.signal.throwIfAborted();
+    await exerciseChatDispatch("hidden_send_rich", provider, testContext, "public");
+  });
+  test(`public ${provider} sends from a hidden empty composer without activating its tab`, { timeout: 15000 }, async testContext => {
+    testContext.signal.throwIfAborted();
+    await exerciseChatDispatch("hidden_send", provider, testContext, "public");
+  });
   test(`public ${provider} removed debugger probes cannot change a human draft`, { timeout: 15000 }, async testContext => {
     testContext.signal.throwIfAborted();
     await exerciseChatDispatch("removed_probes", provider, testContext, "public");

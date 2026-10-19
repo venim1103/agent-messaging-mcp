@@ -1,12 +1,12 @@
 export type GeminiRenderedMessage = { direction: "incoming" | "outgoing"; text: string; truncated?: true;
   generationState?: "streaming" | "complete" };
 
-export function inspectGeminiDraft(input: { expectedUrl: string; text: string; draftMode?: "empty" | "prepared"; checkSubmit?: boolean }):
+export function inspectGeminiDraft(input: { expectedUrl: string; text: string; draftMode?: "empty" | "prepared"; checkSubmit?: boolean; allowHidden?: true }):
   { ok: true; editor: "contenteditable" } | { ok: false;
     code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE" } {
   const failed = (code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE") =>
     ({ ok: false as const, code });
-  if (!input || window.top !== window || document.visibilityState !== "visible"
+  if (!input || window.top !== window || (document.visibilityState !== "visible" && input.allowHidden !== true)
     || location.href !== input.expectedUrl || location.origin !== "https://gemini.google.com") return failed("TARGET_CHANGED");
   const url = new URL(location.href);
   const route = url.pathname.split("/").filter(Boolean);
@@ -15,7 +15,8 @@ export function inspectGeminiDraft(input: { expectedUrl: string; text: string; d
   if (typeof input.text !== "string" || input.text.length > 2048
     || new TextEncoder().encode(input.text).length > 4000 || !input.text.trim()
     || (input.draftMode !== undefined && input.draftMode !== "empty" && input.draftMode !== "prepared")
-    || (input.checkSubmit !== undefined && typeof input.checkSubmit !== "boolean")) {
+    || (input.checkSubmit !== undefined && typeof input.checkSubmit !== "boolean")
+    || (input.allowHidden !== undefined && input.allowHidden !== true)) {
     return failed("UNSUPPORTED_MESSAGE_TEXT");
   }
   const visible = (element: HTMLElement) => element.getClientRects().length > 0
@@ -61,13 +62,13 @@ export function inspectGeminiDraft(input: { expectedUrl: string; text: string; d
 }
 
 export function fillGeminiDraft(input: { expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number;
-  leftover?: { operationId: string; text: string } }):
+  leftover?: { operationId: string; text: string }; allowHidden?: true }):
   { ok: true; editor: "contenteditable" } | { ok: false;
     code: "FILL_UNAVAILABLE" | "FILL_UNCERTAIN" | "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_PRESENT" } {
   const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
     || typeof input.attemptId !== "string" || !identifier.test(input.attemptId)
-    || !Number.isSafeInteger(input.expiresAt)) return { ok: false, code: "FILL_UNAVAILABLE" };
+    || !Number.isSafeInteger(input.expiresAt) || (input.allowHidden !== undefined && input.allowHidden !== true)) return { ok: false, code: "FILL_UNAVAILABLE" };
   const scope = globalThis as typeof globalThis & {
     geminiDraftFillAttempts?: Set<string>;
     agentDraftOwnership?: import("./draft-ownership").DraftOwnershipTracker;
@@ -90,7 +91,7 @@ export function fillGeminiDraft(input: { expectedUrl: string; text: string; oper
   if (url.href.length > 512 || url.username || url.password || url.hash || route.length !== 2
     || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return { ok: false, code: "TARGET_CHANGED" };
   const inspect = (filled = false) => {
-    if (location.href !== input.expectedUrl || document.visibilityState !== "visible") return { ok: false as const, code: "TARGET_CHANGED" as const };
+    if (location.href !== input.expectedUrl || (document.visibilityState !== "visible" && input.allowHidden !== true)) return { ok: false as const, code: "TARGET_CHANGED" as const };
     const visible = (element: HTMLElement) => element.getClientRects().length > 0 && getComputedStyle(element).visibility === "visible";
     const regions = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);
     if (regions.length !== 1) return { ok: false as const, code: "TARGET_CHANGED" as const };
@@ -155,12 +156,13 @@ export function fillGeminiDraft(input: { expectedUrl: string; text: string; oper
   }
 }
 
-export function submitGeminiDraft(input: { expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number }):
+export function submitGeminiDraft(input: { expectedUrl: string; text: string; operationId: string; attemptId: string; expiresAt: number; allowHidden?: true }):
   { ok: true; editor: "contenteditable"; activated: true } | { ok: false;
     code: "DISPATCH_UNAVAILABLE" | "DISPATCH_UNCERTAIN" | "TARGET_CHANGED" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE" } {
   const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
-    || input.attemptId !== input.operationId || !Number.isSafeInteger(input.expiresAt)) return { ok: false, code: "DISPATCH_UNAVAILABLE" };
+    || input.attemptId !== input.operationId || !Number.isSafeInteger(input.expiresAt)
+    || (input.allowHidden !== undefined && input.allowHidden !== true)) return { ok: false, code: "DISPATCH_UNAVAILABLE" };
   const scope = globalThis as typeof globalThis & { geminiSubmitAttempts?: Set<string> };
   const attempts = scope.geminiSubmitAttempts ??= new Set<string>();
   if (attempts.has(input.operationId) || attempts.size >= 100) return { ok: false, code: "DISPATCH_UNAVAILABLE" };
@@ -175,7 +177,7 @@ export function submitGeminiDraft(input: { expectedUrl: string; text: string; op
   if (url.href.length > 512 || url.username || url.password || url.hash || route.length !== 2
     || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return { ok: false, code: "TARGET_CHANGED" };
   const inspect = () => {
-    if (location.href !== input.expectedUrl || document.visibilityState !== "visible") return { ok: false as const, code: "TARGET_CHANGED" as const };
+    if (location.href !== input.expectedUrl || (document.visibilityState !== "visible" && input.allowHidden !== true)) return { ok: false as const, code: "TARGET_CHANGED" as const };
     const visible = (element: HTMLElement) => element.getClientRects().length > 0 && getComputedStyle(element).visibility === "visible";
     const regions = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);
     if (regions.length !== 1) return { ok: false as const, code: "TARGET_CHANGED" as const };

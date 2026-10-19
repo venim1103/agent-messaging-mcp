@@ -6,7 +6,7 @@ You choose the conversation and approve each assistant once. That assistant can 
 
 Reply waiting uses page completion indicators where available and quiet-period estimates otherwise.
 
-> **Experimental prototype.** Not ready for everyday use or personal conversations. Sending is tested with local and simulated chats; sending in the actual Google Gemini web app is not yet verified. Messages observed on the page are not proof of delivery.
+> **Experimental prototype.** Not ready for everyday use or personal conversations. Browser and site support is limited; background-tab reliability on real sites is unverified. Messages observed on the page are not proof of delivery.
 
 ## Documentation
 

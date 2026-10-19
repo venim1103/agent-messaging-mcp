@@ -1804,9 +1804,6 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
       assert.equal(otherRead.isError, undefined);
       assert.notDeepEqual(otherRead.structuredContent.cursor, firstRead.structuredContent.cursor);
       setPhase("owner removal and lifecycle");
-      if (scenario === "failure") {
-        await popup.locator("#agent-panel").screenshot({ path: join(tmpdir(), `agent-messaging-${provider}-autonomous.png`) });
-      }
       const firstAgentId = await row("Autonomous one").getAttribute("data-agent-id");
       if (scenario === "reload" || scenario === "reload-failure") {
         const originalDocument = await worker.evaluate(async key => (await chrome.storage.session.get(key))[key].documentId, key);
