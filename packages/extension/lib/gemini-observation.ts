@@ -418,6 +418,44 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
         .some(icon => icon.getAttribute("data-mat-icon-name") === "stop" || icon.textContent?.trim() === "stop"));
   const pendingControls = [...regions[0]!.querySelectorAll<HTMLElement>('button[aria-label*="Stop" i], mat-progress-spinner, [role="progressbar"]')]
     .some(signalVisible);
+  const readText = (element: HTMLElement): string | null => {
+    const rendered = element.innerText;
+    if (rendered.trim() || document.visibilityState !== "hidden") return rendered;
+    let autoContent = false;
+    for (let ancestor: HTMLElement | null = element; ancestor; ancestor = ancestor.parentElement) {
+      const style = getComputedStyle(ancestor);
+      if (ancestor.hasAttribute("hidden") || style.display === "none"
+        || style.visibility !== "visible" || style.contentVisibility === "hidden") return "";
+      if (style.contentVisibility === "auto") autoContent = true;
+      if (ancestor === timeline) break;
+    }
+    if (!autoContent) return rendered;
+    let visited = 0;
+    let failed = false;
+    const parts: string[] = [];
+    const collect = (node: Node, depth: number): void => {
+      if (++visited > 4096 || depth > 64) { failed = true; return; }
+      if (node.nodeType === Node.TEXT_NODE) {
+        const value = node.textContent ?? "";
+        const whiteSpace = node.parentElement ? getComputedStyle(node.parentElement).whiteSpace : "normal";
+        parts.push(whiteSpace === "normal" || whiteSpace === "nowrap" ? value.replace(/\s+/g, " ") : value);
+        return;
+      }
+      if (!(node instanceof HTMLElement) || node.matches("script, style, noscript, template, [hidden]")) return;
+      const style = getComputedStyle(node);
+      if (style.display === "none" || style.visibility !== "visible" || style.contentVisibility === "hidden") return;
+      if (node.localName === "br") { parts.push("\n"); return; }
+      const block = !["inline", "inline-block", "inline-flex", "inline-grid", "contents"].includes(style.display);
+      if (block) parts.push("\n");
+      for (const child of node.childNodes) {
+        collect(child, depth + 1);
+        if (failed) return;
+      }
+      if (block) parts.push("\n");
+    };
+    collect(element, 0);
+    return failed ? null : parts.join("").replace(/\n{3,}/g, "\n\n").trim();
+  };
   const messages: GeminiRenderedMessage[] = [];
   let omittedBefore = rows.length > 32;
   for (const [index, row] of rows.entries()) {
@@ -428,11 +466,19 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
       if (content.length !== 1) return null;
       const lines = [...content[0]!.querySelectorAll<HTMLElement>("p.query-text-line")].filter(visible);
       if (!lines.length) return null;
-      text = lines.map((line) => line.innerText).join("\n").trim();
+      const queryLines: string[] = [];
+      for (const line of lines) {
+        const captured = readText(line);
+        if (captured === null) return null;
+        queryLines.push(captured);
+      }
+      text = queryLines.join("\n").trim();
     } else {
       const content = row.querySelectorAll<HTMLElement>("model-response-content");
       if (content.length !== 1) return null;
-      text = content[0]!.innerText.trim();
+      const captured = readText(content[0]!);
+      if (captured === null) return null;
+      text = captured.trim();
     }
     if (!text && row.localName === "model-response") continue;
     if (!text) return null;

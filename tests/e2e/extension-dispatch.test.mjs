@@ -13,11 +13,12 @@ import { chromium } from "playwright-core";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { fillFixtureDraft, inspectFixturePreflight, submitFixtureDraft } from "../../packages/extension/lib/fixture-observation.ts";
-import { fillGeminiDraft, inspectGeminiDraft, submitGeminiDraft } from "../../packages/extension/lib/gemini-observation.ts";
+import { captureGeminiSnapshot, fillGeminiDraft, inspectGeminiDraft, submitGeminiDraft } from "../../packages/extension/lib/gemini-observation.ts";
 import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs } from "./extension-harness.mjs";
 
 async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
-  const setPhase = trackTestPhase(testContext, outcome === "expired_read" ? `${provider} read expiry`
+  const setPhase = trackTestPhase(testContext, outcome === "hidden_structured_reply" ? `${provider} hidden structured reply`
+    : outcome === "expired_read" ? `${provider} read expiry`
     : outcome === "removed_probes" ? `${provider} removed probes` : `${autonomous ? "autonomous " : ""}${provider} submit ${outcome}`);
   const hiddenSettlement = outcome === "hidden_not_sent" || outcome === "hidden_lost_settle";
   const lostSettle = outcome === "lost_settle" || outcome === "hidden_lost_settle";
@@ -29,7 +30,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
   const hiddenNavigated = outcome === "hidden_navigate_after_fill" || outcome === "hidden_navigate_after_submit";
   const hiddenTargetEnded = hiddenClosed || hiddenNavigated;
   const hiddenWorkerRestart = outcome === "hidden_worker_after_fill" || outcome === "hidden_worker_after_submit";
-  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenTargetEnded || hiddenWorkerRestart;
+  const hiddenReply = outcome === "hidden_structured_reply";
+  const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenTargetEnded || hiddenWorkerRestart || hiddenReply;
   let mcpClient;
   let publicSendCancellation;
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
@@ -225,7 +227,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       assert.equal(connection.expiresAt, null);
       assert.deepEqual(connection.capabilities, ["read", "send"]);
       if (autonomous === "public") {
-        setPhase(outcome === "expired_read" ? "public read expiry" : "public autonomous send");
+        setPhase(outcome === "expired_read" ? "public read expiry" : hiddenReply ? "public structured reply reads" : "public autonomous send");
         assert.match(await popup.locator("#connection-consent").textContent(), /site changes may interrupt access/);
         assert.equal(await popup.locator("#status").textContent(), "Agent connected.");
         if (outcome === "removed_probes") {
@@ -353,10 +355,10 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
         await fixture.bringToFront();
         const hidden = outcome === "hidden";
-        const inactive = hidden || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenTargetEnded || hiddenWorkerRestart;
+        const inactive = hidden || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenTargetEnded || hiddenWorkerRestart || hiddenReply;
         let foregroundTabId;
         const hiddenDraft = "Synthetic hidden-tab human draft must remain";
-        if (hidden) {
+        if (hidden || hiddenReply) {
           await fixture.locator(provider === "gemini" ? "[contenteditable]" : "#message").fill(hiddenDraft);
         }
         if (realVisibility) {
@@ -375,6 +377,127 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           if (!inactive) assert.notEqual(windows.currentWindowId, windows.chatWindowId);
           if (inactive) await fixture.waitForFunction(() => document.visibilityState === "hidden", null, { timeout: 4000, polling: 100 });
           assert.equal(await fixture.evaluate(() => document.visibilityState), inactive ? "hidden" : "visible");
+        }
+        if (hiddenReply) {
+          const grant = await worker.evaluate(async tabId => (await chrome.storage.session.get(`gemini-grant-${tabId}`))[`gemini-grant-${tabId}`], selected.tabId);
+          assert.ok(grant);
+          setPhase("creating structured reply while genuinely hidden");
+          await fixture.evaluate(() => {
+            const query = document.querySelector("user-query");
+            query.style.contentVisibility = "auto";
+            query.style.containIntrinsicSize = "auto 80px";
+            const response = document.createElement("model-response");
+            response.style.display = "block";
+            response.style.contentVisibility = "auto";
+            response.style.containIntrinsicSize = "auto 180px";
+            const content = document.createElement("model-response-content");
+            content.style.display = "block";
+            const card = document.createElement("section");
+            const icon = document.createElement("span");
+            icon.setAttribute("role", "img");
+            icon.setAttribute("aria-label", "Synthetic card icon");
+            icon.textContent = "Synthetic card";
+            card.append(icon);
+            const summary = document.createElement("p");
+            summary.textContent = "Synthetic trailing summary must be readable";
+            content.append(card, summary);
+            for (const style of ["display:none", "visibility:hidden", "content-visibility:hidden"]) {
+              const excluded = document.createElement("span");
+              excluded.style.cssText = `display:block;${style}`;
+              excluded.textContent = "Excluded synthetic card text";
+              content.append(excluded);
+            }
+            const script = document.createElement("script");
+            script.type = "application/json";
+            script.textContent = JSON.stringify({ excluded: "Excluded synthetic script text" });
+            content.append(script);
+            response.append(content);
+            for (const name of ["section", "div"]) {
+              const marker = document.createElement(name);
+              marker.setAttribute("aria-busy", "false");
+              marker.textContent = "Synthetic completion marker";
+              response.append(marker);
+            }
+            const copy = document.createElement("button");
+            copy.setAttribute("aria-label", "Copy");
+            copy.textContent = "Copy";
+            response.append(copy);
+            document.querySelector("infinite-scroller").append(response);
+          });
+          let replyText;
+          for (const visible of [false, true, false]) {
+            if (visible) await fixture.bringToFront();
+            else await worker.evaluate(tabId => chrome.tabs.update(tabId, { active: true }), foregroundTabId);
+            await fixture.waitForFunction(expected => document.visibilityState === expected, visible ? "visible" : "hidden",
+              { timeout: 4000, polling: 100 });
+            setPhase(visible ? "reading identical structured reply visible" : "reading structured reply hidden");
+            const snapshot = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId, limit: 1 } });
+            assert.equal(snapshot.isError, undefined, JSON.stringify(snapshot.structuredContent));
+            const reply = snapshot.structuredContent.messages.at(-1);
+            assert.equal(reply.direction, "incoming", reply.direction === "incoming" ? undefined
+              : JSON.stringify({ snapshot: snapshot.structuredContent, captured: await fixture.evaluate(captureGeminiSnapshot, fixture.url()) }));
+            assert.match(reply.text, /Synthetic card/);
+            assert.match(reply.text, /Synthetic trailing summary must be readable/);
+            assert.doesNotMatch(reply.text, /Excluded/);
+            replyText ??= reply.text;
+            assert.equal(reply.text, replyText);
+            assert.equal(reply.generationState, "complete");
+            const waited = await mcpClient.callTool({ name: "chat_wait_for_reply", arguments: { connectionId: connection.connectionId, timeoutMs: 1500 } });
+            assert.equal(waited.structuredContent.timedOut, false);
+            assert.equal(waited.structuredContent.reply.text, replyText);
+            assert.equal(await fixture.locator("[contenteditable]").innerText(), hiddenDraft);
+            assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 0);
+            assert.deepEqual(await worker.evaluate(async tabId => (await chrome.storage.session.get(`gemini-grant-${tabId}`))[`gemini-grant-${tabId}`], selected.tabId), grant);
+            assert.deepEqual(await worker.evaluate(async tabId => ({ active: (await chrome.tabs.get(tabId)).active,
+              foregroundTabId: (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id }), selected.tabId),
+            { active: visible, foregroundTabId: visible ? selected.tabId : foregroundTabId });
+          }
+          setPhase("hidden reply without completion evidence");
+          await fixture.evaluate(() => {
+            for (const marker of document.querySelectorAll('model-response [aria-busy], model-response button')) marker.remove();
+          });
+          const unknown = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId, limit: 1 } });
+          assert.equal(unknown.isError, undefined);
+          assert.equal(unknown.structuredContent.messages.at(-1).generationState, "unknown");
+          assert.equal(unknown.structuredContent.messages.at(-1).text, replyText);
+          const pending = await mcpClient.callTool({ name: "chat_wait_for_reply", arguments: { connectionId: connection.connectionId, timeoutMs: 1000 } });
+          assert.deepEqual(pending.structuredContent, { timedOut: true });
+          setPhase("hidden text exclusion and bounds");
+          await fixture.evaluate(() => {
+            document.querySelector("infinite-scroller").style.contentVisibility = "auto";
+            document.querySelector("model-response").style.contentVisibility = "hidden";
+          });
+          const excluded = await fixture.evaluate(captureGeminiSnapshot, fixture.url());
+          assert.ok(excluded);
+          assert.equal(excluded.messages.some(message => message.direction === "incoming"), false);
+          await fixture.evaluate(() => {
+            document.querySelector("model-response").style.contentVisibility = "auto";
+            const content = document.querySelector("model-response-content");
+            content.replaceChildren();
+            let parent = content;
+            for (let depth = 0; depth < 65; depth++) {
+              const child = document.createElement("div");
+              parent.append(child);
+              parent = child;
+            }
+            parent.textContent = "Synthetic depth limit";
+          });
+          assert.equal(await fixture.evaluate(captureGeminiSnapshot, fixture.url()), null);
+          await fixture.evaluate(() => {
+            const content = document.querySelector("model-response-content");
+            content.replaceChildren();
+            const fragment = document.createDocumentFragment();
+            for (let count = 0; count < 4096; count++) fragment.append(document.createElement("span"));
+            content.append(fragment);
+          });
+          assert.equal(await fixture.evaluate(captureGeminiSnapshot, fixture.url()), null);
+          await fixture.evaluate(() => { document.querySelector("model-response-content").textContent = "Synthetic bounded text ".repeat(1000); });
+          const bounded = await fixture.evaluate(captureGeminiSnapshot, fixture.url());
+          assert.ok(bounded);
+          assert.equal(bounded.messages.at(-1).text.length, 16000);
+          assert.equal(bounded.messages.at(-1).truncated, true);
+          for (const phase of ["fill", "proof", "submit", "settle"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
+          return;
         }
         if (hiddenSend) {
           const before = await fixture.evaluate(() => ({ html: document.body.innerHTML, focus: document.activeElement?.outerHTML }));
@@ -1186,6 +1309,10 @@ for (const provider of ["fixture", "gemini"]) {
   if (provider === "fixture") test("public fixture sends from a hidden rich empty composer without activating its tab", { timeout: 15000 }, async testContext => {
     testContext.signal.throwIfAborted();
     await exerciseChatDispatch("hidden_send_rich", provider, testContext, "public");
+  });
+  if (provider === "gemini") test("public gemini reads structured replies hidden and visible on one connection", { timeout: 15000 }, async testContext => {
+    testContext.signal.throwIfAborted();
+    await exerciseChatDispatch("hidden_structured_reply", provider, testContext, "public");
   });
   test(`public ${provider} sends from a hidden empty composer without activating its tab`, { timeout: 15000 }, async testContext => {
     testContext.signal.throwIfAborted();
