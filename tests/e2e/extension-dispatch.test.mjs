@@ -497,7 +497,9 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             card.append(icon);
             const summary = document.createElement("p");
             summary.textContent = "Synthetic trailing summary must be readable";
-            content.append(card, summary);
+            const quantity = document.createElement("p");
+            quantity.innerHTML = 'Synthetic quantity: <span class="katex"><span class="katex-mathml" style="position:absolute;overflow:hidden;clip:rect(1px,1px,1px,1px);width:1px;height:1px">Excluded synthetic duplicate equation</span><span class="katex-html" aria-hidden="true">2 + 2 = 4</span></span>.';
+            content.append(card, summary, quantity);
             for (const style of ["display:none", "visibility:hidden", "content-visibility:hidden"]) {
               const excluded = document.createElement("span");
               excluded.style.cssText = `display:block;${style}`;
@@ -535,6 +537,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
               : JSON.stringify({ snapshot: snapshot.structuredContent, captured: await fixture.evaluate(captureGeminiSnapshot, fixture.url()) }));
             assert.match(reply.text, /Synthetic card/);
             assert.match(reply.text, /Synthetic trailing summary must be readable/);
+            assert.match(reply.text, /Synthetic quantity: 2 \+ 2 = 4\./);
             assert.doesNotMatch(reply.text, /Excluded/);
             replyText ??= reply.text;
             assert.equal(reply.text, replyText);

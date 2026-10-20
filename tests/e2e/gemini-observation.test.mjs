@@ -626,6 +626,85 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
   }
 });
 
+test("Gemini capture avoids clipped duplicate math representations", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("https://gemini.google.com/**", route => route.fulfill({
+      contentType: "text/html; charset=utf-8", body: `<!doctype html><html><head><style>
+        main, infinite-scroller, model-response, model-response-content { display:block }
+        .katex-mathml { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(1px,1px,1px,1px) }
+      </style></head><body><main><infinite-scroller>
+        <model-response><model-response-content><p>Synthetic quantity: <span class="katex"><span class="katex-mathml">Synthetic duplicate expression: 2 + 2 = 4</span><span class="katex-html" aria-hidden="true">2 + 2 = 4</span></span>.</p></model-response-content></model-response>
+      </infinite-scroller></main></body></html>`
+    }));
+    await page.goto("https://gemini.google.com/app/synthetic-math");
+    const capture = async () => {
+      const before = await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML,
+        scroll: [scrollX, scrollY] }));
+      const result = await page.evaluate(captureGeminiSnapshot, page.url());
+      assert.deepEqual(await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML,
+        scroll: [scrollX, scrollY] })), before);
+      return result;
+    };
+    const expected = { omittedBefore: false, messages: [
+      { direction: "incoming", text: "Synthetic quantity: 2 + 2 = 4." }
+    ] };
+    assert.deepEqual(await capture(), expected);
+    await page.locator(".katex-mathml").evaluate(alternative => {
+      alternative.style.clip = "rect(0px, 0px, 0px, 0px)";
+      alternative.innerHTML = '<math><semantics><mrow><mn>2</mn><mo>+</mo><mn>2</mn><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">Excluded synthetic source annotation</annotation></semantics></math>';
+    });
+    assert.deepEqual(await capture(), expected);
+    for (const scenario of ["visible-alternative", "missing-visual", "hidden-visual", "unrecognized-renderer"]) {
+      await page.reload();
+      await page.evaluate(scenario => {
+        if (scenario === "visible-alternative") document.querySelector(".katex-mathml").removeAttribute("class");
+        else if (scenario === "missing-visual") document.querySelector(".katex-html").remove();
+        else if (scenario === "hidden-visual") document.querySelector(".katex-html").hidden = true;
+        else document.querySelector(".katex").className = "unrecognized-renderer";
+      }, scenario);
+      const rendered = await page.locator("model-response-content").innerText();
+      assert.deepEqual(await capture(), { omittedBefore: false, messages: [{ direction: "incoming", text: rendered.trim() }] }, scenario);
+    }
+    await page.reload();
+    await page.evaluate(() => {
+      document.querySelector("main").style.marginTop = "20000px";
+      const row = document.querySelector("model-response");
+      row.style.contentVisibility = "auto";
+      row.style.containIntrinsicSize = "auto 100px";
+      const content = document.querySelector("model-response-content");
+      for (const style of ["display:none", "visibility:hidden", "content-visibility:hidden"]) {
+        const excluded = document.createElement("div");
+        excluded.style.cssText = style;
+        excluded.textContent = "Excluded synthetic hidden text";
+        content.append(excluded);
+      }
+    });
+    assert.equal(await page.locator("model-response-content").innerText(), "");
+    assert.deepEqual(await capture(), expected);
+    for (const limit of ["nodes", "depth"]) {
+      await page.reload();
+      await page.evaluate(limit => {
+        const content = document.querySelector("model-response-content");
+        if (limit === "nodes") {
+          for (let index = 0; index < 4096; index++) content.append(document.createElement("span"));
+        } else {
+          let parent = content;
+          for (let depth = 0; depth < 65; depth++) {
+            const child = document.createElement("span");
+            parent.append(child);
+            parent = child;
+          }
+        }
+      }, limit);
+      assert.equal(await capture(), null, limit);
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
 test("Gemini capture reads auto-contained offscreen messages in a visible chat", { timeout: 15000 }, async () => {
   const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
   try {

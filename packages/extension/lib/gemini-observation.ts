@@ -420,7 +420,16 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
     .some(signalVisible);
   const readText = (element: HTMLElement): string | null => {
     const rendered = element.innerText;
-    if (rendered.trim()) return rendered;
+    const clippedMath = new Set([...element.querySelectorAll<HTMLElement>(".katex > .katex-mathml")].filter(alternative => {
+      const visual = alternative.parentElement?.querySelector<HTMLElement>(":scope > .katex-html");
+      if (!(visual instanceof HTMLElement) || visual.hidden) return false;
+      const style = getComputedStyle(alternative);
+      const visualStyle = getComputedStyle(visual);
+      return style.position === "absolute" && style.overflow === "hidden"
+        && ["rect(1px, 1px, 1px, 1px)", "rect(0px, 0px, 0px, 0px)"].includes(style.clip)
+        && visualStyle.display !== "none" && visualStyle.visibility === "visible" && visualStyle.contentVisibility !== "hidden";
+    }));
+    if (rendered.trim() && !clippedMath.size) return rendered;
     let autoContent = false;
     for (let ancestor: HTMLElement | null = element; ancestor; ancestor = ancestor.parentElement) {
       const style = getComputedStyle(ancestor);
@@ -429,7 +438,7 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
       if (style.contentVisibility === "auto") autoContent = true;
       if (ancestor === timeline) break;
     }
-    if (!autoContent) return rendered;
+    if (!autoContent && !clippedMath.size) return rendered;
     let visited = 0;
     let failed = false;
     const parts: string[] = [];
@@ -441,7 +450,7 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
         parts.push(whiteSpace === "normal" || whiteSpace === "nowrap" ? value.replace(/\s+/g, " ") : value);
         return;
       }
-      if (!(node instanceof HTMLElement) || node.matches("script, style, noscript, template, [hidden]")) return;
+      if (!(node instanceof HTMLElement) || node.matches("script, style, noscript, template, [hidden]") || clippedMath.has(node)) return;
       const style = getComputedStyle(node);
       if (style.display === "none" || style.visibility !== "visible" || style.contentVisibility === "hidden") return;
       if (node.localName === "br") { parts.push("\n"); return; }
