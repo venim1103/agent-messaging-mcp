@@ -351,6 +351,103 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             arguments: { connectionId: connection.connectionId } })).structuredContent;
           assert.equal(beforeSend.messages.at(-1).generationState, "complete");
         }
+        if (provider === "gemini" && outcome === "rolling_window") {
+          setPhase("seeding a saturated 32-row chat");
+          await fixture.bringToFront();
+          await fixture.evaluate(() => {
+            const timeline = document.querySelector("infinite-scroller");
+            timeline.style.cssText = "display:block;max-height:200px;overflow:auto";
+            timeline.replaceChildren();
+            for (let index = 0; index < 32; index++) {
+              const row = document.createElement(index % 2 === 0 ? "user-query" : "model-response");
+              row.style.display = "block";
+              const content = document.createElement(index % 2 === 0 ? "user-query-content" : "model-response-content");
+              const line = document.createElement("p");
+              if (index % 2 === 0) line.className = "query-text-line";
+              line.textContent = `Synthetic bounded baseline row ${index}`;
+              content.append(line);
+              row.append(content);
+              timeline.append(row);
+            }
+            document.querySelector('button[type="submit"]').addEventListener("click", () => {
+              const response = document.createElement("model-response");
+              response.style.display = "block";
+              const content = document.createElement("model-response-content");
+              content.textContent = `Synthetic bounded reply ${globalThis.fixtureSubmitCount}`;
+              response.append(content);
+              for (const name of ["section", "div"]) {
+                const marker = document.createElement(name);
+                marker.setAttribute("aria-busy", "false");
+                marker.textContent = "Synthetic completion marker";
+                response.append(marker);
+              }
+              const copy = document.createElement("button");
+              copy.setAttribute("aria-label", "Copy");
+              copy.textContent = "Copy";
+              response.append(copy);
+              timeline.append(response);
+            });
+          });
+          const baseline = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+          assert.equal(baseline.isError, undefined);
+          assert.equal(baseline.structuredContent.messages.length, 32);
+          assert.equal(baseline.structuredContent.omittedBefore, false);
+          let cursor = baseline.structuredContent.cursor;
+          const grant = await worker.evaluate(async tabId => (await chrome.storage.session.get(`gemini-grant-${tabId}`))[`gemini-grant-${tabId}`], selected.tabId);
+          assert.ok(grant);
+          for (let turn = 1; turn <= 2; turn++) {
+            testContext.signal.throwIfAborted();
+            setPhase(`public rolling-window send ${turn}`);
+            const args = { connectionId: connection.connectionId, text: `Synthetic rolling-window public message ${turn}`,
+              idempotencyKey: crypto.randomUUID() };
+            const sent = await mcpClient.callTool({ name: "chat_send_message", arguments: args });
+            assert.equal(sent.isError, false, JSON.stringify({ status: sent.structuredContent,
+              jobs: await worker.evaluate(() => globalThis.browserJobTrace) }));
+            const status = sent.structuredContent;
+            assert.equal(status.state, "sent");
+            assert.equal(status.code, "PAGE_SENT");
+            assert.equal(status.retryAllowed, false);
+            assert.equal(status.resolution.source, "page");
+            const { recoveryToken, ...withoutReceipt } = status;
+            assert.match(recoveryToken, /^[0-9a-f]{64}$/);
+            assert.deepEqual((await mcpClient.callTool({ name: "chat_send_message", arguments: args })).structuredContent, withoutReceipt);
+            assert.equal((await facade.getPreparedOperation(status.operationId, recoveryToken)).payload.resolution.outcome, "sent");
+            const snapshot = await mcpClient.callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+            assert.equal(snapshot.isError, undefined);
+            assert.equal(snapshot.structuredContent.messages.length, 32);
+            assert.equal(snapshot.structuredContent.omittedBefore, true);
+            assert.equal(snapshot.structuredContent.messages[0].text, `Synthetic bounded baseline row ${turn * 2}`);
+            assert.equal(snapshot.structuredContent.messages.at(-2).text, args.text);
+            assert.equal(snapshot.structuredContent.messages.at(-1).text, `Synthetic bounded reply ${turn}`);
+            assert.equal(snapshot.structuredContent.cursor.epoch, cursor.epoch);
+            assert.ok(snapshot.structuredContent.cursor.sequence > cursor.sequence);
+            cursor = snapshot.structuredContent.cursor;
+            const reply = await mcpClient.callTool({ name: "chat_wait_for_reply", arguments: {
+              connectionId: connection.connectionId, timeoutMs: 1500
+            } });
+            assert.equal(reply.isError, undefined);
+            assert.equal(reply.structuredContent.timedOut, false);
+            assert.equal(reply.structuredContent.omittedBefore, true);
+            assert.equal(reply.structuredContent.reply.text, `Synthetic bounded reply ${turn}`);
+            assert.equal(reply.structuredContent.reply.generationState, "complete");
+            assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), turn);
+            assert.equal(await fixture.locator("[contenteditable]").innerText(), "");
+            assert.equal(await worker.evaluate(async operationId =>
+              (await chrome.storage.local.get(`gemini-submit-attempt-${operationId}`))[`gemini-submit-attempt-${operationId}`], status.operationId), true);
+            for (const phase of ["fill", "proof", "submit", "settle"]) assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
+          }
+          assert.equal(await fixture.locator("infinite-scroller user-query, infinite-scroller model-response").count(), 36);
+          assert.deepEqual(await worker.evaluate(async tabId => (await chrome.storage.session.get(`gemini-grant-${tabId}`))[`gemini-grant-${tabId}`], selected.tabId), grant);
+          const { DatabaseSync } = await import("node:sqlite");
+          const journal = new DatabaseSync(join(profile, ".config/agent-messaging-mcp/operations.sqlite"), { readOnly: true });
+          try {
+            assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get().count, 2);
+            assert.equal(journal.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions WHERE outcome = 'sent' AND source = 'page'").get().count, 2);
+          } finally { journal.close(); }
+          assert.deepEqual((await mcpClient.callTool({ name: "chat_disconnect", arguments: { connectionId: connection.connectionId } })).structuredContent,
+            { disconnected: true });
+          return;
+        }
         const argumentsValue = { connectionId: connection.connectionId, text: "Synthetic public autonomous message",
           idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
         await fixture.bringToFront();
@@ -1327,7 +1424,7 @@ for (const provider of ["fixture", "gemini"]) {
     await exerciseChatDispatch("expired_read", provider, testContext, "public");
   });
   for (const outcome of ["observed", "own_window", "hidden", "hidden_disconnect_after_fill", "hidden_disconnect_after_submit", "hidden_not_sent", "hidden_lost_settle", "hidden_expired_fill", "hidden_expired_submit", "hidden_close_after_fill", "hidden_close_after_submit", "hidden_navigate_after_fill", "hidden_navigate_after_submit", "revoked_after_fill", "revoked_after_submit", "cancel_after_fill", "cancel_after_submit", "not_sent", "lost_settle", "owned_leftover",
-    ...(provider === "gemini" ? ["hidden_worker_after_fill", "hidden_worker_after_submit"] : [])]) {
+    ...(provider === "gemini" ? ["hidden_worker_after_fill", "hidden_worker_after_submit", "rolling_window"] : [])]) {
     test(`public ${provider} send uses one connection and returns idempotent status (${outcome})`, { timeout: 15000 }, async testContext => {
       testContext.signal.throwIfAborted();
       await exerciseChatDispatch(outcome, provider, testContext, "public");

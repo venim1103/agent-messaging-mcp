@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
-import { MAX_FIXTURE_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget,
+import { MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget,
   type FixtureSnapshot, type GeminiSnapshot } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
@@ -1729,26 +1729,48 @@ export class PreparedMessageOperations {
     const baseline = this.geminiDispatchBaselines.get(operationId);
     const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
     const status = this.dispatchStatus(operationId);
-    if (!operation || operation.owner !== owner || !baseline || baseline.omittedBefore
+    if (!operation || operation.owner !== owner || !baseline
       || baseline.messages.some(message => message.truncated) || !live || !this.sameGeminiTarget(operation.target, live)
       || status?.state !== "dispatch_uncertain" || this.ambiguousEvidence.has(operationId)) return null;
     const snapshot = this.requests.getGeminiSnapshot(owner, operation.connectionId, now);
-    if (!snapshot || snapshot === "not_ready" || snapshot.omittedBefore || snapshot.capturedAt < status.startedAt
+    if (!snapshot || snapshot === "not_ready" || snapshot.capturedAt < status.startedAt
       || snapshot.capturedAt > now || snapshot.cursor.epoch !== baseline.cursor.epoch
       || snapshot.cursor.sequence < baseline.cursor.sequence) return null;
     const events = this.requests.readGeminiEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
     if (!events || events === "not_ready" || events.state !== "ok"
       || events.cursor.sequence !== snapshot.cursor.sequence) return null;
     let appended = false;
+    let droppedRows = 0;
     for (const capture of [...events.events.map(event => geminiObservationSchema.safeParse(event.payload)),
       geminiObservationSchema.safeParse({ kind: "gemini_snapshot", omittedBefore: snapshot.omittedBefore, messages: snapshot.messages })]) {
-      if (!capture.success || capture.data.omittedBefore || capture.data.messages.some(message => message.truncated)
-        || baseline.messages.some((message, index) => message.direction !== capture.data.messages[index]?.direction
-          || message.text !== capture.data.messages[index]?.text)) {
+      if (!capture.success || capture.data.messages.some(message => message.truncated)) {
         this.ambiguousEvidence.add(operationId);
         return null;
       }
-      const added = capture.data.messages.slice(baseline.messages.length);
+      let offset = 0;
+      if (baseline.omittedBefore || capture.data.omittedBefore) {
+        if (baseline.messages.length !== MAX_GEMINI_SNAPSHOT_MESSAGES
+          || capture.data.messages.length !== MAX_GEMINI_SNAPSHOT_MESSAGES || !capture.data.omittedBefore) {
+          this.ambiguousEvidence.add(operationId);
+          return null;
+        }
+        const offsets = baseline.messages.flatMap((_, start) => baseline.messages.slice(start).every((message, index) =>
+          message.direction === capture.data.messages[index]?.direction && message.text === capture.data.messages[index]?.text)
+          ? [start] : []);
+        const matched = offsets[0];
+        if (offsets.length !== 1 || matched === undefined || matched > 2 || matched < droppedRows
+          || (matched === 0 && !baseline.omittedBefore)) {
+          this.ambiguousEvidence.add(operationId);
+          return null;
+        }
+        offset = matched;
+      } else if (droppedRows > 0 || baseline.messages.some((message, index) =>
+        message.direction !== capture.data.messages[index]?.direction || message.text !== capture.data.messages[index]?.text)) {
+        this.ambiguousEvidence.add(operationId);
+        return null;
+      }
+      droppedRows = offset;
+      const added = capture.data.messages.slice(baseline.messages.length - offset);
       if (!added.length) {
         if (appended) {
           this.ambiguousEvidence.add(operationId);
@@ -1763,6 +1785,7 @@ export class PreparedMessageOperations {
       }
       appended = true;
     }
+    if (!appended && (baseline.omittedBefore || snapshot.omittedBefore)) return null;
     return Object.freeze({ outcome: appended ? "sent" as const : "unchanged" as const, observedAt: snapshot.capturedAt });
   }
 

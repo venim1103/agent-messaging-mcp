@@ -696,6 +696,91 @@ test("staged Gemini durable jobs offer once under original proof lease and remai
   }
 });
 
+test("Gemini dispatch evidence confirms a unique append across the bounded 32-row window", async () => {
+  for (const omittedBaseline of [false, true]) for (const mode of ["outgoing", "reply", "streaming-reply", "metadata-only",
+    "unchanged", "wrong-text", "retained-edit", "transient-edit", "extra-outgoing", "incoming-first", "drop-three",
+    "short-window", "short-baseline", "unmarked-shift", "backward-window", "outgoing-disappears",
+    "truncated-baseline", "truncated-retained", "truncated-outgoing", "gap", "ambiguous-overlap"]) {
+    const requests = new PendingConnectionRequests();
+    const database = new DatabaseSync(":memory:");
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("Gemini rolling evidence owner");
+    const target = { origin: "https://gemini.google.com" as const, conversationId: "synthetic-rolling-evidence",
+      url: "https://gemini.google.com/app/synthetic-rolling-evidence", tabId: 4, documentId: "synthetic-rolling-document" };
+    const pending = requests.create(owner, 1000);
+    const grant = requests.approveGemini(pending.requestId, target, 2000)!;
+    try {
+      const prepared = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic rolling evidence message", randomUUID(), 2001);
+      const review = ledger.listGeminiReviews(target, 2002).reviews[0]!;
+      ledger.approveGeminiReview(target, prepared.operationId, review.reviewId, 2002);
+      await approveSyntheticGeminiSend(ledger, owner, prepared.operationId, target, 2003);
+      const receipt = ledger.createGeminiRecoveryReceipt(owner, prepared.operationId, 2003);
+      const baseline = Array.from({ length: mode === "short-baseline" ? 31 : 32 }, (_, index) => ({
+        direction: index % 2 === 0 ? "outgoing" as const : "incoming" as const,
+        text: `Synthetic retained row ${mode === "ambiguous-overlap" ? index % 2 : index}`,
+        ...(mode === "truncated-baseline" && index === 10 ? { truncated: true as const } : {})
+      }));
+      requests.publishGeminiSnapshot(target, baseline, 2004, undefined, omittedBaseline);
+      const checkId = await checkSyntheticGeminiDispatch(ledger, owner, prepared.operationId, target, prepared.preview.text, 2005);
+      const dispatch = ledger.requestGeminiDispatch(owner, prepared.operationId, checkId, 2007);
+      assert.equal(ledger.listGeminiDispatchAttempts(2007)[0]?.operationId, prepared.operationId);
+      const outgoing = { direction: "outgoing" as const,
+        text: mode === "wrong-text" ? "Synthetic different outgoing text" : prepared.preview.text,
+        ...(mode === "truncated-outgoing" ? { truncated: true as const } : {}) };
+      const reply = { direction: "incoming" as const, text: "Synthetic rolling reply" };
+      const rolled = [...baseline.slice(1), outgoing];
+      if (mode === "streaming-reply" || mode === "outgoing-disappears") {
+        requests.publishGeminiSnapshot(target, rolled, 2008, undefined, true);
+      } else if (mode === "backward-window") {
+        requests.publishGeminiSnapshot(target, [...baseline.slice(2), outgoing, reply], 2008, undefined, true);
+      } else if (mode === "transient-edit") {
+        requests.publishGeminiSnapshot(target, rolled.map((row, index) => index === 10
+          ? { ...row, text: "Synthetic temporarily changed retained row" } : row), 2008, undefined, true);
+      } else if (mode === "metadata-only") {
+        requests.publishGeminiSnapshot(target, baseline.map((row, index) => index === 31
+          ? { ...row, generationState: "streaming" as const } : row), 2008, undefined, omittedBaseline);
+      } else if (mode === "gap") assert.equal(requests.markGeminiObservationGap(target, 2008), 1);
+      const rows = mode === "unchanged" || mode === "outgoing-disappears" ? baseline
+        : mode === "reply" || mode === "streaming-reply" ? [...baseline.slice(2), outgoing, reply]
+        : mode === "extra-outgoing" ? [...baseline.slice(2), outgoing, outgoing]
+        : mode === "incoming-first" ? [...baseline.slice(2), reply, outgoing]
+        : mode === "drop-three" ? [...baseline.slice(3), outgoing, reply, reply]
+        : mode === "short-window" ? [...baseline.slice(2), outgoing]
+        : mode === "retained-edit" ? rolled.map((row, index) => index === 10
+          ? { ...row, text: "Synthetic edited retained row" } : row)
+        : mode === "truncated-retained" ? rolled.map((row, index) => index === 10
+          ? { ...row, truncated: true as const } : row)
+        : rolled;
+      requests.publishGeminiSnapshot(target, rows, 2009, undefined,
+        mode === "unchanged" || mode === "outgoing-disappears" ? omittedBaseline : mode !== "unmarked-shift");
+      if (mode === "streaming-reply") requests.publishGeminiSnapshot(target,
+        [...baseline.slice(2), outgoing, { ...reply, text: "Synthetic rolling reply continued" }], 2010, undefined, true);
+      assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId,
+        { ok: true, editor: "contenteditable", activated: true }, 2011), mode !== "gap", mode);
+      const result = await dispatch.result;
+      const positive = ["outgoing", "reply", "streaming-reply", "metadata-only"].includes(mode);
+      assert.equal(result.state, positive ? "resolved" : "dispatch_uncertain", `${mode}; omitted baseline: ${omittedBaseline}`);
+      if (result.state === "resolved") assert.deepEqual(result.resolution,
+        { outcome: "sent", source: "page", resolvedAt: mode === "streaming-reply" ? 2010 : 2009 });
+      assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, receipt.recoveryToken), result);
+      assert.deepEqual(ledger.listGeminiDispatchAttempts(2011), []);
+      assert.equal(ledger.completeGeminiDispatch(target, prepared.operationId, prepared.operationId,
+        { ok: true, editor: "contenteditable", activated: true }, 2011), false);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()?.count, positive ? 1 : 0);
+      assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, 2011), null);
+      if (!positive) {
+        requests.publishGeminiSnapshot(target, rolled, 2012, undefined, true);
+        assert.equal(ledger.reconcileGeminiObservation(owner, prepared.operationId, 2012).state,
+          mode === "unchanged" ? "resolved" : "dispatch_uncertain", mode);
+      }
+    } finally {
+      ledger.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
 test("Gemini dispatch evidence requires continuous exact append-only outgoing rows", async () => {
   for (const mode of ["sent", "reply", "streaming-reply", "duplicate", "baseline-edit", "transient-edit", "row-disappears",
     "wrong-text", "incoming-first", "omitted-baseline", "omitted-current", "truncated-baseline", "truncated-outgoing", "gap"]) {
@@ -1108,7 +1193,7 @@ test("autonomous settlement is capped at five seconds and never restores consume
 
 test("autonomous page-not-sent requires fresh terminal proof and continuous unchanged evidence", async testContext => {
   for (const provider of ["fixture", "gemini"] as const) {
-    for (const outcome of ["unchanged", "gap", "prefix-edit", "omitted", "truncated", "no-proof", "draft-changed", "send-unavailable",
+    for (const outcome of ["unchanged", "gap", "prefix-edit", "omitted", "omitted-baseline", "truncated", "no-proof", "draft-changed", "send-unavailable",
       "mismatched-draft", "proof-expired", "no-read", "owner-revoked"] as const) {
       testContext.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 10_000 });
       const requests = new PendingConnectionRequests();
@@ -1121,8 +1206,12 @@ test("autonomous page-not-sent requires fresh terminal proof and continuous unch
           url: "https://gemini.google.com/app/synthetic-terminal-settlement", tabId: 8, documentId: "terminal-settlement" }
         : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
           tabId: 8, documentId: "terminal-settlement" };
-      const baseline = [{ id: "terminal-baseline", direction: "incoming" as const, text: "Synthetic terminal baseline" }];
-      const publish = (challengeId?: string, messages: FixtureSnapshot["messages"] = baseline, omittedBefore = false) => target.origin === "https://gemini.google.com"
+      const baseline = outcome === "omitted-baseline" ? Array.from({ length: 32 }, (_, index) => ({
+        id: `terminal-baseline-${index}`, direction: index % 2 === 0 ? "outgoing" as const : "incoming" as const,
+        text: `Synthetic terminal retained row ${index}`
+      })) : [{ id: "terminal-baseline", direction: "incoming" as const, text: "Synthetic terminal baseline" }];
+      const publish = (challengeId?: string, messages: FixtureSnapshot["messages"] = baseline,
+        omittedBefore = outcome === "omitted-baseline") => target.origin === "https://gemini.google.com"
         ? requests.publishGeminiSnapshot(target, messages.map(message => ({ direction: message.direction, text: message.text,
           ...(message.truncated ? { truncated: true as const } : {}) })), Date.now(), challengeId, omittedBefore)
         : requests.publishFixtureSnapshot(target, messages, Date.now(), challengeId, omittedBefore);
@@ -1184,7 +1273,8 @@ test("autonomous page-not-sent requires fresh terminal proof and continuous unch
           if (outcome === "owner-revoked") {
             requests.disconnect(owner);
             assert.equal(publish(terminalRead.challengeId), 0);
-          } else if (outcome !== "no-read") publish(terminalRead.challengeId, baseline, outcome === "omitted");
+          } else if (outcome !== "no-read") publish(terminalRead.challengeId, baseline,
+            outcome === "omitted" || outcome === "omitted-baseline");
           await Promise.resolve();
         }
         if (outcome !== "unchanged") testContext.mock.timers.tick(1_000);
@@ -1203,6 +1293,8 @@ test("autonomous page-not-sent requires fresh terminal proof and continuous unch
         assert.equal(ledger.requestChatFill(owner, prepared.operationId), null);
         assert.throws(() => ledger.requestChatProof(owner, prepared.operationId), /DISPATCH_CHECK_UNAVAILABLE/);
         assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()?.count,
+          outcome === "unchanged" ? 1 : 0);
         if (outcome === "unchanged") {
           const foreign = Symbol("foreign leftover owner");
           const foreignAgent = requests.registerAgent(foreign, "Synthetic foreign leftover agent");

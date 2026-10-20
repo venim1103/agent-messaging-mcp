@@ -316,7 +316,11 @@ Positive results are UI observations, never acceptance or delivery, and every fi
 
 ### Gemini outcome evidence (decided, D9)
 
-Fixture evidence relies on stable row IDs. Gemini rows have none, so the staged Gemini job always ends `dispatch_uncertain`. Rule: report `observed_in_ui` only when, under continuous observation since the post-consent baseline (same epoch, no gap), a later snapshot equals the baseline rows followed by exactly one new outgoing row whose text equals the prepared text, optionally followed by incoming rows. Window shifts, duplicates, edits or gaps stay uncertain.
+Fixture evidence relies on stable row IDs. Gemini rows have none, so the staged Gemini job initially has `dispatch_uncertain` status until evidence resolves it. For complete snapshots, require continuous observation since the post-consent baseline (same epoch, no gap), with the baseline rows followed by exactly one new outgoing row whose text equals the prepared text, optionally followed by incoming rows. Window shifts outside D9a, duplicates, retained-row edits or gaps stay uncertain.
+
+**D9a (decided 2026-10-20):** Bounded rolling-window page-sent evidence may use an already omitted baseline. Baseline and every omitted capture must contain the maximum 32 rows, with exactly one exact suffix/prefix alignment retaining at least 30 baseline rows. The dropped-row count cannot decrease. Require exactly one matching new outgoing row, optionally followed by one incoming reply; permit that reply to stream. Keep exact owner/target, same-epoch continuous observations, no truncation, no retained-row edits, no ambiguous overlap and no extra outgoing row. Smaller/byte-trimmed or otherwise ambiguous omitted captures stay uncertain.
+
+Changes solely outside the captured window cannot be detected. D9a is bounded page evidence, never provider acceptance/delivery. Partial-window evidence cannot establish `not_sent`, restore authority, retry or resolve the earlier uncertain live attempt. Capture limits, original budgets, durable intent and one-activation rules remain unchanged. The decision authorizes synthetic implementation only, not a live test.
 
 ### Unconfirmed sends (decided, D10)
 
@@ -542,6 +546,7 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D7 Checkpoint size: decided.** One checkpoint per authority boundary when it follows an established pattern, with shorter handoff entries.
 - **D8 Observation window and failure policy: decided.** Publish the newest rows with `omittedBefore`, mark per-message truncation explicitly within the frame limit, and when URL, document and conversation are unchanged skip a failed capture instead of revoking; challenged reads then return `OBSERVATION_UNAVAILABLE`. Identity changes still revoke.
 - **D9 Gemini outcome evidence: decided.** The append-only rule in section 10.
+- **D9a Bounded rolling-window send evidence: decided (2026-10-20).** The person approved the bounded exception in section 10 rather than retaining complete-history-only evidence with pre-dispatch refusal. Synthetic implementation only; no live test is authorized.
 - **D10 Unconfirmed sends: decided.** Resolve from page evidence and pause only the affected conversation across all owners when still unclear, with a one-click popup resolution. New keyed attempts use the shared conversation barrier; legacy unkeyed attempts remain globally blocking (section 10, D13a).
 - **D10a Leftover draft: decided (2026-10-13).** The user permits clearing only the agent's own exactly matching unsent leftover draft, never a person's draft. Require fresh target/ownership evidence and resolve uncertainty first; no retry or restored authority. See section 10. This policy is not a live-test grant.
 - **D11 Hidden tab: decided, phased.** The first phase required a visible chat, including its own window. D11a approves the second autonomous hidden-tab phase; supervised operations remain visible-only. Hiding a tab does not itself create or renew a connection; closure, target change, revocation and the other connection-ending rules remain.
