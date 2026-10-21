@@ -102,6 +102,19 @@ The SHA-256 input is the generated manifest with `version_name` removed, followe
 
 This is local package-identification metadata, not signed integrity attestation, a source-commit ID, companion/broker identity or proof that every old context was reloaded. It neither selects a chat nor reads, approves, renews or sends anything. A matching loaded marker does not establish text fidelity or live-test permission. No new permission, command, network call or browser-control surface is added; public `browser_chat_feasibility` remains the no-browser-data stdio check.
 
+### Local Extension Archive
+
+```bash
+npm run package:extension
+npm run verify:extension
+```
+
+The default command rebuilds the production Chrome extension with WXT, stamps its build marker, verifies the output tree immediately before archiving, and writes a ZIP under `packages/extension/.output` named `browser-chat-mcp-<version>-chrome.zip`. Source archives are explicitly disabled. Only the default Chrome production path is covered; this is not a signed release, store submission or complete companion installer.
+
+For manual loading, extract a successfully produced archive into a new, otherwise empty directory and use Chrome's **Load unpacked** on that directory, not on the ZIP. Keep the normal companion/native-host setup and human reload steps above. Compare the popup's loaded Build marker with the verified package marker before any separately approved live check. Packaging never installs, starts services, opens a browser or grants chat access; it does not include a profile, credentials or companion runtime.
+
+Build/verify failure is not a new archive: an older ZIP may remain at the same filename, so require successful command completion and matching metadata rather than file presence. Use a quiescent build directory; the pre-archive verifier is a consistency check, not protection against concurrent filesystem replacement. Tests compare the exact ZIP entry set and bytes with the verified output and verify an extracted copy; byte-for-byte reproducible ZIP container metadata is not promised.
+
 ## Agent Workflow
 
 ### Popup-first connection
@@ -337,7 +350,7 @@ Extension (`packages/extension`):
 - `entrypoints/popup/`: trusted popup, including local loaded-build metadata.
 - `lib/fixture-observation.ts`: fixture page functions and the persistent submit reservation (`reserveBrowserSubmitAttempt`).
 - `lib/gemini-observation.ts`: Gemini page functions for eligibility, identity, observation, capture, inspection, fill, submit and diagnostics.
-- [packages/extension/wxt.config.ts](packages/extension/wxt.config.ts): manifest, production fingerprint hook and unchanged required/optional permissions.
+- [packages/extension/wxt.config.ts](packages/extension/wxt.config.ts): manifest, production fingerprint and pre-archive verification hooks, disabled source archives and unchanged required/optional permissions.
 - [packages/extension/build-fingerprint.ts](packages/extension/build-fingerprint.ts): Node-only artifact hashing and offline consistency verification; not a browser or broker module.
 - [packages/extension/verify-build.mjs](packages/extension/verify-build.mjs): fixed-target read-only verification CLI with sanitized failure output.
 
@@ -349,6 +362,7 @@ Tests: `tests/fixtures/` holds the synthetic chat page and server. `tests/e2e/ex
 | --- | --- |
 | `npm run build` | Companion `tsc` and extension `wxt build` |
 | `npm run verify:extension` | Read-only consistency check of completed production extension output; never rebuilds or opens a browser |
+| `npm run package:extension` | Rebuilds and verifies the default production Chrome extension, then creates its ZIP; no source archive or installation |
 | `npm run typecheck` | Both packages |
 | `npm run test:unit` | Runs fixture and compiled companion tests; build first, reuses the gate's existing build |
 | `npm run test:unit:build` | Builds the companion, then runs all units; standalone convenience |

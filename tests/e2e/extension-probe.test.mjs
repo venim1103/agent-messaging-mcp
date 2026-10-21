@@ -13,6 +13,7 @@ import { promisify } from "node:util";
 import { runInNewContext } from "node:vm";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { unzipSync } from "fflate";
 import { chromium } from "playwright-core";
 import { fingerprintExtension, verifyExtensionBuild } from "../../packages/extension/build-fingerprint.ts";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
@@ -317,6 +318,58 @@ test("offline extension package verification refuses stale, malformed and linked
       assert.equal(error.stderr, "Extension package verification failed. Rebuild with npm run build:extension before loading it.\n");
       return true;
     });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("extension packaging archives verified artifacts and refuses a stale build before creating a ZIP", { timeout: 30000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-archive-test-"));
+  const builder = join(home, "builder");
+  const execute = promisify(execFile);
+  const cli = fileURLToPath(new URL("../../node_modules/wxt/bin/wxt.mjs", import.meta.url));
+  try {
+    await mkdir(builder);
+    for (const name of ["entrypoints", "lib", "package.json", "wxt.config.ts", "build-fingerprint.ts"]) {
+      await cp(fileURLToPath(new URL(`../../packages/extension/${name}`, import.meta.url)), join(builder, name), { recursive: true });
+    }
+    await symlink(fileURLToPath(new URL("../../node_modules/", import.meta.url)), join(builder, "node_modules"), "dir");
+    await execute(process.execPath, [cli, "zip"], { cwd: builder });
+    const directory = join(builder, ".output", "chrome-mv3");
+    const marker = await verifyExtensionBuild(directory);
+    const archiveName = "browser-chat-mcp-0.0.1-chrome.zip";
+    const archivePath = join(builder, ".output", archiveName);
+    assert.deepEqual((await readdir(join(builder, ".output"))).filter(name => name.endsWith(".zip")), [archiveName]);
+    const entries = unzipSync(await readFile(archivePath));
+    const files = (await readdir(directory, { recursive: true, withFileTypes: true }))
+      .filter(entry => entry.isFile()).map(entry => relative(directory, join(entry.parentPath, entry.name))).sort();
+    assert.deepEqual(Object.keys(entries).sort(), files);
+    const extracted = join(home, "extracted");
+    for (const name of files) {
+      assert.deepEqual(Buffer.from(entries[name]), await readFile(join(directory, name)));
+      const target = join(extracted, name);
+      await mkdir(join(target, ".."), { recursive: true });
+      await writeFile(target, entries[name]);
+    }
+    assert.equal(await verifyExtensionBuild(extracted), marker);
+    await rm(archivePath);
+    const helper = JSON.stringify(fileURLToPath(new URL("../../packages/extension/build-fingerprint.ts", import.meta.url)));
+    await writeFile(join(builder, "build-fingerprint.ts"), `
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { verifyExtensionBuild as verify } from ${helper};
+export { fingerprintExtension } from ${helper};
+export async function verifyExtensionBuild(directory) {
+  await writeFile(join(directory, "unexpected.txt"), "Synthetic stale artifact");
+  return verify(directory);
+}
+`);
+    await assert.rejects(execute(process.execPath, [cli, "zip"], { cwd: builder }), error => {
+      assert.equal(error.code, 1);
+      assert.match(error.stdout + error.stderr, /does not match packaged artifacts/);
+      return true;
+    });
+    await assert.rejects(stat(archivePath), { code: "ENOENT" });
   } finally {
     await rm(home, { recursive: true, force: true });
   }

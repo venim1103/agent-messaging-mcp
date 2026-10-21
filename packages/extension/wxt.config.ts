@@ -1,9 +1,10 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { defineConfig } from "wxt";
-import { fingerprintExtension } from "./build-fingerprint";
+import { fingerprintExtension, verifyExtensionBuild } from "./build-fingerprint";
 
 export default defineConfig({
+  zip: { name: "browser-chat-mcp", zipSources: false },
   hooks: {
     "build:done": async (wxt, output) => {
       if (wxt.config.command === "serve") return;
@@ -11,6 +12,9 @@ export default defineConfig({
       const fingerprint = await fingerprintExtension(wxt.config.outDir, files, output.manifest);
       const manifest = { ...output.manifest, version_name: `${output.manifest.version}+sha256.${fingerprint}` };
       await writeFile(join(wxt.config.outDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+    },
+    "zip:extension:start": async (wxt) => {
+      await verifyExtensionBuild(wxt.config.outDir);
     }
   },
   manifest: {
