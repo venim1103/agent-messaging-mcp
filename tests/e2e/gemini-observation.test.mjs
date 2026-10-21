@@ -652,17 +652,31 @@ test("Gemini capture avoids clipped duplicate math representations", { timeout: 
     ] };
     assert.deepEqual(await capture(), expected);
     await page.locator(".katex-mathml").evaluate(alternative => {
+      alternative.style.clip = "auto";
+      alternative.style.clipPath = "inset(50%)";
+    });
+    assert.deepEqual(await capture(), expected, "zero-area modern clip");
+    await page.locator(".katex-mathml").evaluate(alternative => {
       alternative.style.clip = "rect(0px, 0px, 0px, 0px)";
+      alternative.style.clipPath = "none";
       alternative.innerHTML = '<math><semantics><mrow><mn>2</mn><mo>+</mo><mn>2</mn><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">Excluded synthetic source annotation</annotation></semantics></math>';
     });
     assert.deepEqual(await capture(), expected);
-    for (const scenario of ["visible-alternative", "missing-visual", "hidden-visual", "unrecognized-renderer"]) {
+    for (const scenario of ["visible-alternative", "missing-visual", "hidden-visual", "unrecognized-renderer",
+      "nonzero-modern-clip", "fixed-modern-clip", "overflow-modern-clip"]) {
       await page.reload();
       await page.evaluate(scenario => {
         if (scenario === "visible-alternative") document.querySelector(".katex-mathml").removeAttribute("class");
         else if (scenario === "missing-visual") document.querySelector(".katex-html").remove();
         else if (scenario === "hidden-visual") document.querySelector(".katex-html").hidden = true;
-        else document.querySelector(".katex").className = "unrecognized-renderer";
+        else if (scenario === "unrecognized-renderer") document.querySelector(".katex").className = "unrecognized-renderer";
+        else {
+          const alternative = document.querySelector(".katex-mathml");
+          alternative.style.clip = "auto";
+          alternative.style.clipPath = scenario === "nonzero-modern-clip" ? "inset(49%)" : "inset(50%)";
+          if (scenario === "fixed-modern-clip") alternative.style.position = "fixed";
+          if (scenario === "overflow-modern-clip") alternative.style.overflow = "visible";
+        }
       }, scenario);
       const rendered = await page.locator("model-response-content").innerText();
       assert.deepEqual(await capture(), { omittedBefore: false, messages: [{ direction: "incoming", text: rendered.trim() }] }, scenario);
@@ -683,6 +697,11 @@ test("Gemini capture avoids clipped duplicate math representations", { timeout: 
     });
     assert.equal(await page.locator("model-response-content").innerText(), "");
     assert.deepEqual(await capture(), expected);
+    await page.locator(".katex-mathml").evaluate(alternative => {
+      alternative.style.clip = "auto";
+      alternative.style.clipPath = "inset(50%)";
+    });
+    assert.deepEqual(await capture(), expected, "offscreen modern clip");
     for (const limit of ["nodes", "depth"]) {
       await page.reload();
       await page.evaluate(limit => {

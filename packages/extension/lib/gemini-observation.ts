@@ -426,7 +426,8 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
       const style = getComputedStyle(alternative);
       const visualStyle = getComputedStyle(visual);
       return style.position === "absolute" && style.overflow === "hidden"
-        && ["rect(1px, 1px, 1px, 1px)", "rect(0px, 0px, 0px, 0px)"].includes(style.clip)
+        && (["rect(1px, 1px, 1px, 1px)", "rect(0px, 0px, 0px, 0px)"].includes(style.clip)
+          || style.clipPath === "inset(50%)")
         && visualStyle.display !== "none" && visualStyle.visibility === "visible" && visualStyle.contentVisibility !== "hidden";
     }));
     if (rendered.trim() && !clippedMath.size) return rendered;

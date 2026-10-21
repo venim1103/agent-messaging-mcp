@@ -499,7 +499,9 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             summary.textContent = "Synthetic trailing summary must be readable";
             const quantity = document.createElement("p");
             quantity.innerHTML = 'Synthetic quantity: <span class="katex"><span class="katex-mathml" style="position:absolute;overflow:hidden;clip:rect(1px,1px,1px,1px);width:1px;height:1px">Excluded synthetic duplicate equation</span><span class="katex-html" aria-hidden="true">2 + 2 = 4</span></span>.';
-            content.append(card, summary, quantity);
+            const modernQuantity = document.createElement("p");
+            modernQuantity.innerHTML = 'Synthetic modern quantity: <span class="katex"><span class="katex-mathml" style="position:absolute;overflow:hidden;clip-path:inset(50%);width:1px;height:1px">Excluded synthetic modern equation</span><span class="katex-html" aria-hidden="true">3 + 3 = 6</span></span>.';
+            content.append(card, summary, quantity, modernQuantity);
             for (const style of ["display:none", "visibility:hidden", "content-visibility:hidden"]) {
               const excluded = document.createElement("span");
               excluded.style.cssText = `display:block;${style}`;
@@ -538,6 +540,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             assert.match(reply.text, /Synthetic card/);
             assert.match(reply.text, /Synthetic trailing summary must be readable/);
             assert.match(reply.text, /Synthetic quantity: 2 \+ 2 = 4\./);
+            assert.match(reply.text, /Synthetic modern quantity: 3 \+ 3 = 6\./);
             assert.doesNotMatch(reply.text, /Excluded/);
             replyText ??= reply.text;
             assert.equal(reply.text, replyText);
