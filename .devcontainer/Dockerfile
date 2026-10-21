@@ -19,7 +19,12 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates chromium \
+    && apt-get install -y --no-install-recommends ca-certificates chromium libnss3-tools \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install --global npm@12.1.0
+
+COPY configure-chromium-certificates.sh /usr/local/bin/configure-chromium-certificates
+USER node
+RUN bash /usr/local/bin/configure-chromium-certificates
+USER root
