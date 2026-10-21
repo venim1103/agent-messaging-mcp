@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { once } from "node:events";
-import { chmod, cp, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ import { runInNewContext } from "node:vm";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { chromium } from "playwright-core";
+import { fingerprintExtension } from "../../packages/extension/build-fingerprint.ts";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
@@ -216,6 +217,35 @@ test("extension broker readiness rejects a socket until its permissions are priv
   }
 });
 
+test("extension build fingerprints are deterministic and bind packaged bytes and manifest settings", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-messaging-build-fingerprint-"));
+  try {
+    await writeFile(join(directory, "background.js"), "synthetic worker");
+    await writeFile(join(directory, "popup.js"), "synthetic popup");
+    const manifest = { manifest_version: 3, name: "Synthetic build", version: "0.0.1", permissions: ["storage"] };
+    const before = structuredClone(manifest);
+    const files = ["popup.js", "background.js"];
+    const fingerprint = await fingerprintExtension(directory, files, manifest);
+    assert.match(fingerprint, /^[0-9a-f]{64}$/);
+    const stamped = { ...manifest, version_name: `0.0.1+sha256.${fingerprint}` };
+    await writeFile(join(directory, "manifest.json"), JSON.stringify(stamped));
+    assert.equal(await fingerprintExtension(directory, ["manifest.json", "background.js", "popup.js", "popup.js"], stamped), fingerprint);
+    await writeFile(join(directory, "popup.js"), "changed synthetic popup");
+    assert.notEqual(await fingerprintExtension(directory, files, manifest), fingerprint);
+    await writeFile(join(directory, "popup.js"), "synthetic popup");
+    assert.equal(await fingerprintExtension(directory, files, manifest), fingerprint);
+    assert.notEqual(await fingerprintExtension(directory, ["popup.js"], manifest), fingerprint);
+    await cp(join(directory, "popup.js"), join(directory, "renamed.js"));
+    assert.notEqual(await fingerprintExtension(directory, ["background.js", "renamed.js"], manifest), fingerprint);
+    assert.notEqual(await fingerprintExtension(directory, files, { ...manifest, version: "0.0.2" }), fingerprint);
+    assert.notEqual(await fingerprintExtension(directory, files, { ...manifest, permissions: ["storage", "tabs"] }), fingerprint);
+    await assert.rejects(fingerprintExtension(directory, ["missing.js"], manifest), { code: "ENOENT" });
+    assert.deepEqual(manifest, before);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("isolated Chromium loads the extension, popup, and native host", { timeout: 15000 }, async () => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-extension-test-"));
   const launch = () => chromium.launchPersistentContext(profile, {
@@ -231,10 +261,24 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
     assert.match(extensionId, /^[a-p]{32}$/);
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     assert.equal(await worker.evaluate(() => typeof chrome.storage.session.get), "function");
+    const manifest = await worker.evaluate(() => chrome.runtime.getManifest());
+    assert.match(manifest.version_name ?? "", /^\d+(?:\.\d+){0,3}\+sha256\.[0-9a-f]{64}$/);
+    const packagedManifest = JSON.parse(await readFile(join(extensionDirectory, "manifest.json"), "utf8"));
+    const files = (await readdir(extensionDirectory, { recursive: true, withFileTypes: true }))
+      .filter(entry => entry.isFile()).map(entry => relative(extensionDirectory, join(entry.parentPath, entry.name)));
+    assert.equal(manifest.version_name, `${packagedManifest.version}+sha256.${await fingerprintExtension(extensionDirectory, files, packagedManifest)}`);
+    assert.deepEqual(manifest.permissions, ["activeTab", "scripting", "nativeMessaging", "storage"]);
+    assert.deepEqual(manifest.optional_host_permissions, ["http://127.0.0.1:8787/*", "https://gemini.google.com/*"]);
 
     const popup = await context.newPage();
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);
     assert.equal(await popup.locator("h1").textContent(), "Browser chat");
+    assert.equal(await popup.locator("#build-version").textContent(), `Build ${manifest.version_name}`);
+    assert.equal(await popup.locator("#build-version").evaluate(element => {
+      const bounds = element.getBoundingClientRect();
+      const body = document.body.getBoundingClientRect();
+      return bounds.left >= body.left && bounds.right <= body.right && element.scrollWidth <= element.clientWidth;
+    }), true);
     assert.equal(await popup.getByRole("button", { name: "Inspect this chat" }).count(), 1);
     assert.equal(await popup.getByRole("button", { name: "View pending requests" }).isHidden(), true);
 

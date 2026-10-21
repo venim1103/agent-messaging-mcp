@@ -88,6 +88,18 @@ Running processes keep the code they started with.
 
 Toolbar clicks, extension reloads and profile unlocks are human steps. Ask for them precisely and never assume that an earlier service, grant or approval survived (AGENTS.md).
 
+### Loaded Extension Build Identity
+
+Production `npm run build:extension` stamps the packaged manifest's `version_name` as `<version>+sha256.<64 hex digits>`. The trusted popup displays its loaded manifest's full **Build** value, wrapping inside the existing width. After a human reload, compare it with the package you intended to load:
+
+```bash
+node --input-type=module -e 'import { readFileSync } from "node:fs"; console.log(JSON.parse(readFileSync("packages/extension/.output/chrome-mv3/manifest.json", "utf8")).version_name)'
+```
+
+The SHA-256 input is the generated manifest with `version_name` removed, followed by sorted unique output paths and their bytes, with names/byte lengths framed into the hash. The helper collects no clock, Git state, machine path, browser profile, chat data or credential; it reads only listed package artifacts. The same artifacts/settings reproduce the marker; changed code, files or manifest settings change it. A missing listed output fails the build instead of producing a partial fingerprint. Development/watch builds remain **unversioned**.
+
+This is local package-identification metadata, not signed integrity attestation, a source-commit ID, companion/broker identity or proof that every old context was reloaded. It neither selects a chat nor reads, approves, renews or sends anything. A matching loaded marker does not establish text fidelity or live-test permission. No new permission, command, network call or browser-control surface is added; public `browser_chat_feasibility` remains the no-browser-data stdio check.
+
 ## Agent Workflow
 
 ### Popup-first connection
@@ -320,10 +332,11 @@ Companion (`packages/companion/src`; tests sit beside modules as `*.test.ts` and
 Extension (`packages/extension`):
 
 - `entrypoints/background.ts`: service worker with native watches, approvals, consent handlers, fill, proof and submit executors, revocation and native-bridge diagnostics.
-- `entrypoints/popup/`: trusted popup.
+- `entrypoints/popup/`: trusted popup, including local loaded-build metadata.
 - `lib/fixture-observation.ts`: fixture page functions and the persistent submit reservation (`reserveBrowserSubmitAttempt`).
 - `lib/gemini-observation.ts`: Gemini page functions for eligibility, identity, observation, capture, inspection, fill, submit and diagnostics.
-- `wxt.config.ts`: manifest and required permissions (`activeTab`, `scripting`, `nativeMessaging`, `storage`); fixture/Gemini origins remain optional host permissions.
+- [packages/extension/wxt.config.ts](packages/extension/wxt.config.ts): manifest, production fingerprint hook and unchanged required/optional permissions.
+- [packages/extension/build-fingerprint.ts](packages/extension/build-fingerprint.ts): build-only hashing of generated manifest/settings and packaged bytes; not a browser or broker module.
 
 Tests: `tests/fixtures/` holds the synthetic chat page and server. `tests/e2e/extension-probe.test.mjs` covers full-stack admission, reads and fills; `tests/e2e/extension-dispatch.test.mjs` covers autonomous/supervised dispatch, loss and crashes. Both use disposable Chromium, broker and native host through shared `extension-harness.mjs` readiness/timing helpers. `tests/e2e/fixture-editor.test.mjs` and `tests/e2e/gemini-observation.test.mjs` test page functions on synthetic pages. `tests/diagnostics/clock-probe.c` is optional and must not run without explicit authorization.
 

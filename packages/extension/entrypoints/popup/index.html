@@ -113,10 +113,14 @@
         border-top: 1px solid #d4dbd7;
       }
 
-      #agent-count, .agent-instance {
+      #agent-count, .agent-instance, #build-version {
         font-size: 12px;
         color: #52645d;
         overflow-wrap: anywhere;
+      }
+
+      #build-version {
+        margin: 8px 0 0;
       }
 
       #agent-list {
@@ -153,6 +157,7 @@
         <h1>Browser chat</h1>
         <span class="mode">Experimental</span>
       </header>
+      <p id="build-version">Build unversioned</p>
       <button type="button" id="inspect">Inspect this chat</button>
       <section id="agent-panel" hidden>
         <h2>Agents</h2>

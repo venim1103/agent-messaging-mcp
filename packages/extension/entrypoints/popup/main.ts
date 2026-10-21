@@ -46,6 +46,7 @@ const fixtureReviewButton = document.querySelector<HTMLButtonElement>("#view-fix
 const fixtureFillReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-fill-reviews");
 const fixtureSendReviewButton = document.querySelector<HTMLButtonElement>("#view-fixture-send-reviews");
 const status = document.querySelector<HTMLElement>("#status");
+const buildVersion = document.querySelector<HTMLElement>("#build-version");
 const result = document.querySelector<HTMLElement>("#result");
 const fixtureDocumentStatus = document.querySelector<HTMLElement>("#fixture-document-status");
 const pendingResult = document.querySelector<HTMLElement>("#pending-result");
@@ -112,10 +113,12 @@ function inspectGeminiStructure(): GeminiPreview | null {
 if (!inspectButton || !agentPanel || !agentCount || !agentList || !refreshAgentsButton || !disconnectChatButton
   || !unconfirmedPanel || !unconfirmedStatus || !unconfirmedList || !refreshUnconfirmedButton
   || !pendingButton || !fixtureReviewButton || !fixtureFillReviewButton || !fixtureSendReviewButton
-  || !status || !result || !fixtureDocumentStatus || !pendingResult
+  || !status || !buildVersion || !result || !fixtureDocumentStatus || !pendingResult
   || !pendingTarget || !pendingRequests || !fixtureReviewResult || !fixtureReviewHeading || !fixtureReviews || !conversation || !messages) {
   throw new Error("Fixture probe UI is incomplete");
 }
+
+buildVersion.textContent = `Build ${browser.runtime.getManifest().version_name ?? "unversioned"}`;
 
 let selectedFixtureTab: { id: number; url: string } | null = null;
 let selectedGeminiTab: { id: number; url: string } | null = null;
