@@ -1,19 +1,20 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { once } from "node:events";
-import { chmod, cp, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { runInNewContext } from "node:vm";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { chromium } from "playwright-core";
-import { fingerprintExtension } from "../../packages/extension/build-fingerprint.ts";
+import { fingerprintExtension, verifyExtensionBuild } from "../../packages/extension/build-fingerprint.ts";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
@@ -229,11 +230,14 @@ test("extension build fingerprints are deterministic and bind packaged bytes and
     assert.match(fingerprint, /^[0-9a-f]{64}$/);
     const stamped = { ...manifest, version_name: `0.0.1+sha256.${fingerprint}` };
     await writeFile(join(directory, "manifest.json"), JSON.stringify(stamped));
+    assert.equal(await verifyExtensionBuild(directory), stamped.version_name);
     assert.equal(await fingerprintExtension(directory, ["manifest.json", "background.js", "popup.js", "popup.js"], stamped), fingerprint);
     await writeFile(join(directory, "popup.js"), "changed synthetic popup");
     assert.notEqual(await fingerprintExtension(directory, files, manifest), fingerprint);
+    await assert.rejects(verifyExtensionBuild(directory), /does not match packaged artifacts/);
     await writeFile(join(directory, "popup.js"), "synthetic popup");
     assert.equal(await fingerprintExtension(directory, files, manifest), fingerprint);
+    assert.equal(await verifyExtensionBuild(directory), stamped.version_name);
     assert.notEqual(await fingerprintExtension(directory, ["popup.js"], manifest), fingerprint);
     await cp(join(directory, "popup.js"), join(directory, "renamed.js"));
     assert.notEqual(await fingerprintExtension(directory, ["background.js", "renamed.js"], manifest), fingerprint);
@@ -243,6 +247,78 @@ test("extension build fingerprints are deterministic and bind packaged bytes and
     assert.deepEqual(manifest, before);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("offline extension package verification refuses stale, malformed and linked artifacts", { timeout: 5000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-package-verification-"));
+  const builder = join(home, "builder");
+  const directory = join(builder, ".output", "chrome-mv3");
+  const execute = promisify(execFile);
+  try {
+    await mkdir(join(directory, "chunks"), { recursive: true });
+    await writeFile(join(directory, "background.js"), "synthetic worker");
+    await writeFile(join(directory, "chunks", "popup.js"), "synthetic popup");
+    const manifest = { manifest_version: 3, name: "Synthetic package", version: "0.0.1" };
+    const marker = `0.0.1+sha256.${await fingerprintExtension(directory, ["background.js", "chunks/popup.js"], manifest)}`;
+    const serialized = JSON.stringify({ ...manifest, version_name: marker });
+    const manifestPath = join(directory, "manifest.json");
+    await writeFile(manifestPath, serialized);
+    assert.equal(await verifyExtensionBuild(directory), marker);
+    for (const value of [null, [], 42, manifest, { ...manifest, version_name: "unversioned" }, { ...manifest, version_name: 42 }]) {
+      await writeFile(manifestPath, JSON.stringify(value));
+      await assert.rejects(verifyExtensionBuild(directory));
+    }
+    await writeFile(manifestPath, "{");
+    await assert.rejects(verifyExtensionBuild(directory), SyntaxError);
+    await writeFile(manifestPath, JSON.stringify({ ...manifest, version_name: marker, permissions: ["tabs"] }));
+    await assert.rejects(verifyExtensionBuild(directory), /does not match packaged artifacts/);
+    await writeFile(manifestPath, serialized);
+    await writeFile(join(directory, "extra.js"), "synthetic extra file");
+    await assert.rejects(verifyExtensionBuild(directory), /does not match packaged artifacts/);
+    await rm(join(directory, "extra.js"));
+    await rm(join(directory, "chunks", "popup.js"));
+    await assert.rejects(verifyExtensionBuild(directory), /does not match packaged artifacts/);
+    await writeFile(join(directory, "chunks", "popup.js"), "synthetic popup");
+    const outside = join(home, "outside.txt");
+    await writeFile(outside, "Excluded synthetic outside bytes");
+    await symlink(outside, join(directory, "chunks", "linked.js"));
+    await assert.rejects(verifyExtensionBuild(directory), /non-regular entry/);
+    await rm(join(directory, "chunks", "linked.js"));
+    await rm(manifestPath);
+    await symlink(outside, manifestPath);
+    await assert.rejects(verifyExtensionBuild(directory), /non-regular entry/);
+    await rm(manifestPath);
+    await writeFile(manifestPath, serialized);
+    const linkedDirectory = join(home, "linked-package");
+    await symlink(directory, linkedDirectory, "dir");
+    await assert.rejects(verifyExtensionBuild(linkedDirectory), /must be a real directory/);
+    await assert.rejects(verifyExtensionBuild(join(linkedDirectory, "chunks")), /must be a real directory/);
+    assert.equal(await verifyExtensionBuild(directory), marker);
+    assert.equal(await readFile(manifestPath, "utf8"), serialized);
+    assert.equal(await readFile(outside, "utf8"), "Excluded synthetic outside bytes");
+    for (const name of ["verify-build.mjs", "build-fingerprint.ts"]) {
+      await cp(fileURLToPath(new URL(`../../packages/extension/${name}`, import.meta.url)), join(builder, name));
+    }
+    await writeFile(join(builder, "package.json"), JSON.stringify({ type: "module" }));
+    const cli = join(builder, "verify-build.mjs");
+    const verified = await execute(process.execPath, [cli]);
+    assert.equal(verified.stdout, `Extension package verified: ${marker}\n`);
+    assert.equal(verified.stderr, "");
+    await assert.rejects(execute(process.execPath, [cli, "unexpected"]), error => {
+      assert.equal(error.code, 1);
+      assert.match(error.stderr, /Usage: npm run verify:extension/);
+      return true;
+    });
+    await writeFile(join(directory, "background.js"), "changed synthetic worker");
+    await assert.rejects(execute(process.execPath, [cli]), error => {
+      assert.equal(error.code, 1);
+      assert.equal(error.stdout, "");
+      assert.equal(error.stderr, "Extension package verification failed. Rebuild with npm run build:extension before loading it.\n");
+      return true;
+    });
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });
 

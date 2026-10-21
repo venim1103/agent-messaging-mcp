@@ -13,6 +13,7 @@
     "build": "npm run build:companion && npm run build:extension",
     "build:companion": "npm run build --workspace @agent-messaging/companion",
     "build:extension": "npm run build --workspace @agent-messaging/extension",
+    "verify:extension": "node packages/extension/verify-build.mjs",
     "typecheck": "npm run typecheck --workspace @agent-messaging/companion && npm run typecheck --workspace @agent-messaging/extension",
     "test:unit": "node --test tests/fixtures/*.test.mjs packages/companion/dist/*.test.js",
     "test:unit:build": "npm run build:companion && npm run test:unit",
