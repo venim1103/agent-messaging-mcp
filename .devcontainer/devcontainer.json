@@ -1,7 +1,9 @@
 {
   "name": "Browser Chat MCP (Podman)",
+  "initializeCommand": ["bash", "${localWorkspaceFolder}/.devcontainer/prepare-build.sh"],
   "build": {
-    "dockerfile": "Dockerfile"
+    "dockerfile": "Dockerfile",
+    "context": "."
   },
   "remoteUser": "node",
   "updateRemoteUserUID": false,
