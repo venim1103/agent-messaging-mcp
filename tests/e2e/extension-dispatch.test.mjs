@@ -16,6 +16,13 @@ import { fillFixtureDraft, inspectFixturePreflight, submitFixtureDraft } from ".
 import { captureGeminiSnapshot, fillGeminiDraft, inspectGeminiDraft, submitGeminiDraft } from "../../packages/extension/lib/gemini-observation.ts";
 import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs } from "./extension-harness.mjs";
 
+async function describePublicSendMismatch(result, expectedState, provider, outcome, worker) {
+  const status = result.structuredContent;
+  return result.isError !== (expectedState !== "sent") || status.state !== expectedState || status.failureStage
+    ? JSON.stringify({ provider, outcome, state: status.state, code: status.code, failureStage: status.failureStage,
+      jobs: await worker.evaluate(() => globalThis.browserJobTrace) }) : undefined;
+}
+
 async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
   const setPhase = trackTestPhase(testContext, outcome === "hidden_structured_reply" ? `${provider} hidden structured reply`
     : outcome === "expired_read" ? `${provider} read expiry`
@@ -928,9 +935,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           { active: false, foregroundTabId });
         }
         const expectedState = outcome === "observed" || outcome === "own_window" || hiddenSend ? "sent" : lostSettle ? "unresolved" : "not_sent";
-        const sendDiagnostic = result.isError !== (expectedState !== "sent") || status.failureStage
-          ? JSON.stringify({ provider, outcome, state: status.state, code: status.code, failureStage: status.failureStage,
-            jobs: await worker.evaluate(() => globalThis.browserJobTrace) }) : undefined;
+        const sendDiagnostic = await describePublicSendMismatch(result, expectedState, provider, outcome, worker);
         assert.equal(result.isError, expectedState !== "sent", sendDiagnostic);
         assert.equal(status.state, expectedState, sendDiagnostic);
         if (hiddenSend) {
@@ -1407,6 +1412,29 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     }
   }
 }
+
+test("public send mismatch diagnostics include unexpected non-sent states without message or receipt content", async () => {
+  let evaluations = 0;
+  const jobs = [{ event: "offer", phase: "settle", atMs: 10 }];
+  const worker = { evaluate: async () => { evaluations++; return jobs; } };
+  const result = { isError: true, structuredContent: { state: "unresolved", code: "DISPATCH_UNCERTAIN",
+    text: "Synthetic message must not appear in diagnostics", recoveryToken: "synthetic-receipt" } };
+  const diagnostic = await describePublicSendMismatch(result, "not_sent", "fixture", "owned_leftover", worker);
+  assert.equal(typeof diagnostic, "string");
+  assert.deepEqual(JSON.parse(diagnostic), { provider: "fixture", outcome: "owned_leftover", state: "unresolved",
+    code: "DISPATCH_UNCERTAIN", jobs });
+  assert.equal(evaluations, 1);
+  for (const state of ["sent", "not_sent", "unresolved"]) {
+    assert.equal(await describePublicSendMismatch({ isError: state !== "sent", structuredContent: { state } },
+      state, "fixture", "observed", worker), undefined);
+  }
+  assert.equal(evaluations, 1);
+  assert.equal(JSON.parse(await describePublicSendMismatch({ isError: true, structuredContent: { state: "sent" } },
+    "sent", "fixture", "observed", worker)).state, "sent");
+  assert.equal(JSON.parse(await describePublicSendMismatch({ isError: true,
+    structuredContent: { state: "not_sent", failureStage: "proof" } }, "not_sent", "fixture", "not_sent", worker)).failureStage, "proof");
+  assert.equal(evaluations, 3);
+});
 
 for (const provider of ["fixture", "gemini"]) {
   if (provider === "fixture") test("public fixture sends from a hidden rich empty composer without activating its tab", { timeout: 15000 }, async testContext => {
