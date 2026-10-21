@@ -26,6 +26,7 @@
     "dev:broker": "npm run build:companion && node packages/companion/dist/broker-process.js"
   },
   "devDependencies": {
+    "katex": "0.19.0",
     "playwright-core": "1.63.0"
   }
 }

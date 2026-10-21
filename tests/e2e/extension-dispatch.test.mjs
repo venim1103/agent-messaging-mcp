@@ -9,6 +9,7 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import katex from "katex";
 import { chromium } from "playwright-core";
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
@@ -485,8 +486,17 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         if (hiddenReply) {
           const grant = await worker.evaluate(async tabId => (await chrome.storage.session.get(`gemini-grant-${tabId}`))[`gemini-grant-${tabId}`], selected.tabId);
           assert.ok(grant);
+          const mathCssUrl = new URL(import.meta.resolve("katex/dist/katex.min.css"));
+          await fixture.route("**/fonts/KaTeX_*", async route => {
+            const filename = new URL(route.request().url()).pathname.split("/").at(-1);
+            assert.match(filename, /^KaTeX_[A-Za-z0-9_-]+\.(?:woff2?|ttf)$/);
+            await route.fulfill({ contentType: "font/woff2", body: await readFile(new URL(`fonts/${filename}`, mathCssUrl)) });
+          });
           setPhase("creating structured reply while genuinely hidden");
-          await fixture.evaluate(() => {
+          await fixture.evaluate(({ mathCss, mathHtml }) => {
+            const style = document.createElement("style");
+            style.textContent = mathCss;
+            document.head.append(style);
             const query = document.querySelector("user-query");
             query.style.contentVisibility = "auto";
             query.style.containIntrinsicSize = "auto 80px";
@@ -508,7 +518,11 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             quantity.innerHTML = 'Synthetic quantity: <span class="katex"><span class="katex-mathml" style="position:absolute;overflow:hidden;clip:rect(1px,1px,1px,1px);width:1px;height:1px">Excluded synthetic duplicate equation</span><span class="katex-html" aria-hidden="true">2 + 2 = 4</span></span>.';
             const modernQuantity = document.createElement("p");
             modernQuantity.innerHTML = 'Synthetic modern quantity: <span class="katex"><span class="katex-mathml" style="position:absolute;overflow:hidden;clip-path:inset(50%);width:1px;height:1px">Excluded synthetic modern equation</span><span class="katex-html" aria-hidden="true">3 + 3 = 6</span></span>.';
-            content.append(card, summary, quantity, modernQuantity);
+            const scripts = document.createElement("p");
+            scripts.innerHTML = "Synthetic scripts: k<sub>2</sub><sup>7</sup>.";
+            const structured = document.createElement("p");
+            structured.innerHTML = `Synthetic structured quantity: ${mathHtml}.`;
+            content.append(card, summary, quantity, modernQuantity, scripts, structured);
             for (const style of ["display:none", "visibility:hidden", "content-visibility:hidden"]) {
               const excluded = document.createElement("span");
               excluded.style.cssText = `display:block;${style}`;
@@ -531,7 +545,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             copy.textContent = "Copy";
             response.append(copy);
             document.querySelector("infinite-scroller").append(response);
-          });
+          }, { mathCss: await readFile(mathCssUrl, "utf8"), mathHtml: katex.renderToString(String.raw`\frac{d_{4}}{\sqrt{u^{2}+v^{2}}}`,
+            { throwOnError: true, strict: "error", trust: false }) });
           let replyText;
           for (const visible of [false, true, false]) {
             if (visible) await fixture.bringToFront();
@@ -548,6 +563,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             assert.match(reply.text, /Synthetic trailing summary must be readable/);
             assert.match(reply.text, /Synthetic quantity: 2 \+ 2 = 4\./);
             assert.match(reply.text, /Synthetic modern quantity: 3 \+ 3 = 6\./);
+            assert.ok(reply.text.includes("Synthetic scripts: k_(2)^(7)."));
+            assert.ok(reply.text.includes("Synthetic structured quantity: (d_(4))/(sqrt(u^(2)+v^(2)))."));
             assert.doesNotMatch(reply.text, /Excluded/);
             replyText ??= reply.text;
             assert.equal(reply.text, replyText);

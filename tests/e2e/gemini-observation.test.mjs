@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import katex from "katex";
 import { chromium } from "playwright-core";
 import { installDraftOwnershipTracker } from "../../packages/extension/lib/draft-ownership.ts";
 import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl,
@@ -621,6 +623,150 @@ test("reviewed Gemini parser captures only bounded visible message content", asy
     await page.goto("about:blank");
     assert.equal(await page.evaluate(captureGeminiSnapshot), null);
     assert.equal(await page.evaluate(identifyGeminiConversation), null);
+  } finally {
+    await browser.close();
+  }
+});
+
+test("Gemini capture preserves visible superscripts and subscripts without hidden source", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("https://gemini.google.com/**", route => route.fulfill({
+      contentType: "text/html; charset=utf-8", body: `<!doctype html><html><head><style>
+        main, infinite-scroller, user-query, user-query-content, model-response, model-response-content { display:block }
+      </style></head><body><main><infinite-scroller>
+        <user-query><user-query-content><p class="query-text-line">Existing draft notation: r<sup>8</sup>.</p></user-query-content></user-query>
+        <model-response><model-response-content>
+          <p>Power: x<sup>4</sup>.</p>
+          <p>Indexed: b<sub>k</sub><sup>3</sup>.</p>
+          <p>Nested: z<sup>r<sub>2</sub>+1</sup>.</p>
+          <p>Control: ^ and _ stay literal.</p>
+          <p>Hidden: q<sup hidden>Excluded synthetic exponent</sup><sub style="display:none">Excluded synthetic index</sub>.</p>
+        </model-response-content></model-response>
+      </infinite-scroller></main></body></html>`
+    }));
+    await page.goto("https://gemini.google.com/app/synthetic-scripts");
+    const before = await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML,
+      scroll: [scrollX, scrollY] }));
+    assert.deepEqual(await page.evaluate(captureGeminiSnapshot, page.url()), { omittedBefore: false, messages: [
+      { direction: "outgoing", text: "Existing draft notation: r8." },
+      { direction: "incoming", text: "Power: x^(4).\n\nIndexed: b_(k)^(3).\n\nNested: z^(r_(2)+1).\n\nControl: ^ and _ stay literal.\n\nHidden: q." }
+    ] });
+    assert.deepEqual(await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML,
+      scroll: [scrollX, scrollY] })), before);
+  } finally {
+    await browser.close();
+  }
+});
+
+test("Gemini capture preserves structured visible KaTeX math without hidden source", { timeout: 15000 }, async () => {
+  const cases = [
+    ["Power", String.raw`w^5`, "w^(5)"],
+    ["Index", String.raw`t_{8}`, "t_(8)"],
+    ["Indexed", String.raw`c_{j}^{6}`, "c_(j)^(6)"],
+    ["Greek", String.raw`\omega_{n}^{2}`, "\u03c9_(n)^(2)"],
+    ["Fraction", String.raw`\frac{7}{13}`, "(7)/(13)"],
+    ["Display fraction", String.raw`\dfrac{x+y}{z-2}`, "(x+y)/(z\u22122)"],
+    ["Root", String.raw`\sqrt{29}`, "sqrt(29)"],
+    ["Indexed root", String.raw`\sqrt[3]{31}`, "root(3, 31)"],
+    ["Nested root", String.raw`\sqrt{\frac{3}{17}}`, "sqrt((3)/(17))"],
+    ["Nested", String.raw`\frac{m_{2}+1}{\sqrt{a^{2}+b^{2}}}`, "(m_(2)+1)/(sqrt(a^(2)+b^(2)))"]
+  ];
+  const cssUrl = new URL(import.meta.resolve("katex/dist/katex.min.css"));
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("https://gemini.google.com/**", route => {
+      if (route.request().resourceType() === "font") {
+        const filename = new URL(route.request().url()).pathname.split("/").at(-1);
+        assert.match(filename, /^KaTeX_[A-Za-z0-9_-]+\.(?:woff2?|ttf)$/);
+        return route.fulfill({ contentType: "font/woff2", body: readFileSync(new URL(`fonts/${filename}`, cssUrl)) });
+      }
+      return route.fulfill({ contentType: "text/html; charset=utf-8", body: `<!doctype html><html><head><style>
+        ${readFileSync(cssUrl, "utf8")}
+        main, infinite-scroller, model-response, model-response-content { display:block }
+      </style></head><body><main><infinite-scroller><model-response><model-response-content>${cases.map(([label, expression]) =>
+        `<p>${label}: ${katex.renderToString(expression, { throwOnError: true, strict: "error", trust: false })}.</p>`).join("")}
+      </model-response-content></model-response></infinite-scroller></main></body></html>` });
+    });
+    await page.goto("https://gemini.google.com/app/synthetic-structured-math");
+    await page.evaluate(() => document.fonts.ready.then(() => {}));
+    const expected = { omittedBefore: false, messages: [
+      { direction: "incoming", text: cases.map(([label, , text]) => `${label}: ${text}.`).join("\n\n") }
+    ] };
+    const capture = async () => {
+      const before = await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML,
+        scroll: [scrollX, scrollY] }));
+      const result = await page.evaluate(captureGeminiSnapshot, page.url());
+      assert.deepEqual(await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML,
+        scroll: [scrollX, scrollY] })), before);
+      return result;
+    };
+    assert.deepEqual(await capture(), expected);
+    await page.locator(".katex-mathml").evaluateAll(alternatives => {
+      for (const alternative of alternatives) alternative.textContent = "Excluded synthetic hidden source";
+    });
+    assert.deepEqual(await capture(), expected, "hidden source never supplies the visible representation");
+    await page.locator(".katex-mathml").first().evaluate(alternative => {
+      for (let index = 0; index < 4096; index++) alternative.append(document.createElement("span"));
+    });
+    assert.deepEqual(await capture(), expected, "excluded source does not consume the visible traversal budget");
+    for (const selector of [".msupsub", ".mfrac", ".sqrt"]) {
+      await page.reload();
+      await page.locator(selector).first().evaluate(element => {
+        const extra = document.createElement("span");
+        extra.textContent = "Visible synthetic extra term";
+        element.append(extra);
+      });
+      assert.match((await capture()).messages[0].text, /Visible synthetic extra term/, selector);
+    }
+    for (const scenario of ["unpositioned-script", "hidden-fraction-bar", "hidden-radical"]) {
+      await page.reload();
+      await page.evaluate(scenario => {
+        if (scenario === "unpositioned-script") {
+          document.querySelector(".msupsub > .vlist-t > .vlist-r > .vlist > span").style.position = "static";
+        } else if (scenario === "hidden-fraction-bar") document.querySelector(".frac-line").style.display = "none";
+        else document.querySelector(".sqrt svg").style.display = "none";
+      }, scenario);
+      const text = (await capture()).messages[0].text;
+      const refused = scenario === "unpositioned-script" ? /Power: w\^\(5\)/
+        : scenario === "hidden-fraction-bar" ? /Fraction: \(7\)\/\(13\)/ : /Root: sqrt\(29\)/;
+      assert.doesNotMatch(text, refused, scenario);
+    }
+    await page.reload();
+    await page.evaluate(() => {
+      document.querySelector("main").style.marginTop = "20000px";
+      const row = document.querySelector("model-response");
+      row.style.contentVisibility = "auto";
+      row.style.containIntrinsicSize = "auto 100px";
+    });
+    assert.equal(await page.locator("model-response-content").innerText(), "");
+    assert.deepEqual(await capture(), expected, "offscreen structure is independent of element geometry");
+    for (const limit of ["nodes", "depth"]) {
+      await page.reload();
+      await page.locator(".katex-html").first().evaluate((visual, limit) => {
+        if (limit === "nodes") {
+          for (let index = 0; index < 4096; index++) visual.append(document.createElement("span"));
+        } else {
+          let parent = visual;
+          for (let depth = 0; depth < 65; depth++) {
+            const child = document.createElement("span");
+            parent.append(child);
+            parent = child;
+          }
+        }
+      }, limit);
+      assert.equal(await capture(), null, limit);
+    }
+    await page.reload();
+    await page.locator(".katex-html .msupsub .katex-sizing").first().evaluate(payload => {
+      payload.textContent = "Q".repeat(20000);
+    });
+    const truncated = await capture();
+    assert.equal(truncated.messages[0].text.length, 16000);
+    assert.equal(truncated.messages[0].truncated, true);
+    assert.match(truncated.messages[0].text, /^Power: w\^\(Q+/);
   } finally {
     await browser.close();
   }

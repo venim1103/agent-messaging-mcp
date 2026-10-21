@@ -418,8 +418,9 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
         .some(icon => icon.getAttribute("data-mat-icon-name") === "stop" || icon.textContent?.trim() === "stop"));
   const pendingControls = [...regions[0]!.querySelectorAll<HTMLElement>('button[aria-label*="Stop" i], mat-progress-spinner, [role="progressbar"]')]
     .some(signalVisible);
-  const readText = (element: HTMLElement): string | null => {
+  const readText = (element: HTMLElement, structured = false): string | null => {
     const rendered = element.innerText;
+    const hasScripts = structured && element.querySelector("sup, sub") !== null;
     const clippedMath = new Set([...element.querySelectorAll<HTMLElement>(".katex > .katex-mathml")].filter(alternative => {
       const visual = alternative.parentElement?.querySelector<HTMLElement>(":scope > .katex-html");
       if (!(visual instanceof HTMLElement) || visual.hidden) return false;
@@ -430,7 +431,7 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
           || style.clipPath === "inset(50%)")
         && visualStyle.display !== "none" && visualStyle.visibility === "visible" && visualStyle.contentVisibility !== "hidden";
     }));
-    if (rendered.trim() && !clippedMath.size) return rendered;
+    if (rendered.trim() && !clippedMath.size && !hasScripts) return rendered;
     let autoContent = false;
     for (let ancestor: HTMLElement | null = element; ancestor; ancestor = ancestor.parentElement) {
       const style = getComputedStyle(ancestor);
@@ -439,22 +440,112 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
       if (style.contentVisibility === "auto") autoContent = true;
       if (ancestor === timeline) break;
     }
-    if (!autoContent && !clippedMath.size) return rendered;
+    if (!autoContent && !clippedMath.size && !hasScripts) return rendered;
     let visited = 0;
     let failed = false;
     const parts: string[] = [];
+    type MathText = { element: HTMLElement | null; text: string; children: MathText[] };
+    const mathVisuals = new Set(structured ? [...clippedMath].map(alternative =>
+      alternative.parentElement!.querySelector<HTMLElement>(":scope > .katex-html")!) : []);
+    const mathLayers = (node: MathText): { payload: MathText; offset: number }[] => {
+      const tables = node.children.filter(child => child.element?.matches(".vlist-t"));
+      if (tables.length !== 1) return [];
+      const table = tables[0]!;
+      if (node.children.some(child => child !== table
+        && (!node.element?.matches(".sqrt") || !child.element?.matches(".root, .katex-root")))) return [];
+      const row = table.children[0];
+      const column = row?.children[0];
+      if (!row?.element?.matches(".vlist-r") || !column?.element?.matches(".vlist")) return [];
+      if (table.children.length > 2 || table.children[1]?.text.trim() || row.children.length > 2 || row.children[1]?.text.trim()
+        || getComputedStyle(table.element!).display !== "inline-table" || getComputedStyle(row.element).display !== "table-row"
+        || getComputedStyle(column.element).display !== "table-cell") return [];
+      const layers: { payload: MathText; offset: number }[] = [];
+      for (const layer of column.children) {
+        const strut = layer.children[0];
+        const payload = layer.children[1];
+        if (!layer.element || layer.children.length !== 2 || !strut?.element?.matches(".pstrut")
+          || strut.text.trim() || !payload?.element) return [];
+        const style = getComputedStyle(layer.element);
+        const offset = Number.parseFloat(style.top) + Number.parseFloat(getComputedStyle(strut.element).height);
+        if (style.position !== "relative" || style.display !== "block" || !Number.isFinite(offset)) return [];
+        layers.push({ payload, offset });
+      }
+      return layers;
+    };
+    const collectMath = (node: Node, depth: number): MathText | null => {
+      if (++visited > 4096 || depth > 64) { failed = true; return null; }
+      if (node.nodeType === Node.TEXT_NODE) {
+        const value = node.textContent ?? "";
+        const whiteSpace = node.parentElement ? getComputedStyle(node.parentElement).whiteSpace : "normal";
+        return { element: null, text: whiteSpace === "normal" || whiteSpace === "nowrap" ? value.replace(/\s+/g, " ") : value, children: [] };
+      }
+      if (!(node instanceof HTMLElement) || node.matches("script, style, noscript, template, [hidden]") || clippedMath.has(node)) return null;
+      const style = getComputedStyle(node);
+      if (style.display === "none" || style.visibility !== "visible" || style.contentVisibility === "hidden") return null;
+      const children: MathText[] = [];
+      for (const child of node.childNodes) {
+        const captured = collectMath(child, depth + 1);
+        if (failed) return null;
+        if (captured) children.push(captured);
+      }
+      const text = children.map(child => child.text).join("");
+      const block = !["inline", "inline-block", "inline-flex", "inline-grid", "contents"].includes(style.display);
+      const result = { element: node, text: node.localName === "br" ? "\n" : block ? `\n${text}\n` : text, children };
+      if (node.matches(".vlist-s") && text === "\u200b") result.text = "";
+      if (node.matches(".msupsub")) {
+        const layers = mathLayers(result);
+        if (layers.length >= 1 && layers.length <= 2 && layers.every(layer => layer.payload.text.trim() && layer.offset !== 0)
+          && new Set(layers.map(layer => Math.sign(layer.offset))).size === layers.length) {
+          result.text = layers.toSorted((left, right) => right.offset - left.offset)
+            .map(layer => `${layer.offset > 0 ? "_" : "^"}(${layer.payload.text.trim()})`).join("");
+        }
+      } else if (node.matches(".mfrac")) {
+        const layers = mathLayers(result).toSorted((left, right) => left.offset - right.offset);
+        const bar = layers[1]?.payload.element;
+        if (layers.length === 3 && bar?.matches(".frac-line") && getComputedStyle(bar).borderBottomStyle === "solid"
+          && Number.parseFloat(getComputedStyle(bar).borderBottomWidth) > 0 && !layers[1]!.payload.text.trim()
+          && layers[0]!.offset < layers[1]!.offset && layers[1]!.offset < layers[2]!.offset
+          && layers[0]!.payload.text.trim() && layers[2]!.payload.text.trim()) {
+          result.text = `(${layers[0]!.payload.text.trim()})/(${layers[2]!.payload.text.trim()})`;
+        }
+      } else if (node.matches(".sqrt")) {
+        const layers = mathLayers(result);
+        const radicand = layers.find(layer => layer.payload.element?.matches(".mord"))?.payload;
+        const radical = layers.find(layer => layer.payload.element?.matches(".hide-tail"))?.payload;
+        const svg = radical?.element?.querySelector(":scope > svg");
+        const index = children.find(child => child.element?.matches(".root, .katex-root"));
+        const indexLayers = index ? mathLayers(index) : [];
+        if (layers.length === 2 && radicand?.text.trim() && svg instanceof SVGElement && !radical?.text.trim()
+          && getComputedStyle(svg).display !== "none" && getComputedStyle(svg).visibility === "visible"
+          && children.length === 1 + Number(Boolean(index))
+          && (!index || indexLayers.length === 1 && indexLayers[0]!.payload.text.trim())) {
+          result.text = index ? `root(${indexLayers[0]!.payload.text.trim()}, ${radicand.text.trim()})` : `sqrt(${radicand.text.trim()})`;
+        }
+      }
+      return result;
+    };
     const collect = (node: Node, depth: number): void => {
+      if (node instanceof HTMLElement && mathVisuals.has(node)) {
+        const captured = collectMath(node, depth);
+        if (captured) parts.push(captured.text);
+        return;
+      }
       if (++visited > 4096 || depth > 64) { failed = true; return; }
       if (node.nodeType === Node.TEXT_NODE) {
         const value = node.textContent ?? "";
         const whiteSpace = node.parentElement ? getComputedStyle(node.parentElement).whiteSpace : "normal";
-        parts.push(whiteSpace === "normal" || whiteSpace === "nowrap" ? value.replace(/\s+/g, " ") : value);
+        const collapse = whiteSpace === "normal" || whiteSpace === "nowrap";
+        if (collapse && !value.trim() && parts.at(-1)?.endsWith("\n")) return;
+        parts.push(collapse ? value.replace(/\s+/g, " ") : value);
         return;
       }
       if (!(node instanceof HTMLElement) || node.matches("script, style, noscript, template, [hidden]") || clippedMath.has(node)) return;
       const style = getComputedStyle(node);
       if (style.display === "none" || style.visibility !== "visible" || style.contentVisibility === "hidden") return;
       if (node.localName === "br") { parts.push("\n"); return; }
+      const script = structured && node.localName === "sup" ? "^" : structured && node.localName === "sub" ? "_" : "";
+      const scriptStart = parts.length;
+      if (script) parts.push(`${script}(`);
       const block = !["inline", "inline-block", "inline-flex", "inline-grid", "contents"].includes(style.display);
       if (block) parts.push("\n");
       for (const child of node.childNodes) {
@@ -462,6 +553,10 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
         if (failed) return;
       }
       if (block) parts.push("\n");
+      if (script) {
+        if (parts.slice(scriptStart + 1).join("").trim()) parts.push(")");
+        else parts.length = scriptStart;
+      }
     };
     collect(element, 0);
     return failed ? null : parts.join("").replace(/\n{3,}/g, "\n\n").trim();
@@ -486,7 +581,7 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
     } else {
       const content = row.querySelectorAll<HTMLElement>("model-response-content");
       if (content.length !== 1) return null;
-      const captured = readText(content[0]!);
+      const captured = readText(content[0]!, true);
       if (captured === null) return null;
       text = captured.trim();
     }
