@@ -77,6 +77,22 @@ Everything runs inside the Podman devcontainer ([devcontainer.json](.devcontaine
    - On the fixture tab, the toolbar popup's **Inspect this chat** lists the fixture rows and `Native bridge ready (protocol v1). Nothing was sent.`
    - `chat_request_connection` returns a pending request. `BROKER_UNAVAILABLE` means private broker startup/connection failed; inspect ownership, permissions and startup state rather than retrying uncertain writes.
 
+### Development Profile Volume Ownership
+
+The devcontainer specifies both `containerUser: node` and `remoteUser: node`, with UID/GID 1000 and `updateRemoteUserUID: false`. Podman's `:U` profile-volume option follows the container runtime user, not just the VS Code remote user. A root runtime user can therefore leave the saved profile root-owned while Chromium runs as `node`.
+
+If Chromium cannot unlock its profile because of `Permission denied`, inspect ownership metadata rather than deleting locks or profile data. A root-only `NativeMessagingHosts` directory can also make the existing registration inaccessible; a failed existence check alone does not prove it is missing.
+
+After explicit authorization, with the old browser/container stopped, the person can perform this one-time repair from the WSL host, outside the devcontainer. Replace `CONTAINER_ID` with the current development container's ID:
+
+```bash
+podman exec --user 0 CONTAINER_ID chown -hR --from=0:0 1000:1000 -- /home/node/.local/share/agent-messaging-mcp/chromium-dev
+```
+
+This changes only root-owned entries inside the development profile; `-h` avoids changing symlink targets. Verify ownership afterward, then let the person use Chromium's own unlock/relaunch prompt. Restore a missing native launcher from an accessible recognized registration with the normal `restore:native` setup command; do not invent a new extension ID or replace an unknown manifest.
+
+The container-user setting takes effect when the devcontainer is recreated. A one-time ownership repair does not prove future Podman remount behavior or recreate the current container. Follow the [agent safety boundaries](AGENTS.md#safety-boundaries) for privileged/profile work and trusted browser gestures.
+
 ## Coordinated Restart After Source Changes
 
 Running processes keep the code they started with.

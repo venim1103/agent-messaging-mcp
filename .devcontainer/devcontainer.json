@@ -5,6 +5,7 @@
     "dockerfile": "Dockerfile",
     "context": "."
   },
+  "containerUser": "node",
   "remoteUser": "node",
   "updateRemoteUserUID": false,
   "runArgs": [
