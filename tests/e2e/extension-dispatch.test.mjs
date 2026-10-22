@@ -493,7 +493,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             await route.fulfill({ contentType: "font/woff2", body: await readFile(new URL(`fonts/${filename}`, mathCssUrl)) });
           });
           setPhase("creating structured reply while genuinely hidden");
-          await fixture.evaluate(({ mathCss, mathHtml }) => {
+          await fixture.evaluate(async ({ mathCss, mathHtml }) => {
             const style = document.createElement("style");
             style.textContent = mathCss;
             document.head.append(style);
@@ -524,8 +524,15 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             structured.innerHTML = `Synthetic structured quantity: ${mathHtml}.`;
             for (const graphic of structured.querySelectorAll(".sqrt .hide-tail > svg")) {
               const wrapper = document.createElement("span");
+              const image = document.createElement("img");
+              image.alt = "Excluded synthetic radical alt";
+              image.style.width = graphic.getAttribute("width") || "1em";
+              image.style.height = graphic.getAttribute("height") || "1em";
+              image.style.display = "block";
+              image.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(graphic.outerHTML);
               graphic.replaceWith(wrapper);
-              wrapper.append(graphic);
+              wrapper.append(image);
+              await image.decode();
             }
             content.append(card, summary, quantity, modernQuantity, scripts, structured);
             for (const style of ["display:none", "visibility:hidden", "content-visibility:hidden"]) {

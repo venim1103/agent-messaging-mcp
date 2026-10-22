@@ -561,10 +561,12 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
         const whiteSpace = node.parentElement ? getComputedStyle(node.parentElement).whiteSpace : "normal";
         return { element: null, text: whiteSpace === "normal" || whiteSpace === "nowrap" ? value.replace(/\s+/g, " ") : value, children: [] };
       }
-      if (node instanceof SVGSVGElement) {
+      if (node instanceof SVGSVGElement || node instanceof HTMLImageElement) {
         const style = getComputedStyle(node);
         if (node.hasAttribute("hidden") || style.display === "none" || style.visibility !== "visible"
           || style.contentVisibility === "hidden" || Number(style.opacity) === 0) return null;
+        if (node instanceof HTMLImageElement && (!node.complete || node.naturalWidth === 0 || node.naturalHeight === 0
+          || !(Number.parseFloat(style.width) > 0) || !(Number.parseFloat(style.height) > 0))) return null;
         return { element: null, text: "", children: [], visibleGraphic: true };
       }
       if (!(node instanceof HTMLElement) || node.matches("script, style, noscript, template, [hidden]") || clippedMath.has(node)) return null;

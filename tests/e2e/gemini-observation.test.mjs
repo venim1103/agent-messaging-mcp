@@ -811,6 +811,18 @@ test("Gemini capture preserves structured visible KaTeX math without hidden sour
         scroll: [scrollX, scrollY] })), before);
       return result;
     };
+    const useImageRadicals = () => page.locator(".sqrt .hide-tail svg").evaluateAll(async graphics => {
+      await Promise.all(graphics.map(async graphic => {
+        const image = document.createElement("img");
+        image.alt = "Excluded synthetic image alt";
+        image.style.width = getComputedStyle(graphic).width;
+        image.style.height = getComputedStyle(graphic).height;
+        image.style.display = "block";
+        image.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(graphic.outerHTML);
+        graphic.replaceWith(image);
+        await image.decode();
+      }));
+    });
     assert.deepEqual(await capture(), expected);
     await page.locator(".sqrt .hide-tail > svg").evaluateAll(graphics => {
       for (const graphic of graphics) {
@@ -820,6 +832,21 @@ test("Gemini capture preserves structured visible KaTeX math without hidden sour
       }
     });
     assert.deepEqual(await capture(), expected, "visible radical wrappers preserve structure");
+    await useImageRadicals();
+    assert.deepEqual(await capture(), expected, "loaded image-backed radicals preserve structure without reading image source");
+    await page.locator(".sqrt img").evaluateAll(images => {
+      for (const image of images) {
+        for (const property of ["src", "srcset", "currentSrc", "alt", "textContent", "innerHTML", "outerHTML", "childNodes"]) {
+          Object.defineProperty(image, property, { get() { throw new Error("Forbidden image source access"); }, configurable: true });
+        }
+        const getAttribute = image.getAttribute;
+        image.getAttribute = function(name) {
+          if (["src", "srcset", "alt"].includes(name.toLowerCase())) throw new Error("Forbidden image attribute access");
+          return getAttribute.call(this, name);
+        };
+      }
+    });
+    assert.deepEqual(await capture(), expected, "images are opaque leaves, never source or alt text");
     await page.locator(".katex-mathml").evaluateAll(alternatives => {
       for (const alternative of alternatives) alternative.textContent = "Excluded synthetic hidden source";
     });
@@ -862,39 +889,77 @@ test("Gemini capture preserves structured visible KaTeX math without hidden sour
         : scenario === "hidden-fraction-bar" ? /Fraction: \(7\)\/\(13\)/ : /Root: sqrt\(29\)/;
       assert.doesNotMatch(text, refused, scenario);
     }
-    await page.reload();
-    await page.locator(".sqrt .hide-tail > svg").evaluateAll(graphics => {
-      for (const graphic of graphics) {
-        const wrapper = document.createElement("span");
-        graphic.replaceWith(wrapper);
-        wrapper.append(graphic);
-      }
-    });
-    await page.evaluate(() => {
-      document.querySelector("main").style.marginTop = "20000px";
-      const row = document.querySelector("model-response");
-      row.style.contentVisibility = "auto";
-      row.style.containIntrinsicSize = "auto 100px";
-    });
-    assert.equal(await page.locator("model-response-content").innerText(), "");
-    assert.deepEqual(await capture(), expected, "offscreen structure is independent of element geometry");
-    for (const limit of ["nodes", "depth"]) {
+    for (const scenario of ["missing", "broken", "hidden", "display", "visibility", "content", "transparent", "width", "height",
+      "hidden-wrapper", "display-wrapper", "visibility-wrapper", "content-wrapper", "transparent-wrapper"]) {
       await page.reload();
-      await page.locator(".sqrt .hide-tail").first().evaluate((radical, limit) => {
-        if (limit === "nodes") {
-          for (let index = 0; index < 4096; index++) radical.prepend(document.createElement("span"));
-        } else {
-          const graphic = radical.querySelector("svg");
-          let parent = radical;
-          for (let depth = 0; depth < 65; depth++) {
-            const wrapper = document.createElement("span");
-            parent.append(wrapper);
-            parent = wrapper;
-          }
-          parent.append(graphic);
+      await useImageRadicals();
+      await page.locator(".sqrt img").first().evaluate(async (image, scenario) => {
+        if (scenario === "missing") image.removeAttribute("src");
+        else if (scenario === "broken") {
+          image.src = "data:image/svg+xml,invalid";
+          await image.decode().catch(() => {});
+        } else if (scenario.endsWith("-wrapper")) {
+          const wrapper = document.createElement("span");
+          if (scenario === "hidden-wrapper") wrapper.hidden = true;
+          else wrapper.style.cssText = { "display-wrapper": "display:none", "visibility-wrapper": "visibility:hidden",
+            "content-wrapper": "content-visibility:hidden", "transparent-wrapper": "opacity:0" }[scenario];
+          image.before(wrapper);
+          wrapper.append(image);
+        } else if (scenario === "hidden") image.hidden = true;
+        else image.style.cssText += { display: ";display:none", visibility: ";visibility:hidden", content: ";content-visibility:hidden",
+          transparent: ";opacity:0", width: ";width:0", height: ";height:0" }[scenario];
+      }, scenario);
+      assert.doesNotMatch((await capture()).messages[0].text, /Root: sqrt\(29\)/, `image ${scenario}`);
+    }
+    await page.reload();
+    await useImageRadicals();
+    const pendingImageUrl = "https://gemini.google.com/pending-synthetic-radical.svg";
+    let pendingImage;
+    await page.route(pendingImageUrl, route => { pendingImage = route; });
+    const requested = page.waitForRequest(pendingImageUrl, { timeout: 1000 });
+    await page.locator(".sqrt img").first().evaluate((image, url) => { image.src = url; }, pendingImageUrl);
+    await requested;
+    assert.equal(await page.locator(".sqrt img").first().evaluate(image => image.complete), false);
+    assert.doesNotMatch((await capture()).messages[0].text, /Root: sqrt\(29\)/, "pending image");
+    await pendingImage.abort();
+    await page.unroute(pendingImageUrl);
+    for (const graphicType of ["svg", "image"]) {
+      await page.reload();
+      if (graphicType === "image") await useImageRadicals();
+      await page.locator(".sqrt .hide-tail > svg, .sqrt .hide-tail > img").evaluateAll(graphics => {
+        for (const graphic of graphics) {
+          const wrapper = document.createElement("span");
+          graphic.replaceWith(wrapper);
+          wrapper.append(graphic);
         }
-      }, limit);
-      assert.equal(await capture(), null, `radical wrapper ${limit}`);
+      });
+      await page.evaluate(() => {
+        document.querySelector("main").style.marginTop = "20000px";
+        const row = document.querySelector("model-response");
+        row.style.contentVisibility = "auto";
+        row.style.containIntrinsicSize = "auto 100px";
+      });
+      assert.equal(await page.locator("model-response-content").innerText(), "");
+      assert.deepEqual(await capture(), expected, `${graphicType} offscreen structure is independent of element geometry`);
+      for (const limit of ["nodes", "depth"]) {
+        await page.reload();
+        if (graphicType === "image") await useImageRadicals();
+        await page.locator(".sqrt .hide-tail").first().evaluate((radical, limit) => {
+          if (limit === "nodes") {
+            for (let index = 0; index < 4096; index++) radical.prepend(document.createElement("span"));
+          } else {
+            const graphic = radical.querySelector("svg, img");
+            let parent = radical;
+            for (let depth = 0; depth < 65; depth++) {
+              const wrapper = document.createElement("span");
+              parent.append(wrapper);
+              parent = wrapper;
+            }
+            parent.append(graphic);
+          }
+        }, limit);
+        assert.equal(await capture(), null, `${graphicType} radical wrapper ${limit}`);
+      }
     }
     for (const limit of ["nodes", "depth"]) {
       await page.reload();
