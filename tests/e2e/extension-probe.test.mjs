@@ -2531,6 +2531,10 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
       </style></head><body><main><div contenteditable="true" aria-label="Enter a prompt for Gemini">Private draft</div>
         <infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic question</p>
           </user-query-content></user-query><model-response><model-response-content><p>Synthetic answer</p>
+          <span class="katex"><span class="katex-mathml" hidden>Private hidden math</span>
+            <span class="katex-html"><span class="sqrt"><span class="hide-tail"><span>
+              <svg width="10" height="10"><path d="M0 0L1 1"></path></svg>
+            </span></span></span></span></span>
           </model-response-content></model-response></infinite-scroller></main>
         <button type="button" class="send-button" aria-label="Send message" onclick="window.controlActivations += 1">Private control text</button>
         <script>window.controlActivations = 0;</script></body></html>`
@@ -2560,8 +2564,17 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     assert.ok(controlDiagnostic.includes("1 prompt matches; nonempty"));
     assert.ok(controlDiagnostic.includes("Nearby prompt controls"));
     assert.ok(controlDiagnostic.includes("None within bounded ancestors"));
+    assert.ok(controlDiagnostic.includes("Math layout"));
+    assert.ok(controlDiagnostic.includes("katex 1; visual 1; roots 1; SVG 1; images 0"));
+    assert.ok(controlDiagnostic.includes("depth 3; svg; children 0"));
     assert.equal(controlDiagnostic.includes("Private control text"), false);
     assert.equal(controlDiagnostic.includes("Private draft"), false);
+    assert.equal(controlDiagnostic.includes("Private hidden math"), false);
+    assert.equal(controlDiagnostic.includes("Synthetic question"), false);
+    assert.equal(controlDiagnostic.includes("Synthetic answer"), false);
+    assert.equal(controlDiagnostic.includes(url), false);
+    assert.equal(await popup.locator("#messages").evaluate(list => list.scrollWidth <= list.clientWidth
+      && [...list.querySelectorAll("p")].every(value => value.scrollWidth <= value.clientWidth)), true);
     assert.equal(await page.locator("body").innerHTML(), beforeInspection);
     assert.equal(await page.evaluate(() => window.controlActivations), 0);
     assert.equal((await facade.getConnection(created.payload.requestId)).payload.state, "pending");

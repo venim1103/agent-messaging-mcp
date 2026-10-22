@@ -172,7 +172,7 @@ A missing or ambiguous message element skips publication when URL, document and 
 
 ### Waiting For Replies
 
-`chat_wait_for_reply { connectionId, timeoutMs? }` waits at most 20 seconds (default 20 seconds) using existing fresh exact-document reads. Zero returns `{ timedOut: true }` without reading. Success returns `{ timedOut: false, coverage, generation, capturedAt, cursor, omittedBefore, reply }`; only the newest rendered row may qualify, and it must be incoming, nonempty and untruncated. A previously existing newest reply can qualify; this is not correlation to a particular send.
+`chat_wait_for_reply { connectionId, timeoutMs? }` waits at most 20 seconds (default 20 seconds) using existing fresh exact-document reads. Zero returns `{ timedOut: true }` without reading. No new read starts with at most 25 ms remaining, matching the broker's existing response reserve; this shortens work within the original budget, never extends a deadline or preserves authority after a real disconnect. Success returns `{ timedOut: false, coverage, generation, capturedAt, cursor, omittedBefore, reply }`; only the newest rendered row may qualify, and it must be incoming, nonempty and untruncated. A previously existing newest reply can qualify; this is not correlation to a particular send.
 
 Without a reviewed complete signal, the tracker requires a two-second span of advancing fresh captures with the same observation epoch/sequence and entire rendered window. Revisions, changed-restored text reflected in the cursor, gaps, reloads, truncation, outgoing tails, backward time, unavailable captures and positive streaming evidence reset it. Unchanged streaming text cannot settle. After streaming clears, the fallback needs a fresh full quiet period and returns `settled_heuristic`; network stalls can look quiet.
 
@@ -280,13 +280,15 @@ The toolbar popup is the only approval surface; page scripts and MCP calls canno
 
 Open this small panel from the extension icon in container Chromium's toolbar, using the Extensions puzzle-piece menu if necessary, while the chat tab remains selected underneath. Do not open the extension UI as a full browser tab or confuse it with the `chrome://extensions` management page. After an approval click, report its actual confirmation or error; clicking alone is not evidence that consent was granted.
 
-- **Inspect this chat**: a read-only diagnostic. On the fixture it lists rows and checks the native bridge. On Gemini it shows only structure metadata (regions, editors, row lengths, **Send controls**, **Prompt state** and **Nearby prompt controls**), never chat text.
+- **Inspect this chat**: a read-only diagnostic. On the fixture it lists rows and checks the native bridge. On Gemini it shows only structure metadata (regions, editors, row lengths, **Send controls**, **Prompt state**, **Nearby prompt controls** and **Math layout**), never chat text.
 - **View pending requests**, then **Approve read-only fixture** or **Approve read-only Gemini chat**.
 - Agent roster: **Connect this chat** per agent, **Remove access**, **Disconnect all** and **Refresh agents**. The consent text discloses read/send authority and influence from chat content, and warns that site changes may interrupt access. See HANDOFF.md for current acceptance evidence.
 - **Unconfirmed Sends**: **Refresh status** loads eligible selected-chat operation IDs/timestamps; **Sent** / **Not sent** record an immutable person assessment, never activate Send or touch the composer. It does not automatically check on ordinary popup opens.
 - **Review fixture drafts** or **Review Gemini drafts**, then **Approve draft (no send)**.
 - **Review fixture draft fill** or **Review Gemini fill consent**, then **Allow draft fill (no send)**.
 - **Review fixture sending** or **Review Gemini send consent**, then **Approve fixture send** or **Approve Gemini send**.
+
+**Math layout** scans only the newest rendered incoming response on the exact selected saved-chat URL/document. It returns counts and fixed-vocabulary root shapes: relative depths, child counts, display categories, relative positioning, strut/offset-sign and hidden/nonzero-opacity flags. It visits at most 4,096 nodes to depth 64 and records at most four outer root subtrees with 64 shape nodes each; limit flags mark partial results. SVGs/images are opaque leaves. No text/HTML, unknown class/attribute values, hidden MathML/TeX, SVG contents, URLs or credentials are read or returned by this math probe. It does not focus, scroll, edit, approve a connection or send. Active/visible top-level-page and exact-document checks remain required; do not infer renderer fidelity from its counts.
 
 The legacy **Test fixture input** and **Fill test draft** controls and runtime routes are removed (D6). All connected writes stay inside the operation pipeline; native-bridge diagnostics remain. The extension no longer requests debugger permission. D11a autonomous hidden sending has source/synthetic coverage, not installed/live acceptance.
 

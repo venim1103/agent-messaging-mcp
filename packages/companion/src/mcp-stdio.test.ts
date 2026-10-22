@@ -14,6 +14,7 @@ import { connectBroker } from "./broker-client.js";
 import { startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials } from "./broker-roles.js";
 import { openPrivateOperationDatabase, PreparedMessageOperations } from "./message-operations.js";
+import { NativeFrameDecoder } from "./native-framing.js";
 import { PendingConnectionRequests } from "./pending-connections.js";
 
 const brokerStartupObserver = `import { appendFileSync } from "node:fs";
@@ -114,7 +115,15 @@ for (const target of [
     let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
     let mode: "steady" | "outgoing" | "truncated" | "held" | "unavailable" | "streaming" | "complete" | "complete_truncated" = "steady";
     let reads = 0;
+    let wireReads = 0;
     let releaseCapture: (() => void) | undefined;
+    const originalFrames = NativeFrameDecoder.prototype.frames;
+    context.mock.method(NativeFrameDecoder.prototype, "frames", function*(this: NativeFrameDecoder, chunk: Buffer) {
+      for (const message of originalFrames.call(this, chunk)) {
+        if (typeof message === "object" && message !== null && "kind" in message && message.kind === "read_approved_snapshot") wireReads++;
+        yield message;
+      }
+    });
     context.mock.method(PendingConnectionRequests.prototype,
       target.origin === "https://gemini.google.com" ? "requestFreshGeminiRead" : "requestFreshFixtureRead", () => {
         reads++;
@@ -152,6 +161,10 @@ for (const target of [
         assert.equal((await wait({ connectionId, ...extra })).isError, true);
       }
       assert.deepEqual((await wait({ connectionId, timeoutMs: 0 })).structuredContent, { timedOut: true });
+      assert.equal(reads, 0);
+      const beforeShortBudget = wireReads;
+      assert.deepEqual((await wait({ connectionId, timeoutMs: 20 })).structuredContent, { timedOut: true });
+      assert.equal(wireReads, beforeShortBudget, "Sub-reserve waits must not start a broker read");
       assert.equal(reads, 0);
       const settled = await wait({ connectionId, timeoutMs: 4000 });
       assert.equal(settled.isError, undefined);

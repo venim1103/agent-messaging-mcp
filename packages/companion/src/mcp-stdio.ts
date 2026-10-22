@@ -259,9 +259,9 @@ server.registerTool("chat_wait_for_reply", {
     if (remaining() <= 0) return timedOut();
     client = await bounded(pendingBroker());
     if (extra.mcpReq.signal.aborted) { cancel(); return output({ code: "CANCELLED" }, true); }
-    if (!client || remaining() <= 1) return timedOut();
+    if (!client || remaining() <= 25) return timedOut();
     let observation = new ReplyObservation();
-    while (remaining() > 1) {
+    while (remaining() > 25) {
       const readDeadline = Math.min(deadlineMs, Date.now() + Math.min(5000, Math.ceil(remaining())));
       const read = await bounded(client.readApprovedSnapshot(connectionId, 32, readDeadline));
       if (extra.mcpReq.signal.aborted) return output({ code: "CANCELLED" }, true);

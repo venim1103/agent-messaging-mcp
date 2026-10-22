@@ -1,5 +1,5 @@
 import { browser } from "wxt/browser";
-import { captureGeminiSnapshot, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl } from "../../lib/gemini-observation";
+import { captureGeminiSnapshot, inspectGeminiMathLayout, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl } from "../../lib/gemini-observation";
 
 type FixturePreview = {
   conversationId: string;
@@ -586,6 +586,7 @@ inspectButton.addEventListener("click", async () => {
       let readShape: { direction: string; characters: number }[] | null = null;
       let submitShape: ReturnType<typeof inspectGeminiSubmitControls> = null;
       let promptShape: ReturnType<typeof inspectGeminiPromptControls> = null;
+      let mathShape: ReturnType<typeof inspectGeminiMathLayout> = null;
       const documentId = injection.documentId;
       if (typeof documentId === "string" && /^[!-~]{1,128}$/.test(documentId)
         && preview.mainRegions === 1 && preview.timelineCount === 1) {
@@ -611,6 +612,12 @@ inspectButton.addEventListener("click", async () => {
               direction: message.direction, characters: message.text.length
             }));
           }
+          const [layout] = await browser.scripting.executeScript({
+            target: { tabId: tab.id, documentIds: [documentId] }, func: inspectGeminiMathLayout, args: [tab.url]
+          });
+          const [mathTab] = await browser.tabs.query({ active: true, currentWindow: true });
+          if (layout?.frameId === 0 && layout.documentId === documentId && mathTab?.id === tab.id
+            && (await browser.tabs.get(tab.id)).url === tab.url) mathShape = layout.result ?? null;
         } catch {}
       }
 
@@ -650,7 +657,18 @@ inspectButton.addEventListener("click", async () => {
           ? preview.rows.map((row) => `${row.tag} (${row.characters} chars)`).join("\n") || "No visible rows"
           : "Missing or ambiguous chat region; no text inspected"],
         ["Read shape", readShape?.map((row) => `${row.direction} (${row.characters} chars)`).join("\n")
-          || "Unsupported or changed; no connection approved"]
+          || "Unsupported or changed; no connection approved"],
+        ["Math layout", mathShape ? [
+          `${mathShape.visitedNodes} visited nodes; ${mathShape.limited ? "limit reached" : "within limits"}`,
+          `katex ${mathShape.counts.katex}; visual ${mathShape.counts.visuals}; roots ${mathShape.counts.roots}; `
+            + `SVG ${mathShape.counts.svgs}; images ${mathShape.counts.images}`,
+          ...mathShape.roots.flatMap((root, index) => [
+            `Root ${index + 1}${root.limited ? " (limited)" : ""}`,
+            ...root.nodes.map(node => `depth ${node.depth}; ${node.kind}; children ${node.children}; display ${node.display}; `
+              + `relative ${node.positioned}; strut ${node.strut}; offset ${node.offset}; hidden ${node.hidden}; `
+              + `nontransparent ${node.nontransparent}`)
+          ])
+        ].join("\n") : "Unsupported or changed"]
       ];
       const grantStatusKey = `gemini-grant-status-${tab.id}`;
       const grantStatus = (await browser.storage.session.get(grantStatusKey))[grantStatusKey] as

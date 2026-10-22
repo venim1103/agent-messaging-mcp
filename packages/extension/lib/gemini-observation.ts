@@ -301,6 +301,88 @@ export function inspectGeminiPromptControls(expectedUrl: string): { promptCount:
   return { promptCount: 1, empty, ancestorDepth: null, controls: [], hasMore: false };
 }
 
+export function inspectGeminiMathLayout(expectedUrl: string): {
+  visitedNodes: number; limited: boolean;
+  counts: { katex: number; visuals: number; roots: number; svgs: number; images: number };
+  roots: { limited: boolean; nodes: {
+    depth: number; kind: "sqrt" | "index" | "table" | "row" | "column" | "strut" | "radicand" | "radical" | "svg" | "image" | "other";
+    children: number; display: "inline" | "inline-block" | "block" | "inline-table" | "table-row" | "table-cell" | "none" | "other";
+    positioned: boolean; strut: boolean; offset: "negative" | "zero" | "positive" | "nonfinite";
+    hidden: boolean; nontransparent: boolean;
+  }[] }[];
+} | null {
+  if (window.top !== window || document.visibilityState !== "visible" || location.href !== expectedUrl
+    || location.origin !== "https://gemini.google.com") return null;
+  const url = new URL(location.href);
+  const route = url.pathname.split("/").filter(Boolean);
+  if (url.href.length > 512 || url.username || url.password || url.hash || route.length !== 2
+    || route.some((segment) => !/^[A-Za-z0-9_-]{1,128}$/.test(segment))) return null;
+  const visible = (element: HTMLElement) => element.getClientRects().length > 0
+    && getComputedStyle(element).visibility === "visible";
+  const regions = [...document.querySelectorAll<HTMLElement>("main, [role=main]")].filter(visible);
+  if (regions.length !== 1) return null;
+  const timelines = [...regions[0]!.querySelectorAll<HTMLElement>("infinite-scroller")]
+    .filter(timeline => visible(timeline) && timeline.querySelector("user-query, model-response"));
+  if (timelines.length !== 1) return null;
+  const latest = [...timelines[0]!.querySelectorAll<HTMLElement>("model-response")].filter(visible).at(-1);
+  const contents = latest ? [...latest.querySelectorAll<HTMLElement>("model-response-content")].filter(visible) : [];
+  if (contents.length !== 1) return null;
+  type Layout = NonNullable<ReturnType<typeof inspectGeminiMathLayout>>;
+  const result: Layout = { visitedNodes: 0, limited: false,
+    counts: { katex: 0, visuals: 0, roots: 0, svgs: 0, images: 0 }, roots: [] };
+  const visit = (node: Node, depth: number, root: Layout["roots"][number] | null = null, rootDepth = 0): void => {
+    if (result.visitedNodes === 4096 || depth > 64) {
+      result.limited = true;
+      if (root) root.limited = true;
+      return;
+    }
+    result.visitedNodes++;
+    if (!(node instanceof Element)
+      || node.matches("script, style, noscript, template, math, annotation, .katex-mathml")) return;
+    if (node.classList.contains("katex")) result.counts.katex++;
+    if (node.classList.contains("katex-html")) result.counts.visuals++;
+    if (node instanceof SVGSVGElement) result.counts.svgs++;
+    if (node instanceof HTMLImageElement) result.counts.images++;
+    if (node.classList.contains("sqrt")) {
+      result.counts.roots++;
+      if (!root) {
+        if (result.roots.length === 4) { result.limited = true; return; }
+        root = { limited: false, nodes: [] };
+        rootDepth = depth;
+        result.roots.push(root);
+      }
+    }
+    if (root) {
+      if (root.nodes.length === 64) { root.limited = true; result.limited = true; return; }
+      const style = getComputedStyle(node);
+      const first = node.firstElementChild;
+      const strut = first?.classList.contains("pstrut") === true;
+      const offset = strut ? Number.parseFloat(style.top) + Number.parseFloat(getComputedStyle(first!).height) : NaN;
+      const kind = node instanceof SVGSVGElement ? "svg" : node instanceof HTMLImageElement ? "image"
+        : node.classList.contains("sqrt") ? "sqrt" : node.matches(".root, .katex-root") ? "index"
+        : node.classList.contains("vlist-t") ? "table" : node.classList.contains("vlist-r") ? "row"
+        : node.classList.contains("vlist") ? "column" : node.classList.contains("pstrut") ? "strut"
+        : node.classList.contains("hide-tail") ? "radical" : node.classList.contains("mord") ? "radicand" : "other";
+      const display = style.display;
+      root.nodes.push({ depth: depth - rootDepth, kind,
+        children: node instanceof SVGElement || node instanceof HTMLImageElement ? 0 : node.childNodes.length,
+        display: display === "inline" || display === "inline-block" || display === "block" || display === "inline-table"
+          || display === "table-row" || display === "table-cell" || display === "none" ? display : "other",
+        positioned: style.position === "relative", strut,
+        offset: !Number.isFinite(offset) ? "nonfinite" : offset < 0 ? "negative" : offset > 0 ? "positive" : "zero",
+        hidden: node.hasAttribute("hidden") || style.display === "none" || style.visibility !== "visible" || style.contentVisibility === "hidden",
+        nontransparent: Number(style.opacity) !== 0 });
+    }
+    if (node instanceof SVGElement || node instanceof HTMLImageElement) return;
+    for (const child of node.childNodes) {
+      visit(child, depth + 1, root, rootDepth);
+      if (result.limited) return;
+    }
+  };
+  visit(contents[0]!, 0);
+  return result;
+}
+
 export function isEligibleGeminiUrl(href: string): boolean {
   try {
     const url = new URL(href);

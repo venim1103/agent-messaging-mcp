@@ -4,9 +4,117 @@ import { test } from "node:test";
 import katex from "katex";
 import { chromium } from "playwright-core";
 import { installDraftOwnershipTracker } from "../../packages/extension/lib/draft-ownership.ts";
-import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl,
+import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, inspectGeminiDraft, inspectGeminiMathLayout, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl,
   observeGeminiIdentity, observeGeminiMessages, submitGeminiDraft }
   from "../../packages/extension/lib/gemini-observation.ts";
+
+test("Gemini math-layout diagnostic returns bounded allowlisted shape only", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    const expectedUrl = "https://gemini.google.com/app/disposable-math?hl=en";
+    const rendered = katex.renderToString("\\sqrt{29}");
+    const styles = readFileSync(new URL("../../node_modules/katex/dist/katex.min.css", import.meta.url), "utf8");
+    await page.route("https://gemini.google.com/**", route => route.fulfill({ contentType: "text/html; charset=utf-8",
+      body: `<!doctype html><style>${styles}
+        main, infinite-scroller, model-response, model-response-content { display: block; }
+      </style><main><infinite-scroller>
+        <model-response><model-response-content>${rendered}${rendered}</model-response-content></model-response>
+        <model-response><model-response-content><span class="private-unreviewed-class" data-private="Private attribute">
+          Private reply text</span>${rendered}</model-response-content></model-response>
+      </infinite-scroller><textarea>Private unsent draft</textarea><button>Private control</button></main>
+      <script>window.submits = 0; document.querySelector('button').onclick = () => window.submits++;</script>` }));
+    await page.goto(expectedUrl);
+    const inspect = async (url = expectedUrl) => {
+      const before = await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML,
+        scroll: [scrollX, scrollY] }));
+      const result = await page.evaluate(inspectGeminiMathLayout, url);
+      assert.deepEqual(await page.evaluate(() => ({ html: document.body.innerHTML, active: document.activeElement?.outerHTML,
+        scroll: [scrollX, scrollY] })), before);
+      assert.equal(await page.evaluate(() => window.submits), 0);
+      assert.equal(/Private|private-|disposable|https:|\\sqrt|annotation|path/.test(JSON.stringify(result)), false);
+      return result;
+    };
+    const result = await inspect();
+    assert.equal(result.limited, false);
+    assert.deepEqual(result.counts, { katex: 1, visuals: 1, roots: 1, svgs: 1, images: 0 });
+    assert.equal(result.roots.length, 1);
+    assert.equal(result.roots[0].limited, false);
+    assert.ok(result.roots[0].nodes.some(node => node.kind === "table" && node.display === "inline-table"));
+    assert.ok(result.roots[0].nodes.some(node => node.kind === "column" && node.display === "table-cell"));
+    assert.ok(result.roots[0].nodes.some(node => node.kind === "svg" && !node.hidden && node.nontransparent));
+    assert.equal(await inspect(expectedUrl.replace("hl=en", "hl=fr")), null);
+    await page.locator("model-response").last().locator(".vlist").evaluateAll(columns => {
+      for (const column of columns) column.style.display = "block";
+    });
+    assert.ok((await inspect()).roots[0].nodes
+      .some(node => node.kind === "column" && node.display === "block"));
+    await page.locator("model-response").last().locator("svg").evaluate(svg => { svg.style.display = "none"; });
+    assert.ok((await inspect()).roots[0].nodes
+      .some(node => node.kind === "svg" && node.hidden));
+    await page.reload();
+    await page.locator("model-response").last().locator("svg").evaluate(svg => {
+      const wrapper = document.createElement("span");
+      wrapper.style.opacity = "0";
+      svg.before(wrapper);
+      wrapper.append(svg);
+    });
+    assert.ok((await inspect()).roots[0].nodes.some(node => node.kind === "other" && !node.nontransparent));
+    await page.reload();
+    await page.locator("model-response-content").last().evaluate(content => {
+      const root = content.querySelector(".sqrt");
+      content.replaceChildren(...Array.from({ length: 5 }, () => root.cloneNode(true)));
+    });
+    const roots = await inspect();
+    assert.equal(roots.limited, true);
+    assert.equal(roots.roots.length, 4);
+    await page.reload();
+    await page.locator("model-response-content").last().evaluate(content => {
+      content.querySelector(".sqrt").append(...Array.from({ length: 80 }, () => document.createElement("span")));
+    });
+    const rootNodes = await inspect();
+    assert.equal(rootNodes.limited, true);
+    assert.equal(rootNodes.roots[0].limited, true);
+    assert.equal(rootNodes.roots[0].nodes.length, 64);
+    await page.reload();
+    await page.locator("model-response-content").last().evaluate(content => {
+      const root = content.querySelector(".sqrt");
+      for (let depth = 0; depth < 70; depth++) {
+        const wrapper = document.createElement("span");
+        root.before(wrapper);
+        wrapper.append(root);
+      }
+    });
+    const depth = await inspect();
+    assert.equal(depth.limited, true);
+    assert.equal(depth.roots.length, 0);
+    await page.reload();
+    await page.locator("model-response-content").last().evaluate(content => {
+      content.replaceChildren(...Array.from({ length: 4200 }, () => document.createElement("span")));
+    });
+    const nodes = await inspect();
+    assert.equal(nodes.limited, true);
+    assert.equal(nodes.visitedNodes, 4096);
+    await page.reload();
+    await page.locator("model-response").last().evaluate(response => {
+      response.append(response.querySelector("model-response-content").cloneNode(true));
+    });
+    assert.equal(await inspect(), null);
+    await page.reload();
+    await page.evaluate(() => {
+      for (const [prototype, property] of [[Node.prototype, "textContent"], [HTMLElement.prototype, "innerText"],
+        [Element.prototype, "innerHTML"], [Element.prototype, "outerHTML"]]) {
+        Object.defineProperty(prototype, property, { get() { throw new Error("Forbidden content access"); }, configurable: true });
+      }
+      for (const element of document.querySelectorAll(".katex-mathml, svg")) {
+        Object.defineProperty(element, "childNodes", { get() { throw new Error("Forbidden source traversal"); }, configurable: true });
+      }
+    });
+    assert.deepEqual((await page.evaluate(inspectGeminiMathLayout, expectedUrl)).counts, result.counts);
+  } finally {
+    await browser.close();
+  }
+});
 
 test("read-only Gemini draft inspection refuses unsafe composers without editing or submitting", { timeout: 15000 }, async () => {
   const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
