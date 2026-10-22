@@ -444,7 +444,7 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
     let visited = 0;
     let failed = false;
     const parts: string[] = [];
-    type MathText = { element: HTMLElement | null; text: string; children: MathText[] };
+    type MathText = { element: HTMLElement | null; text: string; children: MathText[]; visibleGraphic?: true };
     const mathVisuals = new Set(structured ? [...clippedMath].map(alternative =>
       alternative.parentElement!.querySelector<HTMLElement>(":scope > .katex-html")!) : []);
     const mathLayers = (node: MathText): { payload: MathText; offset: number }[] => {
@@ -479,6 +479,12 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
         const whiteSpace = node.parentElement ? getComputedStyle(node.parentElement).whiteSpace : "normal";
         return { element: null, text: whiteSpace === "normal" || whiteSpace === "nowrap" ? value.replace(/\s+/g, " ") : value, children: [] };
       }
+      if (node instanceof SVGSVGElement) {
+        const style = getComputedStyle(node);
+        if (node.hasAttribute("hidden") || style.display === "none" || style.visibility !== "visible"
+          || style.contentVisibility === "hidden" || Number(style.opacity) === 0) return null;
+        return { element: null, text: "", children: [], visibleGraphic: true };
+      }
       if (!(node instanceof HTMLElement) || node.matches("script, style, noscript, template, [hidden]") || clippedMath.has(node)) return null;
       const style = getComputedStyle(node);
       if (style.display === "none" || style.visibility !== "visible" || style.contentVisibility === "hidden") return null;
@@ -490,7 +496,8 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
       }
       const text = children.map(child => child.text).join("");
       const block = !["inline", "inline-block", "inline-flex", "inline-grid", "contents"].includes(style.display);
-      const result = { element: node, text: node.localName === "br" ? "\n" : block ? `\n${text}\n` : text, children };
+      const result: MathText = { element: node, text: node.localName === "br" ? "\n" : block ? `\n${text}\n` : text, children };
+      if (Number(style.opacity) !== 0 && children.some(child => child.visibleGraphic)) result.visibleGraphic = true;
       if (node.matches(".vlist-s") && text === "\u200b") result.text = "";
       if (node.matches(".msupsub")) {
         const layers = mathLayers(result);
@@ -512,11 +519,9 @@ export function captureGeminiSnapshot(expectedUrl?: string): { messages: GeminiR
         const layers = mathLayers(result);
         const radicand = layers.find(layer => layer.payload.element?.matches(".mord"))?.payload;
         const radical = layers.find(layer => layer.payload.element?.matches(".hide-tail"))?.payload;
-        const svg = radical?.element?.querySelector(":scope > svg");
         const index = children.find(child => child.element?.matches(".root, .katex-root"));
         const indexLayers = index ? mathLayers(index) : [];
-        if (layers.length === 2 && radicand?.text.trim() && svg instanceof SVGElement && !radical?.text.trim()
-          && getComputedStyle(svg).display !== "none" && getComputedStyle(svg).visibility === "visible"
+        if (layers.length === 2 && radicand?.text.trim() && radical?.visibleGraphic && !radical.text.trim()
           && children.length === 1 + Number(Boolean(index))
           && (!index || indexLayers.length === 1 && indexLayers[0]!.payload.text.trim())) {
           result.text = index ? `root(${indexLayers[0]!.payload.text.trim()}, ${radicand.text.trim()})` : `sqrt(${radicand.text.trim()})`;

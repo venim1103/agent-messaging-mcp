@@ -704,6 +704,14 @@ test("Gemini capture preserves structured visible KaTeX math without hidden sour
       return result;
     };
     assert.deepEqual(await capture(), expected);
+    await page.locator(".sqrt .hide-tail > svg").evaluateAll(graphics => {
+      for (const graphic of graphics) {
+        const wrapper = document.createElement("span");
+        graphic.replaceWith(wrapper);
+        wrapper.append(graphic);
+      }
+    });
+    assert.deepEqual(await capture(), expected, "visible radical wrappers preserve structure");
     await page.locator(".katex-mathml").evaluateAll(alternatives => {
       for (const alternative of alternatives) alternative.textContent = "Excluded synthetic hidden source";
     });
@@ -721,13 +729,25 @@ test("Gemini capture preserves structured visible KaTeX math without hidden sour
       });
       assert.match((await capture()).messages[0].text, /Visible synthetic extra term/, selector);
     }
-    for (const scenario of ["unpositioned-script", "hidden-fraction-bar", "hidden-radical"]) {
+    for (const scenario of ["unpositioned-script", "hidden-fraction-bar", "hidden-radical", "hidden-radical-wrapper",
+      "display-hidden-radical-wrapper", "visibility-hidden-radical-wrapper", "content-hidden-radical-wrapper", "transparent-radical-wrapper",
+      "transparent-radical-svg"]) {
       await page.reload();
       await page.evaluate(scenario => {
         if (scenario === "unpositioned-script") {
           document.querySelector(".msupsub > .vlist-t > .vlist-r > .vlist > span").style.position = "static";
         } else if (scenario === "hidden-fraction-bar") document.querySelector(".frac-line").style.display = "none";
-        else document.querySelector(".sqrt svg").style.display = "none";
+        else if (scenario === "hidden-radical") document.querySelector(".sqrt svg").style.display = "none";
+        else if (scenario === "transparent-radical-svg") document.querySelector(".sqrt svg").style.opacity = "0";
+        else {
+          const graphic = document.querySelector(".sqrt svg");
+          const wrapper = document.createElement("span");
+          if (scenario === "hidden-radical-wrapper") wrapper.hidden = true;
+          else wrapper.style.cssText = { "display-hidden-radical-wrapper": "display:none", "visibility-hidden-radical-wrapper": "visibility:hidden",
+            "content-hidden-radical-wrapper": "content-visibility:hidden", "transparent-radical-wrapper": "opacity:0" }[scenario];
+          graphic.replaceWith(wrapper);
+          wrapper.append(graphic);
+        }
       }, scenario);
       const text = (await capture()).messages[0].text;
       const refused = scenario === "unpositioned-script" ? /Power: w\^\(5\)/
@@ -735,6 +755,13 @@ test("Gemini capture preserves structured visible KaTeX math without hidden sour
       assert.doesNotMatch(text, refused, scenario);
     }
     await page.reload();
+    await page.locator(".sqrt .hide-tail > svg").evaluateAll(graphics => {
+      for (const graphic of graphics) {
+        const wrapper = document.createElement("span");
+        graphic.replaceWith(wrapper);
+        wrapper.append(graphic);
+      }
+    });
     await page.evaluate(() => {
       document.querySelector("main").style.marginTop = "20000px";
       const row = document.querySelector("model-response");
@@ -743,6 +770,24 @@ test("Gemini capture preserves structured visible KaTeX math without hidden sour
     });
     assert.equal(await page.locator("model-response-content").innerText(), "");
     assert.deepEqual(await capture(), expected, "offscreen structure is independent of element geometry");
+    for (const limit of ["nodes", "depth"]) {
+      await page.reload();
+      await page.locator(".sqrt .hide-tail").first().evaluate((radical, limit) => {
+        if (limit === "nodes") {
+          for (let index = 0; index < 4096; index++) radical.prepend(document.createElement("span"));
+        } else {
+          const graphic = radical.querySelector("svg");
+          let parent = radical;
+          for (let depth = 0; depth < 65; depth++) {
+            const wrapper = document.createElement("span");
+            parent.append(wrapper);
+            parent = wrapper;
+          }
+          parent.append(graphic);
+        }
+      }, limit);
+      assert.equal(await capture(), null, `radical wrapper ${limit}`);
+    }
     for (const limit of ["nodes", "depth"]) {
       await page.reload();
       await page.locator(".katex-html").first().evaluate((visual, limit) => {

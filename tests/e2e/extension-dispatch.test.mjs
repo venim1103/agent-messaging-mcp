@@ -522,6 +522,11 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
             scripts.innerHTML = "Synthetic scripts: k<sub>2</sub><sup>7</sup>.";
             const structured = document.createElement("p");
             structured.innerHTML = `Synthetic structured quantity: ${mathHtml}.`;
+            for (const graphic of structured.querySelectorAll(".sqrt .hide-tail > svg")) {
+              const wrapper = document.createElement("span");
+              graphic.replaceWith(wrapper);
+              wrapper.append(graphic);
+            }
             content.append(card, summary, quantity, modernQuantity, scripts, structured);
             for (const style of ["display:none", "visibility:hidden", "content-visibility:hidden"]) {
               const excluded = document.createElement("span");
