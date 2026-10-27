@@ -19,8 +19,11 @@ import { PendingConnectionRequests } from "./pending-connections.js";
 
 const brokerStartupObserver = `import { appendFileSync } from "node:fs";
   import { join } from "node:path";
-  if (process.argv[1]?.endsWith("/broker-process.js"))
-    appendFileSync(join(process.env.HOME, "broker-pids"), String(process.pid) + "\\n", { mode: 0o600 });`;
+  if (process.argv[1]?.endsWith("/broker-process.js")) {
+    appendFileSync(join(process.env.HOME, "broker-pids"), String(process.pid) + "\\n", { mode: 0o600 });
+    process.once("exit", code => appendFileSync(join(process.env.HOME, "broker-exits"),
+      JSON.stringify({ pid: process.pid, code }) + "\\n", { mode: 0o600 }));
+  }`;
 
 async function brokerSocketReady(socketPath: string): Promise<boolean> {
   try {
@@ -443,7 +446,7 @@ test("concurrent SDK send cancellation never labels an existing durable attempt 
   }
 });
 
-test("two MCP facades auto-start one private broker before any tool call", { timeout: 10000 }, async () => {
+test("two MCP facades auto-start one private broker before any tool call", { timeout: 10000 }, async testContext => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-mcp-auto-start-"));
   const runtimeDirectory = join(home, ".config/agent-messaging-mcp/broker");
   const options = { command: process.execPath,
@@ -453,13 +456,20 @@ test("two MCP facades auto-start one private broker before any tool call", { tim
   const clients = [new Client({ name: `${"A".repeat(79)} B`, version: "0.0.1" }),
     new Client({ name: "auto-start-two", version: "0.0.1" })] as const;
   try {
+    const started = performance.now();
     await Promise.all(clients.map((client) => client.connect(new StdioClientTransport(options))));
+    const initializedMs = Math.round(performance.now() - started);
     let ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
       ready = await brokerSocketReady(join(runtimeDirectory, "broker.sock"));
       if (ready) break;
       await setTimeout(25);
     }
+    const spawned = await readFile(join(home, "broker-pids"), "utf8").catch(() => "");
+    const exited = await readFile(join(home, "broker-exits"), "utf8").catch(() => "");
+    testContext.diagnostic(JSON.stringify({ initializedMs, readinessMs: Math.round(performance.now() - started),
+      brokerStarts: spawned.trim().split("\n").filter(Boolean).length,
+      brokerExitCodes: exited.trim().split("\n").filter(Boolean).map(line => JSON.parse(line).code) }));
     assert.equal(ready, true, "Broker must start before a tool is invoked");
     const credential = await readFile(join(runtimeDirectory, "facade.key"), "utf8");
     const created = await Promise.all(clients.map((client) => client.callTool({

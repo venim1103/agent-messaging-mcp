@@ -141,6 +141,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         };
       }, { provider, autonomous, lostSettle });
     }
+    setPhase("native registration and MCP startup");
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     facade = await connectBroker("facade", directory, undefined, undefined,
       autonomous === true ? "Synthetic autonomous browser owner" : undefined);
@@ -149,6 +150,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
     await mcpClient.connect(new StdioClientTransport({ command: process.execPath, args: [mcpEntry],
       env: { ...process.env, HOME: profile } }));
+    setPhase("synthetic chat setup");
     const fixture = await context.newPage();
     const html = provider === "gemini" ? `<!doctype html><html><head><meta charset="utf-8"><style>
       main, infinite-scroller, user-query, user-query-content { display:block }
@@ -212,6 +214,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     }, provider);
     assert.equal(selected.conversation, provider === "gemini" ? "synthetic-neutral-submit" : "fixture-alpha");
     if (autonomous) {
+      setPhase("popup connection approval");
       const popup = await context.newPage();
       await fixture.bringToFront();
       await popup.goto(`chrome-extension://${extensionId}/popup.html`);
@@ -224,6 +227,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       }, { once: true }));
       await connect.press("Enter", { timeout: 4000 });
       assert.deepEqual(await popup.evaluate(() => globalThis.visibilityApprovalGesture), { trusted: true, active: true });
+      setPhase("waiting for connected roster");
       await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent?.startsWith("1 connected"), null,
         { timeout: 4000, polling: realVisibility ? 100 : "raf" });
       const pickup = autonomous === "public"
@@ -683,12 +687,18 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
               finally { finish(); }
             };
           }, { tabId: selected.tabId, afterSubmit });
+          setPhase(afterSubmit ? "starting hidden queued submit send" : "starting hidden queued fill send");
           const sending = mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
-          await worker.evaluate(() => globalThis.suspendedWriteReady);
+          const queuedWriteRemainingMs = await worker.evaluate(async () => {
+            await globalThis.suspendedWriteReady;
+            return globalThis.suspendedWriteExpiresAt - Date.now();
+          });
           const lifecycle = await context.newCDPSession(fixture);
           setPhase(afterSubmit ? "hidden page frozen before queued submit execution" : "hidden page frozen before queued fill execution");
           await lifecycle.send("Page.setWebLifecycleState", { state: "frozen" });
+          setPhase(`awaiting frozen send/settlement; queued write had ${queuedWriteRemainingMs} ms remaining`);
           const result = await sending;
+          setPhase("frozen send/settlement returned");
           const expectedState = afterSubmit ? "unresolved" : "not_sent";
           assert.equal(result.structuredContent.state, expectedState);
           assert.equal(result.structuredContent.retryAllowed, false);
@@ -957,6 +967,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         }
         const result = await mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
         const status = result.structuredContent;
+        if (hiddenSettlement) testContext.diagnostic(`Hidden settlement trace: ${JSON.stringify(
+          await worker.evaluate(() => globalThis.browserJobTrace))}`);
         if (inactive) {
           assert.equal(await fixture.evaluate(() => document.visibilityState), "hidden");
           assert.deepEqual(await worker.evaluate(async tabId => ({ active: (await chrome.tabs.get(tabId)).active,

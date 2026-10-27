@@ -44,6 +44,28 @@ async function exchange(socket: Socket, message: unknown): Promise<unknown> {
   });
 }
 
+test("broker claims its runtime before initializing the operation database", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-start-order-"));
+  const directory = join(home, "broker");
+  const database = new DatabaseSync(":memory:");
+  let broker: Awaited<ReturnType<typeof startBrokerSocket>> | undefined = await startBrokerSocket(directory, createBrokerCredentials());
+  try {
+    await assert.rejects(startBrokerSocket(directory, createBrokerCredentials(), database), { code: "EEXIST" });
+    assert.deepEqual(database.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").all(), [],
+      "A losing starter must not initialize or recover the operation database");
+    await broker.close();
+    broker = undefined;
+    database.close();
+    await assert.rejects(startBrokerSocket(directory, createBrokerCredentials(), database), /database is not open/);
+    await assert.rejects(stat(directory), { code: "ENOENT" });
+    broker = await startBrokerSocket(directory, createBrokerCredentials());
+  } finally {
+    await broker?.close();
+    if (database.isOpen) database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 for (const target of [
   { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
   { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,

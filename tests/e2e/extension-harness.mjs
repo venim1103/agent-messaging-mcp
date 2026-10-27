@@ -42,6 +42,10 @@ async function traceBrowserJobs(worker) {
       port.onMessage.addListener(reply => {
         for (const job of reply.payload?.jobs ?? reply.payload?.checks ?? []) record({ event: "offer",
           kind: reply.kind, remainingMs: job.expiresAt - Date.now() });
+        for (const challenge of reply.payload?.challenges ?? []) record({ event: "read_challenge",
+          kind: reply.kind, remainingMs: challenge.expiresAt - Date.now() });
+        if (reply.kind.endsWith("_recorded") && typeof reply.payload?.accepted === "boolean") record({ event: "acknowledgement",
+          kind: reply.kind, accepted: reply.payload.accepted, remainingMs: reply.deadlineMs - Date.now() });
       });
       const post = port.postMessage.bind(port);
       port.postMessage = message => {

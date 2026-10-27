@@ -53,6 +53,8 @@ Everything runs inside the Podman devcontainer ([devcontainer.json](.devcontaine
 
    Starting the MCP facade also connects it to the broker. If the runtime is missing or its socket refuses, the facade makes at most one detached broker-start attempt and checks readiness within a five-second absolute startup budget. The child uses ignored stdio, never MCP stdout. Private directory/key/socket ownership, modes and authenticated role checks remain mandatory; unsafe runtimes or failed authentication do not trigger a replacement. Concurrent facades share the broker but keep separate owners; a detached broker stays running when a facade exits.
 
+   A broker must atomically claim its private runtime directory before initializing the operation ledger. A losing starter must not create tables or recover the running broker's persisted attempts. Ledger initialization failure removes the newly claimed runtime without publishing a socket; it does not change SQLite locking, security checks or startup deadlines.
+
    The startup budget clips only authentication, not the persistent facade's later requests or keepalive. The private connector's separate upstream deadline still clips every request made by a short-lived native relay. Neither deadline grants or renews chat authority.
 
    `npm run dev:broker` remains available for foreground debugging (stop with Ctrl+C). It refuses a second instance (`Broker is already running`) and recovers only its own dead runtime. Set `BROWSER_CHAT_AUTO_START_BROKER=0` in the MCP process environment to disable eager connection and auto-start for tests/manual debugging; tool calls then connect lazily to an already running broker.

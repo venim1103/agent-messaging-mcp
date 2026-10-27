@@ -18,7 +18,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
   const relayKeyPath = join(runtimeDirectory, "relay.key");
   const clients = new Set<Socket>();
   const requests = new PendingConnectionRequests();
-  const operations = operationDatabase ? new PreparedMessageOperations(requests, operationDatabase) : undefined;
+  let operations: PreparedMessageOperations | undefined;
   await mkdir(runtimeDirectory, { mode: 0o700 });
   const server = createServer((socket) => {
     if (clients.size >= 16) {
@@ -246,6 +246,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
   });
 
   try {
+    operations = operationDatabase ? new PreparedMessageOperations(requests, operationDatabase) : undefined;
     await writeFile(facadeKeyPath, credentials.facade, { flag: "wx", mode: 0o600 });
     await writeFile(relayKeyPath, credentials.relay, { flag: "wx", mode: 0o600 });
     await new Promise<void>((resolve, reject) => {

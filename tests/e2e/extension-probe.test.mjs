@@ -42,30 +42,40 @@ test("synthetic Gemini proof faults stay bound to their starting invocation", { 
   }
 });
 
-async function createNativeWatchHarness(profile, requestKind) {
+async function createNativeWatchHarness(profile, requestKind, dropRequest = false) {
   const pidPath = join(profile, "native-watch.json");
+  const dropPath = join(profile, "native-dropped-requests");
   const relayPath = join(profile, "native-watch-relay.mjs");
   await writeFile(relayPath, `import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
-import { NativeFrameDecoder } from ${JSON.stringify(fileURLToPath(new URL("../../packages/companion/dist/native-framing.js", import.meta.url)))};
+import { appendFileSync, writeFileSync } from "node:fs";
+import { encodeNativeFrame, NativeFrameDecoder } from ${JSON.stringify(fileURLToPath(new URL("../../packages/companion/dist/native-framing.js", import.meta.url)))};
 const relay = spawn(process.execPath, [${JSON.stringify(nativeRelayPath)}, ...process.argv.slice(2)], { stdio: ["pipe", "pipe", "inherit"] });
 const decoder = new NativeFrameDecoder();
+const dropRequest = ${JSON.stringify(dropRequest)};
 let marked = false;
 process.stdin.on("data", chunk => {
   for (const request of decoder.push(chunk)) {
-    if (!marked && request.kind === ${JSON.stringify(requestKind)}) {
-      writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ pid: relay.pid, parent: process.pid }), { mode: 0o600 });
-      marked = true;
+    if (request.kind === ${JSON.stringify(requestKind)}) {
+      if (!marked) {
+        writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ pid: relay.pid, parent: process.pid }), { mode: 0o600 });
+        marked = true;
+      }
+      if (dropRequest) {
+        appendFileSync(${JSON.stringify(dropPath)}, "drop\\n", { mode: 0o600 });
+        continue;
+      }
     }
+    if (dropRequest) relay.stdin.write(encodeNativeFrame(request));
   }
 });
-process.stdin.pipe(relay.stdin);
+if (dropRequest) process.stdin.on("end", () => relay.stdin.end());
+else process.stdin.pipe(relay.stdin);
 relay.stdout.pipe(process.stdout);
 relay.once("close", code => process.exit(code ?? 1));
 relay.once("error", () => process.exit(1));
 process.on("SIGTERM", () => relay.kill("SIGTERM"));
 `, { mode: 0o600 });
-  return { pidPath, relayPath };
+  return { pidPath, dropPath, relayPath };
 }
 
 async function stopNativeWatch(harness) {
@@ -2222,6 +2232,8 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
     testContext.signal.addEventListener("abort", () => testContext.diagnostic(`Synthetic Gemini phase at test end: ${phase}`), { once: true });
     testContext.signal.throwIfAborted();
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-worker-fill-"));
+    const nativeLoss = outcome === "completion-request-loss"
+      ? await createNativeWatchHarness(profile, "complete_gemini_fill", true) : undefined;
     const unpacked = join(profile, "unpacked-extension");
     await cp(extensionDirectory, unpacked, { recursive: true });
     const manifestPath = join(unpacked, "manifest.json");
@@ -2242,7 +2254,7 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
       });
       let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
       const extensionId = new URL(worker.url()).hostname;
-      await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+      await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeLoss?.relayPath ?? nativeRelayPath, profile));
       broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
       brokerExit = once(broker, "exit");
       let ready = false;
@@ -2259,22 +2271,6 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
       const page = await context.newPage();
       const url = "https://gemini.google.com/app/synthetic-worker-fill?hl=en";
       if (outcome === "observed") await traceBrowserJobs(worker);
-      await worker.evaluate(scenario => {
-        globalThis.syntheticFillCompletionDrops = 0;
-        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
-        chrome.runtime.connectNative = (...args) => {
-          const port = connect(...args);
-          const post = port.postMessage.bind(port);
-          port.postMessage = message => {
-            if (scenario === "completion-request-loss" && message.kind === "complete_gemini_fill") {
-              globalThis.syntheticFillCompletionDrops++;
-              return;
-            }
-            post(message);
-          };
-          return port;
-        };
-      }, outcome);
       await page.route("https://gemini.google.com/**", route => route.fulfill({ contentType: "text/html; charset=utf-8",
         body: `<!doctype html><html><head><meta charset="utf-8"><style>
           main, infinite-scroller, user-query, user-query-content { display:block }
@@ -2423,7 +2419,8 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
       assert.equal(await nativeInsertCalls(), 1);
       assert.equal(await page.evaluate(() => window.controlActivations), 0);
       assert.equal(await worker.evaluate(() => globalThis.syntheticFillExecutions ?? 0), outcome === "worker-stop" ? 0 : 1);
-      assert.equal(await worker.evaluate(() => globalThis.syntheticFillCompletionDrops ?? 0), outcome === "completion-request-loss" ? 1 : 0);
+      const completionDrops = nativeLoss ? (await readFile(nativeLoss.dropPath, "utf8")).trim().split("\n").filter(Boolean).length : 0;
+      assert.equal(completionDrops, outcome === "completion-request-loss" ? 1 : 0);
       assert.deepEqual((await facade.fillGeminiDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
       assert.deepEqual((await relay.listGeminiFillChallenges()).payload, { fills: [] });
       const status = await facade.getPreparedOperation(prepared.payload.operationId);
