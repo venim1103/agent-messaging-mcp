@@ -19,7 +19,7 @@ import { fingerprintExtension, verifyExtensionBuild } from "../../packages/exten
 import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
-import { createNativeRequestChannel } from "../../packages/extension/lib/native-channel.ts";
+import { createNativeRequestChannel, requestNativeGrantCount } from "../../packages/extension/lib/native-channel.ts";
 import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
 test("synthetic Gemini proof faults stay bound to their starting invocation", { timeout: 1000 }, async () => {
@@ -143,6 +143,50 @@ test("native request channel reuses bounded ports without replay after loss or e
   await assert.rejects(request("list_chat_agents", {}, Date.now()), /unavailable/);
   await assert.rejects(request("list_chat_agents", {}, Date.now() + 30_001), /unavailable/);
   assert.equal(ports.length, 3);
+
+  const counts = createNativeChannelHarness();
+  const fixtureTarget = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 7, documentId: "count-doc" };
+  const commands = [
+    { kind: "revoke_all_fixture", payload: {} },
+    { kind: "revoke_fixture", payload: { tabId: 7, observed: null } },
+    { kind: "mark_fixture_observation_gap", payload: { target: fixtureTarget } },
+    { kind: "mark_gemini_observation_gap", payload: { target: { origin: "https://gemini.google.com",
+      conversationId: "synthetic-count", url: "https://gemini.google.com/app/synthetic-count", tabId: 8, documentId: "gemini-count-doc" } } }
+  ];
+  const countRequests = commands.map(command => requestNativeGrantCount(counts.request, command));
+  assert.equal(counts.ports.length, 1, "Gap/revocation requests reuse the existing bounded control channel");
+  assert.equal(counts.ports[0].messages.length, commands.length);
+  for (const [index, command] of commands.entries()) {
+    const message = counts.ports[0].messages[index];
+    assert.equal(message.kind, command.kind);
+    assert.deepEqual(message.payload, command.payload);
+    assert.equal(message.deadlineMs, Date.now() + 10_000, "Grant-count deadline remains ten seconds");
+    counts.ports[0].listeners.message({ ...message, kind: command.kind === "mark_fixture_observation_gap"
+      ? "fixture_gap_marked" : command.kind === "mark_gemini_observation_gap" ? "gemini_gap_marked" : "fixture_revoked",
+    payload: { count: index } });
+  }
+  assert.deepEqual(await Promise.all(countRequests), [true, true, true, true]);
+  for (const payload of [{ count: -1 }, { count: 0.5 }, { count: "1" }, { count: Number.MAX_SAFE_INTEGER + 1 }, {}, { count: 1, extra: true }]) {
+    const invalid = requestNativeGrantCount(counts.request, commands[0]);
+    const message = counts.ports[0].messages.at(-1);
+    counts.ports[0].listeners.message({ ...message, kind: "fixture_revoked", payload });
+    assert.equal(await invalid, false, "Malformed grant counts cannot acknowledge revocation or gap marking");
+  }
+  const wrongKind = requestNativeGrantCount(counts.request, commands[0]);
+  counts.ports[0].listeners.message({ ...counts.ports[0].messages.at(-1), kind: "gemini_gap_marked", payload: { count: 1 } });
+  assert.equal(await wrongKind, false);
+  const wrongDeadline = requestNativeGrantCount(counts.request, commands[0]);
+  const message = counts.ports[0].messages.at(-1);
+  counts.ports[0].listeners.message({ ...message, kind: "fixture_revoked", deadlineMs: message.deadlineMs + 1, payload: { count: 1 } });
+  assert.equal(await wrongDeadline, false);
+  assert.equal(counts.ports[0].disconnected, true);
+  const expiredCount = requestNativeGrantCount(counts.request, commands[0]);
+  assert.equal(counts.ports.length, 2);
+  testContext.mock.timers.tick(10_000);
+  assert.equal(await expiredCount, false);
+  assert.equal(counts.ports[1].disconnected, true);
+  testContext.mock.timers.tick(10_000);
+  assert.equal(counts.ports.length, 2, "Failed grant-count requests never reopen or replay automatically");
 });
 
 test("native request channel fails closed on malformed replies and startup or post errors", async testContext => {
@@ -588,7 +632,8 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
   }
 });
 
-test("worker wake marks a gap; reload, tab close, denied reads, and disconnect revoke grants", { timeout: 30000 }, async () => {
+test("worker wake marks a gap; reload, tab close, denied reads, and disconnect revoke grants", { timeout: 30000 }, async testContext => {
+  const setPhase = trackTestPhase(testContext, "Worker wake and revocation");
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-restart-test-"));
   const directory = join(profile, ".config/agent-messaging-mcp/broker");
   const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
@@ -604,6 +649,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
   let facade;
   let relay;
   try {
+    setPhase("browser startup");
     context = await launch();
     const manager = await context.newPage();
     await manager.goto("chrome://extensions/");
@@ -617,6 +663,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     assert.equal(new URL(worker.url()).hostname, extensionId);
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
 
+    setPhase("broker startup");
     broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
     brokerExit = once(broker, "exit");
     let ready = false;
@@ -692,6 +739,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
       });
     }
 
+    setPhase("seeded worker-wake observation");
     const beforeReload = await grant(3);
     const beforeWake = await facade.getConnection(beforeReload);
     if (beforeWake.kind !== "connection_state" || beforeWake.payload.state !== "ready_readonly") {
@@ -750,6 +798,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await awake.close();
     await serviceWorkers.detach();
 
+    setPhase("extension reload revocation");
     const geminiBeforeReload = await facade.requestConnection();
     if (geminiBeforeReload.kind !== "connection_requested") throw new Error("Expected Gemini reload request");
     const geminiReloadApproval = await relay.approveGemini(geminiBeforeReload.payload.requestId, {
@@ -782,6 +831,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     assert.equal(runtimeErrors.some((message) => message.includes("Unchecked runtime.lastError: Native host has exited")),
       false, JSON.stringify(runtimeErrors));
 
+    setPhase("browser restart revocation");
     const beforeBrowserRestart = await grant(4);
     await context.close();
     context = await launch();
@@ -798,6 +848,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
       (await chrome.storage.session.get("fixture-reset-done"))["fixture-reset-done"]), true);
     await restartedPopup.close();
 
+    setPhase("tab-close revocation");
     const trackedTab = await createSettledTab();
     const beforeTabClose = await grant(trackedTab.id);
     await worker.evaluate(({ tabId }) => chrome.storage.session.set({
@@ -822,6 +873,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await worker.evaluate((tabId) => chrome.tabs.remove(tabId), geminiTab.id);
     await waitForStale(geminiPending.payload.requestId);
 
+    setPhase("seeded denied-read grants");
     const unapprovedTab = await createSettledTab();
     const beforeDeniedRead = await grant(unapprovedTab.id);
     const deniedState = await facade.getConnection(beforeDeniedRead);
@@ -860,6 +912,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
       "gemini-grant-9999": { documentId: "CHROME-doc_orphan",
         url: "https://gemini.google.com/app/disposable-chat?hl=en", expiresAt: Date.now() + 30_000 }
     }));
+    setPhase("read-worker restart");
     const resumedManager = await context.newPage();
     await resumedManager.goto("chrome://extensions/");
     const readerWorkers = await context.newCDPSession(resumedManager);
@@ -887,7 +940,9 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await resumedPopup.waitForFunction(async () =>
       (await chrome.storage.session.get("gemini-grant-9999"))["gemini-grant-9999"] === undefined,
     undefined, { timeout: 8000 });
+    setPhase("denied fixture read");
     const denied = await facade.readFixtureSnapshot(deniedState.payload.connectionId);
+    setPhase("fixture revocation result");
     assert.equal(denied.kind, "error");
     assert.deepEqual(denied.payload, { code: "CONNECTION_NOT_FOUND" });
     await waitForStale(beforeDeniedRead);
@@ -899,7 +954,9 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     assert.equal(beforeGeminiChallenge.payload.state, "ready_readonly",
       `Gemini grant was revoked before its challenge; tracked: ${trackedGeminiBefore}`);
     assert.equal(trackedGeminiBefore, true);
+    setPhase("denied Gemini read");
     const deniedGeminiRead = await facade.readGeminiSnapshot(unapprovedGeminiState.payload.connectionId);
+    setPhase("Gemini revocation result");
     assert.equal(deniedGeminiRead.kind, "error");
     assert.deepEqual(deniedGeminiRead.payload, { code: "CONNECTION_NOT_FOUND" });
     await waitForStale(unapprovedGemini.payload.requestId);
@@ -914,6 +971,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     assert.equal(geminiStatus?.code, "target_changed");
     assert.equal(Number.isSafeInteger(geminiStatus?.recordedAt), true);
     assert.deepEqual(Object.keys(geminiStatus).sort(), ["code", "recordedAt"]);
+    setPhase("explicit disconnect");
     assert.deepEqual((await facade.disconnectFixture(disconnectState.payload.connectionId)).payload,
       { disconnected: true });
     await resumedPopup.waitForFunction(async (tabId) => {
@@ -926,12 +984,14 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
     await resumedPopup.close();
     await readerWorkers.detach();
   } finally {
+    setPhase("cleanup");
     await context?.close();
     facade?.close();
     relay?.close();
     broker?.kill("SIGTERM");
     if (brokerExit) await brokerExit;
     await rm(profile, { recursive: true, force: true });
+    setPhase("complete");
   }
 });
 
@@ -2003,7 +2063,38 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
           }
           assert.equal(captureHeld, true, "Old-document capture was not held before reload");
         }
+        let delayedReloadRoute;
+        if (provider === "gemini") {
+          delayedReloadRoute = route => route.fulfill({ contentType: "text/html; charset=utf-8", body: "<!doctype html><div>Loading synthetic chat</div>" });
+          await page.route(url, delayedReloadRoute);
+          await worker.evaluate(({ tabId, originalDocument }) => {
+            globalThis.syntheticReloadMissingIdentity = false;
+            const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+            chrome.scripting.executeScript = async options => {
+              const result = await execute(options);
+              if (options.target.tabId === tabId && !options.target.documentIds
+                && result[0]?.documentId !== originalDocument && result[0]?.result === null) {
+                globalThis.syntheticReloadMissingIdentity = true;
+              }
+              return result;
+            };
+          }, { tabId: selected.tabId, originalDocument });
+        }
         await page.reload();
+        if (delayedReloadRoute) {
+          let missingIdentity = false;
+          for (let attempt = 0; attempt < 80; attempt++) {
+            testContext.signal.throwIfAborted();
+            missingIdentity = await worker.evaluate(() => globalThis.syntheticReloadMissingIdentity);
+            if (missingIdentity) break;
+            await setTimeout(25);
+          }
+          assert.equal(missingIdentity, true, "Reload identity was not checked before the synthetic chat rendered");
+          assert.equal((await clients[1].callTool({ name: "chat_read_messages",
+            arguments: { connectionId: second.connectionId } })).isError, true, "Reloading chat must not serve reads before identity is available");
+          await page.evaluate(markup => { document.body.innerHTML = markup; }, html);
+          await page.unroute(url, delayedReloadRoute);
+        }
         let reloaded = false;
         for (let attempt = 0; attempt < 80; attempt++) {
           testContext.signal.throwIfAborted();

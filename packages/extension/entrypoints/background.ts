@@ -4,7 +4,7 @@ import { captureFixtureSnapshot, fillFixtureDraft, inspectFixturePreflight, obse
 import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, inspectGeminiDraft, isEligibleGeminiUrl,
   observeGeminiIdentity, observeGeminiMessages, submitGeminiDraft }
   from "../lib/gemini-observation";
-import { createNativeRequestChannel } from "../lib/native-channel";
+import { createNativeRequestChannel, requestNativeGrantCount, type GrantCountRequest } from "../lib/native-channel";
 import { installDraftOwnershipTracker } from "../lib/draft-ownership";
 
 const nativeHostName = "com.agent_messaging_mcp.bridge";
@@ -60,16 +60,6 @@ const geminiStatusKey = (tabId: number) => `gemini-grant-status-${tabId}`;
 type StoredFixtureGrant = { documentId: string; expiresAt: number | null; url?: string; revision?: string; reloadPending?: true };
 type StoredGeminiGrant = { documentId: string; url: string; expiresAt: number | null; revision?: string; reloadPending?: true };
 type GeminiGrantStatus = { code: "target_changed" | "observation_unavailable"; recordedAt: number };
-type GrantCountRequest = { kind: "revoke_fixture"; payload: {
-  tabId: number; observed: { documentId: string; conversationId: string } | null
-} } | { kind: "revoke_all_fixture"; payload: Record<string, never> }
-  | { kind: "mark_fixture_observation_gap"; payload: { target: {
-    origin: "http://127.0.0.1:8787"; conversationId: "fixture-alpha";
-    tabId: number; documentId: string
-  } } } | { kind: "mark_gemini_observation_gap"; payload: { target: {
-    origin: "https://gemini.google.com"; conversationId: string; url: string;
-    tabId: number; documentId: string
-  } } };
 let fixtureResetPromise: Promise<boolean> | undefined;
 const fixtureSnapshotJobs = new Map<number, Promise<boolean>>();
 const geminiSnapshotJobs = new Map<number, Promise<boolean>>();
@@ -196,49 +186,8 @@ async function revokeFixtureTab(tabId: number,
   return sendGrantCountRequest({ kind: "revoke_fixture", payload: { tabId, observed } });
 }
 
-async function sendGrantCountRequest(command: GrantCountRequest): Promise<boolean> {
-  try {
-    return await new Promise<boolean>((resolve) => {
-      const requestId = crypto.randomUUID();
-      const deadlineMs = Date.now() + 10_000;
-      let port: ReturnType<typeof browser.runtime.connectNative>;
-      try {
-        port = browser.runtime.connectNative(nativeHostName);
-      } catch {
-        resolve(false);
-        return;
-      }
-      let settled = false;
-      const timer = setTimeout(() => finish(false), 10_000);
-
-      function finish(ok: boolean) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(ok);
-        port.disconnect();
-      }
-
-      port.onMessage.addListener((value: unknown) => {
-        if (typeof value !== "object" || value === null || Array.isArray(value)) return finish(false);
-        const reply = value as Record<string, unknown>;
-        const payload = reply.payload;
-        finish(reply.kind === (command.kind === "mark_fixture_observation_gap" ? "fixture_gap_marked"
-          : command.kind === "mark_gemini_observation_gap" ? "gemini_gap_marked" : "fixture_revoked")
-          && reply.protocolVersion === protocolVersion
-          && reply.requestId === requestId && reply.connectionGeneration === 0 && reply.deadlineMs === deadlineMs
-          && typeof payload === "object" && payload !== null && !Array.isArray(payload)
-          && Object.keys(payload).length === 1 && typeof (payload as { count?: unknown }).count === "number"
-          && Number.isSafeInteger((payload as { count: number }).count)
-          && (payload as { count: number }).count >= 0);
-      });
-      port.onDisconnect.addListener(() => { void browser.runtime.lastError; finish(false); });
-      port.postMessage({ ...command, protocolVersion, requestId,
-        connectionGeneration: 0, deadlineMs });
-    });
-  } catch {
-    return false;
-  }
+function sendGrantCountRequest(command: GrantCountRequest): Promise<boolean> {
+  return requestNativeGrantCount(sendNativeRequest, command);
 }
 
 function ensureFixtureReset(): Promise<boolean> {
@@ -1773,8 +1722,14 @@ async function handleChatTabUpdate(tabId: number, change: { status?: string; url
           return;
         }
         const deadlineMs = Date.now() + 10_000;
-        target = await chatDocumentTarget(tabId, stored.url);
-        if (!target || target.documentId === previous.documentId || target.origin !== previous.origin
+        do {
+          target = await chatDocumentTarget(tabId, stored.url);
+          if (target || previous.origin !== geminiOrigin || (await browser.tabs.get(tabId)).url !== stored.url) break;
+          const waitMs = Math.min(50, deadlineMs - Date.now());
+          if (waitMs <= 0) break;
+          await new Promise(resolve => setTimeout(resolve, waitMs));
+        } while (Date.now() < deadlineMs);
+        if (Date.now() >= deadlineMs || !target || target.documentId === previous.documentId || target.origin !== previous.origin
           || target.conversationId !== previous.conversationId) throw new Error();
         const reply = await sendChatAgentRequest("rebind_chat", { previous, target }, deadlineMs);
         if (reply.kind !== "chat_rebound" || Object.keys(reply.payload).length !== 1

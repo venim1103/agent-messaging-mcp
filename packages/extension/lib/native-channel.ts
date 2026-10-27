@@ -12,6 +12,28 @@ type PendingRequest = { deadlineMs: number; timer: ReturnType<typeof setTimeout>
 type NativeChannel = { port: NativePort; requests: Map<string, PendingRequest>;
   idleTimer?: ReturnType<typeof setTimeout> };
 
+export type GrantCountRequest = { kind: "revoke_fixture"; payload: {
+  tabId: number; observed: { documentId: string; conversationId: string } | null
+} } | { kind: "revoke_all_fixture"; payload: Record<string, never> }
+  | { kind: "mark_fixture_observation_gap"; payload: { target: {
+    origin: "http://127.0.0.1:8787"; conversationId: "fixture-alpha"; tabId: number; documentId: string
+  } } } | { kind: "mark_gemini_observation_gap"; payload: { target: {
+    origin: "https://gemini.google.com"; conversationId: string; url: string; tabId: number; documentId: string
+  } } };
+
+export async function requestNativeGrantCount(request: ReturnType<typeof createNativeRequestChannel>,
+  command: GrantCountRequest): Promise<boolean> {
+  try {
+    const reply = await request(command.kind, command.payload, Date.now() + 10_000);
+    return reply.kind === (command.kind === "mark_fixture_observation_gap" ? "fixture_gap_marked"
+      : command.kind === "mark_gemini_observation_gap" ? "gemini_gap_marked" : "fixture_revoked")
+      && Object.keys(reply.payload).length === 1 && typeof reply.payload.count === "number"
+      && Number.isSafeInteger(reply.payload.count) && reply.payload.count >= 0;
+  } catch {
+    return false;
+  }
+}
+
 export function createNativeRequestChannel(connect: () => NativePort, consumeLastError: () => void = () => {}) {
   let active: NativeChannel | undefined;
 
