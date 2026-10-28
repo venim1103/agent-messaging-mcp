@@ -42,6 +42,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
   const realVisibility = outcome === "own_window" || outcome === "hidden" || hiddenSend || hiddenDisconnect || hiddenSettlement || hiddenSuspension || hiddenTargetEnded || hiddenWorkerRestart || hiddenReply;
   let mcpClient;
   let publicSendCancellation;
+  const replyObservations = [];
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
@@ -148,8 +149,44 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     relay = await connectBroker("relay", directory);
     mcpClient = new Client({ name: autonomous === "public" ? "Synthetic autonomous browser owner" : "fixture-browser-commit-test", version: "0.0.1" });
     const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
-    await mcpClient.connect(new StdioClientTransport({ command: process.execPath, args: [mcpEntry],
-      env: { ...process.env, HOME: profile } }));
+    const traceReplies = autonomous === "public" && outcome === "observed";
+    const replyTraceImport = `import { ReplyObservation } from ${JSON.stringify(new URL("../../packages/companion/dist/pending-connections.js", import.meta.url).href)};
+      const observe = ReplyObservation.prototype.observe;
+      const startedAt = Date.now();
+      const instances = new WeakMap();
+      let nextInstance = 1;
+      let recorded = 0;
+      ReplyObservation.prototype.observe = function(snapshot, ...args) {
+        const reply = observe.call(this, snapshot, ...args);
+        if (recorded++ < 32) {
+          if (!instances.has(this)) instances.set(this, nextInstance++);
+          const previous = this.previous;
+          const now = Date.now();
+          process.stderr.write("Synthetic reply timing " + JSON.stringify({
+            instance: instances.get(this), atMs: now - startedAt, capturedAgeMs: now - snapshot.capturedAt,
+            quietMs: previous ? now - previous.since : null,
+            capturedQuietMs: previous ? snapshot.capturedAt - previous.since : null,
+            rows: snapshot.messages.length, sequence: snapshot.cursor.sequence,
+            tracking: Boolean(previous), settled: Boolean(reply)
+          }) + "\\n");
+        }
+        return reply;
+      };`;
+    const transport = new StdioClientTransport({ command: process.execPath,
+      args: traceReplies ? ["--import", `data:text/javascript,${encodeURIComponent(replyTraceImport)}`, mcpEntry] : [mcpEntry],
+      ...(traceReplies ? { stderr: "pipe" } : {}), env: { ...process.env, HOME: profile } });
+    if (traceReplies) {
+      let remaining = "";
+      transport.stderr.on("data", chunk => {
+        const lines = `${remaining}${chunk}`.slice(-8192).split("\n");
+        remaining = lines.pop() ?? "";
+        for (const line of lines) if (line.startsWith("Synthetic reply timing ")) {
+          replyObservations.push(JSON.parse(line.slice("Synthetic reply timing ".length)));
+          if (replyObservations.length > 32) replyObservations.shift();
+        }
+      });
+    }
+    await mcpClient.connect(transport);
     setPhase("synthetic chat setup");
     const fixture = await context.newPage();
     const html = provider === "gemini" ? `<!doctype html><html><head><meta charset="utf-8"><style>
@@ -1117,6 +1154,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
               globalThis.replyRevisionAt = performance.now();
             }, 500);
           }, provider);
+          replyObservations.length = 0;
           const reply = await mcpClient.callTool({ name: "chat_wait_for_reply", arguments: {
             connectionId: connection.connectionId, timeoutMs: 4000
           } });
@@ -1124,7 +1162,9 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           assert.equal(reply.structuredContent.timedOut, false, JSON.stringify({ provider,
             revision: await fixture.evaluate(() => ({ count: globalThis.replyRevisionCount,
               ageMs: performance.now() - globalThis.replyRevisionAt })),
-            ...(reply.structuredContent.timedOut ? { trace: await worker.evaluate(() => globalThis.browserJobTrace?.slice(-32)) } : {}) }));
+            ...(reply.structuredContent.timedOut ? { observations: replyObservations,
+              trace: await worker.evaluate(() => globalThis.browserJobTrace?.slice(-32)) } : {}) }));
+          assert.ok(replyObservations.length > 0 && replyObservations.length <= 32);
           assert.equal(reply.structuredContent.reply.text, "Synthetic final reply");
           assert.equal(reply.structuredContent.reply.generationState, "settled_heuristic");
           assert.equal(await fixture.evaluate(() => globalThis.replyRevisionCount), 1);

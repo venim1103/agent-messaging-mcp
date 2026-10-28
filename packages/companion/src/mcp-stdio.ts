@@ -283,9 +283,10 @@ server.registerTool("chat_wait_for_reply", {
       await waitForPoll(Math.min(500, Math.max(0, remaining())), extra.mcpReq.signal);
     }
     return timedOut();
-  } catch {
+  } catch (error) {
     if (extra.mcpReq.signal.aborted) return output({ code: "CANCELLED" }, true);
-    if (remaining() <= 0) return timedOut();
+    if (remaining() <= 0 || (remaining() <= 25 && error instanceof Error
+      && error.message === "Invalid autonomous request deadline")) return timedOut();
     client?.close();
     if (broker === client) broker = undefined;
     return output({ code: "BROKER_UNAVAILABLE" }, true);

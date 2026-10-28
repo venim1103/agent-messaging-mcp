@@ -2573,7 +2573,10 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
       let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
       const extensionId = new URL(worker.url()).hostname;
       await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeLoss?.relayPath ?? nativeRelayPath, profile));
-      broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+      let brokerStderr = "";
+      const brokerStarted = performance.now();
+      broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: ["ignore", "ignore", "pipe"] });
+      broker.stderr.on("data", chunk => { brokerStderr = `${brokerStderr}${chunk}`.slice(0, 1024); });
       brokerExit = once(broker, "exit");
       let ready = false;
       for (let attempt = 0; attempt < 80; attempt++) {
@@ -2583,7 +2586,10 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
         }
         await setTimeout(25);
       }
-      assert.equal(ready, true, "Broker did not start");
+      assert.equal(ready, true, `Broker did not start (${outcome}): ${JSON.stringify({
+        elapsedMs: Math.round(performance.now() - brokerStarted), exitCode: broker.exitCode,
+        signalCode: broker.signalCode, stderr: brokerStderr
+      })}`);
       facade = await connectBroker("facade", brokerDirectory);
       relay = await connectBroker("relay", brokerDirectory);
       const page = await context.newPage();

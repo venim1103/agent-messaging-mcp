@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,31 @@ const brokerStartupObserver = `import { appendFileSync } from "node:fs";
     process.once("exit", code => appendFileSync(join(process.env.HOME, "broker-exits"),
       JSON.stringify({ pid: process.pid, code }) + "\\n", { mode: 0o600 }));
   }`;
+
+const replyWaitClock = `import { readFileSync, renameSync, writeFileSync } from "node:fs";
+  import { join } from "node:path";
+  import { performance } from "node:perf_hooks";
+  const clockPath = join(process.env.HOME, "reply-clock.json");
+  const now = () => JSON.parse(readFileSync(clockPath, "utf8")).now;
+  const startedAt = now();
+  Date.now = now;
+  Object.defineProperty(performance, "now", { value: () => now() - startedAt });
+  const stringify = JSON.stringify;
+  JSON.stringify = (value, ...options) => {
+    if (value?.kind === "read_approved_snapshot") {
+      const clock = JSON.parse(readFileSync(clockPath, "utf8"));
+      if (Number.isSafeInteger(clock.encodeUntil)) {
+        const encodeError = clock.encodeError === true;
+        clock.now = clock.encodeUntil;
+        delete clock.encodeUntil;
+        delete clock.encodeError;
+        writeFileSync(clockPath + ".next", stringify(clock), { mode: 0o600 });
+        renameSync(clockPath + ".next", clockPath);
+        if (encodeError) throw new Error("Synthetic encoding failure");
+      }
+    }
+    return Reflect.apply(stringify, JSON, [value, ...options]);
+  };`;
 
 async function brokerSocketReady(socketPath: string): Promise<boolean> {
   try {
@@ -100,6 +126,121 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     }]);
   } finally {
     await client.close();
+  }
+});
+
+test("SDK reply wait distinguishes fresh quiet from delayed final captures", { timeout: 10000 }, async context => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-reply-clock-"));
+  const directory = join(home, ".config/agent-messaging-mcp/broker");
+  const clockPath = join(home, "reply-clock.json");
+  let logicalNow = Date.now();
+  const advanceClock = async (now: number, encodeUntil?: number, encodeError = false) => {
+    await writeFile(`${clockPath}.next`, JSON.stringify({ now, encodeUntil, encodeError }), { mode: 0o600 });
+    await rename(`${clockPath}.next`, clockPath);
+    logicalNow = now;
+  };
+  await advanceClock(logicalNow);
+  context.mock.method(Date, "now", () => {
+    logicalNow = JSON.parse(readFileSync(clockPath, "utf8")).now;
+    return logicalNow;
+  });
+  const client = new Client({ name: "Synthetic scheduled reply owner", version: "0.0.1" });
+  const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3,
+    documentId: "synthetic-document" } as const;
+  let broker: Awaited<ReturnType<typeof startBrokerSocket>> | undefined;
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let captures: readonly (readonly [number, number, boolean])[] = [];
+  let captureIndex = 0;
+  let scenarioStarted = logicalNow;
+  const wireDeadlines: unknown[] = [];
+  const timing: { receivedMs: number; capturedMs: number }[] = [];
+  const originalFrames = NativeFrameDecoder.prototype.frames;
+  context.mock.method(NativeFrameDecoder.prototype, "frames", function*(this: NativeFrameDecoder, chunk: Buffer) {
+    for (const message of originalFrames.call(this, chunk)) {
+      if (typeof message === "object" && message !== null && "kind" in message
+        && message.kind === "read_approved_snapshot" && "deadlineMs" in message) wireDeadlines.push(message.deadlineMs);
+      yield message;
+    }
+  });
+  context.mock.method(PendingConnectionRequests.prototype, "requestFreshStableRead", () => ({ result: (async () => {
+    const capture = captures[captureIndex++];
+    assert.ok(capture, "Wait requested an observation beyond the controlled schedule");
+    const [receivedMs, capturedMs, final] = capture;
+    await advanceClock(scenarioStarted + receivedMs);
+    timing.push({ receivedMs, capturedMs });
+    return { coverage: "rendered_only", generation: 1, capturedAt: scenarioStarted + capturedMs,
+      cursor: { epoch: "c66b3997-9d43-4554-8399-267d1fe9f75c", sequence: final ? 2 : 1 }, omittedBefore: false,
+      messages: [{ id: "synthetic-reply", direction: "incoming", text: final ? "Synthetic final reply" : "Synthetic partial reply" }] };
+  })() }) as never);
+  try {
+    await mkdir(join(home, ".config/agent-messaging-mcp"), { recursive: true, mode: 0o700 });
+    broker = await startBrokerSocket(directory, createBrokerCredentials());
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: ["--import", `data:text/javascript,${encodeURIComponent(replyWaitClock)}`,
+        fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+      env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "0" } }));
+    await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+    relay = await connectBroker("relay", directory);
+    const roster = await relay.listChatAgents(target);
+    if (roster.kind !== "chat_agents") throw new Error("Expected scheduled reply owner roster");
+    const agent = roster.payload.agents.find(agent => agent.label === "Synthetic scheduled reply owner");
+    assert.ok(agent);
+    await relay.approveChatAgent(target, agent.agentId);
+    const picked = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+    const connectionId = (picked.structuredContent as { connections: { connectionId: string }[] }).connections[0]!.connectionId;
+    for (const scenario of [
+      { settles: true, captures: [[0, 0, false], [500, 500, true], [1500, 1500, true], [2500, 2500, true]] },
+      { settles: false, captures: [[0, 0, false], [1500, 500, true], [2500, 2000, true], [3500, 3000, true], [3975, 3400, true]] }
+    ] as const) {
+      scenarioStarted = logicalNow + 1000;
+      await advanceClock(scenarioStarted);
+      captures = scenario.captures;
+      captureIndex = 0;
+      wireDeadlines.length = 0;
+      timing.length = 0;
+      const result = await client.callTool({ name: "chat_wait_for_reply", arguments: { connectionId, timeoutMs: 4000 } });
+      assert.equal(result.isError, undefined, JSON.stringify(timing));
+      assert.equal(captureIndex, captures.length, JSON.stringify(timing));
+      assert.deepEqual(wireDeadlines, captures.map(() => scenarioStarted + 4000));
+      if (scenario.settles) {
+        const payload = result.structuredContent as { timedOut: boolean; reply: { text: string; generationState: string } };
+        assert.equal(payload.timedOut, false, JSON.stringify(timing));
+        assert.equal(payload.reply.text, "Synthetic final reply");
+        assert.equal(payload.reply.generationState, "settled_heuristic");
+      } else {
+        assert.deepEqual(result.structuredContent, { timedOut: true }, JSON.stringify(timing));
+        assert.ok(timing.at(-1)!.receivedMs - timing[1]!.capturedMs > 2000);
+        assert.ok(timing.at(-1)!.capturedMs - timing[1]!.receivedMs < 2000);
+      }
+      const owned = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      assert.equal((owned.structuredContent as { connections: { connectionId: string }[] }).connections[0]?.connectionId, connectionId);
+    }
+    const encodingStarted = logicalNow + 1000;
+    await advanceClock(encodingStarted, encodingStarted + 1000 - 25);
+    captures = [];
+    captureIndex = 0;
+    wireDeadlines.length = 0;
+    const encoded = await client.callTool({ name: "chat_wait_for_reply", arguments: { connectionId, timeoutMs: 1000 } });
+    assert.equal(encoded.isError, undefined, JSON.stringify(encoded.structuredContent));
+    assert.deepEqual(encoded.structuredContent, { timedOut: true });
+    assert.equal(captureIndex, 0);
+    assert.deepEqual(wireDeadlines, []);
+    const owned = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+    assert.equal((owned.structuredContent as { connections: { connectionId: string }[] }).connections[0]?.connectionId, connectionId);
+    const failedEncodingStarted = logicalNow + 1000;
+    await advanceClock(failedEncodingStarted, failedEncodingStarted + 1000 - 25, true);
+    const failed = await client.callTool({ name: "chat_wait_for_reply", arguments: { connectionId, timeoutMs: 1000 } });
+    assert.equal(failed.isError, true);
+    assert.deepEqual(failed.structuredContent, { code: "BROKER_UNAVAILABLE" });
+    assert.equal(captureIndex, 0);
+    assert.deepEqual(wireDeadlines, []);
+    assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+      { connections: [], timedOut: true });
+  } finally {
+    relay?.close();
+    await client.close();
+    await broker?.close();
+    await rm(home, { recursive: true, force: true });
   }
 });
 

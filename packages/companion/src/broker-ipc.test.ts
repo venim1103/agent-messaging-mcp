@@ -875,6 +875,29 @@ test("broker client spends encoding time inside its original deadline", { timeou
       assert.equal(facade.closed, false);
       assert.deepEqual((await facade.getConnection(requestId)).payload, { state: "unknown" });
     }
+    for (const remainingMs of [25, 10]) {
+      let now = Date.now();
+      const deadlineMs = now + 1000;
+      const stringify = JSON.stringify;
+      context.mock.method(Date, "now", () => now);
+      context.mock.method(JSON, "stringify", (value: unknown, ...options: unknown[]) => {
+        if (typeof value === "object" && value !== null && "kind" in value && value.kind === "read_approved_snapshot") {
+          now = deadlineMs - remainingMs;
+        }
+        return Reflect.apply(stringify, JSON, [value, ...options]);
+      });
+      const timers = context.mock.method(globalThis, "setTimeout");
+      const writes = context.mock.method(Socket.prototype, "write");
+      const refused = await facade.readApprovedSnapshot(requestId, undefined, deadlineMs)
+        .then(() => undefined, (error: unknown) => error);
+      assert.equal(writes.mock.callCount(), 0, "Encoding into the read response reserve must not write a broker frame");
+      assert.equal(timers.mock.callCount(), 0);
+      assert.ok(refused instanceof Error);
+      assert.match(refused.message, /Invalid autonomous request deadline/);
+      context.mock.restoreAll();
+      assert.equal(facade.closed, false);
+      assert.deepEqual((await facade.getConnection(requestId)).payload, { state: "unknown" });
+    }
   } finally {
     context.mock.restoreAll();
     facade?.close();

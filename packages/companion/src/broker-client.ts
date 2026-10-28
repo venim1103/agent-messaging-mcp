@@ -683,7 +683,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         const responseStartedAt = Date.now();
         const responseTimeoutMs = (originalDeadlineMs === undefined ? brokerRequestDeadline(responseStartedAt, deadlineMs, budgetMs)
           : deadlineMs) - responseStartedAt;
-        if (responseTimeoutMs <= 0) throw new Error("Invalid autonomous request deadline");
+        if (responseTimeoutMs <= (kind === "read_approved_snapshot" ? 25 : 0)) throw new Error("Invalid autonomous request deadline");
         const response = new Promise<unknown>((resolve, reject) => {
           const timer = setTimeout(() => socket.destroy(new Error("Broker request timed out")), responseTimeoutMs);
           replies.set(requestId, { deadlineMs, timer, resolve, reject });
