@@ -303,42 +303,36 @@ for (const target of [
       for (const extra of [{ approved: true }, { provider: "fixture" }, { mode: "autonomous" }, { timeoutMs: 60_000 }]) {
         assert.equal((await clients[0].callTool({ name: "chat_send_message", arguments: { ...sendArguments, ...extra } })).isError, true);
       }
-      if ("provider" in target && target.provider === "databag") {
-        const refused = await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
-        assert.equal(refused.isError, true);
-        assert.deepEqual(refused.structuredContent, { state: "not_sent", code: "CONNECTION_NOT_FOUND", retryAllowed: false });
-        for (const provider of ["fixture", "gemini"] as const) {
-          for (const phase of ["fill", "proof", "submit", "settle"] as const) {
-            assert.deepEqual((await relay.listChatJobs(phase, provider)).payload, { jobs: [] });
-          }
+      const sending = clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
+      const provider = "provider" in target && target.provider === "databag" ? "databag"
+        : target.origin === "https://gemini.google.com" ? "gemini" : "fixture";
+      let offered: Awaited<ReturnType<typeof relay.listChatJobs>> | undefined;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        if (provider === "databag") {
+          assert.deepEqual((await relay.listChatJobs("fill", "fixture")).payload, { jobs: [] });
+          assert.deepEqual((await relay.listChatJobs("fill", "gemini")).payload, { jobs: [] });
         }
-      } else {
-        const sending = clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
-        const provider = target.origin === "https://gemini.google.com" ? "gemini" : "fixture";
-        let offered: Awaited<ReturnType<typeof relay.listChatJobs>> | undefined;
-        for (let attempt = 0; attempt < 40; attempt++) {
-          offered = await relay.listChatJobs("fill", provider);
-          if (offered.kind === "chat_jobs" && offered.payload.jobs.length) break;
-          await setTimeout(25);
-        }
-        if (offered?.kind !== "chat_jobs" || !offered.payload.jobs[0]) throw new Error("Expected one owned SDK fill job");
-        const fill = offered.payload.jobs[0];
-        assert.equal((await relay.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", { ok: false, code: "FILL_UNAVAILABLE" })).kind,
-          "chat_job_recorded");
-        const refused = await sending;
-        const refusedStatus = refused.structuredContent as { operationId: string; state: string; code: string;
-          recoveryToken: string; retryAllowed: boolean; failureStage: string };
-        assert.equal(refused.isError, true);
-        assert.equal(refusedStatus.operationId, fill.operationId);
-        assert.equal(refusedStatus.state, "not_sent");
-        assert.equal(refusedStatus.code, "DISPATCH_UNAVAILABLE");
-        assert.equal(refusedStatus.failureStage, "fill");
-        assert.equal(refusedStatus.retryAllowed, false);
-        assert.match(refusedStatus.recoveryToken, /^[0-9a-f]{64}$/);
-        assert.deepEqual((await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments })).structuredContent, refusedStatus);
-        assert.deepEqual((await relay.listChatJobs("fill", provider)).payload, { jobs: [] });
-        assert.equal((await clients[0].callTool({ name: "chat_send_message", arguments: { ...sendArguments, text: "Synthetic changed SDK draft" } })).isError, true);
+        offered = await relay.listChatJobs("fill", provider);
+        if (offered.kind === "chat_jobs" && offered.payload.jobs.length) break;
+        await setTimeout(25);
       }
+      if (offered?.kind !== "chat_jobs" || !offered.payload.jobs[0]) throw new Error("Expected one owned SDK fill job");
+      const fill = offered.payload.jobs[0];
+      assert.equal((await relay.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", { ok: false, code: "FILL_UNAVAILABLE" })).kind,
+        "chat_job_recorded");
+      const refused = await sending;
+      const refusedStatus = refused.structuredContent as { operationId: string; state: string; code: string;
+        recoveryToken: string; retryAllowed: boolean; failureStage: string };
+      assert.equal(refused.isError, true);
+      assert.equal(refusedStatus.operationId, fill.operationId);
+      assert.equal(refusedStatus.state, "not_sent");
+      assert.equal(refusedStatus.code, "DISPATCH_UNAVAILABLE");
+      assert.equal(refusedStatus.failureStage, "fill");
+      assert.equal(refusedStatus.retryAllowed, false);
+      assert.match(refusedStatus.recoveryToken, /^[0-9a-f]{64}$/);
+      assert.deepEqual((await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments })).structuredContent, refusedStatus);
+      assert.deepEqual((await relay.listChatJobs("fill", provider)).payload, { jobs: [] });
+      assert.equal((await clients[0].callTool({ name: "chat_send_message", arguments: { ...sendArguments, text: "Synthetic changed SDK draft" } })).isError, true);
       assert.equal((await relay.approveChatAgent(target, second.agentId)).kind, "chat_agent_approved");
       const other = await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
       const otherPickup = other.structuredContent as typeof pickup;

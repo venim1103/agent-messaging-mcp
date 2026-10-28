@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
-import { isDatabagOrigin, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget,
+import { isDatabagOrigin, isGeminiTarget, targetProvider, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget, type StableDomTarget,
   type FixtureSnapshot, type GeminiSnapshot } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
@@ -78,7 +78,8 @@ export const chatTargetSchema = z.discriminatedUnion("provider", [
     documentId: z.string().regex(/^[!-~]{1,128}$/) }),
   z.strictObject({ provider: z.literal("gemini"), origin: z.literal("https://gemini.google.com"),
     conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), url: z.string().min(1).max(512),
-    tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/) })
+    tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/) }),
+  databagTargetSchema
 ]);
 export type ChatTarget = z.infer<typeof chatTargetSchema>;
 export const chatSubmitResultSchema = z.union([fixtureDispatchResultSchema, geminiDispatchResultSchema]);
@@ -88,7 +89,7 @@ export const chatJobSchema = z.strictObject({ operationId: z.uuid(), jobId: z.uu
   leftover: z.strictObject({ operationId: z.uuid(), text: z.string().min(1).max(2048)
     .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES && text.trim() === text && !text.includes("\r")) }).optional() })
   .refine(job => (!job.leftover || (job.phase === "fill" && job.leftover.operationId !== job.operationId))
-    && (job.phase !== "submit" || job.jobId === job.operationId) && (job.target.provider !== "gemini"
+    && (job.phase !== "submit" || job.jobId === job.operationId) && (job.target.provider === "fixture"
     || (job.text.length <= 2048 && job.text.trim() === job.text && !job.text.includes("\r"))));
 export type ChatJob = z.infer<typeof chatJobSchema>;
 export const chatSubmitJobSchema = chatJobSchema.safeExtend({ phase: z.literal("submit") });
@@ -125,7 +126,8 @@ export const chatJobCompletionSchema = z.discriminatedUnion("phase", [
   z.strictObject({ ...chatCompletionIdentity, phase: z.literal("submit"), observation: chatSubmitResultSchema })
 ]).refine(payload => (payload.phase !== "submit" || payload.operationId === payload.jobId)
   && (!payload.observation.ok || (payload.target.provider === "gemini"
-    ? payload.observation.editor === "contenteditable" : payload.observation.editor !== "contenteditable")));
+    ? payload.observation.editor === "contenteditable" : payload.target.provider === "databag"
+      ? payload.observation.editor === "textarea" : payload.observation.editor !== "contenteditable")));
 export type ChatJobObservation = z.infer<typeof chatJobCompletionSchema>["observation"];
 export const geminiFillStatusSchema = z.discriminatedUnion("ok", [
   geminiFillResultSchema.options[0].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() }),
@@ -178,7 +180,7 @@ export function openPrivateOperationDatabase(directory: string): DatabaseSync {
   return new DatabaseSync(filePath);
 }
 
-type PreparedMessage<TargetLabel extends "fixture-alpha" | "gemini" = "fixture-alpha"> = Readonly<{
+type PreparedMessage<TargetLabel extends "fixture-alpha" | "gemini" | "databag" = "fixture-alpha"> = Readonly<{
   operationId: string;
   connectionId: string;
   state: "awaiting_approval";
@@ -196,11 +198,11 @@ type FixtureDispatchBaseline = Readonly<{
   omittedBefore: boolean;
 }>;
 type FixtureDispatchCheck = Readonly<{
-  checkId: string; owner: symbol; target: FixtureTarget; text: string; createdAt: number; expiresAt: number;
+  checkId: string; owner: symbol; target: StableDomTarget; text: string; createdAt: number; expiresAt: number;
   baseline: FixtureDispatchBaseline; checkedAt: number | null
 }>;
 type FixtureDispatchAuthorization = Readonly<{
-  owner: symbol; operationId: string; target: FixtureTarget; text: string; startedAt: number; expiresAt: number
+  owner: symbol; operationId: string; target: StableDomTarget; text: string; startedAt: number; expiresAt: number
 }>;
 type GeminiDispatchCheck = Readonly<{
   checkId: string; owner: symbol; target: GeminiTarget; text: string; createdAt: number; expiresAt: number;
@@ -209,13 +211,13 @@ type GeminiDispatchCheck = Readonly<{
 type FixtureDispatchStatus = Readonly<z.infer<typeof fixtureDispatchStatusSchema>>;
 type FixturePreflightStatus = z.infer<typeof fixturePreflightStatusSchema>;
 type PendingFixturePreflight = {
-  owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number;
+  owner: symbol; operationId: string; target: StableDomTarget; text: string; expiresAt: number;
   timer: ReturnType<typeof setTimeout>; resolve: (status: FixturePreflightStatus | null) => void
 };
 type FixtureFillStatus = z.infer<typeof fixtureFillStatusSchema>;
 type FixtureDraftFillState = z.infer<typeof fixtureDraftFillStateSchema>;
 type PendingFixtureFill = {
-  owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number;
+  owner: symbol; operationId: string; target: StableDomTarget; text: string; expiresAt: number;
   timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureFillStatus | null) => void
 };
 type GeminiFillStatus = z.infer<typeof geminiFillStatusSchema>;
@@ -224,7 +226,7 @@ type PendingGeminiFill = {
   timer: ReturnType<typeof setTimeout>; resolve: (status: GeminiFillStatus | null) => void
 };
 type PendingFixtureDispatch = {
-  owner: symbol; operationId: string; target: FixtureTarget; text: string; expiresAt: number; startedAt: number;
+  owner: symbol; operationId: string; target: StableDomTarget; text: string; expiresAt: number; startedAt: number;
   issued: boolean; timer: ReturnType<typeof setTimeout>; resolve: (status: FixtureDispatchStatus) => void
 };
 type GeminiDispatchStatus = FixtureDispatchStatus;
@@ -247,7 +249,7 @@ export class PreparedMessageOperations {
     owner: symbol; job: Readonly<ChatJob>; createdAt: number; issued: boolean; completedAt: number | null; ready: boolean
   }>();
   private readonly contents = new Map<string, Readonly<{
-    owner: symbol; connectionId: string; target: FixtureTarget; text: string; expiresAt: number; autonomous?: true
+    owner: symbol; connectionId: string; target: StableDomTarget; text: string; expiresAt: number; autonomous?: true
   }>>();
   private readonly geminiContents = new Map<string, Readonly<{
     owner: symbol; connectionId: string; target: GeminiTarget; text: string; expiresAt: number; autonomous?: true
@@ -532,7 +534,7 @@ export class PreparedMessageOperations {
       throw new Error("INVALID_REQUEST_DEADLINE");
     }
     const prepared = this.prepareBound(owner, connectionId, 1, target,
-      target.origin === "https://gemini.google.com" ? "gemini" : "fixture-alpha", text, idempotencyKey, now, deadlineMs);
+      target.provider === "databag" ? "databag" : isGeminiTarget(target) ? "gemini" : "fixture-alpha", text, idempotencyKey, now, deadlineMs);
     const receipt = this.createRecoveryReceiptRecord(prepared.operationId);
     return Object.freeze({ ...prepared, state: "prepared" as const, recoveryToken: receipt.recoveryToken });
   }
@@ -562,10 +564,7 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
     const live = operation && this.requests.getAutonomousTarget(owner, operation.connectionId, now);
     if (!operation?.autonomous || operation.owner !== owner || !this.owners.has(owner) || !live
-      || operation.target.origin !== live.origin || operation.target.conversationId !== live.conversationId
-      || operation.target.tabId !== live.tabId || operation.target.documentId !== live.documentId
-      || (operation.target.origin === "https://gemini.google.com"
-        && (live.origin !== "https://gemini.google.com" || operation.target.url !== live.url))) return null;
+      || !this.sameComposerTarget(operation.target, live)) return null;
     return Object.freeze({ operationId, target: operation.target, text: operation.text, expiresAt: operation.expiresAt });
   }
 
@@ -638,15 +637,14 @@ export class PreparedMessageOperations {
     return true;
   }
 
-  private prepareBound<TargetLabel extends "fixture-alpha" | "gemini">(owner: symbol, connectionId: string,
+  private prepareBound<TargetLabel extends "fixture-alpha" | "gemini" | "databag">(owner: symbol, connectionId: string,
     expectedGeneration: number, target: ApprovedTarget, label: TargetLabel, text: string,
     idempotencyKey: string, now: number, autonomousExpiresAt?: number): PreparedMessage<TargetLabel> {
-    if (target.provider === "databag") throw new Error("CONNECTION_NOT_FOUND");
     if (expectedGeneration !== 1) throw new Error("GENERATION_MISMATCH");
     if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > MAX_PREPARED_MESSAGE_BYTES || !text.trim()) {
       throw new Error("INVALID_MESSAGE_TEXT");
     }
-    if (target.origin === "https://gemini.google.com"
+    if (target.origin !== "http://127.0.0.1:8787"
       && (text.length > 2048 || text !== text.trim() || text.includes("\r"))) throw new Error("INVALID_MESSAGE_TEXT");
     if (typeof idempotencyKey !== "string"
       || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) {
@@ -691,7 +689,7 @@ export class PreparedMessageOperations {
       VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_approval')`)
       .run(operationId, ownerId, connectionId, idempotencyKey, contentDigest, targetDigest, expiresAt);
     const mode = autonomousExpiresAt === undefined ? {} : { autonomous: true as const };
-    if (target.origin === "https://gemini.google.com") {
+    if (isGeminiTarget(target)) {
       this.geminiContents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt, ...mode }));
     } else {
       this.contents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt, ...mode }));
@@ -839,7 +837,7 @@ export class PreparedMessageOperations {
     const operation = this.geminiContents.get(operationId);
     if (operation?.autonomous) {
       const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
-      return authority?.target.origin === "https://gemini.google.com" ? Object.freeze({ ...authority, target: authority.target }) : null;
+      return authority && isGeminiTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
     }
     const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
     const grantExpiresAt = operation && this.requests.getConnectionExpiresAt(owner, operation.connectionId, now);
@@ -857,7 +855,7 @@ export class PreparedMessageOperations {
     const operation = this.geminiContents.get(operationId);
     if (operation?.autonomous) {
       const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "fill", now);
-      return authority?.target.origin === "https://gemini.google.com" ? Object.freeze({ ...authority, target: authority.target }) : null;
+      return authority && isGeminiTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
     }
     const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
     const consent = this.fillApprovals.get(operationId);
@@ -910,7 +908,9 @@ export class PreparedMessageOperations {
 
   private sameComposerTarget(left: ApprovedTarget, right: ApprovedTarget): boolean {
     return left.origin === right.origin && left.conversationId === right.conversationId
-      && left.tabId === right.tabId && left.documentId === right.documentId;
+      && left.tabId === right.tabId && left.documentId === right.documentId
+      && targetProvider(left) === targetProvider(right)
+      && (!("url" in left) || ("url" in right && left.url === right.url));
   }
 
   private hasOccupiedComposer(operationId: string, target: ApprovedTarget, now: number): boolean {
@@ -1067,7 +1067,7 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     if (operation?.autonomous) {
       const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "fill", now);
-      return authority?.target.origin === "http://127.0.0.1:8787" ? Object.freeze({ ...authority, target: authority.target }) : null;
+      return authority && !isGeminiTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
     }
     const consent = this.fillApprovals.get(operationId);
     if (!operation || operation.owner !== owner || !consent || consent.expiresAt <= now
@@ -1134,7 +1134,7 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     if (operation?.autonomous) {
       const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
-      return authority?.target.origin === "http://127.0.0.1:8787" ? Object.freeze({ ...authority, target: authority.target }) : null;
+      return authority && !isGeminiTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
     }
     const consent = this.sendApprovals.get(operationId);
     if (!operation || operation.owner !== owner || !consent || consent.expiresAt <= now
@@ -1280,26 +1280,27 @@ export class PreparedMessageOperations {
     return { attemptId, result };
   }
 
-  listFixtureFillChallenges(now = Date.now(), autonomous = false) {
+  listFixtureFillChallenges(now = Date.now(), autonomous = false, provider: "fixture" | "databag" = "fixture") {
     for (const [attemptId, pending] of this.fillChecks) {
       const state = this.getOperation(pending.owner, pending.operationId, now).state;
       if (pending.expiresAt <= now || (state !== "approved" && state !== "prepared")) {
         this.finishFillCheck(attemptId, null, now);
       }
     }
-    return [...this.fillChecks].filter(([, pending]) => (this.contents.get(pending.operationId)?.autonomous === true) === autonomous)
+    return [...this.fillChecks].filter(([, pending]) => targetProvider(pending.target) === provider
+      && (this.contents.get(pending.operationId)?.autonomous === true) === autonomous)
       .map(([attemptId, pending]) => Object.freeze({
       attemptId, operationId: pending.operationId, target: pending.target, text: pending.text, expiresAt: pending.expiresAt
     }));
   }
 
-  completeFixtureFill(target: FixtureTarget, attemptId: string, observation: FixtureFillResult,
+  completeFixtureFill(target: StableDomTarget, attemptId: string, observation: FixtureFillResult,
     now = Date.now()): boolean {
     const parsed = fixtureFillResultSchema.safeParse(observation);
     const pending = this.fillChecks.get(attemptId);
     if (!parsed.success || !pending || pending.expiresAt <= now
-      || pending.target.origin !== target.origin || pending.target.conversationId !== target.conversationId
-      || pending.target.tabId !== target.tabId || pending.target.documentId !== target.documentId
+      || !this.sameComposerTarget(pending.target, target)
+      || (target.provider === "databag" && parsed.data.ok && parsed.data.editor !== "textarea")
       || !["approved", "prepared"].includes(this.getOperation(pending.owner, pending.operationId, now).state)) return false;
     this.finishFillCheck(attemptId, { ...parsed.data, operationId: pending.operationId, completedAt: now });
     return true;
@@ -1309,15 +1310,14 @@ export class PreparedMessageOperations {
     this.discardExpired(now);
     const operation = this.contents.get(operationId);
     const approval = this.approvals.get(operationId);
-    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    const live = operation && this.requests.getStableTarget(owner, operation.connectionId, now);
     const autonomous = operation?.autonomous && this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
     if (!operation || operation.owner !== owner || (!autonomous && (!approval || approval.expiresAt <= now)) || !live
-      || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
-      || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId
+      || !this.sameComposerTarget(live, operation.target)
       || this.database.prepare("SELECT 1 FROM message_dispatch_attempts WHERE operation_id = ?").get(operationId)) {
       throw new Error("APPROVAL_REQUIRED");
     }
-    const snapshot = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+    const snapshot = this.requests.getStableSnapshot(owner, operation.connectionId, now);
     if (!snapshot || snapshot === "not_ready" || snapshot.capturedAt > now) throw new Error("OBSERVATION_UNAVAILABLE");
     const baseline = Object.freeze({ capturedAt: snapshot.capturedAt, cursor: snapshot.cursor,
       messageIds: Object.freeze(snapshot.messages.map((message) => message.id)), messages: snapshot.messages,
@@ -1333,7 +1333,7 @@ export class PreparedMessageOperations {
     const fill = this.fillStates.get(operationId);
     const approvedAt = operation?.autonomous && fill?.state === "filled" ? fill.completedAt : consent?.approvedAt;
     const baseline = this.dispatchBaselines.get(operationId);
-    const current = operation && this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+    const current = operation && this.requests.getStableSnapshot(owner, operation.connectionId, now);
     if (approvedAt === undefined || !baseline || baseline.capturedAt < approvedAt || baseline.capturedAt > now
       || baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS <= now
       || !current || current === "not_ready" || current.capturedAt > now
@@ -1494,7 +1494,7 @@ export class PreparedMessageOperations {
       text: check.text, expiresAt: check.expiresAt });
   }
 
-  listFixtureDispatchChecks(now = Date.now(), autonomous = false) {
+  listFixtureDispatchChecks(now = Date.now(), autonomous = false, provider: "fixture" | "databag" = "fixture") {
     this.discardExpired(now);
     for (const [operationId, check] of this.dispatchChecks) {
       try {
@@ -1508,20 +1508,21 @@ export class PreparedMessageOperations {
       }
     }
     return [...this.dispatchChecks].filter(([operationId, check]) => check.checkedAt === null
+      && targetProvider(check.target) === provider
       && (this.contents.get(operationId)?.autonomous === true) === autonomous)
       .map(([operationId, check]) => Object.freeze({ operationId, checkId: check.checkId,
         target: check.target, text: check.text, expiresAt: check.expiresAt }));
   }
 
-  completeFixtureDispatchCheck(target: FixtureTarget, operationId: string, checkId: string,
+  completeFixtureDispatchCheck(target: StableDomTarget, operationId: string, checkId: string,
     observation: FixtureDispatchCheckResult, now = Date.now()): boolean {
     this.discardExpired(now);
     const check = this.dispatchChecks.get(operationId);
     const parsed = fixtureDispatchCheckResultSchema.safeParse(observation);
     if (!check || check.checkId !== checkId || check.checkedAt !== null || check.createdAt > now
       || check.expiresAt <= now || !parsed.success
-      || check.target.origin !== target.origin || check.target.conversationId !== target.conversationId
-      || check.target.tabId !== target.tabId || check.target.documentId !== target.documentId) return false;
+      || !this.sameComposerTarget(check.target, target)
+      || (target.provider === "databag" && parsed.data.ok && parsed.data.editor !== "textarea")) return false;
     if (!parsed.data.ok || parsed.data.draftText !== check.text
       || !this.getFixtureSendAuthorization(check.owner, operationId, now)) {
       this.discardFixtureDispatchCheck(operationId);
@@ -1571,7 +1572,7 @@ export class PreparedMessageOperations {
     return Object.freeze({ operationId, state: "dispatching" as const, startedAt: now });
   }
 
-  private recordDispatchIntent(operationId: string, target: Pick<FixtureTarget | GeminiTarget, "origin" | "conversationId">, now: number): void {
+  private recordDispatchIntent(operationId: string, target: Pick<ApprovedTarget, "origin" | "conversationId">, now: number): void {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       if (this.hasUnresolvedDispatch(target)) throw new Error("DISPATCH_UNCERTAIN");
@@ -1595,12 +1596,11 @@ export class PreparedMessageOperations {
       .get(operationId)) throw new Error("DISPATCH_UNCERTAIN");
     const operation = this.contents.get(operationId);
     const approval = this.approvals.get(operationId);
-    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    const live = operation && this.requests.getStableTarget(owner, operation.connectionId, now);
     const authorized = operation?.autonomous ? this.getAutonomousPhaseAuthorization(owner, operationId, "send", now)
       : approval && approval.expiresAt > now;
     if (!operation || operation.owner !== owner || !authorized || !live
-      || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
-      || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId) {
+      || !this.sameComposerTarget(live, operation.target)) {
       throw new Error("APPROVAL_REQUIRED");
     }
     if (!this.getFixtureSendAuthorization(owner, operationId, now)) throw new Error("SEND_APPROVAL_REQUIRED");
@@ -1630,13 +1630,12 @@ export class PreparedMessageOperations {
     if (!authorization || authorization.owner !== owner) return null;
     this.dispatchAuthorizations.delete(operationId);
     const operation = this.contents.get(operationId);
-    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    const live = operation && this.requests.getStableTarget(owner, operation.connectionId, now);
     const baseline = this.dispatchBaselines.get(operationId);
-    const current = operation && this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+    const current = operation && this.requests.getStableSnapshot(owner, operation.connectionId, now);
     const intent = this.database.prepare("SELECT started_at, state FROM message_dispatch_attempts WHERE operation_id = ?")
       .get(operationId) as { started_at: number; state: string } | undefined;
-    if (!live || live.origin !== authorization.target.origin || live.conversationId !== authorization.target.conversationId
-      || live.tabId !== authorization.target.tabId || live.documentId !== authorization.target.documentId
+    if (!live || !this.sameComposerTarget(live, authorization.target)
       || authorization.startedAt > now || authorization.expiresAt <= now
       || intent?.state !== "dispatching" || intent.started_at !== authorization.startedAt
       || !baseline || baseline.capturedAt > now || baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS <= now
@@ -1816,6 +1815,7 @@ export class PreparedMessageOperations {
   }
 
   async commitFixtureMessage(owner: symbol, operationId: string, deadlineMs: number) {
+    if (this.contents.get(operationId)?.target.provider === "databag") throw new Error("DISPATCH_UNAVAILABLE");
     if (!this.contents.has(operationId) && !this.dispatchStatus(operationId)) throw new Error("DISPATCH_UNAVAILABLE");
     return this.commitPreparedMessage(owner, operationId, deadlineMs);
   }
@@ -1847,7 +1847,7 @@ export class PreparedMessageOperations {
         failureStage = "read";
         const reading = operation.target.origin === "https://gemini.google.com"
           ? this.requests.requestFreshGeminiRead(owner, operation.connectionId, Date.now(), expiresAt)
-          : this.requests.requestFreshFixtureRead(owner, operation.connectionId, Date.now(), expiresAt);
+          : this.requests.requestFreshStableRead(owner, operation.connectionId, Date.now(), expiresAt);
         if (!reading || reading === "busy") throw new Error("DISPATCH_UNAVAILABLE");
         const snapshot = await reading.result;
         if (!snapshot || snapshot === "not_ready" || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
@@ -1891,7 +1891,7 @@ export class PreparedMessageOperations {
         terminal.ready = false;
         const reading = authorization.target.origin === "https://gemini.google.com"
           ? this.requests.requestFreshGeminiRead(owner, operation.connectionId, Date.now(), terminal.job.expiresAt)
-          : this.requests.requestFreshFixtureRead(owner, operation.connectionId, Date.now(), terminal.job.expiresAt);
+          : this.requests.requestFreshStableRead(owner, operation.connectionId, Date.now(), terminal.job.expiresAt);
         const snapshot = reading && reading !== "busy" ? await reading.result : null;
         const now = Date.now();
         if (snapshot && snapshot !== "not_ready" && snapshot.capturedAt >= terminal.completedAt && now < terminal.job.expiresAt
@@ -1919,15 +1919,15 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     const baseline = this.dispatchBaselines.get(operationId);
     const status = this.dispatchStatus(operationId);
-    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    const live = operation && this.requests.getStableTarget(owner, operation.connectionId, now);
     if (!operation || operation.owner !== owner || !baseline || baseline.omittedBefore
       || baseline.messages.some(message => message.truncated) || !live || !this.sameComposerTarget(operation.target, live)
       || status?.state !== "dispatch_uncertain" || this.ambiguousEvidence.has(operationId)) return null;
-    const snapshot = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+    const snapshot = this.requests.getStableSnapshot(owner, operation.connectionId, now);
     if (!snapshot || snapshot === "not_ready" || snapshot.omittedBefore || snapshot.capturedAt < status.startedAt
       || snapshot.capturedAt > now || snapshot.cursor.epoch !== baseline.cursor.epoch
       || snapshot.cursor.sequence < baseline.cursor.sequence) return null;
-    const events = this.requests.readFixtureEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
+    const events = this.requests.readStableEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
     if (!events || events === "not_ready" || events.state !== "ok" || events.cursor.sequence !== snapshot.cursor.sequence) return null;
     for (const capture of [...events.events.map(event => fixtureObservationSchema.safeParse(event.payload)),
       fixtureObservationSchema.safeParse({ kind: "fixture_snapshot", omittedBefore: snapshot.omittedBefore, messages: snapshot.messages })]) {
@@ -1973,8 +1973,8 @@ export class PreparedMessageOperations {
     return adapter.dispatch(inspecting.checkId, expiresAt).result;
   }
 
-  listChatSubmitJobs(provider: "fixture" | "gemini", now = Date.now()) {
-    const attempts = provider === "gemini" ? this.listGeminiDispatchAttempts(now) : this.listFixtureDispatchAttempts(now, true);
+  listChatSubmitJobs(provider: "fixture" | "gemini" | "databag", now = Date.now()) {
+    const attempts = provider === "gemini" ? this.listGeminiDispatchAttempts(now) : this.listFixtureDispatchAttempts(now, true, provider);
     return attempts.map(attempt => Object.freeze(chatSubmitJobSchema.parse({ operationId: attempt.operationId, jobId: attempt.attemptId,
       phase: "submit" as const, target: Object.freeze({ ...attempt.target, provider }),
       text: attempt.text, expiresAt: attempt.expiresAt })));
@@ -2019,7 +2019,7 @@ export class PreparedMessageOperations {
     const existing = this.settlementChecks.get(operationId);
     if (existing) return existing.job.expiresAt > now ? existing.job : null;
     if (this.settlementChecks.size >= MAX_PENDING_FIXTURE_DISPATCH_CHECKS) return null;
-    const provider = authorization.target.origin === "https://gemini.google.com" ? "gemini" : "fixture";
+    const provider = targetProvider(authorization.target);
     const parsed = chatJobSchema.parse({ operationId, jobId: randomUUID(), phase: "settle",
       target: { ...authorization.target, provider }, text: authorization.text,
       expiresAt: Math.min(deadlineMs, authorization.expiresAt, reservation.expiresAt, now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) });
@@ -2028,7 +2028,7 @@ export class PreparedMessageOperations {
     return job;
   }
 
-  listChatJobs(phase: ChatJob["phase"], provider: "fixture" | "gemini", now = Date.now()) {
+  listChatJobs(phase: ChatJob["phase"], provider: "fixture" | "gemini" | "databag", now = Date.now()) {
     if (phase === "settle") {
       this.discardExpired(now);
       for (const [operationId, pending] of this.settlementChecks) {
@@ -2043,8 +2043,8 @@ export class PreparedMessageOperations {
       return Object.freeze([] as ChatJob[]);
     }
     if (phase === "submit") return this.listChatSubmitJobs(provider, now);
-    const checks = phase === "fill" ? provider === "gemini" ? this.listGeminiFillChallenges(now, true) : this.listFixtureFillChallenges(now, true)
-      : provider === "gemini" ? this.listGeminiDispatchChecks(now, true) : this.listFixtureDispatchChecks(now, true);
+    const checks = phase === "fill" ? provider === "gemini" ? this.listGeminiFillChallenges(now, true) : this.listFixtureFillChallenges(now, true, provider)
+      : provider === "gemini" ? this.listGeminiDispatchChecks(now, true) : this.listFixtureDispatchChecks(now, true, provider);
     const jobs: ChatJob[] = [];
     for (const check of checks) {
       const jobId = "attemptId" in check ? check.attemptId : check.checkId;
@@ -2091,8 +2091,7 @@ export class PreparedMessageOperations {
 
   completeChatSubmitJob(target: ApprovedTarget, operationId: string, jobId: string,
     observation: FixtureDispatchResult | GeminiDispatchResult, now = Date.now()) {
-    if (target.provider === "databag") return false;
-    if (target.origin === "https://gemini.google.com") {
+    if (isGeminiTarget(target)) {
       const parsed = geminiDispatchResultSchema.safeParse(observation);
       return parsed.success && this.completeGeminiDispatch(target, operationId, jobId, parsed.data, now);
     }
@@ -2121,26 +2120,26 @@ export class PreparedMessageOperations {
     return { operationId, result };
   }
 
-  listFixtureDispatchAttempts(now = Date.now(), includeAutonomous = false) {
+  listFixtureDispatchAttempts(now = Date.now(), includeAutonomous = false, provider: "fixture" | "databag" = "fixture") {
     this.discardExpired(now);
-    const attempts: Array<Readonly<{ operationId: string; attemptId: string; target: FixtureTarget;
+    const attempts: Array<Readonly<{ operationId: string; attemptId: string; target: StableDomTarget;
       text: string; expiresAt: number }>> = [];
     for (const [operationId, pending] of this.dispatchJobs) {
+      if (targetProvider(pending.target) !== provider) continue;
       const operation = this.contents.get(operationId);
       if (operation?.autonomous && !includeAutonomous) continue;
-      const live = operation && this.requests.getApprovedTarget(pending.owner, operation.connectionId, now);
+      const live = operation && this.requests.getStableTarget(pending.owner, operation.connectionId, now);
       const intent = this.database.prepare("SELECT state, started_at FROM message_dispatch_attempts WHERE operation_id = ?")
         .get(operationId) as { state: string; started_at: number } | undefined;
       if (!operation || operation.owner !== pending.owner || !live || intent?.state !== "dispatching"
         || intent.started_at !== pending.startedAt || pending.startedAt > now
-        || live.origin !== pending.target.origin || live.conversationId !== pending.target.conversationId
-        || live.tabId !== pending.target.tabId || live.documentId !== pending.target.documentId) {
+        || !this.sameComposerTarget(live, pending.target)) {
         this.finishFixtureDispatch(operationId);
         continue;
       }
       if (pending.issued) continue;
       const baseline = this.dispatchBaselines.get(operationId);
-      const current = this.requests.getFixtureSnapshot(pending.owner, operation.connectionId, now);
+      const current = this.requests.getStableSnapshot(pending.owner, operation.connectionId, now);
       if (!baseline || baseline.capturedAt > now || baseline.capturedAt + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS <= now
         || !current || current === "not_ready" || current.capturedAt > now || current.capturedAt < baseline.capturedAt
         || current.cursor.epoch !== baseline.cursor.epoch || current.cursor.sequence !== baseline.cursor.sequence) {
@@ -2154,21 +2153,19 @@ export class PreparedMessageOperations {
     return attempts;
   }
 
-  completeFixtureDispatch(target: FixtureTarget, operationId: string, attemptId: string,
+  completeFixtureDispatch(target: StableDomTarget, operationId: string, attemptId: string,
     observation: FixtureDispatchResult, now = Date.now()): boolean {
     this.discardExpired(now);
     const pending = this.dispatchJobs.get(operationId);
     const parsed = fixtureDispatchResultSchema.safeParse(observation);
     const operation = this.contents.get(operationId);
-    const live = operation && pending && this.requests.getApprovedTarget(pending.owner, operation.connectionId, now);
+    const live = operation && pending && this.requests.getStableTarget(pending.owner, operation.connectionId, now);
     const intent = this.database.prepare("SELECT state, started_at FROM message_dispatch_attempts WHERE operation_id = ?")
       .get(operationId) as { state: string; started_at: number } | undefined;
     if (!pending || !pending.issued || attemptId !== operationId || !parsed.success || !live || pending.startedAt > now
       || intent?.state !== "dispatching" || intent.started_at !== pending.startedAt
-      || pending.target.origin !== target.origin || pending.target.conversationId !== target.conversationId
-      || pending.target.tabId !== target.tabId || pending.target.documentId !== target.documentId
-      || live.origin !== target.origin || live.conversationId !== target.conversationId
-      || live.tabId !== target.tabId || live.documentId !== target.documentId) return false;
+      || !this.sameComposerTarget(pending.target, target) || !this.sameComposerTarget(live, target)
+      || (target.provider === "databag" && parsed.data.ok && parsed.data.editor !== "textarea")) return false;
     if (parsed.data.ok) this.reconcileFixtureObservation(pending.owner, operationId, now);
     this.finishFixtureDispatch(operationId);
     return true;
@@ -2179,15 +2176,14 @@ export class PreparedMessageOperations {
     if (status.state !== "dispatch_uncertain") return status;
     const operation = this.contents.get(operationId);
     const baseline = this.dispatchBaselines.get(operationId);
-    const live = operation && this.requests.getApprovedTarget(owner, operation.connectionId, now);
+    const live = operation && this.requests.getStableTarget(owner, operation.connectionId, now);
     if (!operation || operation.owner !== owner || !baseline || baseline.omittedBefore || !live || this.ambiguousEvidence.has(operationId)
-      || live.origin !== operation.target.origin || live.conversationId !== operation.target.conversationId
-      || live.tabId !== operation.target.tabId || live.documentId !== operation.target.documentId) return status;
-    const snapshot = this.requests.getFixtureSnapshot(owner, operation.connectionId, now);
+      || !this.sameComposerTarget(live, operation.target)) return status;
+    const snapshot = this.requests.getStableSnapshot(owner, operation.connectionId, now);
     if (!snapshot || snapshot === "not_ready" || snapshot.omittedBefore
       || snapshot.capturedAt < status.startedAt || snapshot.capturedAt > now
       || snapshot.cursor.epoch !== baseline.cursor.epoch || snapshot.cursor.sequence <= baseline.cursor.sequence) return status;
-    const events = this.requests.readFixtureEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
+    const events = this.requests.readStableEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
     if (!events || events === "not_ready" || events.state !== "ok"
       || events.cursor.sequence !== snapshot.cursor.sequence) return status;
     const known = new Set(baseline.messageIds);
@@ -2228,7 +2224,8 @@ export class PreparedMessageOperations {
     if (dispatch) return dispatch;
     if (record.expires_at <= now) return { operationId, state: "expired" as const };
     if (!this.requests.getApprovedTarget(owner, record.connection_id, now)
-      && !this.requests.getGeminiTarget(owner, record.connection_id, now)) {
+      && !this.requests.getGeminiTarget(owner, record.connection_id, now)
+      && !this.requests.getAutonomousTarget(owner, record.connection_id, now)) {
       return { operationId, state: "stale" as const };
     }
     const retained = this.contents.get(operationId) ?? this.geminiContents.get(operationId);

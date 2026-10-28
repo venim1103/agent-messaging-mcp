@@ -12,9 +12,129 @@ import { AutonomousCommitFailure, MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MES
   FIXTURE_PREFLIGHT_TIMEOUT_MS, FIXTURE_FILL_TIMEOUT_MS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   fixtureFillResultSchema, fixtureDraftFillStateSchema, geminiFillResultSchema, geminiFillStatusSchema,
   fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureDispatchStatusSchema,
-  geminiDispatchCheckResultSchema, geminiDispatchResultSchema }
+  geminiDispatchCheckResultSchema, geminiDispatchResultSchema, chatJobSchema, chatJobCompletionSchema }
   from "./message-operations.js";
-import { PendingConnectionRequests, type FixtureSnapshot, type FixtureTarget, type GeminiTarget } from "./pending-connections.js";
+import { isGeminiTarget, PendingConnectionRequests, type FixtureSnapshot, type FixtureTarget, type GeminiTarget } from "./pending-connections.js";
+
+test("Databag autonomous preparation and composer reservations remain exact, owned and shared", async () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  const ledger = new PreparedMessageOperations(requests, database);
+  const owner = Symbol("Databag prepared owner");
+  const other = Symbol("Databag other owner");
+  const agent = requests.registerAgent(owner, "Synthetic Databag owner");
+  const otherAgent = requests.registerAgent(other, "Synthetic Databag other");
+  const target = { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`,
+    url: "https://databag.example/#/session", tabId: 3, documentId: "synthetic-document" } as const;
+  try {
+    const connection = requests.approveAgent(agent.agentId, target)!;
+    const second = requests.approveAgent(otherAgent.agentId, target)!;
+    const separateTarget = { ...target, conversationId: `databag_${"b".repeat(64)}`, tabId: 4 };
+    const separateConnection = requests.approveAgent(agent.agentId, separateTarget)!;
+    const deadlineMs = Date.now() + 5000;
+    const text = "Synthetic Databag owned draft";
+    const key = randomUUID();
+    const prepared = ledger.prepareAutonomous(owner, connection.connectionId, text, key, deadlineMs);
+    assert.equal(prepared.preview.target, "databag");
+    assert.equal(prepared.expiresAt, deadlineMs);
+    assert.deepEqual(requests.getStableTarget(owner, connection.connectionId), target);
+    assert.equal(requests.getStableTarget(other, connection.connectionId), null);
+    assert.deepEqual(ledger.getAutonomousAuthorization(owner, prepared.operationId)?.target, target);
+    assert.equal(ledger.getAutonomousAuthorization(other, prepared.operationId), null);
+    assert.equal(ledger.prepareAutonomous(owner, connection.connectionId, text, key, deadlineMs + 1000).operationId, prepared.operationId);
+    assert.throws(() => ledger.prepareAutonomous(other, connection.connectionId, text, randomUUID(), deadlineMs), /CONNECTION_NOT_FOUND/);
+    assert.throws(() => ledger.prepare(owner, connection.connectionId, 1, text, randomUUID()), /CONNECTION_NOT_FOUND/);
+    assert.throws(() => ledger.prepareGemini(owner, connection.connectionId, 1, text, randomUUID()), /CONNECTION_NOT_FOUND/);
+    for (const invalid of [" draft", "draft ", "draft\rtext", "x".repeat(2049)]) {
+      assert.throws(() => ledger.prepareAutonomous(owner, connection.connectionId, invalid, randomUUID(), deadlineMs), /INVALID_MESSAGE_TEXT/);
+    }
+    const waiting = ledger.prepareAutonomous(other, second.connectionId, "Synthetic waiting draft", randomUUID(), deadlineMs);
+    const separate = ledger.prepareAutonomous(owner, separateConnection.connectionId, "Synthetic separate channel", randomUUID(), deadlineMs);
+    assert.equal(await ledger.acquireComposer(owner, prepared.operationId, deadlineMs), true);
+    assert.equal(await ledger.acquireComposer(owner, separate.operationId, deadlineMs), true);
+    let granted = false;
+    const queued = ledger.acquireComposer(other, waiting.operationId, deadlineMs).then(value => { granted = value; return value; });
+    await Promise.resolve();
+    assert.equal(granted, false);
+    assert.equal(ledger.releaseComposer(other, prepared.operationId), false);
+    assert.equal(ledger.releaseComposer(owner, prepared.operationId), true);
+    assert.equal(await queued, true);
+    assert.equal(ledger.releaseComposer(other, waiting.operationId), true);
+    assert.equal(ledger.releaseComposer(owner, separate.operationId), true);
+    assert.equal(await ledger.acquireComposer(owner, prepared.operationId, deadlineMs), true);
+    const filling = ledger.requestChatFill(owner, prepared.operationId, Date.now(), deadlineMs);
+    assert.ok(filling && filling !== "busy");
+    assert.deepEqual(ledger.listChatJobs("fill", "fixture"), []);
+    assert.deepEqual(ledger.listChatJobs("fill", "gemini"), []);
+    assert.deepEqual(ledger.listFixtureFillChallenges(Date.now(), true), []);
+    const fill = ledger.listChatJobs("fill", "databag")[0]!;
+    assert.equal(fill.operationId, prepared.operationId);
+    assert.deepEqual(fill.target, target);
+    assert.ok(fill.expiresAt <= deadlineMs);
+    assert.deepEqual(ledger.listChatJobs("fill", "databag"), []);
+    assert.equal(ledger.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", { ok: true, editor: "rich" }), false);
+    assert.equal(ledger.completeChatJob({ ...target, url: `${target.url}?other` }, fill.operationId, fill.jobId, "fill",
+      { ok: true, editor: "textarea" }), false);
+    assert.equal(ledger.completeChatJob({ ...target, conversationId: separateTarget.conversationId }, fill.operationId, fill.jobId, "fill",
+      { ok: true, editor: "textarea" }), false);
+    assert.equal(ledger.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", { ok: true, editor: "textarea" }), true);
+    assert.equal(ledger.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", { ok: true, editor: "textarea" }), false);
+    assert.equal((await filling.result)?.ok, true);
+    assert.equal(ledger.requestChatFill(owner, prepared.operationId, Date.now(), deadlineMs), null);
+    requests.publishStableSnapshot(target, []);
+    const inspecting = ledger.requestChatProof(owner, prepared.operationId, Date.now(), deadlineMs);
+    assert.ok(inspecting && inspecting !== "busy");
+    assert.deepEqual(ledger.listChatJobs("proof", "fixture"), []);
+    assert.deepEqual(ledger.listChatJobs("proof", "gemini"), []);
+    assert.deepEqual(ledger.listFixtureDispatchChecks(Date.now(), true), []);
+    const proof = ledger.listChatJobs("proof", "databag")[0]!;
+    assert.equal(proof.operationId, prepared.operationId);
+    assert.deepEqual(proof.target, target);
+    assert.deepEqual(ledger.listChatJobs("proof", "databag"), []);
+    const proofObservation = { ok: true as const, editor: "textarea" as const, draftText: text,
+      selected: true as const, writable: true as const, submitReady: true as const };
+    assert.equal(ledger.completeChatJob({ ...target, url: `${target.url}?other` }, proof.operationId, proof.jobId, "proof", proofObservation), false);
+    assert.equal(ledger.completeChatJob(proof.target, proof.operationId, proof.jobId, "proof", proofObservation), true);
+    assert.equal(await inspecting.result, true);
+    assert.equal(ledger.completeChatJob(proof.target, proof.operationId, proof.jobId, "proof", proofObservation), false);
+    assert.deepEqual(ledger.listChatJobs("submit", "databag"), []);
+    assert.equal(ledger.releaseComposer(owner, prepared.operationId), true);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    requests.removeChatAgent(agent.agentId, target);
+    assert.equal(ledger.getAutonomousAuthorization(owner, prepared.operationId), null);
+    assert.notEqual(ledger.getAutonomousAuthorization(other, waiting.operationId), null);
+  } finally {
+    requests.disconnect(owner);
+    requests.disconnect(other);
+    database.close();
+  }
+});
+
+test("Databag neutral job contracts bind exact sessions, bounded plain text and textarea results", () => {
+  const operationId = randomUUID();
+  const target = { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`,
+    url: "https://databag.example/#/session", tabId: 3, documentId: "synthetic-document" } as const;
+  const job = { operationId, jobId: randomUUID(), phase: "fill", target, text: "Synthetic Databag draft", expiresAt: 2000 };
+  assert.equal(chatJobSchema.safeParse(job).success, true);
+  for (const invalid of [{ ...job, target: { ...target, url: `${target.url}?other` } },
+    { ...job, target: { ...target, origin: "https://other.example" } },
+    { ...job, target: { ...target, conversationId: "displayed-title" } },
+    { ...job, target: { ...target, provider: "fixture" } }, { ...job, approved: true },
+    ...[" draft", "draft ", "draft\rtext", "x".repeat(2049)].map(text => ({ ...job, text }))]) {
+    assert.equal(chatJobSchema.safeParse(invalid).success, false);
+  }
+  for (const phase of ["fill", "proof", "submit", "settle"] as const) {
+    const observation = phase === "fill" ? { ok: true, editor: "textarea" }
+      : phase === "submit" ? { ok: true, editor: "textarea", activated: true }
+        : { ok: true, editor: "textarea", draftText: job.text, selected: true, writable: true, submitReady: true };
+    const payload = { target, operationId, jobId: phase === "submit" ? operationId : job.jobId, phase, observation };
+    assert.equal(chatJobCompletionSchema.safeParse(payload).success, true);
+    for (const editor of ["rich", "contenteditable"]) {
+      assert.equal(chatJobCompletionSchema.safeParse({ ...payload, observation: { ...observation, editor } }).success, false);
+    }
+    assert.equal(chatJobCompletionSchema.safeParse({ ...payload, approved: true }).success, false);
+  }
+});
 
 function approveSyntheticSend(ledger: PreparedMessageOperations, owner: symbol, operationId: string,
   target: FixtureTarget, now: number) {
@@ -919,7 +1039,8 @@ test("staged Gemini durable jobs never reoffer or restore authority after loss, 
 
 test("autonomous commits share one owned deadline across neutral fill, proof, intent and submit", async () => {
   for (const [provider, outcome] of [["fixture", "observed"], ["gemini", "observed"],
-    ["fixture", "uncertain"], ["gemini", "uncertain"], ["fixture", "delayed"], ["gemini", "delayed"]] as const) {
+    ["databag", "observed"], ["fixture", "uncertain"], ["gemini", "uncertain"], ["databag", "uncertain"],
+    ["fixture", "delayed"], ["gemini", "delayed"], ["databag", "delayed"]] as const) {
     const requests = new PendingConnectionRequests();
     const database = new DatabaseSync(":memory:");
     const ledger = new PreparedMessageOperations(requests, database);
@@ -930,6 +1051,8 @@ test("autonomous commits share one owned deadline across neutral fill, proof, in
     const target = provider === "gemini"
       ? { origin: "https://gemini.google.com" as const, conversationId: "synthetic-autonomous-commit",
         url: "https://gemini.google.com/app/synthetic-autonomous-commit", tabId: 8, documentId: "autonomous-commit" }
+      : provider === "databag" ? { provider: "databag" as const, origin: "https://databag.example" as const,
+        conversationId: `databag_${"a".repeat(64)}`, url: "https://databag.example/#/session", tabId: 8, documentId: "autonomous-commit" }
       : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
         tabId: 8, documentId: "autonomous-commit" };
     try {
@@ -940,6 +1063,10 @@ test("autonomous commits share one owned deadline across neutral fill, proof, in
       const committing = ledger.commitAutonomousMessage(owner, prepared.operationId, deadlineMs);
       const replaying = ledger.commitAutonomousMessage(owner, prepared.operationId, deadlineMs + 1000);
       await Promise.resolve();
+      if (provider === "databag") {
+        assert.deepEqual(ledger.listChatJobs("fill", "fixture"), []);
+        assert.deepEqual(ledger.listChatJobs("fill", "gemini"), []);
+      }
       const fill = ledger.listChatJobs("fill", provider)[0]!;
       assert.equal(fill.operationId, prepared.operationId);
       assert.equal(fill.expiresAt <= deadlineMs, true);
@@ -959,16 +1086,20 @@ test("autonomous commits share one owned deadline across neutral fill, proof, in
         : { ok: true as const, editor: "textarea" as const };
       assert.equal(ledger.completeChatJob(fill.target, prepared.operationId, fill.jobId, "fill", fillObservation), true);
       await Promise.resolve();
-      if (target.origin === "https://gemini.google.com") {
+      if (isGeminiTarget(target)) {
         const challenge = requests.listGeminiReadChallenges()[0]!;
         assert.equal(challenge.expiresAt <= deadlineMs, true);
         requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic autonomous baseline" }], Date.now(), challenge.challengeId);
       } else {
-        const challenge = requests.listFixtureReadChallenges()[0]!;
+        const challenge = requests.listStableReadChallenges()[0]!;
         assert.equal(challenge.expiresAt <= deadlineMs, true);
-        requests.publishFixtureSnapshot(target, [], Date.now(), challenge.challengeId);
+        requests.publishStableSnapshot(target, [], Date.now(), challenge.challengeId);
       }
       await Promise.resolve();
+      if (provider === "databag") {
+        assert.deepEqual(ledger.listChatJobs("proof", "fixture"), []);
+        assert.deepEqual(ledger.listChatJobs("proof", "gemini"), []);
+      }
       const proof = ledger.listChatJobs("proof", provider)[0]!;
       assert.equal(proof.expiresAt <= deadlineMs, true);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
@@ -977,6 +1108,11 @@ test("autonomous commits share one owned deadline across neutral fill, proof, in
       assert.equal(ledger.completeChatJob(proof.target, prepared.operationId, proof.jobId, "proof", provider === "gemini"
         ? { ...proofObservation, editor: "contenteditable" } : { ...proofObservation, editor: "textarea" }), true);
       await Promise.resolve();
+      if (provider === "databag") {
+        assert.deepEqual(ledger.listChatJobs("submit", "fixture"), []);
+        assert.deepEqual(ledger.listChatJobs("submit", "gemini"), []);
+        assert.deepEqual(ledger.listFixtureDispatchAttempts(Date.now(), true), []);
+      }
       const submit = ledger.listChatJobs("submit", provider)[0]!;
       assert.equal(submit.operationId, prepared.operationId);
       assert.equal(submit.expiresAt <= deadlineMs, true);
@@ -986,10 +1122,10 @@ test("autonomous commits share one owned deadline across neutral fill, proof, in
       assert.equal(waitingFinished, false);
       assert.deepEqual(ledger.listChatJobs("fill", provider), []);
       if (outcome === "observed") {
-        if (target.origin === "https://gemini.google.com") {
+        if (isGeminiTarget(target)) {
           requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic autonomous baseline" },
             { direction: "outgoing", text: prepared.preview.text }]);
-        } else requests.publishFixtureSnapshot(target, [{ id: "synthetic-autonomous-sent", direction: "outgoing", text: prepared.preview.text }]);
+        } else requests.publishStableSnapshot(target, [{ id: "synthetic-autonomous-sent", direction: "outgoing", text: prepared.preview.text }]);
       }
       assert.equal(ledger.completeChatJob(submit.target, prepared.operationId, submit.jobId, "submit", provider === "gemini"
         ? { ok: true, editor: "contenteditable", activated: true } : { ok: true, editor: "textarea", activated: true }), true);
@@ -997,10 +1133,10 @@ test("autonomous commits share one owned deadline across neutral fill, proof, in
         await new Promise<void>(done => setTimeout(done, 30));
         assert.equal(waitingFinished, false);
         assert.deepEqual(ledger.listChatJobs("fill", provider), []);
-        if (target.origin === "https://gemini.google.com") {
+        if (isGeminiTarget(target)) {
           requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic autonomous baseline" },
             { direction: "outgoing", text: prepared.preview.text }]);
-        } else requests.publishFixtureSnapshot(target, [{ id: "synthetic-autonomous-delayed", direction: "outgoing", text: prepared.preview.text }]);
+        } else requests.publishStableSnapshot(target, [{ id: "synthetic-autonomous-delayed", direction: "outgoing", text: prepared.preview.text }]);
       }
       const result = await committing;
       assert.equal(result.state, outcome === "uncertain" ? "dispatch_uncertain" : provider === "gemini" ? "resolved" : "observed_in_ui");

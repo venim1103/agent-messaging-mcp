@@ -83,7 +83,9 @@ test("native neutral jobs validate phase, provider, exact target and phase-speci
   for (const target of [
     { provider: "fixture", origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-neutral" },
     { provider: "gemini", origin: "https://gemini.google.com", conversationId: "synthetic-neutral", tabId: 4,
-      documentId: "synthetic-neutral", url: "https://gemini.google.com/app/synthetic-neutral?hl=en" }
+      documentId: "synthetic-neutral", url: "https://gemini.google.com/app/synthetic-neutral?hl=en" },
+    { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 5,
+      documentId: "synthetic-neutral", url: "https://databag.example/#/session" }
   ]) {
     for (const phase of ["fill", "proof", "submit", "settle"]) {
       const listing = { ...request, kind: "list_chat_jobs", payload: { phase, provider: target.provider } };
@@ -114,6 +116,11 @@ test("native neutral jobs validate phase, provider, exact target and phase-speci
       if (target.provider === "gemini") {
         for (const url of ["https://gemini.google.com/app/other", `${target.url}#fragment`,
           "https://gemini.google.com/not-app/synthetic-neutral", "https://example.com/app/synthetic-neutral"]) {
+          assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
+            target: { ...target, url } } }, now));
+        }
+      } else if (target.provider === "databag") {
+        for (const url of ["https://databag.example/", `${target.url}?other`, "https://other.example/#/session"]) {
           assert.throws(() => parseNativeChatJobRequest({ ...completion, payload: { ...completion.payload,
             target: { ...target, url } } }, now));
         }

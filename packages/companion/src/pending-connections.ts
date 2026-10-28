@@ -431,6 +431,11 @@ export class PendingConnectionRequests {
     return target?.origin === "http://127.0.0.1:8787" ? target : null;
   }
 
+  getStableTarget(owner: symbol, connectionId: string, now = Date.now()): StableDomTarget | null {
+    const target = this.liveGrant(owner, connectionId, now)?.target;
+    return target && !isGeminiTarget(target) ? target : null;
+  }
+
   getGeminiTarget(owner: symbol, connectionId: string, now = Date.now()): GeminiTarget | null {
     const target = this.liveGrant(owner, connectionId, now)?.target;
     return target && isGeminiTarget(target) ? target : null;

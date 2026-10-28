@@ -399,7 +399,8 @@ const replySchema = z.discriminatedUnion("kind", [
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ operationId: z.uuid(), connectionId: z.uuid(), state: z.literal("prepared"),
       expiresAt: z.number().int().safe(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/),
-      preview: z.union([geminiReview.shape.preview, z.strictObject({ target: z.literal("fixture-alpha"),
+      preview: z.union([geminiReview.shape.preview, geminiReview.shape.preview.extend({ target: z.literal("databag") }),
+        z.strictObject({ target: z.literal("fixture-alpha"),
         text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES) })]) })
   }),
   z.strictObject({
@@ -764,7 +765,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       dispatchFixtureMessage: (operationId: string, checkId: string) => request("dispatch_fixture_message", { operationId, checkId }),
       commitFixtureMessage: (operationId: string) => request("commit_fixture_message", { operationId }),
       commitPreparedMessage: (operationId: string, deadlineMs?: number) => request("commit_prepared_message", { operationId }, deadlineMs),
-      listChatJobs: (phase: ChatJob["phase"], provider: "fixture" | "gemini") => request("list_chat_jobs", { phase, provider }),
+      listChatJobs: (phase: ChatJob["phase"], provider: "fixture" | "gemini" | "databag") => request("list_chat_jobs", { phase, provider }),
       completeChatJob: (target: ChatTarget, operationId: string, jobId: string, phase: ChatJob["phase"],
         observation: ChatJobObservation) => request("complete_chat_job", { target, operationId, jobId, phase, observation }),
       listFixtureDispatchAttempts: () => request("list_fixture_dispatch_attempts", {}),

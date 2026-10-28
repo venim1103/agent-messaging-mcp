@@ -249,11 +249,11 @@ function isValidGeminiTarget(target: z.infer<typeof geminiTargetSchema>): boolea
 }
 
 const chatAgentTargetSchema = z.union([fixtureTargetSchema, geminiTargetSchema.refine(isValidGeminiTarget), databagTargetSchema]);
-const chatJobTargetSchema = chatTargetSchema.refine(target => target.provider === "fixture"
+const chatJobTargetSchema = chatTargetSchema.refine(target => target.provider !== "gemini"
   || (isValidGeminiTarget(target) && new URL(target.url).pathname === `/app/${target.conversationId}`));
 const chatJobRequestSchema = z.discriminatedUnion("kind", [
   pendingListSchema.extend({ kind: z.literal("list_chat_jobs"), payload: z.strictObject({
-    phase: chatJobSchema.shape.phase, provider: z.enum(["fixture", "gemini"])
+    phase: chatJobSchema.shape.phase, provider: z.enum(["fixture", "gemini", "databag"])
   }) }),
   pendingListSchema.extend({ kind: z.literal("complete_chat_job"), payload: chatJobCompletionSchema
     .refine(payload => chatJobTargetSchema.safeParse(payload.target).success) })

@@ -127,7 +127,7 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("commit_fixture_message"), payload: z.strictObject({ operationId: z.uuid() }) }),
   z.strictObject({ ...envelope, kind: z.literal("commit_prepared_message"), payload: z.strictObject({ operationId: z.uuid() }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_chat_jobs"), payload: z.strictObject({
-    phase: chatJobSchema.shape.phase, provider: z.enum(["fixture", "gemini"])
+    phase: chatJobSchema.shape.phase, provider: z.enum(["fixture", "gemini", "databag"])
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("complete_chat_job"), payload: chatJobCompletionSchema }),
   z.strictObject({ ...envelope, kind: z.literal("list_fixture_dispatch_attempts"), payload: z.strictObject({}) }),
