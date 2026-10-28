@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Synthetic Databag conversation</title>
+<style>body{font-family:sans-serif;margin:24px}textarea{display:block;width:360px;height:80px}button{margin:8px} [data-chat-text]{white-space:pre-wrap}</style></head>
+<body>
+<button id="switch-channel">Switch channel</button><button id="switch-account">Switch account</button>
+<div data-chat-contract="databag-dom-v1" data-chat-ready="true" data-chat-account="synthetic-account"
+  data-chat-peer="host" data-chat-channel="synthetic-channel">
+  <h1>Same displayed title</h1>
+  <div data-chat-timeline="true" role="log"><div class="topicPad"></div>
+    <div data-chat-message-id="synthetic-1" data-chat-direction="incoming" data-chat-readable="true"><span data-chat-text="true">Synthetic incoming message</span></div>
+    <div data-chat-message-id="synthetic-2" data-chat-direction="outgoing" data-chat-readable="true"><span data-chat-text="true">Synthetic outgoing message</span></div>
+  </div>
+  <div data-chat-composer="true"><textarea aria-label="Message"></textarea><button data-chat-send="true" disabled>Send</button></div>
+</div>
+<script>
+const root = document.querySelector('[data-chat-contract]');
+const editor = root.querySelector('textarea');
+const send = root.querySelector('[data-chat-send]');
+const timeline = root.querySelector('[role=log]');
+let messageCount = 2;
+window.syntheticActivations = 0;
+window.syntheticTrustedInputs = 0;
+editor.addEventListener('input', event => {
+  if (event.isTrusted) window.syntheticTrustedInputs++;
+  send.disabled = !editor.value;
+});
+send.addEventListener('click', () => {
+  window.syntheticActivations++;
+  if (!editor.value) return;
+  const row = document.createElement('div');
+  row.dataset.chatMessageId = `synthetic-${++messageCount}`;
+  row.dataset.chatDirection = 'outgoing';
+  row.dataset.chatReadable = 'true';
+  const text = document.createElement('span');
+  text.dataset.chatText = 'true';
+  text.textContent = editor.value;
+  row.append(text);
+  timeline.append(row);
+  editor.value = '';
+  send.disabled = true;
+});
+document.querySelector('#switch-channel').addEventListener('click', () => { root.dataset.chatChannel = 'other-channel'; });
+document.querySelector('#switch-account').addEventListener('click', () => { root.dataset.chatAccount = 'other-account'; });
+</script>
+</body>
+</html>

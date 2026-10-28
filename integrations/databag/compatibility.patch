@@ -1,0 +1,154 @@
+diff --git a/app/client/web/src/conversation/Conversation.tsx b/app/client/web/src/conversation/Conversation.tsx
+--- a/app/client/web/src/conversation/Conversation.tsx
++++ b/app/client/web/src/conversation/Conversation.tsx
+@@ -27,7 +27,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
+   const thread = useRef(null as HTMLDivElement | null)
+   const scrollPos = useRef(0)
+   const [sending, setSending] = useState(false)
+-  const { state, actions } = useConversation()
++  const { state, actions, binding } = useConversation()
+   const attachImage = useRef({ click: () => {} } as HTMLInputElement)
+   const attachVideo = useRef({ click: () => {} } as HTMLInputElement)
+   const attachAudio = useRef({ click: () => {} } as HTMLInputElement)
+@@ -146,7 +146,9 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
+   const enableBinary = state.detail?.enableBinary
+ 
+   return (
+-    <div className={classes.conversation}>
++    <div className={classes.conversation} data-chat-contract="databag-dom-v1"
++      data-chat-ready={binding ? 'true' : 'false'} data-chat-account={binding?.account}
++      data-chat-peer={binding?.peer} data-chat-channel={binding?.channel}>
+       <div className={classes.header}>
+         <div className={classes.status}>
+           <ActionIcon variant="subtle">
+@@ -171,7 +173,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
+       </div>
+       <div ref={thread} className={classes.frame} style={state.loadingMore ? { overflow: 'hidden' } : { overflow: 'auto' }} onScroll={onScroll}>
+         {state.loaded && (
+-          <div className={classes.thread}>
++          <div className={classes.thread} data-chat-timeline="true" role="log">
+             <div className="topicPad" />
+             {topics}
+           </div>
+@@ -192,7 +194,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
+         {sending && <div className={classes.progress} style={{ width: `${state.progress}%` }} />}
+       </div>
+       <AnimateHeight className={classes.add} duration={333} height={height ? height : 132}>
+-        <div ref={ref} className={classes.staging}>
++        <div ref={ref} className={classes.staging} data-chat-composer="true">
+           <input type="file" name="asset" accept="image/*" ref={attachImage} onChange={(e) => addImage(e.target?.files?.[0])} style={{ display: 'none' }} />
+           <input type="file" name="asset" accept="video/*" ref={attachVideo} onChange={(e) => addVideo(e.target?.files?.[0])} style={{ display: 'none' }} />
+           <input type="file" name="asset" accept="audio/*" ref={attachAudio} onChange={(e) => addAudio(e.target?.files?.[0])} style={{ display: 'none' }} />
+@@ -265,6 +267,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
+             </Menu>
+             <div className={classes.send}>
+               <ActionIcon
++                data-chat-send="true"
+                 className={classes.attach}
+                 variant="light"
+                 disabled={(!state.message && state.assets.length === 0) || !state.detail || state.detail.locked || sending}
+diff --git a/app/client/web/src/conversation/useConversation.hook.ts b/app/client/web/src/conversation/useConversation.hook.ts
+--- a/app/client/web/src/conversation/useConversation.hook.ts
++++ b/app/client/web/src/conversation/useConversation.hook.ts
+@@ -95,6 +95,7 @@ export function useConversation() {
+     detail: undefined as FocusDetail | null | undefined,
+     strings: display.state.strings,
+     cardId: null as null | string,
++    channelId: null as null | string,
+     detailSet: false,
+     focus: null as Focus | null,
+     layout: null,
+@@ -157,8 +158,9 @@ export function useConversation() {
+     const focus = app.state.focus
+     const { contact, identity } = app.state.session || {}
+     if (focus && contact && identity) {
++      let active = true
+       const setTopics = (topics: Topic[]) => {
+-        if (topics) {
++        if (active && topics) {
+           const filtered = topics.filter((topic) => !topic.blocked)
+           const sorted = filtered.sort((a, b) => {
+             if (a.created < b.created) {
+@@ -173,6 +175,7 @@ export function useConversation() {
+         }
+       }
+       const setCards = (cards: Card[]) => {
++        if (!active) return
+         const contacts = new Map<string, Card>()
+         cards.forEach((card) => {
+           contacts.set(card.guid, card)
+@@ -180,23 +183,29 @@ export function useConversation() {
+         updateState({ cards: contacts })
+       }
+       const setProfile = (profile: Profile) => {
++        if (!active) return
+         updateState({ profile })
+       }
+       const setDetail = (focused: { cardId: string | null; channelId: string; detail: FocusDetail | null }) => {
++        if (!active) return
+         const detail = focused ? focused.detail : null
+-        const cardId = focused.cardId
+-        updateState({ detail, cardId })
++        const cardId = focused?.cardId ?? null
++        const channelId = focused?.channelId ?? null
++        updateState({ detail, cardId, channelId })
+       }
+       const setOffsync = (offsync: boolean) => {
++        if (!active) return
+         updateState({ offsync });
+       }
+-      updateState({ assets: [], message: '', topics: [], loaded: false })
++      updateState({ focus, detail: undefined, detailSet: false, cardId: null, channelId: null,
++        profile: null, cards: new Map<string, Card>(), assets: [], message: '', topics: [], loaded: false })
+       focus.addTopicListener(setTopics)
+       focus.addDetailListener(setDetail)
+       focus.addOffsyncListener(setOffsync)
+       contact.addCardListener(setCards)
+       identity.addProfileListener(setProfile)
+       return () => {
++        active = false
+         focus.removeTopicListener(setTopics)
+         focus.removeDetailListener(setDetail)
+         focus.removeOffsyncListener(setOffsync)
+@@ -206,6 +215,11 @@ export function useConversation() {
+     }
+   }, [app.state.focus])
+ 
++  const binding = app.state.focus === state.focus && state.focus && state.loaded && state.detailSet && state.detail
++    && state.channelId && state.profile?.guid
++    ? { account: state.profile.guid, peer: state.cardId === null ? 'host' : `contact_${state.cardId}`, channel: state.channelId }
++    : null
++
+   const actions = {
+     close: () => {
+       app.actions.clearFocus()
+@@ -375,5 +389,5 @@ export function useConversation() {
+     },
+   }
+ 
+-  return { state, actions }
++  return { state, actions, binding }
+ }
+diff --git a/app/client/web/src/message/Message.tsx b/app/client/web/src/message/Message.tsx
+--- a/app/client/web/src/message/Message.tsx
++++ b/app/client/web/src/message/Message.tsx
+@@ -183,7 +183,9 @@ export function Message({ topic, card, profile, host }: { topic: Topic; card: Card | null; profile: Profile | null; host: boolean }) {
+       })
+ 
+   return (
+-    <div className={classes.topic}>
++    <div className={classes.topic} data-chat-message-id={String(topicId)}
++      data-chat-direction={profile ? 'outgoing' : 'incoming'}
++      data-chat-readable={!locked && status === 'confirmed' && !editing ? 'true' : 'false'}>
+       <div className={classes.content}>
+         <Image radius="sm" className={classes.logo} src={logoUrl} />
+         <div className={classes.body}>
+@@ -218,7 +220,7 @@ export function Message({ topic, card, profile, host }: { topic: Topic; card: Card | null; profile: Profile | null; host: boolean }) {
+           )}
+           {!locked && status === 'confirmed' && text && !editing && (
+             <div className={classes.padding} style={textStyle}>
+-              <span className={classes.text}>{message}</span>
++              <span className={classes.text} data-chat-text="true">{message}</span>
+             </div>
+           )}
+           {!locked && status !== 'confirmed' && (

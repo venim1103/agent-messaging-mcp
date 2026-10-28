@@ -20,7 +20,25 @@ import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 import { createNativeRequestChannel, requestNativeGrantCount } from "../../packages/extension/lib/native-channel.ts";
+import { configuredDatabagOrigins, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
 import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
+
+test("Databag configuration admits one exact HTTPS origin without widening host permission", () => {
+  assert.deepEqual(configuredDatabagOrigins(undefined), []);
+  assert.deepEqual(configuredDatabagOrigins(""), []);
+  for (const origin of ["https://databag.example", "https://databag.example:8443"]) {
+    assert.equal(parseDatabagOrigin(origin), origin);
+    assert.deepEqual(configuredDatabagOrigins(origin), [origin]);
+    assert.equal(Object.isFrozen(configuredDatabagOrigins(origin)), true);
+  }
+  for (const value of ["http://databag.example", "https://gemini.google.com", "https://*.example",
+    "https://databag.example/", "https://databag.example/path", "https://databag.example?token=synthetic",
+    "https://databag.example#session", "https://synthetic:secret@databag.example", "https://databag.example:443",
+    " https://databag.example", "https://databag.example\n", "not a URL"]) {
+    assert.equal(parseDatabagOrigin(value), null);
+    assert.throws(() => configuredDatabagOrigins(value), /canonical HTTPS origin/);
+  }
+});
 
 test("synthetic Gemini proof faults stay bound to their starting invocation", { timeout: 1000 }, async () => {
   for (const [startingMode, nextMode] of [["result-loss", "grant-loss"], ["positive", "result-loss"], ["grant-loss", "result-loss"]]) {

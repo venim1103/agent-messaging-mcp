@@ -531,7 +531,7 @@ Initially target observation-to-event latency under 500 ms at the 95th percentil
 - No transcript persistence: private SQLite stores operation metadata, keyed digests and receipt hashes only.
 - Current visible-chat input uses reviewed page functions; the two earlier debugger input probes and required permission are removed by D6 (2026-10-19).
 
-Still open from the original list: which second chat UI to validate. Installers beyond the devcontainer are not needed for now (D12). None of this ties the architecture to a particular model provider.
+Databag is the selected second chat UI (D14). Installers beyond the devcontainer are not needed for now (D12). None of this ties the architecture to a particular model provider.
 
 ### Decisions (2026-10-09)
 
@@ -555,6 +555,8 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D13 Connection start: decided.** The person clicks **Connect this chat** first and the agent picks the chat up (section 4).
 - **D13a Agent binding: revised and decided (2026-10-12).** Multiple agents may connect to the same chat. Show how many and which agents have access, with individual removal. Supersedes the earlier exclusive-recipient decision and the several-facade refusal proposal. Grants, requests and operations remain individually owned; writes to the shared composer must be serialized. Section 7 explains the facade identity limit.
 - **D13b Additional-agent admission: decided (2026-10-12).** The user chose per-agent approval once. Each agent needs its own trusted popup approval for autonomous read/send in the selected chat, not per-message approval. No automatic admission of later arrivals or silent re-admission after removal. A disconnected, restarted or revoked owner needs fresh approval; same-chat reload preserves the existing owner's connection (D2).
+- **D14 Second chat UI: decided (2026-10-28).** The person selected the standard self-hosted Databag web client, deployed from `balzack/databag:latest`. Reuse browser login, the trusted **Connect this chat** approval and the provider-neutral pipeline (D1, D5); do not add Databag API access, credential handling or provider-specific command families. Scope identity to one selected conversation and document, not the whole server. Keep deployment addresses out of tracked configuration, fixtures and documentation. Public-source review and synthetic checks come before a separately authorized installed read or send test; a mutable image tag alone does not establish the running UI version.
+- **D15 Databag conversation identity: decided (2026-10-28).** The person approved preparing a minimal frontend compatibility patch for deployment. Public upstream `45343338582b394f4f5fdb4b7e271ea1dc8dd5fd` uses one `#/session` route without native DOM identity attributes; React keys and internal SDK state are not DOM identity, and titles alone are insufficient. Expose only non-secret account/conversation identity and message identity/direction in the DOM, then use a reviewed adapter. Pin an exact HTTPS deployment origin in local build configuration, not wildcard host permission or tracked deployment addresses. Login, deployment and trusted exact-chat approval remain human steps. This authorizes neither internal account-state access nor a live test.
 
 The system's value should be **controlled, inspectable chat operations with explicit limitations**, rather than a claim that every website can be automated identically.
 
