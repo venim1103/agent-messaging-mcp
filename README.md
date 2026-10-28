@@ -6,7 +6,7 @@ You choose the conversation and approve each assistant once. That assistant can 
 
 Reply waiting uses page completion indicators where available and quiet-period estimates otherwise.
 
-Supported integrations include Gemini and experimental plain-text Databag chats. Databag requires a patched web client; the stock image alone is not sufficient. See [DEVELOPMENT.md](DEVELOPMENT.md#databag-compatibility) for compatibility requirements.
+Gemini is supported. Stock Databag is not currently supported; see [DEVELOPMENT.md](DEVELOPMENT.md#databag-compatibility). Integrations must work without modifying or redeploying the website.
 
 > **Experimental prototype.** Not ready for everyday use or personal conversations. Browser and site support is limited; background-tab reliability on real sites is unverified. Messages observed on the page are not proof of delivery.
 

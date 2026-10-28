@@ -200,7 +200,11 @@ Independent readers retain independent cursors. Writers share one composer: seri
 
 ## 8. Generic Adapter Strategy
 
+**No website changes (clarified 2026-10-28):** Every supported integration must operate the existing website through the person's browser login. Never require a site patch, added identity attributes, backend plugin, custom frontend build or redeployment. Reviewed extension page functions may inspect the existing DOM and use approved controls; provider APIs, credential access and React/SDK-state inspection remain outside the boundary. A synthetic fixture with extra markers does not establish compatibility with the stock site.
+
 Use progressive support, not a universal selector or a model making a fresh guess for every message.
+
+Use one provider-neutral popup control set. A selected-chat adapter supplies eligibility, inspection and supported supervised commands; shared handlers own selection/document checks, rendering and consent phases. Adding a site must not add another provider-named Inspect, Review, Fill or Send button. Keep ordinary review, fill consent and send consent separate because their authority differs. Diagnostic inspection never approves or renews a connection.
 
 | Level | How it works | Supported behavior |
 | --- | --- | --- |
@@ -208,6 +212,14 @@ Use progressive support, not a universal selector or a model making a fresh gues
 | Calibrated generic adapter | User identifies relevant elements; saved declarative profile | Basic reading and sending only where identity and writer checks pass |
 | Automatic discovery | Rank semantic DOM candidates and offer a preview | Setup assistance; no automatic write authorization |
 | Unsupported | Missing structure, ambiguous identity, or unsupported editor | Explain the limitation and remain read-only or disconnected |
+
+### Unmodified-site identity
+
+- Separate locating UI elements from proving the approved conversation. Native account/chat identifiers are useful when exposed, but a provider's database IDs are not a universal adapter prerequisite. The adapter must supply tested evidence for the lifetime and operations it supports.
+- An extension-local token names a binding; it does not prove continuity. Titles, content hashes, CSS selectors, DOM-node identity and quiet periods alone cannot establish that the account/chat is unchanged. Unknown identity refuses both reads and writes, not just sends.
+- A document-scoped binding is a possible fallback only after proving same-document continuity, including pending asynchronous navigation and recycled UI nodes. It is not automatically safe because it ends on reload. D16 records the unresolved lifetime choice; D1/D2 remain unchanged until explicitly decided.
+- Native message IDs are not universally required either. Observation-local row identities must remain epoch-scoped and must not be presented as provider IDs or fed into stable-ID send evidence. Reuse reviewed snapshot/append evidence only where its assumptions hold; duplicate, missing or ambiguous observations remain uncertain.
+- Prefer a small reviewed stock-site adapter using native controls and bounded structural/semantic checks. Calibration can supply declarative locators and previews, never missing identity evidence or authority. Keep approval, deadlines, draft ownership, composer serialization and no-retry policy in the existing shared pipeline.
 
 ### Generic calibration
 
@@ -224,6 +236,8 @@ Each adapter implements the same conceptual operations: detect compatibility, id
 Use bundled, reviewed TypeScript adapters for exceptional application behavior. Sharing the same rich-text editor does not imply two sites share message identity or conversation semantics.
 
 Initially support top-level DOM chat UIs. Open shadow roots can be handled explicitly; cross-origin frames need additional scoped permission and frame tracking. Canvas-only UIs, inaccessible structures, and closed shadow roots without a tested access path are not promised support.
+
+**Current popup implementation (2026-10-28):** One adapter table selects the shared controls and diagnostic callbacks. Legacy fixture/Gemini supervised command names remain internal; Databag has no supervised capability. The marker-free Databag diagnostic returns bounded layout counts and control states, not conversation identity or chat content. Calibration and the stock conversation adapter remain unimplemented; the earlier duplication assessment below is historical.
 
 **Implementation note (2026-10-09):** The prototype has two hard-coded targets, the synthetic fixture and Gemini, with no adapter interface or calibration. Each capability is a separate provider-specific family in every layer: ledger methods, 52 private broker request kinds, client methods, native parsers, worker executors and popup commands. Several fixture-named functions are in fact provider-generic. This contradicts the rule above that adapters must not reimplement policy, and every new site would cost a full copy. Target, starting with the autonomous send path (decision D5):
 
@@ -556,7 +570,8 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 - **D13a Agent binding: revised and decided (2026-10-12).** Multiple agents may connect to the same chat. Show how many and which agents have access, with individual removal. Supersedes the earlier exclusive-recipient decision and the several-facade refusal proposal. Grants, requests and operations remain individually owned; writes to the shared composer must be serialized. Section 7 explains the facade identity limit.
 - **D13b Additional-agent admission: decided (2026-10-12).** The user chose per-agent approval once. Each agent needs its own trusted popup approval for autonomous read/send in the selected chat, not per-message approval. No automatic admission of later arrivals or silent re-admission after removal. A disconnected, restarted or revoked owner needs fresh approval; same-chat reload preserves the existing owner's connection (D2).
 - **D14 Second chat UI: decided (2026-10-28).** The person selected the standard self-hosted Databag web client, deployed from `balzack/databag:latest`. Reuse browser login, the trusted **Connect this chat** approval and the provider-neutral pipeline (D1, D5); do not add Databag API access, credential handling or provider-specific command families. Scope identity to one selected conversation and document, not the whole server. Keep deployment addresses out of tracked configuration, fixtures and documentation. Public-source review and synthetic checks come before a separately authorized installed read or send test; a mutable image tag alone does not establish the running UI version.
-- **D15 Databag conversation identity: decided (2026-10-28).** The person approved preparing a minimal frontend compatibility patch for deployment. Public upstream `45343338582b394f4f5fdb4b7e271ea1dc8dd5fd` uses one `#/session` route without native DOM identity attributes; React keys and internal SDK state are not DOM identity, and titles alone are insufficient. Expose only non-secret account/conversation identity and message identity/direction in the DOM, then use a reviewed adapter. Pin an exact HTTPS deployment origin in local build configuration, not wildcard host permission or tracked deployment addresses. Login, deployment and trusted exact-chat approval remain human steps. This authorizes neither internal account-state access nor a live test.
+- **D15 Website modifications: superseded and resolved (2026-10-28).** Earlier approval to prepare a Databag frontend compatibility patch is historical. The person clarified that the MCP/extension must never require changes to an accessed website. Do not deploy the patch or make site modification a setup prerequisite. The tested patched-contract implementation is not stock Databag support. Retain exact-origin permissions, browser-only access and exact-chat approval; change the connector, not the website. Section 8 states the cross-provider constraint. No live access is authorized by this decision.
+- **D16 Stock Databag binding and lifetime: open (2026-10-28).** Prove a native-UI binding against same-URL switches, pending asynchronous selection, account changes, duplicate labels, recycled DOM and readiness races before enabling reads/writes. A source-based isolated experiment shows identical DOM and zero mutations can accompany a changed synthetic channel behind an index-keyed row; a node token/observer alone is insufficient. If safe same-document binding is established but cross-reload identity is unavailable, choose explicitly between a document-scoped connection requiring fresh approval after reload and retaining D2 with Databag unsupported. No shorter lifetime, weaker identity, internal-state access or tab-wide approval is silently adopted.
 
 The system's value should be **controlled, inspectable chat operations with explicit limitations**, rather than a claim that every website can be automated identically.
 
