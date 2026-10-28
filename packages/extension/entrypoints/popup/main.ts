@@ -216,13 +216,19 @@ async function inspectDatabagTab(target: InspectionTarget): Promise<InspectionRe
     ["Bounds", `${shape.visitedElements} visited elements; ${shape.limited ? "limit reached" : "within limits"}`],
     ["Native elements", `${shape.nativeElements.textareas} visible textareas; ${shape.nativeElements.contenteditables} visible contenteditables; `
       + `${shape.nativeElements.buttons} visible buttons; ${shape.nativeElements.fileInputs} visited file inputs; ${shape.nativeElements.iframes} visible iframes`],
+    ["CSS naming", `${shape.cssNaming.scoped} scoped region tokens; ${shape.cssNaming.componentPrefixed} component-prefixed region tokens; `
+      + `${shape.cssNaming.other} other class tokens`],
+    ["Control elements", `${shape.controlElements.labels} visible labels; ${shape.controlElements.roleButtons} visible ARIA buttons; `
+      + `${shape.controlElements.svgRoots} visible SVG roots`],
     ["Regions", `${counts.conversationRegions} conversation candidates; ${counts.timelines} timeline candidates`],
     ["Selection and account", `${counts.focusedRows} focused row candidates; ${counts.accountRegions} account regions; ${counts.accountHandles} handle regions`],
     ["Rendered structure", `${counts.messageRows} row candidates; ${counts.messageTexts} text-region candidates`],
     ["Composer", `${counts.composers} composer candidates; ${counts.fileInputs} file inputs; ${counts.stagedAssetChildren} staged elements`],
     ["Editors", `${counts.editorCandidates} candidates; ` + (shape.editors.map(editor =>
       `${editor.disabled ? "disabled" : "enabled"}; ${editor.readOnly ? "read-only" : "writable"}`).join("\n") || "None visible")],
-    ["Send controls", `${counts.sendButtons} candidates; ` + (shape.sends.map(send =>
+    ["Send region elements", `${shape.sendRegions.buttons} buttons; ${shape.sendRegions.labels} labels; ${shape.sendRegions.divs} divs; `
+      + `${shape.sendRegions.spans} spans; ${shape.sendRegions.svgs} SVG roots; ${shape.sendRegions.other} other elements`],
+    ["Send controls", `${counts.sendButtons} native button candidates; ` + (shape.sends.map(send =>
       `${send.disabled ? "disabled" : "enabled"}; ${send.ariaDisabled ? "aria-disabled" : "no aria-disabled"}`).join("\n") || "None visible")],
     ["Contract markers", shape.markerContractPresent ? "Experimental markers present" : "No experimental contract marker"]
   ], status: "Layout metadata only. No message or draft text read, connection approval, or input actions." };

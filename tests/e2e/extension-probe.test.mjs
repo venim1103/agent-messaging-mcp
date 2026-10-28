@@ -104,8 +104,19 @@ test("shared popup inspection is contract-free, document-bound and never approve
         ["[data-chat-composer]", "staging"], ["[data-chat-send]", "send"],
         ["[data-chat-message-id]", "topic"], ["[data-chat-text]", "text"]];
       for (const [selector, name] of mappings) for (const element of document.querySelectorAll(selector)) {
-        element.classList.add(`_${name}_synthetic_1`);
+        element.classList.add(`Synthetic_${name}__1`);
       }
+      const label = document.createElement("label");
+      label.className = "SyntheticPrivateIdentifier";
+      label.title = "Synthetic attachment tooltip";
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("width", "24");
+      svg.setAttribute("height", "24");
+      label.append(svg);
+      const action = document.createElement("span");
+      action.setAttribute("role", "button");
+      action.append(document.createTextNode("Synthetic toolbar action"));
+      document.querySelector("[data-chat-composer]").append(label, action);
       for (const element of document.querySelectorAll("*")) for (const attribute of [...element.attributes]) {
         if (attribute.name.startsWith("data-chat-")) element.removeAttribute(attribute.name);
       }
@@ -151,7 +162,15 @@ test("shared popup inspection is contract-free, document-bound and never approve
     assert.ok(diagnostic.includes("1 visible textareas"));
     assert.ok(diagnostic.includes("0 visible contenteditables"));
     assert.ok(diagnostic.includes("0 visible iframes"));
-    assert.doesNotMatch(diagnostic, /Synthetic incoming message|synthetic-account|synthetic-channel|https:\/\//);
+    assert.ok(diagnostic.includes("CSS naming"));
+    assert.ok(diagnostic.includes("0 scoped region tokens"));
+    assert.match(diagnostic, /[1-9][0-9]* component-prefixed region tokens/);
+    assert.ok(diagnostic.includes("Control elements"));
+    assert.ok(diagnostic.includes("1 visible labels; 1 visible ARIA buttons; 1 visible SVG roots"));
+    assert.ok(diagnostic.includes("Send region elements"));
+    assert.ok(diagnostic.includes("1 buttons; 0 labels; 0 divs; 0 spans; 0 SVG roots; 0 other elements"));
+    assert.ok(diagnostic.includes("1 native button candidates"));
+    assert.doesNotMatch(diagnostic, /Synthetic|synthetic-account|synthetic-channel|https:\/\//);
     assert.equal(await page.content(), beforeMarkup);
     assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), beforeStorage);
     assert.equal(await page.evaluate(() => window.syntheticActivations), 0);

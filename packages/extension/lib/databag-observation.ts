@@ -19,6 +19,9 @@ export type DatabagStructure = {
     accountHandles: number; composers: number; messageRows: number; messageTexts: number; fileInputs: number;
     stagedAssetChildren: number; editorCandidates: number; sendButtons: number };
   nativeElements: { textareas: number; contenteditables: number; buttons: number; fileInputs: number; iframes: number };
+  cssNaming: { scoped: number; componentPrefixed: number; other: number };
+  controlElements: { labels: number; roleButtons: number; svgRoots: number };
+  sendRegions: { buttons: number; labels: number; divs: number; spans: number; svgs: number; other: number };
   editors: { disabled: boolean; readOnly: boolean }[];
   sends: { disabled: boolean; ariaDisabled: boolean }[];
 };
@@ -49,7 +52,9 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
     counts: { conversationRegions: 0, timelines: 0, focusedRows: 0, accountRegions: 0, accountHandles: 0,
       composers: 0, messageRows: 0, messageTexts: 0, fileInputs: 0, stagedAssetChildren: 0,
       editorCandidates: 0, sendButtons: 0 },
-    nativeElements: { textareas: 0, contenteditables: 0, buttons: 0, fileInputs: 0, iframes: 0 }, editors: [], sends: [] };
+    nativeElements: { textareas: 0, contenteditables: 0, buttons: 0, fileInputs: 0, iframes: 0 },
+    cssNaming: { scoped: 0, componentPrefixed: 0, other: 0 }, controlElements: { labels: 0, roleButtons: 0, svgRoots: 0 },
+    sendRegions: { buttons: 0, labels: 0, divs: 0, spans: 0, svgs: 0, other: 0 }, editors: [], sends: [] };
   const ancestry: { conversation: boolean; composer: boolean; send: boolean; account: boolean }[] = [];
   let element: Element | null = body;
   let depth = 0;
@@ -58,10 +63,16 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
     result.visitedElements++;
     const classes = element.getAttribute("class") ?? "";
     if (classes.length > 512) { result.limited = true; break; }
-    const names = new Set(classes.split(/\s+/).flatMap(token => {
-      const match = /^_(conversation|thread|focused|identity|handle|staging|send|files|topic|text)_[A-Za-z0-9_-]+$/.exec(token);
-      return match ? [match[1]] : [];
-    }));
+    const names = new Set<string>();
+    for (const token of classes.split(/\s+/)) {
+      if (!token) continue;
+      const scoped = /^_(conversation|thread|focused|identity|handle|staging|send|files|topic|text)_[A-Za-z0-9_-]+$/.exec(token);
+      const prefixed = scoped ? null
+        : /^[A-Za-z][A-Za-z0-9_-]*_(conversation|thread|focused|identity|handle|staging|send|files|topic|text)__[A-Za-z0-9_-]+$/.exec(token);
+      const match = scoped ?? prefixed;
+      result.cssNaming[scoped ? "scoped" : prefixed ? "componentPrefixed" : "other"]++;
+      if (match) names.add(match[1]);
+    }
     const parent = ancestry[depth - 1];
     const current = { conversation: names.has("conversation") || Boolean(parent?.conversation),
       composer: names.has("staging") || Boolean(parent?.composer), send: names.has("send") || Boolean(parent?.send),
@@ -79,6 +90,9 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
       }
       if (element instanceof HTMLButtonElement) result.nativeElements.buttons++;
       if (element instanceof HTMLIFrameElement) result.nativeElements.iframes++;
+      if (element instanceof HTMLLabelElement) result.controlElements.labels++;
+      if (element.getAttribute("role") === "button") result.controlElements.roleButtons++;
+      if (element instanceof SVGSVGElement) result.controlElements.svgRoots++;
       if (names.has("conversation")) result.counts.conversationRegions++;
       if (names.has("focused")) result.counts.focusedRows++;
       if (names.has("identity")) result.counts.accountRegions++;
@@ -90,6 +104,12 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
         if (names.has("staging")) result.counts.composers++;
       }
       if (current.conversation && current.composer) {
+        if (names.has("send")) {
+          const category = element instanceof HTMLButtonElement ? "buttons" : element instanceof HTMLLabelElement ? "labels"
+            : element instanceof HTMLDivElement ? "divs" : element instanceof HTMLSpanElement ? "spans"
+            : element instanceof SVGSVGElement ? "svgs" : "other";
+          result.sendRegions[category]++;
+        }
         if (names.has("files")) result.counts.stagedAssetChildren += element.childElementCount;
         if (element instanceof HTMLTextAreaElement) {
           result.counts.editorCandidates++;

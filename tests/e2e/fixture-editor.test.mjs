@@ -27,12 +27,17 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
         <div class="_topic_native_1"><span class="_text_native_1">Synthetic message</span></div>
       </div><div class="_staging_native_1"><input type="file" hidden>
         <div class="_files_native_1"></div><textarea>Synthetic human draft</textarea>
+        <label class="send SyntheticPrivateIdentifier" title="Synthetic attachment tooltip">
+          <svg width="24" height="24"><path d="M0 0 L24 24"></path></svg>
+        </label><span role="button">Synthetic toolbar action</span>
         <div class="_send_native_1"><button disabled>Send</button></div>
       </div></div>
       <div style="opacity: 0"><div class="_focused_native_1">Hidden selection</div></div>
       <div contenteditable="true">Synthetic editable</div>
       <iframe srcdoc="<textarea>Synthetic framed draft</textarea>"></iframe>
       <button hidden>Hidden action</button>
+      <label hidden>Hidden label</label><span role="button" hidden>Hidden ARIA button</span>
+      <svg hidden width="24" height="24"></svg>
     </body></html>`;
     await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html", body: html }));
     await page.goto(input.expectedUrl);
@@ -54,6 +59,11 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
         [HTMLIFrameElement.prototype, "contentDocument"], [HTMLIFrameElement.prototype, "contentWindow"]]) {
         Object.defineProperty(prototype, property, { configurable: true, get() { throw new Error("Synthetic private getter accessed"); } });
       }
+      const getAttribute = Element.prototype.getAttribute;
+      Element.prototype.getAttribute = function (name) {
+        if (["title", "aria-label", "d", "src", "href", "id"].includes(name)) throw new Error("Synthetic private attribute accessed");
+        return getAttribute.call(this, name);
+      };
     });
     const structure = await page.evaluate(inspectDatabagStructure, input);
     assert.equal(structure.limited, false);
@@ -68,6 +78,52 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
       draftUnchanged: true, htmlUnchanged: true, adapterInstalled: false, storedKeys: 0 });
     assert.equal(JSON.stringify(structure).includes("Synthetic"), false);
     assert.deepEqual(structure.nativeElements, { textareas: 1, contenteditables: 1, buttons: 1, fileInputs: 1, iframes: 1 });
+    assert.deepEqual(structure.cssNaming, { scoped: 10, componentPrefixed: 0, other: 2 });
+    assert.deepEqual(structure.controlElements, { labels: 1, roleButtons: 1, svgRoots: 1 });
+    assert.deepEqual(structure.sendRegions, { buttons: 0, labels: 0, divs: 1, spans: 0, svgs: 0, other: 0 });
+    await page.evaluate(() => {
+      for (const element of document.querySelectorAll("[class]")) {
+        element.setAttribute("class", element.getAttribute("class").replace(/^_([a-z]+)_/, "Synthetic_$1__"));
+      }
+    });
+    const prefixedBefore = { ...await page.evaluate(() => window.syntheticInspectionState()), mutations: 0 };
+    const prefixed = await page.evaluate(inspectDatabagStructure, input);
+    assert.deepEqual(prefixed.counts, structure.counts);
+    assert.deepEqual(prefixed.nativeElements, structure.nativeElements);
+    assert.deepEqual(prefixed.cssNaming, { scoped: 0, componentPrefixed: 10, other: 2 });
+    assert.deepEqual(prefixed.controlElements, structure.controlElements);
+    assert.deepEqual(prefixed.sendRegions, structure.sendRegions);
+    assert.deepEqual(await page.evaluate(() => window.syntheticInspectionState()), prefixedBefore);
+    assert.equal(JSON.stringify(prefixed).includes("Synthetic"), false);
+    for (const [tag, category] of [["label", "labels"], ["span", "spans"], ["svg", "svgs"], ["button", "buttons"], ["a", "other"]]) {
+      await page.evaluate(tag => {
+        const previous = document.querySelector('[class="Synthetic_send__native_1"]');
+        const replacement = tag === "svg" ? document.createElementNS("http://www.w3.org/2000/svg", "svg") : document.createElement(tag);
+        replacement.setAttribute("class", "Synthetic_send__native_1");
+        replacement.setAttribute("role", "button");
+        replacement.setAttribute("disabled", "");
+        replacement.setAttribute("title", "Synthetic Send tooltip");
+        replacement.setAttribute("style", "display: inline-block; width: 24px; height: 24px");
+        previous.replaceWith(replacement);
+      }, tag);
+      const variantBefore = { ...await page.evaluate(() => window.syntheticInspectionState()), mutations: 0 };
+      const variant = await page.evaluate(inspectDatabagStructure, input);
+      assert.deepEqual(variant.sendRegions, { ...Object.fromEntries(Object.keys(structure.sendRegions).map(key => [key, 0])), [category]: 1 });
+      assert.equal(variant.counts.sendButtons, tag === "button" ? 1 : 0);
+      assert.deepEqual(variant.sends, tag === "button" ? [{ disabled: true, ariaDisabled: false }] : []);
+      assert.deepEqual(variant.controlElements, { labels: tag === "label" ? 2 : 1, roleButtons: 2, svgRoots: tag === "svg" ? 2 : 1 });
+      assert.deepEqual(await page.evaluate(() => window.syntheticInspectionState()), variantBefore);
+      assert.equal(JSON.stringify(variant).includes("Synthetic"), false);
+    }
+    await page.evaluate(() => {
+      const replacement = document.createElement("div");
+      replacement.setAttribute("class", "Synthetic_send__native_1");
+      const button = document.createElement("button");
+      button.disabled = true;
+      button.append(document.createTextNode("Send"));
+      replacement.append(button);
+      document.querySelector('[class="Synthetic_send__native_1"]').replaceWith(replacement);
+    });
     await page.evaluate(() => {
       for (const element of document.querySelectorAll("[class]")) element.removeAttribute("class");
     });
@@ -75,6 +131,9 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
     const unclassified = await page.evaluate(inspectDatabagStructure, input);
     assert.equal(unclassified.limited, false);
     assert.deepEqual(unclassified.nativeElements, structure.nativeElements);
+    assert.deepEqual(unclassified.cssNaming, { scoped: 0, componentPrefixed: 0, other: 0 });
+    assert.deepEqual(unclassified.controlElements, structure.controlElements);
+    assert.deepEqual(unclassified.sendRegions, Object.fromEntries(Object.keys(structure.sendRegions).map(key => [key, 0])));
     assert.deepEqual(unclassified.counts, Object.fromEntries(Object.keys(structure.counts).map(name => [name, 0])));
     assert.deepEqual(await page.evaluate(() => window.syntheticInspectionState()), unclassifiedBefore);
     assert.equal(JSON.stringify(unclassified).includes("Synthetic"), false);
@@ -82,6 +141,22 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
       assert.equal(await page.evaluate(inspectDatabagStructure, { ...input, origin }), null);
     }
     assert.equal(await page.evaluate(inspectDatabagStructure, { ...input, expectedUrl: `${input.expectedUrl}?other` }), null);
+    await page.reload();
+    await page.evaluate(() => {
+      for (const element of document.querySelectorAll("[class]")) element.removeAttribute("class");
+      document.body.setAttribute("class", "send Synthetic_send__ Synthetic_send_suffix Synthetic_conversation__");
+    });
+    const misleading = await page.evaluate(inspectDatabagStructure, input);
+    assert.deepEqual(misleading.cssNaming, { scoped: 0, componentPrefixed: 0, other: 4 });
+    assert.deepEqual(misleading.counts, Object.fromEntries(Object.keys(structure.counts).map(name => [name, 0])));
+    assert.equal(JSON.stringify(misleading).includes("Synthetic"), false);
+    await page.reload();
+    await page.evaluate(() => document.body.setAttribute("class", "SyntheticPrivateIdentifier".repeat(32)));
+    const oversizedClass = await page.evaluate(inspectDatabagStructure, input);
+    assert.equal(oversizedClass.limited, true);
+    assert.equal(oversizedClass.visitedElements, 1);
+    assert.deepEqual(oversizedClass.cssNaming, { scoped: 0, componentPrefixed: 0, other: 0 });
+    assert.equal(JSON.stringify(oversizedClass).includes("Synthetic"), false);
     await page.reload();
     await page.evaluate(() => {
       const container = document.createElement("div");
