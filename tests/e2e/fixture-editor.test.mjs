@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
@@ -10,8 +11,185 @@ import { PreparedMessageOperations } from "../../packages/companion/dist/message
 import { PendingConnectionRequests } from "../../packages/companion/dist/pending-connections.js";
 import { createFixtureServer } from "../fixtures/server.mjs";
 import { installDraftOwnershipTracker } from "../../packages/extension/lib/draft-ownership.ts";
-import { installDatabagAdapter, identifyDatabagConversation, captureDatabagSnapshot, observeDatabagMessages }
+import { installDatabagAdapter, identifyDatabagConversation, captureDatabagSnapshot, observeDatabagMessages,
+  inspectDatabagDraft, fillDatabagDraft, submitDatabagDraft }
   from "../../packages/extension/lib/databag-observation.ts";
+
+test("Databag guarded submits activate once and never retry refused or uncertain outcomes", { timeout: 15000 }, async () => {
+  const html = await readFile(new URL("../fixtures/databag.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    const expectedUrl = "https://databag.example/#/session";
+    await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html", body: html }));
+    await page.goto(expectedUrl);
+    const reset = async () => {
+      await page.reload();
+      await page.evaluate(installDatabagAdapter, ["https://databag.example"]);
+      await page.evaluate(installDraftOwnershipTracker);
+      const identity = await page.evaluate(identifyDatabagConversation);
+      const filling = { expectedUrl, conversationId: identity.conversationId, text: "Synthetic Databag activation",
+        operationId: randomUUID(), attemptId: randomUUID(), expiresAt: Date.now() + 4000 };
+      assert.equal((await page.evaluate(fillDatabagDraft, filling)).ok, true);
+      return { ...filling, attemptId: filling.operationId, expiresAt: Date.now() + 4000 };
+    };
+    let input = await reset();
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, input), { ok: true, editor: "textarea", activated: true });
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 1);
+    assert.equal(await page.locator("textarea").inputValue(), "");
+    assert.equal((await page.evaluate(captureDatabagSnapshot, input.conversationId)).messages.at(-1).text, input.text);
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, { ...input, expiresAt: Date.now() + 4000 }),
+      { ok: false, code: "DISPATCH_UNAVAILABLE" });
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 1);
+    input = await reset();
+    await page.locator("textarea").fill("Synthetic human edit");
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, input), { ok: false, code: "DRAFT_CHANGED" });
+    assert.equal(await page.locator("textarea").inputValue(), "Synthetic human edit");
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+    input = await reset();
+    await page.locator("[data-chat-send]").evaluate(button => button.addEventListener("focus", () => {
+      document.querySelector("[data-chat-contract]").dataset.chatAccount = "other-account";
+    }, { once: true }));
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, input), { ok: false, code: "TARGET_CHANGED" });
+    assert.equal(await page.locator("textarea").inputValue(), input.text);
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+    input = await reset();
+    await page.locator("[data-chat-send]").evaluate(button => { button.disabled = true; });
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, input), { ok: false, code: "SUBMIT_UNAVAILABLE" });
+    await page.locator("[data-chat-send]").evaluate(button => { button.disabled = false; });
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, { ...input, expiresAt: Date.now() + 4000 }),
+      { ok: false, code: "DISPATCH_UNAVAILABLE" });
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+    input = await reset();
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, { ...input, expiresAt: Date.now() - 1 }),
+      { ok: false, code: "DISPATCH_UNAVAILABLE" });
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, input), { ok: false, code: "DISPATCH_UNAVAILABLE" });
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+    input = await reset();
+    await page.evaluate(() => {
+      const activate = HTMLElement.prototype.click;
+      HTMLElement.prototype.click = function() { activate.call(this); throw new Error("Synthetic post-activation failure"); };
+    });
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, input), { ok: false, code: "DISPATCH_UNCERTAIN" });
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, { ...input, expiresAt: Date.now() + 4000 }),
+      { ok: false, code: "DISPATCH_UNAVAILABLE" });
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 1);
+  } finally { await browser.close(); }
+});
+
+test("Databag guarded fills insert once and preserve human or changed-identity drafts", { timeout: 15000 }, async () => {
+  const html = await readFile(new URL("../fixtures/databag.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    const expectedUrl = "https://databag.example/#/session";
+    await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html", body: html }));
+    await page.goto(expectedUrl);
+    const reset = async () => {
+      await page.reload();
+      await page.evaluate(installDatabagAdapter, ["https://databag.example"]);
+      await page.evaluate(installDraftOwnershipTracker);
+      const identity = await page.evaluate(identifyDatabagConversation);
+      return { expectedUrl, conversationId: identity.conversationId, text: "Synthetic Databag owned draft",
+        operationId: randomUUID(), attemptId: randomUUID(), expiresAt: Date.now() + 4000 };
+    };
+    let input = await reset();
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: true, editor: "textarea" });
+    assert.equal(await page.locator("textarea").inputValue(), input.text);
+    assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 1);
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...input, expiresAt: Date.now() + 4000 }), { ok: false, code: "FILL_UNAVAILABLE" });
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...input, attemptId: randomUUID(), expiresAt: Date.now() + 4000 }),
+      { ok: false, code: "DRAFT_PRESENT" });
+    const replacement = { ...input, text: "Synthetic Databag replacement", operationId: randomUUID(), attemptId: randomUUID(),
+      expiresAt: Date.now() + 4000, leftover: { operationId: input.operationId, text: input.text } };
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, replacement), { ok: true, editor: "textarea" });
+    assert.equal(await page.locator("textarea").inputValue(), replacement.text);
+    await page.locator("textarea").fill(replacement.text);
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...replacement, operationId: randomUUID(), attemptId: randomUUID(),
+      expiresAt: Date.now() + 4000, leftover: { operationId: replacement.operationId, text: replacement.text } }),
+    { ok: false, code: "DRAFT_PRESENT" });
+    assert.equal(await page.locator("textarea").inputValue(), replacement.text);
+    input = await reset();
+    await page.locator("textarea").fill("Synthetic human draft");
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: false, code: "DRAFT_PRESENT" });
+    assert.equal(await page.locator("textarea").inputValue(), "Synthetic human draft");
+    input = await reset();
+    await page.locator("textarea").evaluate(editor => editor.addEventListener("focus", () => {
+      document.querySelector("[data-chat-contract]").dataset.chatChannel = "other-channel";
+    }, { once: true }));
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: false, code: "TARGET_CHANGED" });
+    assert.equal(await page.locator("textarea").inputValue(), "");
+    assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 0);
+    input = await reset();
+    await page.locator("[data-chat-contract]").evaluate(root => { root.dataset.chatDraftSafe = "false"; });
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+    input = await reset();
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...input, expiresAt: Date.now() - 1 }), { ok: false, code: "FILL_UNAVAILABLE" });
+    assert.equal(await page.locator("textarea").inputValue(), "");
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+  } finally { await browser.close(); }
+});
+
+test("Databag composer preflight is exact, attachment-free and read-only", { timeout: 15000 }, async () => {
+  const html = await readFile(new URL("../fixtures/databag.html", import.meta.url), "utf8");
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    const expectedUrl = "https://databag.example/#/session";
+    await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html", body: html }));
+    await page.goto(expectedUrl);
+    const reset = async () => {
+      await page.reload();
+      await page.evaluate(installDatabagAdapter, ["https://databag.example"]);
+      const identity = await page.evaluate(identifyDatabagConversation);
+      return { expectedUrl, conversationId: identity.conversationId, text: "Synthetic Databag draft" };
+    };
+    let input = await reset();
+    assert.equal(await page.locator("[data-chat-send]").isDisabled(), true);
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, input), { ok: true, editor: "textarea" });
+    assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 0);
+    await page.locator("textarea").fill(input.text);
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, input), { ok: false, code: "DRAFT_PRESENT" });
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, { ...input, draftState: "prepared" }), { ok: true, editor: "textarea" });
+    await page.locator("[data-chat-send]").evaluate(button => { button.disabled = true; });
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, { ...input, draftState: "prepared" }), { ok: false, code: "SUBMIT_UNAVAILABLE" });
+    assert.equal(await page.locator("textarea").inputValue(), input.text);
+    for (const marker of [null, "false", "unknown"]) {
+      input = await reset();
+      await page.locator("[data-chat-contract]").evaluate((root, marker) => {
+        if (marker === null) root.removeAttribute("data-chat-draft-safe");
+        else root.dataset.chatDraftSafe = marker;
+      }, marker);
+      assert.deepEqual(await page.evaluate(inspectDatabagDraft, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+    }
+    input = await reset();
+    await page.locator("[data-chat-composer]").evaluate(region => {
+      const file = document.createElement("input");
+      file.type = "file";
+      file.hidden = true;
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(["Synthetic attachment"], "synthetic.txt"));
+      file.files = transfer.files;
+      region.append(file);
+    });
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, input), { ok: false, code: "DRAFT_PRESENT" });
+    input = await reset();
+    await page.locator("textarea").evaluate(editor => { editor.readOnly = true; });
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+    input = await reset();
+    await page.locator("[data-chat-composer]").evaluate(region => region.append(document.createElement("textarea")));
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+    input = await reset();
+    await page.locator("[data-chat-contract]").evaluate(root => { root.dataset.chatChannel = "other-channel"; });
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, input), { ok: false, code: "TARGET_CHANGED" });
+    input = await reset();
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, { ...input, text: " draft" }), { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
+    assert.equal(await page.locator("textarea").inputValue(), "");
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+    assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 0);
+  } finally { await browser.close(); }
+});
 
 test("Databag DOM identity binds account and channel without reading internal state", { timeout: 15000 }, async () => {
   const html = await readFile(new URL("../fixtures/databag.html", import.meta.url), "utf8");

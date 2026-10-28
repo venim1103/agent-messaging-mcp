@@ -507,11 +507,18 @@ test("two MCP facades auto-start one private broker before any tool call", { tim
   } finally {
     await Promise.all(clients.map((client) => client.close()));
     const recorded = await readFile(join(home, "broker-pids"), "utf8").catch(() => "");
-    for (const value of recorded.trim().split("\n").filter(Boolean)) {
-      const pid = Number(value);
+    const pids = recorded.trim().split("\n").filter(Boolean).map(Number);
+    const isOwnedProcess = async (pid: number) => {
+      try {
+        return (await readFile(`/proc/${pid}/environ`, "utf8")).split("\0").includes(`HOME=${home}`);
+      } catch (error) {
+        if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ESRCH")) return false;
+        throw error;
+      }
+    };
+    for (const pid of pids) {
       assert.ok(Number.isSafeInteger(pid) && pid > 0);
-      const environment = await readFile(`/proc/${pid}/environ`, "utf8").catch(() => "");
-      if (!environment.split("\0").includes(`HOME=${home}`)) continue;
+      if (!await isOwnedProcess(pid)) continue;
       try {
         process.kill(pid, "SIGTERM");
       } catch (error) {
@@ -519,10 +526,12 @@ test("two MCP facades auto-start one private broker before any tool call", { tim
       }
     }
     for (let attempt = 0; attempt < 80; attempt++) {
-      if (!await brokerSocketReady(join(runtimeDirectory, "broker.sock"))) break;
+      if (!await brokerSocketReady(join(runtimeDirectory, "broker.sock"))
+        && !(await Promise.all(pids.map(isOwnedProcess))).some(Boolean)) break;
       await setTimeout(25);
     }
     assert.equal(await brokerSocketReady(join(runtimeDirectory, "broker.sock")), false);
+    assert.deepEqual(await Promise.all(pids.map(isOwnedProcess)), pids.map(() => false), "Recorded test brokers must exit before deleting their home");
     await rm(home, { recursive: true, force: true });
   }
 });

@@ -544,6 +544,10 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
     const geminiReservation = () => ({ operationId: geminiOperationId, expiresAt: Date.now() + 4000, provider: "gemini" });
     assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt, geminiReservation()), true);
     assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt, geminiReservation()), false);
+    const databagOperationId = crypto.randomUUID();
+    const databagReservation = () => ({ operationId: databagOperationId, expiresAt: Date.now() + 4000, provider: "databag" });
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt, databagReservation()), true);
+    assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt, databagReservation()), false);
     assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt, { ...geminiReservation(), provider: "unsupported" }), false);
     assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
       { operationId: crypto.randomUUID(), expiresAt: Date.now() - 1, provider: "gemini" }), false);
@@ -568,6 +572,8 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
         { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000 }), false);
       assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
         { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000, provider: "gemini" }), false);
+      assert.equal(await worker.evaluate(reserveBrowserSubmitAttempt,
+        { operationId: crypto.randomUUID(), expiresAt: Date.now() + 4000, provider: "databag" }), false);
     } finally {
       await worker.evaluate(() => {
         chrome.storage.local.get = globalThis.fixtureOriginalReservationGet;
@@ -1928,7 +1934,8 @@ for (const provider of ["fixture", "gemini"]) {
 }
 
 for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(provider =>
-  ["failure", "lifetime", "reload", "reload-failure"].map(scenario => ({ provider, scenario })))) {
+  ["failure", "lifetime", "reload", "reload-failure", ...(provider === "databag" ? ["fill-result-loss", "submit-result-loss"] : [])]
+    .map(scenario => ({ provider, scenario })))) {
   test(`${provider} popup autonomous admission (${scenario}) is per agent and preserves other owners`, { timeout: 20000 }, async (testContext) => {
     const setPhase = trackTestPhase(testContext, `${provider} admission ${scenario}`);
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-autonomous-test-"));
@@ -2097,6 +2104,108 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
         const supervisedReview = popup.locator("#view-fixture-fill-reviews");
         assert.equal(await supervisedReview.count(), 1);
         assert.equal(await supervisedReview.isVisible(), false);
+        if (scenario === "reload-failure") {
+          setPhase("public Databag send and reply");
+          const text = "Synthetic Databag autonomous worker message";
+          const sendArguments = { connectionId: first.connectionId, text, idempotencyKey: crypto.randomUUID() };
+          const sent = await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
+          assert.equal(sent.isError, false, JSON.stringify({ state: sent.structuredContent.state,
+            code: sent.structuredContent.code, failureStage: sent.structuredContent.failureStage }));
+          assert.equal(sent.structuredContent.state, "sent");
+          assert.equal(sent.structuredContent.retryAllowed, false);
+          assert.equal(await page.evaluate(() => window.syntheticActivations), 1);
+          assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 1);
+          assert.equal(await page.locator("textarea").inputValue(), "");
+          const operation = await clients[0].callTool({ name: "chat_get_operation", arguments: { operationId: sent.structuredContent.operationId } });
+          assert.equal(operation.isError, undefined);
+          assert.equal(operation.structuredContent.state, "observed_in_ui");
+          assert.equal(Object.hasOwn(operation.structuredContent, "recoveryToken"), false);
+          const { recoveryToken, ...durableStatus } = sent.structuredContent;
+          assert.equal(typeof recoveryToken === "string" && /^[0-9a-f]{64}$/.test(recoveryToken), true);
+          const replay = await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
+          assert.deepEqual(replay.structuredContent, durableStatus);
+          assert.equal(Object.hasOwn(replay.structuredContent, "recoveryToken"), false);
+          assert.equal(await page.evaluate(() => window.syntheticActivations), 1);
+          const observed = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: first.connectionId } });
+          assert.equal(observed.isError, undefined);
+          assert.match(JSON.stringify(observed.structuredContent), /Synthetic Databag autonomous worker message/);
+          const replyText = "Synthetic Databag worker reply";
+          await page.locator("[data-chat-timeline]").evaluate((timeline, text) => {
+            const row = document.createElement("div");
+            row.dataset.chatMessageId = "synthetic-worker-reply";
+            row.dataset.chatDirection = "incoming";
+            row.dataset.chatReadable = "true";
+            const region = document.createElement("span");
+            region.dataset.chatText = "true";
+            region.textContent = text;
+            row.append(region);
+            timeline.append(row);
+          }, replyText);
+          const reply = await clients[0].callTool({ name: "chat_wait_for_reply", arguments: { connectionId: first.connectionId, timeoutMs: 4000 } });
+          assert.equal(reply.isError, undefined, JSON.stringify({ code: reply.structuredContent.code, timedOut: reply.structuredContent.timedOut }));
+          assert.equal(reply.structuredContent.timedOut, false);
+          assert.equal(reply.structuredContent.reply.text, replyText);
+          assert.equal(reply.structuredContent.reply.generationState, "settled_heuristic");
+          await page.locator("textarea").fill("Synthetic Databag human draft");
+          const refused = await clients[0].callTool({ name: "chat_send_message", arguments: { ...sendArguments,
+            text: "Synthetic forbidden replacement", idempotencyKey: crypto.randomUUID() } });
+          assert.equal(refused.structuredContent.state, "not_sent");
+          assert.equal(refused.structuredContent.retryAllowed, false);
+          assert.equal(refused.structuredContent.failureStage, "fill");
+          assert.equal(await page.locator("textarea").inputValue(), "Synthetic Databag human draft");
+          assert.equal(await page.evaluate(() => window.syntheticActivations), 1);
+        }
+        if (scenario === "fill-result-loss" || scenario === "submit-result-loss") {
+          setPhase(`public Databag ${scenario}`);
+          const fillLoss = scenario === "fill-result-loss";
+          await worker.evaluate(fillLoss => {
+            globalThis.syntheticDatabagJobCalls = 0;
+            globalThis.syntheticDatabagDroppedResults = 0;
+            const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+            chrome.scripting.executeScript = async options => {
+              const results = await execute(options);
+              const source = options.func?.toString() ?? "";
+              if (source.includes("agentDatabagAdapter") && source.includes(fillLoss ? ".fill(" : ".submit(")) {
+                globalThis.syntheticDatabagJobCalls++;
+                if (results[0]?.result?.ok && globalThis.syntheticDatabagDroppedResults === 0) {
+                  globalThis.syntheticDatabagDroppedResults++;
+                  return [];
+                }
+              }
+              return results;
+            };
+          }, fillLoss);
+          const text = "Synthetic Databag lost-result message";
+          const sendArguments = { connectionId: first.connectionId, text, idempotencyKey: crypto.randomUUID() };
+          const result = await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
+          assert.equal(result.isError, fillLoss, JSON.stringify({ state: result.structuredContent.state,
+            code: result.structuredContent.code, failureStage: result.structuredContent.failureStage }));
+          assert.equal(result.structuredContent.state, fillLoss ? "not_sent" : "sent");
+          assert.equal(result.structuredContent.retryAllowed, false);
+          if (fillLoss) assert.equal(result.structuredContent.failureStage, "fill");
+          assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagDroppedResults), 1);
+          assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagJobCalls), 1);
+          assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 1);
+          assert.equal(await page.evaluate(() => window.syntheticActivations), fillLoss ? 0 : 1);
+          assert.equal(await page.locator("textarea").inputValue(), fillLoss ? text : "");
+          const { recoveryToken, ...status } = result.structuredContent;
+          assert.equal(typeof recoveryToken === "string" && /^[0-9a-f]{64}$/.test(recoveryToken), true);
+          const replay = await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
+          const { recoveryToken: replayToken, ...replayedStatus } = replay.structuredContent;
+          assert.deepEqual(replayedStatus, status);
+          assert.equal(replayToken === (fillLoss ? recoveryToken : undefined), true);
+          assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagJobCalls), 1);
+          assert.equal(await page.evaluate(() => window.syntheticActivations), fillLoss ? 0 : 1);
+          const reservations = await worker.evaluate(async () => Object.keys(await chrome.storage.local.get(null))
+            .filter(key => key.startsWith("databag-submit-attempt-")).length);
+          assert.equal(reservations, fillLoss ? 0 : 1);
+          const relay = await connectBroker("relay", directory);
+          try {
+            for (const phase of ["fill", "proof", "submit", "settle"]) {
+              assert.deepEqual((await relay.listChatJobs(phase, "databag")).payload, { jobs: [] });
+            }
+          } finally { relay.close(); }
+        }
         if (scenario === "failure") {
           await page.locator("[data-chat-direction=incoming] [data-chat-text]").evaluate(row => { row.textContent = "Synthetic incoming revision"; });
           const events = await clients[0].callTool({ name: "chat_wait_for_events", arguments: {

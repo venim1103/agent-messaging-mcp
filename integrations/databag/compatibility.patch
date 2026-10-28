@@ -10,18 +10,19 @@ diff --git a/app/client/web/src/conversation/Conversation.tsx b/app/client/web/s
    const attachImage = useRef({ click: () => {} } as HTMLInputElement)
    const attachVideo = useRef({ click: () => {} } as HTMLInputElement)
    const attachAudio = useRef({ click: () => {} } as HTMLInputElement)
-@@ -146,7 +146,9 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
+@@ -146,7 +146,10 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
    const enableBinary = state.detail?.enableBinary
  
    return (
 -    <div className={classes.conversation}>
 +    <div className={classes.conversation} data-chat-contract="databag-dom-v1"
 +      data-chat-ready={binding ? 'true' : 'false'} data-chat-account={binding?.account}
-+      data-chat-peer={binding?.peer} data-chat-channel={binding?.channel}>
++      data-chat-peer={binding?.peer} data-chat-channel={binding?.channel}
++      data-chat-draft-safe={binding && state.assets.length === 0 && state.detail && !state.detail.locked && !sending ? 'true' : 'false'}>
        <div className={classes.header}>
          <div className={classes.status}>
            <ActionIcon variant="subtle">
-@@ -171,7 +173,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
+@@ -171,7 +174,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
        </div>
        <div ref={thread} className={classes.frame} style={state.loadingMore ? { overflow: 'hidden' } : { overflow: 'auto' }} onScroll={onScroll}>
          {state.loaded && (
@@ -30,7 +31,7 @@ diff --git a/app/client/web/src/conversation/Conversation.tsx b/app/client/web/s
              <div className="topicPad" />
              {topics}
            </div>
-@@ -192,7 +194,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
+@@ -192,7 +195,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
          {sending && <div className={classes.progress} style={{ width: `${state.progress}%` }} />}
        </div>
        <AnimateHeight className={classes.add} duration={333} height={height ? height : 132}>
@@ -39,7 +40,7 @@ diff --git a/app/client/web/src/conversation/Conversation.tsx b/app/client/web/s
            <input type="file" name="asset" accept="image/*" ref={attachImage} onChange={(e) => addImage(e.target?.files?.[0])} style={{ display: 'none' }} />
            <input type="file" name="asset" accept="video/*" ref={attachVideo} onChange={(e) => addVideo(e.target?.files?.[0])} style={{ display: 'none' }} />
            <input type="file" name="asset" accept="audio/*" ref={attachAudio} onChange={(e) => addAudio(e.target?.files?.[0])} style={{ display: 'none' }} />
-@@ -265,6 +267,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
+@@ -265,6 +268,7 @@ export function Conversation({ openDetails }: { openDetails: () => void }) {
              </Menu>
              <div className={classes.send}>
                <ActionIcon

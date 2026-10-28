@@ -28,7 +28,8 @@ export function installDraftOwnershipTracker(): void {
   const observer = new MutationObserver(inspectMutations);
   observer.observe(document, { subtree: true, childList: true, characterData: true, attributes: true,
     attributeFilter: ["contenteditable", "disabled", "readonly", "aria-readonly", "aria-disabled", "hidden", "inert", "value",
-      "data-conversation-id", "aria-label", "placeholder", "role", "style", "class"] });
+      "data-conversation-id", "data-chat-contract", "data-chat-ready", "data-chat-account", "data-chat-peer", "data-chat-channel",
+      "data-chat-draft-safe", "aria-label", "placeholder", "role", "style", "class"] });
   const invalidate = (event: Event) => {
     if (!record || !(event.target instanceof Node)
       || (event.target !== record.editor && !record.editor.contains(event.target))) return;
