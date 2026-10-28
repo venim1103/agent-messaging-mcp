@@ -11,6 +11,16 @@ export type DatabagFill = DatabagPreflight | { ok: false; code: "FILL_UNAVAILABL
 export type DatabagSubmitInput = Omit<DatabagFillInput, "leftover">;
 export type DatabagSubmit = { ok: true; editor: "textarea"; activated: true } | { ok: false;
   code: "TARGET_CHANGED" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE" | "DISPATCH_UNAVAILABLE" | "DISPATCH_UNCERTAIN" };
+export type DatabagStructure = {
+  visitedElements: number;
+  limited: boolean;
+  markerContractPresent: boolean;
+  counts: { conversationRegions: number; timelines: number; focusedRows: number; accountRegions: number;
+    accountHandles: number; composers: number; messageRows: number; messageTexts: number; fileInputs: number;
+    stagedAssetChildren: number; editorCandidates: number; sendButtons: number };
+  editors: { disabled: boolean; readOnly: boolean }[];
+  sends: { disabled: boolean; ariaDisabled: boolean }[];
+};
 type DatabagAdapter = {
   origins: string;
   identify: () => Promise<DatabagIdentity | null>;
@@ -22,6 +32,75 @@ type DatabagAdapter = {
   stop: () => void;
 };
 type DatabagScope = { agentDatabagAdapter?: DatabagAdapter };
+
+export function inspectDatabagStructure(input: { expectedUrl: string; origin: string }): DatabagStructure | null {
+  if (!input || typeof input.origin !== "string" || typeof input.expectedUrl !== "string"
+    || input.expectedUrl.length > 512 || input.expectedUrl !== `${input.origin}/#/session`
+    || window.top !== window || location.href !== input.expectedUrl || document.visibilityState !== "visible") return null;
+  try {
+    const url = new URL(input.origin);
+    if (url.protocol !== "https:" || url.origin !== input.origin || url.href !== `${input.origin}/`
+      || url.username || url.password || url.hostname.includes("*") || input.origin === "https://gemini.google.com") return null;
+  } catch { return null; }
+  const body = document.body;
+  if (!body) return null;
+  const result: DatabagStructure = { visitedElements: 0, limited: false, markerContractPresent: false,
+    counts: { conversationRegions: 0, timelines: 0, focusedRows: 0, accountRegions: 0, accountHandles: 0,
+      composers: 0, messageRows: 0, messageTexts: 0, fileInputs: 0, stagedAssetChildren: 0,
+      editorCandidates: 0, sendButtons: 0 }, editors: [], sends: [] };
+  const ancestry: { conversation: boolean; composer: boolean; send: boolean; account: boolean }[] = [];
+  let element: Element | null = body;
+  let depth = 0;
+  while (element) {
+    if (result.visitedElements >= 4096 || depth > 64) { result.limited = true; break; }
+    result.visitedElements++;
+    const classes = element.getAttribute("class") ?? "";
+    if (classes.length > 512) { result.limited = true; break; }
+    const names = new Set(classes.split(/\s+/).flatMap(token => {
+      const match = /^_(conversation|thread|focused|identity|handle|staging|send|files|topic|text)_[A-Za-z0-9_-]+$/.exec(token);
+      return match ? [match[1]] : [];
+    }));
+    const parent = ancestry[depth - 1];
+    const current = { conversation: names.has("conversation") || Boolean(parent?.conversation),
+      composer: names.has("staging") || Boolean(parent?.composer), send: names.has("send") || Boolean(parent?.send),
+      account: names.has("identity") || Boolean(parent?.account) };
+    ancestry[depth] = current;
+    const style = getComputedStyle(element);
+    const hidden = element.hasAttribute("hidden") || element.hasAttribute("inert") || element.getAttribute("aria-hidden") === "true"
+      || style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0;
+    if (parent?.composer && element instanceof HTMLInputElement && element.type === "file") result.counts.fileInputs++;
+    if (!hidden && element.getClientRects().length) {
+      if (names.has("conversation")) result.counts.conversationRegions++;
+      if (names.has("focused")) result.counts.focusedRows++;
+      if (names.has("identity")) result.counts.accountRegions++;
+      if (current.account && names.has("handle")) result.counts.accountHandles++;
+      if (current.conversation) {
+        if (names.has("thread")) result.counts.timelines++;
+        if (names.has("topic")) result.counts.messageRows++;
+        if (!current.account && names.has("text")) result.counts.messageTexts++;
+        if (names.has("staging")) result.counts.composers++;
+      }
+      if (current.conversation && current.composer) {
+        if (names.has("files")) result.counts.stagedAssetChildren += element.childElementCount;
+        if (element instanceof HTMLTextAreaElement) {
+          result.counts.editorCandidates++;
+          if (result.editors.length < 4) result.editors.push({ disabled: element.matches(":disabled"), readOnly: element.readOnly });
+        }
+        if (current.send && element instanceof HTMLButtonElement) {
+          result.counts.sendButtons++;
+          if (result.sends.length < 4) result.sends.push({ disabled: element.matches(":disabled"),
+            ariaDisabled: element.getAttribute("aria-disabled") === "true" });
+        }
+      }
+      if (element.hasAttribute("data-chat-contract")) result.markerContractPresent = true;
+    }
+    if (!hidden && element.firstElementChild) { element = element.firstElementChild; depth++; continue; }
+    while (element !== body && !element.nextElementSibling) { element = element.parentElement!; depth--; }
+    if (element === body) break;
+    element = element.nextElementSibling;
+  }
+  return location.href === input.expectedUrl && document.visibilityState === "visible" && body === document.body ? result : null;
+}
 
 export function installDatabagAdapter(origins: readonly string[]): boolean {
   if (!Array.isArray(origins) || origins.length !== 1 || typeof origins[0] !== "string") return false;

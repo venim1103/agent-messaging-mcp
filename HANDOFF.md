@@ -1,6 +1,6 @@
 # Implementation Handoff
 
-Shared popup recovery: 2026-10-28. Saved refactor recovered and stale generic-button selector repaired. Exact gate passes build/both typechecks/247 units, then fails one reply-wait assertion (127/128 independent E2E); composite stage not run. Authorized bounded diagnosis adds failure-only trace output; reply case passes but the original browser group exposes two other timeouts and one broker-start failure. No reproducible cause/production repair; source remains unaccepted/unpackaged. No weakened limits, new gate, live authority or site changes.
+Shared popup WIP snapshot: 2026-10-28. The person explicitly requested commit/push, then continuation; this snapshot preserves the generic popup and marker-free diagnostic without source acceptance. Exact gate passes build/both typechecks/247 units, then fails one reply-wait assertion (127/128 independent E2E); composite stage not run. Bounded diagnosis adds failure-only trace output; reply case passes but the original browser group exposes two other timeouts and one broker-start failure. No reproducible cause/production repair, new package, weakened limits, new gate, live authority or site changes.
 
 Databag correction: 2026-10-28. Integrations must never require changes to accessed websites. D15's frontend-patch direction is superseded; do not ask for patch deployment. Stock Databag chat operations remain unsupported by the marker-dependent adapter. Public-source analysis and an isolated stock-component experiment disprove node identity/observation alone as a substitute. D16 records the remaining native binding/lifetime question; diagnostic metadata is not identity proof.
 
@@ -47,7 +47,7 @@ Revision (2026-10-12, D13a, D13b): multiple agents may connect to the same chat,
 
 ### Repository state
 
-- Current shared popup: one adapter table, selected-chat state and generic control set; legacy transport names remain internal. Stale selector repaired; both composite checks pass. Exact gate remains failed at reply-wait (R20). Authorized diagnosis adds timeout-only existing-trace output; that case passes but the browser group has different timing failures. No established cause, production repair, source checkpoint/package or installed acceptance. See [shared inspection](#shared-popup-and-marker-free-inspection-2026-10-28).
+- Current shared popup: user-requested WIP snapshot of one adapter table, selected-chat state and generic controls; legacy transport names remain internal. Stale selector repaired; both composite checks pass. Exact gate remains failed at reply-wait (R20). Timeout-only existing-trace diagnosis passes that case but the browser group has different timing failures. No established cause, production repair, accepted source checkpoint, package or installed acceptance. See [WIP boundary](#explicit-shared-popup-wip-snapshot-2026-10-28) and [shared inspection](#shared-popup-and-marker-free-inspection-2026-10-28).
 - Current Databag direction: no website changes (D15); stock-UI binding/lifetime remains open (D16). Existing marker-dependent chat operations are not stock support. A source-based isolated experiment shows a channel row can retain identical DOM with zero mutations while targeting another synthetic channel; node tokens alone are insufficient. See [unmodified-site analysis](#databag-unmodified-site-analysis-2026-10-28). No installed state or live authority changed.
 - Previous Databag writer/watch experiment: exact gate passes build/both typechecks, 247 units/132 named E2E, zero failures/cancellations; E2E 403,155 ms and all 64 inputs unchanged through packaging. Verified default ZIP/output paths/bytes/Build agree. Public native-host flow and no-retry/loss cases pass only for the patched contract; the pinned patched frontend production build also passes. Not stock/deployed/installed acceptance; default origin unset. See [writer integration](#databag-guarded-writer-and-public-flow-2026-10-28).
 - Prior backend `2904242`: exact gate passes build/both typechecks, 247 units/127 named E2E, zero failures/cancellations; E2E 408,470 ms and 64 matching inputs. Shared preparation, FIFO composer reservations, provider-filtered one-offer jobs, intent/evidence/settlement and status-only replay support Databag. See [backend integration](#databag-neutral-send-backend-2026-10-28).
@@ -235,7 +235,7 @@ D9a decided 2026-10-20: the person selected bounded rolling-window evidence afte
 
 ### Next step
 
-Source acceptance remains blocked on R20. The person approved broader synthetic timing investigation under existing limits; its bounded diagnostic pass is recorded below, with no established cause or production repair. Do not rerun groups seeking green or weaken evidence. The timeout-only trace is available for a justified reproducible check; preserve all failed history and six pending source/test files. Installed metadata review still needs fresh exact-origin authorization and human reload/inspection. D16 remains open; no site patch or inherited live scope.
+Source acceptance remains blocked on R20. The person requested preserving/pushing the six pending source/test files as WIP, then continuation. Continue from concrete timing/ordering evidence and the existing bounded trace, not unchanged group/gate reruns seeking green. No established cause or production repair; preserve all failed history and existing limits. Installed metadata review still needs fresh exact-origin authorization and human reload/inspection. D16 remains open; no site patch or inherited live scope.
 
 ## Implementation Plan T1-T6 (2026-10-09)
 
@@ -302,6 +302,12 @@ Work top to bottom. Each source checkpoint follows AGENTS.md: focused checks fir
 ### T6 Later
 
 Hidden-tab operation (D11; separately review any new driver/permission under D6), a second chat site on the provider-neutral pipeline, calibration and packaging. D6's current-mode probe/permission removal is a separate checkpoint below; it does not enable hidden input.
+
+## Explicit Shared Popup WIP Snapshot (2026-10-28)
+
+- The person explicitly requested commit/push, then continuation. Preserve the six reviewed pending source/test files plus this status update as an unaccepted WIP snapshot, not a passing source checkpoint or release. Earlier evidence-only commits remain distinct.
+- The latest exact gate and bounded diagnosis remain failed as recorded in [shared inspection](#shared-popup-and-marker-free-inspection-2026-10-28). No unchanged gate rerun, package, installed acceptance or root-cause claim accompanies this snapshot. Scoped syntax, documentation and whitespace checks do not replace the required source gate.
+- Continue synthetic-only R20 diagnosis from a discriminating local check; retain original deadlines, quiet periods, polling, scheduling, assertions, sandbox and authority. Stock Databag identity remains open under D16, with default origin unset and no live account/site-change authority.
 
 ## Shared Popup And Marker-Free Inspection (2026-10-28)
 

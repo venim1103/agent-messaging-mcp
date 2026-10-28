@@ -12,8 +12,82 @@ import { PendingConnectionRequests } from "../../packages/companion/dist/pending
 import { createFixtureServer } from "../fixtures/server.mjs";
 import { installDraftOwnershipTracker } from "../../packages/extension/lib/draft-ownership.ts";
 import { installDatabagAdapter, identifyDatabagConversation, captureDatabagSnapshot, observeDatabagMessages,
-  inspectDatabagDraft, fillDatabagDraft, submitDatabagDraft }
+  inspectDatabagDraft, fillDatabagDraft, submitDatabagDraft, inspectDatabagStructure }
   from "../../packages/extension/lib/databag-observation.ts";
+
+test("Databag stock structure inspection is bounded, metadata-only and never grants access", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    const input = { origin: "https://databag.example", expectedUrl: "https://databag.example/#/session" };
+    const html = `<!doctype html><html><body>
+      <div class="_identity_native_1"><span class="_handle_native_1">Synthetic account</span></div>
+      <div class="_focused_native_1">Synthetic selection</div>
+      <div class="_conversation_native_1"><div class="_thread_native_1">
+        <div class="_topic_native_1"><span class="_text_native_1">Synthetic message</span></div>
+      </div><div class="_staging_native_1"><input type="file" hidden>
+        <div class="_files_native_1"></div><textarea>Synthetic human draft</textarea>
+        <div class="_send_native_1"><button disabled>Send</button></div>
+      </div></div>
+      <div style="opacity: 0"><div class="_focused_native_1">Hidden selection</div></div>
+    </body></html>`;
+    await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html", body: html }));
+    await page.goto(input.expectedUrl);
+    await page.evaluate(() => {
+      const editor = document.querySelector("textarea");
+      const originalValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").get;
+      const originalHtml = Object.getOwnPropertyDescriptor(Element.prototype, "outerHTML").get;
+      const before = originalHtml.call(document.body);
+      let interactions = 0;
+      for (const kind of ["input", "change", "focus", "click"]) document.addEventListener(kind, () => { interactions++; }, true);
+      const observer = new MutationObserver(() => {});
+      observer.observe(document.body, { childList: true, attributes: true, characterData: true, subtree: true });
+      window.syntheticInspectionState = () => ({ interactions, mutations: observer.takeRecords().length,
+        draftUnchanged: originalValue.call(editor) === "Synthetic human draft", htmlUnchanged: originalHtml.call(document.body) === before,
+        adapterInstalled: Object.hasOwn(globalThis, "agentDatabagAdapter"), storedKeys: Object.keys(sessionStorage).length });
+      for (const [prototype, property] of [[Node.prototype, "textContent"], [HTMLElement.prototype, "innerText"],
+        [Element.prototype, "innerHTML"], [Element.prototype, "outerHTML"], [HTMLTextAreaElement.prototype, "value"],
+        [HTMLInputElement.prototype, "value"], [HTMLInputElement.prototype, "files"], [HTMLImageElement.prototype, "src"]]) {
+        Object.defineProperty(prototype, property, { configurable: true, get() { throw new Error("Synthetic private getter accessed"); } });
+      }
+    });
+    const structure = await page.evaluate(inspectDatabagStructure, input);
+    assert.equal(structure.limited, false);
+    assert.equal(structure.markerContractPresent, false);
+    assert.ok(structure.visitedElements > 0 && structure.visitedElements <= 4096);
+    assert.deepEqual(structure.counts, { conversationRegions: 1, timelines: 1, focusedRows: 1, accountRegions: 1,
+      accountHandles: 1, composers: 1, messageRows: 1, messageTexts: 1, fileInputs: 1, stagedAssetChildren: 0,
+      editorCandidates: 1, sendButtons: 1 });
+    assert.deepEqual(structure.editors, [{ disabled: false, readOnly: false }]);
+    assert.deepEqual(structure.sends, [{ disabled: true, ariaDisabled: false }]);
+    assert.deepEqual(await page.evaluate(() => window.syntheticInspectionState()), { interactions: 0, mutations: 0,
+      draftUnchanged: true, htmlUnchanged: true, adapterInstalled: false, storedKeys: 0 });
+    assert.equal(JSON.stringify(structure).includes("Synthetic"), false);
+    for (const origin of ["https://databag.example/", "http://databag.example", "https://gemini.google.com"]) {
+      assert.equal(await page.evaluate(inspectDatabagStructure, { ...input, origin }), null);
+    }
+    assert.equal(await page.evaluate(inspectDatabagStructure, { ...input, expectedUrl: `${input.expectedUrl}?other` }), null);
+    await page.reload();
+    await page.evaluate(() => {
+      const container = document.createElement("div");
+      for (let index = 0; index < 4100; index++) container.append(document.createElement("div"));
+      document.body.append(container);
+    });
+    const limited = await page.evaluate(inspectDatabagStructure, input);
+    assert.equal(limited.limited, true);
+    assert.equal(limited.visitedElements, 4096);
+    await page.reload();
+    await page.evaluate(() => {
+      let parent = document.body;
+      for (let index = 0; index < 66; index++) {
+        const child = document.createElement("div");
+        parent.append(child);
+        parent = child;
+      }
+    });
+    assert.equal((await page.evaluate(inspectDatabagStructure, input)).limited, true);
+  } finally { await browser.close(); }
+});
 
 test("Databag guarded submits activate once and never retry refused or uncertain outcomes", { timeout: 15000 }, async () => {
   const html = await readFile(new URL("../fixtures/databag.html", import.meta.url), "utf8");

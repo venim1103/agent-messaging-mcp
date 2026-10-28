@@ -1123,7 +1123,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           assert.equal(reply.isError, undefined);
           assert.equal(reply.structuredContent.timedOut, false, JSON.stringify({ provider,
             revision: await fixture.evaluate(() => ({ count: globalThis.replyRevisionCount,
-              ageMs: performance.now() - globalThis.replyRevisionAt })) }));
+              ageMs: performance.now() - globalThis.replyRevisionAt })),
+            ...(reply.structuredContent.timedOut ? { trace: await worker.evaluate(() => globalThis.browserJobTrace?.slice(-32)) } : {}) }));
           assert.equal(reply.structuredContent.reply.text, "Synthetic final reply");
           assert.equal(reply.structuredContent.reply.generationState, "settled_heuristic");
           assert.equal(await fixture.evaluate(() => globalThis.replyRevisionCount), 1);
@@ -1220,7 +1221,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     const popup = await context.newPage();
     await fixture.bringToFront();
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);
-    await popup.getByRole("button", { name: provider === "gemini" ? "Review Gemini drafts" : "Review fixture drafts" })
+    await popup.getByRole("button", { name: "Review drafts" })
       .waitFor({ state: "visible", timeout: 4000 });
     const approved = await popup.evaluate(args => chrome.runtime.sendMessage(args),
       { kind: provider === "gemini" ? "approve_gemini" : "approve_fixture",
@@ -1250,11 +1251,11 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           expectedUrl: url, operationId: prepared.operationId, reviewId: reviews.reviews[0].reviewId });
         assert.equal(consent.ok, true);
       }
-    } else for (const [purpose, status] of [["reviews", "Approved fixture draft"], ["fill-reviews", "Allowed fixture draft fill"]]) {
-      await popup.evaluate(id => document.getElementById(id).click(), `view-fixture-${purpose}`);
-      await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
-      assert.equal(await popup.locator("#fixture-reviews pre").textContent(), prepared.preview.text);
-      await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+    } else for (const [purpose, status] of [["reviews", "Approved chat draft"], ["fill-reviews", "Allowed chat draft fill"]]) {
+      await popup.evaluate(id => document.getElementById(id).click(), `view-${purpose}`);
+      await popup.locator("#reviews pre").waitFor({ state: "visible", timeout: 4000 });
+      assert.equal(await popup.locator("#reviews pre").textContent(), prepared.preview.text);
+      await popup.evaluate(() => document.querySelector("#reviews button").click());
       await popup.getByText(`${status} ${prepared.operationId}.`, { exact: false }).waitFor({ state: "visible", timeout: 4000 });
     }
     const filled = provider === "gemini" ? await facade.fillGeminiDraft(prepared.operationId)
@@ -1274,11 +1275,11 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       assert.equal(noConsent.isError, true);
       assert.deepEqual(noConsent.structuredContent, { operationId: prepared.operationId, ok: false,
         code: "DISPATCH_UNAVAILABLE", retryAllowed: false });
-      await popup.evaluate(() => document.getElementById("view-fixture-send-reviews").click());
-      await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
-      assert.equal(await popup.locator("#fixture-reviews pre").textContent(), prepared.preview.text);
-      await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-      await popup.getByText(`Approved fixture send ${prepared.operationId}. No message was sent.`)
+      await popup.evaluate(() => document.getElementById("view-send-reviews").click());
+      await popup.locator("#reviews pre").waitFor({ state: "visible", timeout: 4000 });
+      assert.equal(await popup.locator("#reviews pre").textContent(), prepared.preview.text);
+      await popup.evaluate(() => document.querySelector("#reviews button").click());
+      await popup.getByText(`Approved chat send ${prepared.operationId}. No message was sent.`)
         .waitFor({ state: "visible", timeout: 4000 });
     }
     assert.equal(await fixture.evaluate(() => globalThis.fixtureSubmitCount), 0);

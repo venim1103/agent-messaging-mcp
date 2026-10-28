@@ -43,6 +43,19 @@ function buildDatabagTestExtension(signal) {
   return databagTestBuild;
 }
 
+async function assertSharedPopupControls(popup, supervised) {
+  const controls = [["inspect", "Inspect this chat"], ["view-reviews", "Review drafts"],
+    ["view-fill-reviews", "Review fill consent"], ["view-send-reviews", "Review send consent"]];
+  for (const [id, label] of controls) {
+    const control = popup.locator(`#${id}`);
+    assert.equal(await control.count(), 1);
+    assert.equal(await control.textContent(), label);
+    assert.equal(await control.isVisible(), id === "inspect" || supervised);
+  }
+  const buttons = await popup.locator("button").evaluateAll(elements => elements.map(element => `${element.id} ${element.textContent}`));
+  assert.ok(buttons.every(button => !/fixture|gemini|databag/i.test(button)));
+}
+
 test("Databag configuration admits one exact HTTPS origin without widening host permission", () => {
   assert.equal(isEligibleDatabagUrl("https://databag.example/#/session"), false);
   assert.equal(isEligibleDatabagUrl("https://databag.example/#/session", ["https://databag.example"]), true);
@@ -63,6 +76,113 @@ test("Databag configuration admits one exact HTTPS origin without widening host 
     " https://databag.example", "https://databag.example\n", "not a URL"]) {
     assert.equal(parseDatabagOrigin(value), null);
     assert.throws(() => configuredDatabagOrigins(value), /canonical HTTPS origin/);
+  }
+});
+
+test("shared popup inspection is contract-free, document-bound and never approves access", { timeout: 15000 }, async testContext => {
+  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-inspection-test-"));
+  let context;
+  try {
+    const unpacked = join(profile, "unpacked-extension");
+    await cp(await buildDatabagTestExtension(testContext.signal), unpacked, { recursive: true });
+    const manifestPath = join(unpacked, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.host_permissions = ["https://databag.example/*"];
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
+      executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+      args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
+    const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+    const extensionId = new URL(worker.url()).hostname;
+    const page = await context.newPage();
+    const url = "https://databag.example/#/session";
+    const html = await readFile(new URL("../fixtures/databag.html", import.meta.url), "utf8");
+    await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html", body: html }));
+    await page.goto(url);
+    const prepareStockView = () => {
+      const mappings = [["[data-chat-contract]", "conversation"], ["[data-chat-timeline]", "thread"],
+        ["[data-chat-composer]", "staging"], ["[data-chat-send]", "send"],
+        ["[data-chat-message-id]", "topic"], ["[data-chat-text]", "text"]];
+      for (const [selector, name] of mappings) for (const element of document.querySelectorAll(selector)) {
+        element.classList.add(`_${name}_synthetic_1`);
+      }
+      for (const element of document.querySelectorAll("*")) for (const attribute of [...element.attributes]) {
+        if (attribute.name.startsWith("data-chat-")) element.removeAttribute(attribute.name);
+      }
+    };
+    await page.evaluate(prepareStockView);
+    const popup = await context.newPage();
+    await page.bringToFront();
+    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+    await popup.locator("#agent-panel").waitFor({ state: "visible", timeout: 4000 });
+    await assertSharedPopupControls(popup, false);
+    const beforeMarkup = await page.content();
+    const beforeStorage = await worker.evaluate(() => chrome.storage.session.get(null));
+    await popup.evaluate(() => {
+      globalThis.syntheticInspectionCalls = 0;
+      globalThis.syntheticInspectionDocuments = [];
+      const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+      const contains = chrome.permissions.contains.bind(chrome.permissions);
+      const request = chrome.permissions.request.bind(chrome.permissions);
+      globalThis.restoreInspectionPermissions = () => { chrome.permissions.contains = contains; chrome.permissions.request = request; };
+      chrome.scripting.executeScript = async options => {
+        globalThis.syntheticInspectionCalls++;
+        const result = await execute(options);
+        if (options.func.toString().includes("markerContractPresent")) {
+          globalThis.syntheticInspectionDocuments.push(options.target.documentIds);
+          if (globalThis.holdSyntheticInspection) {
+            globalThis.syntheticInspectionHeld = true;
+            await new Promise(resolve => { globalThis.releaseSyntheticInspection = resolve; });
+          }
+        }
+        return result;
+      };
+    });
+    const inspect = async () => {
+      await popup.evaluate(() => document.getElementById("inspect").click());
+      await popup.getByText("Layout metadata only. No message or draft text read, connection approval, or input actions.",
+        { exact: true }).waitFor({ timeout: 4000 });
+    };
+    await inspect();
+    const diagnostic = await popup.locator("#messages").textContent();
+    assert.ok(diagnostic.includes("No experimental contract marker"));
+    assert.ok(diagnostic.includes("1 composer candidates"));
+    assert.doesNotMatch(diagnostic, /Synthetic incoming message|synthetic-account|synthetic-channel|https:\/\//);
+    assert.equal(await page.content(), beforeMarkup);
+    assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), beforeStorage);
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+    assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 0);
+    const calls = await popup.evaluate(() => globalThis.syntheticInspectionCalls);
+    await popup.evaluate(() => {
+      chrome.permissions.contains = async () => false;
+      chrome.permissions.request = async () => false;
+    });
+    await popup.evaluate(() => document.getElementById("inspect").click());
+    await popup.getByText("Site access denied; no inspection returned.", { exact: true }).waitFor({ timeout: 4000 });
+    assert.equal(await popup.evaluate(() => globalThis.syntheticInspectionCalls), calls);
+    assert.equal(await popup.locator("#result").isHidden(), true);
+    await popup.evaluate(() => { globalThis.restoreInspectionPermissions(); globalThis.holdSyntheticInspection = true; });
+    await popup.evaluate(() => document.getElementById("inspect").click());
+    await popup.waitForFunction(() => globalThis.syntheticInspectionHeld === true, undefined, { timeout: 4000 });
+    await page.reload();
+    await popup.evaluate(() => { globalThis.holdSyntheticInspection = false; globalThis.releaseSyntheticInspection(); });
+    await popup.waitForFunction(() => document.getElementById("inspect").disabled === false, undefined, { timeout: 4000 });
+    assert.equal(await popup.locator("#result").isHidden(), true);
+    assert.equal(await popup.locator("#messages li").count(), 0);
+    assert.equal(await popup.evaluate(() => globalThis.syntheticInspectionDocuments.length), 2);
+    await page.evaluate(prepareStockView);
+    await inspect();
+    const documents = await popup.evaluate(() => globalThis.syntheticInspectionDocuments);
+    assert.equal(documents.length, 3);
+    assert.ok(documents.every(document => document.length === 1 && /^[!-~]{1,128}$/.test(document[0])));
+    assert.deepEqual(documents[0], documents[1]);
+    assert.notDeepEqual(documents[1], documents[2]);
+    assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), beforeStorage);
+    assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+    assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 0);
+  } finally {
+    await context?.close();
+    await rm(profile, { recursive: true, force: true });
   }
 });
 
@@ -1124,9 +1244,9 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
         throw new Error(`Fixture popup did not produce the expected result; status: ${status}`, { cause: error });
       }
     };
-    await popup.getByRole("button", { name: "Review fixture drafts" }).waitFor({ state: "visible" });
+    await popup.getByRole("button", { name: "Review drafts" }).waitFor({ state: "visible" });
     const reviewArgs = { tabId: selected.tabId, expectedUrl: url };
-    assert.equal(await popup.locator("#view-fixture-send-reviews").count(), 1);
+    assert.equal(await popup.locator("#view-send-reviews").count(), 1);
     const before = await popup.evaluate((args) => chrome.runtime.sendMessage({
       kind: "list_fixture_prepared_reviews", ...args
     }), reviewArgs);
@@ -1134,13 +1254,13 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     setPhase("late-review boundaries");
 
     for (const scenario of [
-      { selector: "#view-fixture-reviews", outcome: "empty" },
-      { selector: "#view-fixture-fill-reviews", outcome: "empty" },
-      { selector: "#view-fixture-reviews", outcome: "refused" },
-      { selector: "#view-fixture-fill-reviews", outcome: "rejected" },
-      { selector: "#view-fixture-send-reviews", outcome: "empty" },
-      { selector: "#view-fixture-send-reviews", outcome: "refused" },
-      { selector: "#view-fixture-send-reviews", outcome: "rejected" }
+      { selector: "#view-reviews", outcome: "empty" },
+      { selector: "#view-fill-reviews", outcome: "empty" },
+      { selector: "#view-reviews", outcome: "refused" },
+      { selector: "#view-fill-reviews", outcome: "rejected" },
+      { selector: "#view-send-reviews", outcome: "empty" },
+      { selector: "#view-send-reviews", outcome: "refused" },
+      { selector: "#view-send-reviews", outcome: "rejected" }
     ]) {
       await popup.evaluate(() => {
         globalThis.fixtureOriginalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
@@ -1156,17 +1276,17 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
         await popup.waitForFunction(() => typeof globalThis.fixtureResolveReview === "function", undefined, { timeout: 4000 });
         changedTab = await context.newPage();
         await changedTab.goto("about:blank");
-        await popup.getByText("Selected fixture changed. Draft review cleared.", { exact: true })
+        await popup.getByText("Selected chat changed. Draft review cleared.", { exact: true })
           .waitFor({ state: "visible", timeout: 4000 });
         await popup.evaluate((outcome) => {
           if (outcome === "rejected") globalThis.fixtureRejectReview(new Error("Late fixture review failure"));
           else globalThis.fixtureResolveReview(outcome === "empty" ? { ok: true, reviews: [], hasMore: false }
             : { ok: false, error: "Late fixture review refused" });
         }, scenario.outcome);
-        await popup.waitForFunction(() => !document.querySelector("#view-fixture-reviews").disabled, undefined, { timeout: 4000 });
-        assert.equal(await popup.locator("#fixture-review-result").evaluate((element) => element.hidden), true);
-        assert.equal(await popup.locator("#fixture-reviews pre").count(), 0);
-        assert.equal(await popup.locator("#status").textContent(), "Selected fixture changed. Draft review cleared.");
+        await popup.waitForFunction(() => !document.querySelector("#view-reviews").disabled, undefined, { timeout: 4000 });
+        assert.equal(await popup.locator("#review-result").evaluate((element) => element.hidden), true);
+        assert.equal(await popup.locator("#reviews pre").count(), 0);
+        assert.equal(await popup.locator("#status").textContent(), "Selected chat changed. Draft review cleared.");
       } finally {
         await popup.evaluate(() => {
           chrome.runtime.sendMessage = globalThis.fixtureOriginalSendMessage;
@@ -1177,7 +1297,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
         await changedTab?.close();
         await fixture.bringToFront();
         await popup.reload();
-        await popup.getByRole("button", { name: "Review fixture drafts" }).waitFor({ state: "visible" });
+        await popup.getByRole("button", { name: "Review drafts" }).waitFor({ state: "visible" });
       }
     }
 
@@ -1235,26 +1355,26 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       kind: "list_fixture_send_reviews", ...args
     }), reviewArgs);
     assert.deepEqual(prematureSend, { ok: true, reviews: [], hasMore: false });
-    await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
-    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
-    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
-    assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
+    await popup.evaluate(() => document.querySelector("#view-reviews").click());
+    await waitForPopupResult(popup.locator("#reviews pre"));
+    assert.equal(await popup.locator("#reviews pre").textContent(), text);
+    assert.equal(await popup.locator("#reviews script").count(), 0);
     assert.equal(await popup.getByRole("button", { name: "Approve draft (no send)" }).count(), 1);
-    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-    await waitForPopupResult(popup.getByText(`Approved fixture draft ${prepared.payload.operationId}. No message was sent.`));
-    assert.equal(await popup.locator("#fixture-reviews pre").count(), 0);
+    await popup.evaluate(() => document.querySelector("#reviews button").click());
+    await waitForPopupResult(popup.getByText(`Approved chat draft ${prepared.payload.operationId}. No message was sent.`));
+    assert.equal(await popup.locator("#reviews pre").count(), 0);
     relay = await connectBroker("relay", brokerDirectory);
     const target = { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
       tabId: selected.tabId, documentId: selected.documentId };
     assert.deepEqual((await relay.listFixturePreparedReviews(target)).payload, { reviews: [], hasMore: false });
-    await popup.evaluate(() => document.querySelector("#view-fixture-fill-reviews").click());
-    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
-    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
-    assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
+    await popup.evaluate(() => document.querySelector("#view-fill-reviews").click());
+    await waitForPopupResult(popup.locator("#reviews pre"));
+    assert.equal(await popup.locator("#reviews pre").textContent(), text);
+    assert.equal(await popup.locator("#reviews script").count(), 0);
     assert.equal(await popup.getByRole("button", { name: "Allow draft fill (no send)" }).count(), 1);
     assert.equal(await popup.getByRole("button", { name: "Approve draft (no send)" }).count(), 0);
-    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-    await waitForPopupResult(popup.getByText(`Allowed fixture draft fill ${prepared.payload.operationId}. Editor unchanged. No message was sent.`));
+    await popup.evaluate(() => document.querySelector("#reviews button").click());
+    await waitForPopupResult(popup.getByText(`Allowed chat draft fill ${prepared.payload.operationId}. Editor unchanged. No message was sent.`));
     assert.deepEqual((await relay.listFixtureFillReviews(target)).payload, { reviews: [], hasMore: false });
     assert.equal(await fixture.locator("#message").inputValue(), "");
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
@@ -1300,15 +1420,15 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     const sendReviewId = sendReviews.payload.reviews[0].reviewId;
     assert.deepEqual((await relay.approveFixtureFillReview(target, prepared.payload.operationId,
       sendReviewId)).payload, { code: "FILL_REVIEW_UNAVAILABLE" });
-    await popup.evaluate(() => document.querySelector("#view-fixture-send-reviews").click());
-    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
-    assert.equal(await popup.locator("#fixture-review-heading").textContent(), "Fixture send consent");
-    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
-    assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
-    assert.equal(await popup.getByRole("button", { name: "Approve fixture send", exact: true }).count(), 1);
+    await popup.evaluate(() => document.querySelector("#view-send-reviews").click());
+    await waitForPopupResult(popup.locator("#reviews pre"));
+    assert.equal(await popup.locator("#review-heading").textContent(), "Send consent");
+    assert.equal(await popup.locator("#reviews pre").textContent(), text);
+    assert.equal(await popup.locator("#reviews script").count(), 0);
+    assert.equal(await popup.getByRole("button", { name: "Approve send", exact: true }).count(), 1);
     assert.equal(await popup.getByRole("button", { name: "Allow draft fill (no send)", exact: true }).count(), 0);
-    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-    await waitForPopupResult(popup.getByText(`Approved fixture send ${prepared.payload.operationId}. No message was sent.`));
+    await popup.evaluate(() => document.querySelector("#reviews button").click());
+    await waitForPopupResult(popup.getByText(`Approved chat send ${prepared.payload.operationId}. No message was sent.`));
     assert.equal(await fixture.locator("#message").inputValue(), text);
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
     assert.equal((await facade.getPreparedOperation(prepared.payload.operationId)).payload.state, "approved");
@@ -1367,13 +1487,13 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
 
     const approveFillCandidate = async (candidate) => {
       for (const [buttonId, statusText] of [
-        ["view-fixture-reviews", `Approved fixture draft ${candidate.operationId}. No message was sent.`],
-        ["view-fixture-fill-reviews", `Allowed fixture draft fill ${candidate.operationId}. Editor unchanged. No message was sent.`]
+        ["view-reviews", `Approved chat draft ${candidate.operationId}. No message was sent.`],
+        ["view-fill-reviews", `Allowed chat draft fill ${candidate.operationId}. Editor unchanged. No message was sent.`]
       ]) {
         await popup.evaluate((id) => document.getElementById(id).click(), buttonId);
-        await waitForPopupResult(popup.locator("#fixture-reviews pre"));
-        assert.equal(await popup.locator("#fixture-reviews pre").textContent(), candidate.preview.text);
-        await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+        await waitForPopupResult(popup.locator("#reviews pre"));
+        assert.equal(await popup.locator("#reviews pre").textContent(), candidate.preview.text);
+        await popup.evaluate(() => document.querySelector("#reviews button").click());
         await waitForPopupResult(popup.getByText(statusText));
       }
     };
@@ -1411,13 +1531,13 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     const third = await facade.prepareFixtureMessage(secondConnection.payload.connectionId, 1, "Third fixture draft",
       "d66b3997-9d43-4554-8399-267d1fe9f75c");
     assert.equal(third.kind, "message_prepared");
-    await popup.evaluate(() => document.querySelector("#view-fixture-reviews").click());
-    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
-    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), "Third fixture draft");
+    await popup.evaluate(() => document.querySelector("#view-reviews").click());
+    await waitForPopupResult(popup.locator("#reviews pre"));
+    assert.equal(await popup.locator("#reviews pre").textContent(), "Third fixture draft");
     await fixture.evaluate(() => document.querySelector("main").dataset.conversationId = "fixture-beta");
-    await popup.locator("#fixture-review-result").waitFor({ state: "hidden", timeout: 4000 });
-    assert.equal(await popup.locator("#fixture-review-result").isHidden(), true);
-    assert.equal(await popup.locator("#fixture-reviews pre").count(), 0);
+    await popup.locator("#review-result").waitFor({ state: "hidden", timeout: 4000 });
+    assert.equal(await popup.locator("#review-result").isHidden(), true);
+    assert.equal(await popup.locator("#reviews pre").count(), 0);
     const afterSwitch = await popup.evaluate((args) => chrome.runtime.sendMessage({
       kind: "list_fixture_prepared_reviews", ...args
     }), reviewArgs);
@@ -1428,7 +1548,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     await fixture.goto(richUrl);
     await fixture.bringToFront();
     await popup.reload();
-    await popup.getByRole("button", { name: "Review fixture drafts" }).waitFor({ state: "visible" });
+    await popup.getByRole("button", { name: "Review drafts" }).waitFor({ state: "visible" });
     const richPending = await facade.requestConnection();
     assert.equal(richPending.kind, "connection_requested");
     const richApproval = await popup.evaluate((args) => chrome.runtime.sendMessage({ kind: "approve_fixture", ...args }), {
@@ -1448,11 +1568,11 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     assert.equal(richFilled.payload.editor, "rich");
     assert.equal(await fixture.locator("#rich-message").innerText(), richPrepared.payload.preview.text);
     assert.equal(await fixture.locator("ol[role=log] li").count(), 2);
-    await popup.evaluate(() => document.querySelector("#view-fixture-send-reviews").click());
-    await waitForPopupResult(popup.locator("#fixture-reviews pre"));
-    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), richPrepared.payload.preview.text);
-    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-    await waitForPopupResult(popup.getByText(`Approved fixture send ${richPrepared.payload.operationId}. No message was sent.`));
+    await popup.evaluate(() => document.querySelector("#view-send-reviews").click());
+    await waitForPopupResult(popup.locator("#reviews pre"));
+    assert.equal(await popup.locator("#reviews pre").textContent(), richPrepared.payload.preview.text);
+    await popup.evaluate(() => document.querySelector("#reviews button").click());
+    await waitForPopupResult(popup.getByText(`Approved chat send ${richPrepared.payload.operationId}. No message was sent.`));
     assert.equal((await facade.readFixtureSnapshot(richConnection.payload.connectionId)).kind, "fixture_snapshot");
     const richInspection = await facade.checkFixtureDispatch(richPrepared.payload.operationId);
     assert.equal(richInspection.kind, "fixture_dispatch_check", JSON.stringify(richInspection.payload));
@@ -2041,6 +2161,7 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
       await page.bringToFront();
       await popup.goto(`chrome-extension://${extensionId}/popup.html`);
       await popup.getByText("2 agents available; chat status unavailable", { exact: true }).waitFor({ timeout: 4000 });
+      await assertSharedPopupControls(popup, provider !== "databag");
       await worker.evaluate(() => { globalThis.withheldChatAccess = false; });
       await popup.evaluate(() => {
         const request = chrome.permissions.request.bind(chrome.permissions);
@@ -2101,7 +2222,7 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
         assert.doesNotMatch(JSON.stringify(firstRead.structuredContent), /synthetic-account|synthetic-channel/);
         assert.equal(await page.locator("textarea").inputValue(), "");
         assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
-        const supervisedReview = popup.locator("#view-fixture-fill-reviews");
+        const supervisedReview = popup.locator("#view-fill-reviews");
         assert.equal(await supervisedReview.count(), 1);
         assert.equal(await supervisedReview.isVisible(), false);
         if (scenario === "reload-failure") {
@@ -2642,12 +2763,12 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
           };
         });
         const showSend = async () => {
-          await popup.evaluate(() => document.getElementById("view-fixture-send-reviews").click());
-          await popup.locator("#fixture-reviews pre").waitFor({ state: "visible", timeout: 4000 });
-          assert.equal(await popup.locator("#fixture-review-heading").textContent(), "Gemini send consent");
-          assert.equal(await popup.locator("#fixture-reviews pre").textContent(), text);
-          assert.equal(await popup.locator("#fixture-reviews script").count(), 0);
-          assert.equal(await popup.getByRole("button", { name: "Approve Gemini send", exact: true }).count(), 1);
+          await popup.evaluate(() => document.getElementById("view-send-reviews").click());
+          await popup.locator("#reviews pre").waitFor({ state: "visible", timeout: 4000 });
+          assert.equal(await popup.locator("#review-heading").textContent(), "Send consent");
+          assert.equal(await popup.locator("#reviews pre").textContent(), text);
+          assert.equal(await popup.locator("#reviews script").count(), 0);
+          assert.equal(await popup.getByRole("button", { name: "Approve send", exact: true }).count(), 1);
           assert.equal(await popup.getByRole("button", { name: "Allow draft fill (no send)", exact: true }).count(), 0);
           return popup.evaluate(() => window.syntheticGeminiSendReview);
         };
@@ -2677,9 +2798,9 @@ for (const outcome of ["observed", "script-result-loss", "completion-request-los
           assert.notEqual(refused?.ok, true);
           assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, status.payload);
         }
-        await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
+        await popup.evaluate(() => document.querySelector("#reviews button").click());
         phase = `${outcome}:send-approval`;
-        await popup.getByText(`Approved Gemini send ${prepared.payload.operationId}. No message was sent.`, { exact: true })
+        await popup.getByText(`Approved chat send ${prepared.payload.operationId}. No message was sent.`, { exact: true })
           .waitFor({ state: "visible", timeout: 4000 });
         assert.deepEqual((await facade.getPreparedOperation(prepared.payload.operationId)).payload, status.payload);
         assert.equal((await popup.evaluate(args => chrome.runtime.sendMessage(args), approval)).ok, false);
@@ -2897,15 +3018,15 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     if (prepared.kind !== "gemini_message_prepared") throw new Error("Expected private Gemini candidate");
     setPhase("supervised consent boundaries");
     const reviewArgs = { tabId: selected.tabId, expectedUrl: url };
-    assert.equal(await popup.locator("#view-fixture-send-reviews").isVisible(), true);
-    assert.equal(await popup.locator("#view-fixture-send-reviews").textContent(), "Review Gemini send consent");
-    await popup.evaluate(() => document.getElementById("view-fixture-send-reviews").click());
-    await popup.locator("#fixture-review-result").waitFor({ state: "visible", timeout: 4000 });
-    assert.equal(await popup.locator("#fixture-reviews li").count(), 0);
+    assert.equal(await popup.locator("#view-send-reviews").isVisible(), true);
+    assert.equal(await popup.locator("#view-send-reviews").textContent(), "Review send consent");
+    await popup.evaluate(() => document.getElementById("view-send-reviews").click());
+    await popup.locator("#review-result").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#reviews li").count(), 0);
     assert.equal(await page.evaluate(() => window.controlActivations), 0);
-    await popup.evaluate(() => document.getElementById("view-fixture-fill-reviews").click());
-    await popup.locator("#fixture-review-result").waitFor({ state: "visible", timeout: 4000 });
-    assert.equal(await popup.locator("#fixture-reviews li").count(), 0);
+    await popup.evaluate(() => document.getElementById("view-fill-reviews").click());
+    await popup.locator("#review-result").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#reviews li").count(), 0);
     assert.deepEqual((await facade.fillGeminiDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
     await popup.evaluate(() => {
       window.syntheticOriginalSendMessage = chrome.runtime.sendMessage;
@@ -2915,16 +3036,16 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
         return reply;
       };
     });
-    await popup.evaluate(() => document.getElementById("view-fixture-reviews").click());
-    await popup.locator("#fixture-reviews li").waitFor({ state: "visible", timeout: 4000 });
-    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), prepared.payload.preview.text);
+    await popup.evaluate(() => document.getElementById("view-reviews").click());
+    await popup.locator("#reviews li").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#reviews pre").textContent(), prepared.payload.preview.text);
     const ordinary = await popup.evaluate(() => {
       chrome.runtime.sendMessage = window.syntheticOriginalSendMessage;
       return window.syntheticOrdinaryReply;
     });
     assert.equal(ordinary.ok, true);
-    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-    await popup.waitForFunction(() => document.getElementById("status").textContent.startsWith("Approved Gemini draft"),
+    await popup.evaluate(() => document.querySelector("#reviews button").click());
+    await popup.waitForFunction(() => document.getElementById("status").textContent.startsWith("Approved chat draft"),
       undefined, { timeout: 4000 });
     const phaseConfusion = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
       kind: "approve_gemini_fill_review", ...reviewArgs, operationId: prepared.payload.operationId,
@@ -2932,11 +3053,11 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
     });
     assert.equal(phaseConfusion.ok, false);
     assert.deepEqual((await facade.fillGeminiDraft(prepared.payload.operationId)).payload, { code: "FILL_UNAVAILABLE" });
-    await popup.evaluate(() => document.getElementById("view-fixture-fill-reviews").click());
-    await popup.locator("#fixture-reviews li").waitFor({ state: "visible", timeout: 4000 });
-    assert.equal(await popup.locator("#fixture-reviews pre").textContent(), prepared.payload.preview.text);
-    await popup.evaluate(() => document.querySelector("#fixture-reviews button").click());
-    await popup.waitForFunction(() => document.getElementById("status").textContent.startsWith("Allowed Gemini draft fill"),
+    await popup.evaluate(() => document.getElementById("view-fill-reviews").click());
+    await popup.locator("#reviews li").waitFor({ state: "visible", timeout: 4000 });
+    assert.equal(await popup.locator("#reviews pre").textContent(), prepared.payload.preview.text);
+    await popup.evaluate(() => document.querySelector("#reviews button").click());
+    await popup.waitForFunction(() => document.getElementById("status").textContent.startsWith("Allowed chat draft fill"),
       undefined, { timeout: 4000 });
     assert.equal(await page.locator("[contenteditable]").textContent(), "Private draft");
     assert.equal(await page.evaluate(() => window.controlActivations), 0);
@@ -2976,12 +3097,12 @@ test("test-only Gemini host access carries exact synthetic rows and later observ
       assert.notEqual(refused?.ok, true);
       assert.equal((await facade.getPreparedOperation(guarded.payload.operationId)).payload.state, "awaiting_approval");
     }
-    await popup.evaluate(() => document.getElementById("view-fixture-reviews").click());
-    await popup.locator("#fixture-reviews li").waitFor({ state: "visible", timeout: 4000 });
+    await popup.evaluate(() => document.getElementById("view-reviews").click());
+    await popup.locator("#reviews li").waitFor({ state: "visible", timeout: 4000 });
     const otherTab = await context.newPage();
     await otherTab.goto("about:blank");
-    await popup.locator("#fixture-review-result").waitFor({ state: "hidden", timeout: 4000 });
-    assert.equal(await popup.locator("#fixture-reviews li").count(), 0);
+    await popup.locator("#review-result").waitFor({ state: "hidden", timeout: 4000 });
+    assert.equal(await popup.locator("#reviews li").count(), 0);
     assert.equal((await facade.getPreparedOperation(guarded.payload.operationId)).payload.state, "awaiting_approval");
     await otherTab.close();
     await page.bringToFront();
