@@ -28,19 +28,48 @@ export type PendingRequest = Readonly<{
 }>;
 
 export type FixtureTarget = Readonly<{
+  provider?: "fixture";
   origin: "http://127.0.0.1:8787";
   conversationId: "fixture-alpha";
   tabId: number;
   documentId: string;
 }>;
 export type GeminiTarget = Readonly<{
+  provider?: "gemini";
   origin: "https://gemini.google.com";
   conversationId: string;
   url: string;
   tabId: number;
   documentId: string;
 }>;
-export type ApprovedTarget = FixtureTarget | GeminiTarget;
+export type DatabagTarget = Readonly<{
+  provider: "databag";
+  origin: `https://${string}`;
+  conversationId: string;
+  url: string;
+  tabId: number;
+  documentId: string;
+}>;
+export type ApprovedTarget = FixtureTarget | GeminiTarget | DatabagTarget;
+export type StableDomTarget = FixtureTarget | DatabagTarget;
+
+export function targetProvider(target: ApprovedTarget): "fixture" | "gemini" | "databag" {
+  return target.provider ?? (target.origin === "http://127.0.0.1:8787" ? "fixture" : "gemini");
+}
+
+export function isGeminiTarget(target: ApprovedTarget): target is GeminiTarget {
+  return targetProvider(target) === "gemini" && target.origin === "https://gemini.google.com";
+}
+
+export function isDatabagOrigin(value: unknown): value is `https://${string}` {
+  if (typeof value !== "string" || value.length > 256) return false;
+  try {
+    const origin = new URL(value);
+    return origin.protocol === "https:" && origin.origin === value && origin.href === `${value}/`
+      && !origin.username && !origin.password && !origin.hostname.includes("*")
+      && origin.origin !== "https://gemini.google.com";
+  } catch { return false; }
+}
 
 export type ConnectedAgent = Readonly<{ agentId: string; label: string }>;
 export type ChatAgent = ConnectedAgent & Readonly<{ connectionCount: number; autonomous?: true }>;
@@ -142,7 +171,7 @@ type ConnectionWait = {
 type PendingFixtureRead = {
   owner: symbol;
   connectionId: string;
-  target: ApprovedTarget;
+  target: StableDomTarget;
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
   resolve: (snapshot: FixtureSnapshot | "not_ready" | null) => void;
@@ -177,8 +206,8 @@ export class PendingConnectionRequests {
   private matchesTarget(first: ApprovedTarget, second: ApprovedTarget): boolean {
     return first.origin === second.origin && first.conversationId === second.conversationId
       && first.tabId === second.tabId && first.documentId === second.documentId
-      && (first.origin !== "https://gemini.google.com"
-        || (second.origin === "https://gemini.google.com" && first.url === second.url));
+      && targetProvider(first) === targetProvider(second)
+      && (!("url" in first) || ("url" in second && first.url === second.url));
   }
 
   private isAuthorizedGrant(grant: FixtureGrant, now: number): boolean {
@@ -285,8 +314,8 @@ export class PendingConnectionRequests {
       grant.reloadPending = true;
       grant.snapshot = undefined;
       grant.geminiSnapshot = undefined;
-      if (target.origin === "http://127.0.0.1:8787") grant.observations = new ObservationBuffer(observationLimits);
-      else grant.geminiObservations = new ObservationBuffer(observationLimits);
+      if (isGeminiTarget(target)) grant.geminiObservations = new ObservationBuffer(observationLimits);
+      else grant.observations = new ObservationBuffer(observationLimits);
       for (const [challengeId, pending] of this.fixtureReads) {
         if (pending.connectionId === grant.connection.connectionId) this.finishFixtureRead(challengeId, "not_ready");
       }
@@ -404,7 +433,7 @@ export class PendingConnectionRequests {
 
   getGeminiTarget(owner: symbol, connectionId: string, now = Date.now()): GeminiTarget | null {
     const target = this.liveGrant(owner, connectionId, now)?.target;
-    return target?.origin === "https://gemini.google.com" ? target : null;
+    return target && isGeminiTarget(target) ? target : null;
   }
 
   getAutonomousTarget(owner: symbol, connectionId: string, now = Date.now()): ApprovedTarget | null {
@@ -419,7 +448,7 @@ export class PendingConnectionRequests {
 
   getGeminiSnapshot(owner: symbol, connectionId: string, now = Date.now()): GeminiSnapshot | "not_ready" | null {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (grant?.target.origin !== "https://gemini.google.com") return null;
+    if (!grant || !isGeminiTarget(grant.target)) return null;
     return grant.geminiSnapshot && now - grant.geminiSnapshot.capturedAt <= MAX_GEMINI_SNAPSHOT_AGE_MS
       ? grant.geminiSnapshot : "not_ready";
   }
@@ -427,13 +456,13 @@ export class PendingConnectionRequests {
   readGeminiEvents(owner: symbol, connectionId: string,
     cursor: { epoch: string; sequence: number }, limit = MAX_GEMINI_EVENTS_PER_READ, now = Date.now()) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (grant?.target.origin !== "https://gemini.google.com") return null;
+    if (!grant || !isGeminiTarget(grant.target)) return null;
     return grant.geminiObservations?.read(cursor, limit) ?? "not_ready";
   }
 
   requestFreshGeminiRead(owner: symbol, connectionId: string, now = Date.now(), deadlineMs = now + GEMINI_READ_TIMEOUT_MS) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (grant?.target.origin !== "https://gemini.google.com" || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
+    if (!grant || !isGeminiTarget(grant.target) || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     if (this.geminiReads.size >= MAX_PENDING_GEMINI_READS) return "busy" as const;
     const challengeId = randomUUID();
     const expiresAt = Math.min(now + GEMINI_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt ?? Infinity);
@@ -457,7 +486,7 @@ export class PendingConnectionRequests {
     const tabs = new Set<number>();
     for (const request of this.requests.values()) {
       const grant = request.grant;
-      if (grant?.target.origin === "https://gemini.google.com"
+      if (grant && isGeminiTarget(grant.target)
         && this.isAuthorizedGrant(grant, now)) tabs.add(grant.target.tabId);
     }
     return [...tabs].sort((first, second) => first - second);
@@ -489,9 +518,7 @@ export class PendingConnectionRequests {
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (!grant || !this.isLiveGrant(grant, now)
-        || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
-        || grant.target.url !== target.url || grant.target.tabId !== target.tabId
-        || grant.target.documentId !== target.documentId) continue;
+        || !this.matchesTarget(grant.target, target)) continue;
       grant.geminiObservations ??= new ObservationBuffer(observationLimits);
       const previous = grant.geminiSnapshot?.messages;
       if (!previous || grant.geminiSnapshot?.omittedBefore !== omittedBefore
@@ -510,23 +537,32 @@ export class PendingConnectionRequests {
     return published;
   }
 
-  getFixtureSnapshot(owner: symbol, connectionId: string, now = Date.now()): FixtureSnapshot | "not_ready" | null {
+  getStableSnapshot(owner: symbol, connectionId: string, now = Date.now()): FixtureSnapshot | "not_ready" | null {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (grant?.target.origin !== "http://127.0.0.1:8787") return null;
+    if (!grant || isGeminiTarget(grant.target)) return null;
     return grant.snapshot && now - grant.snapshot.capturedAt <= MAX_FIXTURE_SNAPSHOT_AGE_MS
       ? grant.snapshot : "not_ready";
   }
 
-  readFixtureEvents(owner: symbol, connectionId: string,
+  getFixtureSnapshot(owner: symbol, connectionId: string, now = Date.now()): FixtureSnapshot | "not_ready" | null {
+    return this.getApprovedTarget(owner, connectionId, now) ? this.getStableSnapshot(owner, connectionId, now) : null;
+  }
+
+  readStableEvents(owner: symbol, connectionId: string,
     cursor: { epoch: string; sequence: number }, limit = MAX_FIXTURE_EVENTS_PER_READ, now = Date.now()) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (grant?.target.origin !== "http://127.0.0.1:8787") return null;
+    if (!grant || isGeminiTarget(grant.target)) return null;
     return grant.observations?.read(cursor, limit) ?? "not_ready";
   }
 
-  requestFreshFixtureRead(owner: symbol, connectionId: string, now = Date.now(), deadlineMs = now + FIXTURE_READ_TIMEOUT_MS) {
+  readFixtureEvents(owner: symbol, connectionId: string,
+    cursor: { epoch: string; sequence: number }, limit = MAX_FIXTURE_EVENTS_PER_READ, now = Date.now()) {
+    return this.getApprovedTarget(owner, connectionId, now) ? this.readStableEvents(owner, connectionId, cursor, limit, now) : null;
+  }
+
+  requestFreshStableRead(owner: symbol, connectionId: string, now = Date.now(), deadlineMs = now + FIXTURE_READ_TIMEOUT_MS) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (grant?.target.origin !== "http://127.0.0.1:8787" || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
+    if (!grant || isGeminiTarget(grant.target) || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     if (this.fixtureReads.size >= MAX_PENDING_FIXTURE_READS) return "busy" as const;
     const challengeId = randomUUID();
     const expiresAt = Math.min(now + FIXTURE_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt ?? Infinity);
@@ -537,13 +573,36 @@ export class PendingConnectionRequests {
     return { challengeId, result };
   }
 
-  listFixtureReadChallenges(now = Date.now()) {
+  requestFreshFixtureRead(owner: symbol, connectionId: string, now = Date.now(), deadlineMs = now + FIXTURE_READ_TIMEOUT_MS) {
+    return this.getApprovedTarget(owner, connectionId, now) ? this.requestFreshStableRead(owner, connectionId, now, deadlineMs) : null;
+  }
+
+  listStableReadChallenges(now = Date.now()) {
     for (const [challengeId, pending] of this.fixtureReads) {
       if (pending.expiresAt <= now) this.finishFixtureRead(challengeId, "not_ready");
     }
     return [...this.fixtureReads].map(([challengeId, pending]) => ({
       challengeId, target: pending.target, expiresAt: pending.expiresAt
     }));
+  }
+
+  listFixtureReadChallenges(now = Date.now()) {
+    return this.listStableReadChallenges(now).flatMap(challenge => challenge.target.origin === "http://127.0.0.1:8787"
+      ? [{ ...challenge, target: challenge.target }] : []);
+  }
+
+  listChatReadChallenges(provider: "fixture" | "gemini" | "databag", now = Date.now()) {
+    return provider === "gemini" ? this.listGeminiReadChallenges(now)
+      : this.listStableReadChallenges(now).filter(challenge => targetProvider(challenge.target) === provider);
+  }
+
+  listActiveChatTabIds(provider: "fixture" | "gemini" | "databag", now = Date.now()): number[] {
+    const tabs = new Set<number>();
+    for (const request of this.requests.values()) {
+      const grant = request.grant;
+      if (grant && targetProvider(grant.target) === provider && this.isAuthorizedGrant(grant, now)) tabs.add(grant.target.tabId);
+    }
+    return [...tabs].sort((first, second) => first - second);
   }
 
   listActiveFixtureTabIds(now = Date.now()): number[] {
@@ -563,13 +622,12 @@ export class PendingConnectionRequests {
     return true;
   }
 
-  markFixtureObservationGap(target: FixtureTarget, now = Date.now()): number {
+  markStableObservationGap(target: StableDomTarget, now = Date.now()): number {
     let marked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (!grant || !this.isLiveGrant(grant, now)
-        || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
-        || grant.target.tabId !== target.tabId || grant.target.documentId !== target.documentId) continue;
+        || !this.matchesTarget(grant.target, target)) continue;
       if (!grant.snapshot && (!grant.observations || grant.observations.bookmark().sequence === 0)) continue;
       grant.snapshot = undefined;
       grant.observations = new ObservationBuffer(observationLimits);
@@ -581,14 +639,16 @@ export class PendingConnectionRequests {
     return marked;
   }
 
+  markFixtureObservationGap(target: FixtureTarget, now = Date.now()): number {
+    return target.origin === "http://127.0.0.1:8787" ? this.markStableObservationGap(target, now) : 0;
+  }
+
   markGeminiObservationGap(target: GeminiTarget, now = Date.now()): number {
     let marked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (!grant || !this.isLiveGrant(grant, now)
-        || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
-        || grant.target.url !== target.url || grant.target.tabId !== target.tabId
-        || grant.target.documentId !== target.documentId) continue;
+        || !this.matchesTarget(grant.target, target)) continue;
       if (!grant.geminiSnapshot
         && (!grant.geminiObservations || grant.geminiObservations.bookmark().sequence === 0)) continue;
       grant.geminiSnapshot = undefined;
@@ -601,7 +661,7 @@ export class PendingConnectionRequests {
     return marked;
   }
 
-  publishFixtureSnapshot(target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>,
+  publishStableSnapshot(target: StableDomTarget, messages: ReadonlyArray<FixtureMessage>,
     now = Date.now(), challengeId?: string, omittedBefore = false): number {
     if (messages.length > MAX_FIXTURE_SNAPSHOT_MESSAGES
       || typeof omittedBefore !== "boolean"
@@ -617,15 +677,13 @@ export class PendingConnectionRequests {
     }
     const pending = challengeId ? this.fixtureReads.get(challengeId) : undefined;
     if (challengeId && (!pending || pending.expiresAt <= now
-      || pending.target.origin !== target.origin || pending.target.conversationId !== target.conversationId
-      || pending.target.tabId !== target.tabId || pending.target.documentId !== target.documentId
+      || !this.matchesTarget(pending.target, target)
       || !this.liveGrant(pending.owner, pending.connectionId, now))) return 0;
     let published = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
       if (!grant || !this.isLiveGrant(grant, now)
-        || grant.target.origin !== target.origin || grant.target.conversationId !== target.conversationId
-        || grant.target.tabId !== target.tabId || grant.target.documentId !== target.documentId) continue;
+        || !this.matchesTarget(grant.target, target)) continue;
       grant.observations ??= new ObservationBuffer(observationLimits);
       const previous = grant.snapshot?.messages;
       if (!previous || grant.snapshot?.omittedBefore !== omittedBefore
@@ -642,9 +700,15 @@ export class PendingConnectionRequests {
       published++;
     }
     if (pending && challengeId) {
-      this.finishFixtureRead(challengeId, this.getFixtureSnapshot(pending.owner, pending.connectionId, now));
+      this.finishFixtureRead(challengeId, this.getStableSnapshot(pending.owner, pending.connectionId, now));
     }
     return published;
+  }
+
+  publishFixtureSnapshot(target: FixtureTarget, messages: ReadonlyArray<FixtureMessage>,
+    now = Date.now(), challengeId?: string, omittedBefore = false): number {
+    return target.origin === "http://127.0.0.1:8787"
+      ? this.publishStableSnapshot(target, messages, now, challengeId, omittedBefore) : 0;
   }
 
   approve(requestId: string, target: FixtureTarget, now = Date.now()): ReadonlyConnection | null {
@@ -679,11 +743,17 @@ export class PendingConnectionRequests {
   }
 
   private validTarget(target: ApprovedTarget): boolean {
+    if (target.provider === "databag") {
+      return isDatabagOrigin(target.origin) && /^databag_[a-f0-9]{64}$/.test(target.conversationId)
+        && Number.isSafeInteger(target.tabId) && target.tabId > 0
+        && /^[!-~]{1,128}$/.test(target.documentId) && target.url === `${target.origin}/#/session`;
+    }
     if (target.origin === "http://127.0.0.1:8787") {
-      return target.conversationId === "fixture-alpha" && Number.isSafeInteger(target.tabId) && target.tabId > 0
+      return targetProvider(target) === "fixture" && target.conversationId === "fixture-alpha"
+        && Number.isSafeInteger(target.tabId) && target.tabId > 0
         && /^[!-~]{1,128}$/.test(target.documentId);
     }
-    if (target.origin !== "https://gemini.google.com" || !Number.isSafeInteger(target.tabId) || target.tabId < 1
+    if (!isGeminiTarget(target) || !Number.isSafeInteger(target.tabId) || target.tabId < 1
       || !/^[!-~]{1,128}$/.test(target.documentId) || target.url.length > 512) return false;
     try {
       const url = new URL(target.url);

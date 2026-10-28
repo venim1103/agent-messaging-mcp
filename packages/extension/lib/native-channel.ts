@@ -19,6 +19,8 @@ export type GrantCountRequest = { kind: "revoke_fixture"; payload: {
     origin: "http://127.0.0.1:8787"; conversationId: "fixture-alpha"; tabId: number; documentId: string
   } } } | { kind: "mark_gemini_observation_gap"; payload: { target: {
     origin: "https://gemini.google.com"; conversationId: string; url: string; tabId: number; documentId: string
+  } } } | { kind: "mark_chat_observation_gap"; payload: { target: {
+    provider: "databag"; origin: string; conversationId: string; url: string; tabId: number; documentId: string
   } } };
 
 export async function requestNativeGrantCount(request: ReturnType<typeof createNativeRequestChannel>,
@@ -26,7 +28,8 @@ export async function requestNativeGrantCount(request: ReturnType<typeof createN
   try {
     const reply = await request(command.kind, command.payload, Date.now() + 10_000);
     return reply.kind === (command.kind === "mark_fixture_observation_gap" ? "fixture_gap_marked"
-      : command.kind === "mark_gemini_observation_gap" ? "gemini_gap_marked" : "fixture_revoked")
+      : command.kind === "mark_gemini_observation_gap" ? "gemini_gap_marked"
+        : command.kind === "mark_chat_observation_gap" ? "chat_gap_marked" : "fixture_revoked")
       && Object.keys(reply.payload).length === 1 && typeof reply.payload.count === "number"
       && Number.isSafeInteger(reply.payload.count) && reply.payload.count >= 0;
   } catch {

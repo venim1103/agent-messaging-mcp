@@ -1,5 +1,6 @@
 import { browser } from "wxt/browser";
 import { captureGeminiSnapshot, inspectGeminiMathLayout, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl } from "../../lib/gemini-observation";
+import { isEligibleDatabagUrl } from "../../lib/provider-origins";
 
 type FixturePreview = {
   conversationId: string;
@@ -122,6 +123,7 @@ buildVersion.textContent = `Build ${browser.runtime.getManifest().version_name ?
 
 let selectedFixtureTab: { id: number; url: string } | null = null;
 let selectedGeminiTab: { id: number; url: string } | null = null;
+let selectedDatabagTab: { id: number; url: string } | null = null;
 let fixtureReviewExpiry: ReturnType<typeof setTimeout> | undefined;
 let fixtureReviewGeneration = 0;
 let agentRosterGeneration = 0;
@@ -139,7 +141,7 @@ function clearChatAgents() {
 }
 
 async function refreshUnconfirmedDispatches(): Promise<void> {
-  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  const selected = selectedDatabagTab ?? selectedGeminiTab ?? selectedFixtureTab;
   if (!selected || !unconfirmedList || !unconfirmedStatus || !refreshUnconfirmedButton || !status) return;
   const generation = ++unconfirmedGeneration;
   refreshUnconfirmedButton.disabled = true;
@@ -200,7 +202,7 @@ async function refreshUnconfirmedDispatches(): Promise<void> {
 refreshUnconfirmedButton.addEventListener("click", () => { void refreshUnconfirmedDispatches(); });
 
 async function refreshChatAgents(): Promise<void> {
-  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  const selected = selectedDatabagTab ?? selectedGeminiTab ?? selectedFixtureTab;
   if (!selected || !agentPanel || !agentCount || !agentList || !refreshAgentsButton || !disconnectChatButton || !status) return;
   const generation = ++agentRosterGeneration;
   refreshAgentsButton.disabled = true;
@@ -288,7 +290,7 @@ async function refreshChatAgents(): Promise<void> {
 
 refreshAgentsButton.addEventListener("click", () => { void refreshChatAgents(); });
 disconnectChatButton.addEventListener("click", async () => {
-  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  const selected = selectedDatabagTab ?? selectedGeminiTab ?? selectedFixtureTab;
   if (!selected) return;
   disconnectChatButton.disabled = true;
   try {
@@ -311,31 +313,34 @@ function clearFixtureReviews() {
 }
 
 browser.storage.onChanged.addListener((changes, areaName) => {
-  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  const selected = selectedDatabagTab ?? selectedGeminiTab ?? selectedFixtureTab;
   if (areaName === "session" && selected
-    && Object.hasOwn(changes, `${selectedGeminiTab ? "gemini" : "fixture"}-grant-${selected.id}`)) {
+    && Object.hasOwn(changes, `${selectedDatabagTab ? "databag" : selectedGeminiTab ? "gemini" : "fixture"}-grant-${selected.id}`)) {
     clearFixtureReviews();
     clearChatAgents();
     void refreshChatAgents();
-    status.textContent = selectedGeminiTab ? "Gemini approval changed. Draft review cleared."
+    status.textContent = selectedDatabagTab ? "Chat approval changed."
+      : selectedGeminiTab ? "Gemini approval changed. Draft review cleared."
       : "Fixture approval changed. Draft review cleared.";
   }
 });
 browser.tabs.onActivated.addListener(({ tabId }) => {
-  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  const selected = selectedDatabagTab ?? selectedGeminiTab ?? selectedFixtureTab;
   if (selected && tabId !== selected.id) {
     clearFixtureReviews();
     clearChatAgents();
-    status.textContent = selectedGeminiTab ? "Selected Gemini changed. Draft review cleared."
+    status.textContent = selectedDatabagTab ? "Selected chat changed."
+      : selectedGeminiTab ? "Selected Gemini changed. Draft review cleared."
       : "Selected fixture changed. Draft review cleared.";
   }
 });
 browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  const selected = selectedGeminiTab ?? selectedFixtureTab;
+  const selected = selectedDatabagTab ?? selectedGeminiTab ?? selectedFixtureTab;
   if (selected?.id === tabId && (changeInfo.status === "loading" || changeInfo.url)) {
     clearFixtureReviews();
     clearChatAgents();
-    status.textContent = selectedGeminiTab ? "Gemini document changed. Draft review cleared."
+    status.textContent = selectedDatabagTab ? "Chat document changed."
+      : selectedGeminiTab ? "Gemini document changed. Draft review cleared."
       : "Fixture document changed. Draft review cleared.";
   }
 });
@@ -343,6 +348,8 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
 void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   const url = tab?.url ? new URL(tab.url) : null;
   const selectedSavedGemini = tab?.url ? isEligibleGeminiUrl(tab.url) : false;
+  const selectedDatabag = tab?.url ? isEligibleDatabagUrl(tab.url) : false;
+  inspectButton.hidden = selectedDatabag;
   pendingButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
   fixtureReviewButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
   fixtureFillReviewButton.hidden = url?.origin !== fixtureOrigin && !selectedSavedGemini;
@@ -360,7 +367,8 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   if (tab?.id != null && tab.url && selectedSavedGemini) {
     selectedGeminiTab = { id: tab.id, url: tab.url };
   }
-  agentPanel.hidden = !selectedFixtureTab && !selectedGeminiTab;
+  if (tab?.id != null && tab.url && selectedDatabag) selectedDatabagTab = { id: tab.id, url: tab.url };
+  agentPanel.hidden = !selectedFixtureTab && !selectedGeminiTab && !selectedDatabagTab;
   unconfirmedPanel.hidden = agentPanel.hidden;
   if (!unconfirmedPanel.hidden) unconfirmedStatus.textContent = "Not checked";
   if (!agentPanel.hidden) void refreshChatAgents();

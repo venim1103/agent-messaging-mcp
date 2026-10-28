@@ -2,10 +2,10 @@ import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
 import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureFillResultSchema,
   fixturePreflightResultSchema, geminiFillResultSchema, geminiDispatchCheckResultSchema, MAX_PREPARED_MESSAGE_BYTES,
-  chatJobSchema, chatJobCompletionSchema, PreparedMessageOperations } from "./message-operations.js";
-import { PROTOCOL_VERSION } from "./native-protocol.js";
+  chatJobSchema, chatJobCompletionSchema, databagTargetSchema, PreparedMessageOperations } from "./message-operations.js";
+import { chatGapPayloadSchema, chatReadListPayloadSchema, chatSnapshotPayloadSchema, PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
-  PendingConnectionRequests }
+  isGeminiTarget, PendingConnectionRequests, type ApprovedTarget, type FixtureMessage, type GeminiRenderedMessage }
   from "./pending-connections.js";
 
 const envelope = {
@@ -24,6 +24,7 @@ const geminiTarget = z.strictObject({
   url: z.string().min(1).max(512),
   tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
 });
+const approvedTarget = z.union([fixtureTarget, geminiTarget, databagTargetSchema]);
 const fixtureMessage = z.strictObject({
   id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
   direction: z.enum(["incoming", "outgoing"]), text: z.string().max(16_000),
@@ -35,34 +36,37 @@ const geminiMessage = z.strictObject({
 }).refine(message => !message.generationState || message.direction === "incoming");
 
 const requestSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ ...envelope, kind: z.literal("list_chat_read_challenges"), payload: chatReadListPayloadSchema }),
+  z.strictObject({ ...envelope, kind: z.literal("publish_chat_snapshot"), payload: chatSnapshotPayloadSchema }),
+  z.strictObject({ ...envelope, kind: z.literal("mark_chat_observation_gap"), payload: chatGapPayloadSchema }),
   z.strictObject({ ...envelope, kind: z.literal("keep_alive"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("wait_for_connection"), payload: z.strictObject({
     timeoutMs: z.number().int().min(0).max(20_000)
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("approve_chat_agent"), payload: z.strictObject({
-    target: z.union([fixtureTarget, geminiTarget]), agentId: z.uuid()
+    target: approvedTarget, agentId: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_chat_agents"), payload: z.strictObject({
-    target: z.union([fixtureTarget, geminiTarget])
+    target: approvedTarget
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_available_agents"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("list_unconfirmed_dispatches"), payload: z.strictObject({
-    target: z.union([fixtureTarget, geminiTarget])
+    target: approvedTarget
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("resolve_unconfirmed_dispatch"), payload: z.strictObject({
-    target: z.union([fixtureTarget, geminiTarget]), operationId: z.uuid(), outcome: z.enum(["sent", "not_sent"])
+    target: approvedTarget, operationId: z.uuid(), outcome: z.enum(["sent", "not_sent"])
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("begin_chat_reload"), payload: z.strictObject({
-    target: z.union([fixtureTarget, geminiTarget])
+    target: approvedTarget
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("rebind_chat"), payload: z.strictObject({
-    previous: z.union([fixtureTarget, geminiTarget]), target: z.union([fixtureTarget, geminiTarget])
+    previous: approvedTarget, target: approvedTarget
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("disconnect_chat"), payload: z.strictObject({
-    target: z.union([fixtureTarget, geminiTarget])
+    target: approvedTarget
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("remove_chat_agent"), payload: z.strictObject({
-    target: z.union([fixtureTarget, geminiTarget]), agentId: z.uuid()
+    target: approvedTarget, agentId: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("request_connection"), payload: z.strictObject({}) }),
   z.strictObject({ ...envelope, kind: z.literal("get_connection"), payload: z.strictObject({ requestId: z.uuid() }) }),
@@ -276,6 +280,28 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       : requests.removeChatAgent(request.payload.agentId, request.payload.target, now);
     const remainingAgents = requests.listChatAgents(request.payload.target, now).filter(agent => agent.connectionCount > 0).length;
     return { ...response, kind: "chat_agent_removed" as const, payload: { revoked, remainingAgents } };
+  }
+  if (request.kind === "list_chat_read_challenges") {
+    return role === "relay"
+      ? { ...response, kind: "chat_read_challenges" as const, payload: {
+        challenges: requests.listChatReadChallenges(request.payload.provider, now),
+        activeTabIds: requests.listActiveChatTabIds(request.payload.provider, now) } }
+      : { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+  }
+  if (request.kind === "publish_chat_snapshot") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    const { messages, challengeId, omittedBefore } = request.payload;
+    const target: ApprovedTarget = request.payload.target;
+    const count = isGeminiTarget(target)
+      ? requests.publishGeminiSnapshot(target, messages as ReadonlyArray<GeminiRenderedMessage>, now, challengeId, omittedBefore)
+      : requests.publishStableSnapshot(target, messages as ReadonlyArray<FixtureMessage>, now, challengeId, omittedBefore);
+    return { ...response, kind: "chat_snapshot_published" as const, payload: { count } };
+  }
+  if (request.kind === "mark_chat_observation_gap") {
+    if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
+    const target: ApprovedTarget = request.payload.target;
+    const count = isGeminiTarget(target) ? requests.markGeminiObservationGap(target, now) : requests.markStableObservationGap(target, now);
+    return { ...response, kind: "chat_gap_marked" as const, payload: { count } };
   }
   if (request.kind === "list_fixture_read_challenges") {
     return role === "relay"
@@ -702,10 +728,10 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   }
   if (request.kind === "read_approved_snapshot") {
     const target = requests.getApprovedTarget(owner, request.payload.connectionId, now)
-      ?? requests.getGeminiTarget(owner, request.payload.connectionId, now);
+      ?? requests.getGeminiTarget(owner, request.payload.connectionId, now)
+      ?? requests.getAutonomousTarget(owner, request.payload.connectionId, now);
     return target
-      ? { ...response, kind: target.origin === "http://127.0.0.1:8787"
-        ? "fixture_read_authorized" as const : "gemini_read_authorized" as const,
+      ? { ...response, kind: isGeminiTarget(target) ? "gemini_read_authorized" as const : "fixture_read_authorized" as const,
         payload: { connectionId: request.payload.connectionId, limit: request.payload.limit ?? 32 } }
       : { ...response, kind: "error" as const, payload: { code: "CONNECTION_NOT_FOUND" } };
   }
@@ -719,16 +745,13 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   }
   if (request.kind === "read_approved_events") {
     const target = requests.getApprovedTarget(owner, request.payload.connectionId, now)
-      ?? requests.getGeminiTarget(owner, request.payload.connectionId, now);
-    const events = target?.origin === "http://127.0.0.1:8787"
-      ? requests.readFixtureEvents(owner, request.payload.connectionId, request.payload.cursor,
-        request.payload.limit ?? 2, now)
-      : target?.origin === "https://gemini.google.com"
-        ? requests.readGeminiEvents(owner, request.payload.connectionId, request.payload.cursor,
-          request.payload.limit ?? 2, now) : null;
+      ?? requests.getGeminiTarget(owner, request.payload.connectionId, now)
+      ?? requests.getAutonomousTarget(owner, request.payload.connectionId, now);
+    const events = !target ? null : isGeminiTarget(target)
+      ? requests.readGeminiEvents(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now)
+      : requests.readStableEvents(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now);
     return events && events !== "not_ready"
-      ? { ...response, kind: target?.origin === "http://127.0.0.1:8787"
-        ? "fixture_events" as const : "gemini_events" as const, payload: events }
+      ? { ...response, kind: target && isGeminiTarget(target) ? "gemini_events" as const : "fixture_events" as const, payload: events }
       : { ...response, kind: "error" as const,
         payload: { code: events === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } };
   }

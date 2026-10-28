@@ -13,7 +13,7 @@ import { connectBroker } from "./broker-client.js";
 import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
-  parseNativeChatAgentRequest, parseNativeChatJobRequest,
+  parseNativeChatAgentRequest, parseNativeChatJobRequest, parseNativeChatObservationRequest,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
   parseNativeFixtureFillReviews, parseNativeFixtureFillReviewApproval,
@@ -42,6 +42,42 @@ const request = {
   deadlineMs: now + 10_000,
   payload: {}
 };
+
+test("native neutral observations validate provider, exact target, row model and original limits", () => {
+  const targets = [
+    { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
+    { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
+      documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" },
+    { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 3,
+      documentId: "synthetic-document", url: "https://databag.example/#/session" }
+  ];
+  for (const [index, provider] of ["fixture", "gemini", "databag"].entries()) {
+    const target = targets[index]!;
+    const messages = provider === "gemini" ? [{ direction: "incoming", text: "Synthetic reply" }]
+      : [{ id: "synthetic-row", direction: "incoming", text: "Synthetic reply" }];
+    const publication = { ...request, kind: "publish_chat_snapshot", payload: { target, messages } };
+    const gap = { ...request, kind: "mark_chat_observation_gap", payload: { target } };
+    for (const message of [publication, gap, { ...request, kind: "list_chat_read_challenges", payload: { provider } }]) {
+      assert.deepEqual(parseNativeChatObservationRequest(message, now), message);
+      for (const invalid of [{ ...message, deadlineMs: now }, { ...message, deadlineMs: now + 30_001 },
+        { ...message, payload: { ...message.payload, approved: true } }, { ...message, connectionGeneration: 1 }]) {
+        assert.throws(() => parseNativeChatObservationRequest(invalid, now));
+      }
+    }
+    assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+      messages: Array.from({ length: 33 }, () => messages[0]) } }, now));
+    assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+      messages: [{ ...messages[0], text: "x".repeat(16_001) }] } }, now));
+    if (provider !== "gemini") assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+      messages: [messages[0], messages[0]] } }, now));
+    if (provider === "databag") {
+      assert.throws(() => parseNativeFixtureSnapshot({ ...publication, kind: "publish_fixture_snapshot" }, now));
+      assert.throws(() => parseNativeGeminiSnapshot({ ...publication, kind: "publish_gemini_snapshot" }, now));
+      assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+        target: { ...target, url: `${target.url}?other` } } }, now));
+    }
+  }
+});
 
 test("native neutral jobs validate phase, provider, exact target and phase-specific observations", () => {
   for (const target of [
@@ -93,7 +129,9 @@ test("native agent roster and removal accept only bounded exact-target envelopes
   for (const target of [
     { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
     { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
-      documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat?hl=en" }
+      documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat?hl=en" },
+    { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 3,
+      documentId: "synthetic-document", url: "https://databag.example/#/session" }
   ]) {
     for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat", "approve_chat_agent", "begin_chat_reload", "rebind_chat",
       "list_unconfirmed_dispatches", "resolve_unconfirmed_dispatch"]) {

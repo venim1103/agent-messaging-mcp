@@ -44,6 +44,61 @@ async function exchange(socket: Socket, message: unknown): Promise<unknown> {
   });
 }
 
+  test("Databag neutral IPC carries exact owned fresh reads without enabling legacy commands", { timeout: 5000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-databag-ipc-"));
+    const directory = join(home, "broker");
+    const broker = await startBrokerSocket(directory, createBrokerCredentials());
+    let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let foreign: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    const target = { provider: "databag", origin: "https://databag.example", url: "https://databag.example/#/session",
+      conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" } as const;
+    try {
+      facade = await connectBroker("facade", directory, undefined, undefined, "Synthetic Databag IPC owner");
+      foreign = await connectBroker("facade", directory, undefined, undefined, "Synthetic foreign IPC owner");
+      relay = await connectBroker("relay", directory);
+      const roster = await relay.listChatAgents(target);
+      assert.ok(roster.kind === "chat_agents");
+      const agent = roster.payload.agents.find(candidate => candidate.label === "Synthetic Databag IPC owner")!;
+      assert.equal((await relay.approveChatAgent(target, agent.agentId)).kind, "chat_agent_approved");
+      const pickup = await facade.waitForConnection(0);
+      assert.ok(pickup.kind === "connection_pickup" && pickup.payload.connections[0]);
+      const connection = pickup.payload.connections[0];
+      assert.equal(connection.origin, target.origin);
+      assert.equal(connection.conversationId, target.conversationId);
+      assert.equal("url" in connection || "tabId" in connection || "documentId" in connection, false);
+      assert.throws(() => facade!.listChatReadChallenges("databag"), /Broker role cannot perform/);
+      const reading = facade.readApprovedSnapshot(connection.connectionId, 1);
+      const listing = await relay.listChatReadChallenges("databag");
+      assert.ok(listing.kind === "chat_read_challenges" && listing.payload.challenges[0]);
+      assert.deepEqual(listing.payload.activeTabIds, [3]);
+      const challenge = listing.payload.challenges[0];
+      assert.deepEqual(challenge.target, target);
+      const messages = [{ id: "synthetic-old", direction: "outgoing" as const, text: "Synthetic question" },
+        { id: "synthetic-new", direction: "incoming" as const, text: "Synthetic reply" }];
+      assert.deepEqual((await relay.publishChatSnapshot(target, messages, challenge.challengeId)).payload, { count: 1 });
+      const snapshot = await reading;
+      assert.ok(snapshot.kind === "fixture_snapshot");
+      assert.deepEqual(snapshot.payload.messages, [messages[1]]);
+      assert.equal(snapshot.payload.omittedBefore, true);
+      assert.deepEqual((await foreign.readApprovedSnapshot(connection.connectionId)).payload, { code: "CONNECTION_NOT_FOUND" });
+      assert.deepEqual((await facade.readFixtureSnapshot(connection.connectionId)).payload, { code: "CONNECTION_NOT_FOUND" });
+      assert.deepEqual((await relay.publishChatSnapshot(target, [{ ...messages[1]!, text: "Synthetic revision" }])).payload, { count: 1 });
+      const events = await facade.readApprovedEvents(connection.connectionId, snapshot.payload.cursor);
+      assert.ok(events.kind === "fixture_events" && events.payload.state === "ok");
+      assert.equal(events.payload.events.length, 1);
+      assert.deepEqual((await relay.markChatObservationGap(target)).payload, { count: 1 });
+      assert.deepEqual((await facade.readApprovedEvents(connection.connectionId, snapshot.payload.cursor)).payload,
+        { state: "expired", resnapshot: true });
+    } finally {
+      facade?.close();
+      foreign?.close();
+      relay?.close();
+      await broker.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
 test("broker claims its runtime before initializing the operation database", async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-start-order-"));
   const directory = join(home, "broker");
@@ -557,6 +612,68 @@ test("short fresh-read deadlines expire without disconnecting the approved owner
   }
 });
 
+test("queued fresh reads preserve the response reserve before writing a broker frame", { timeout: 5000 }, async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-queued-read-reserve-"));
+  const directory = join(home, "broker");
+  const broker = await startBrokerSocket(directory, createBrokerCredentials());
+  let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+  let releaseCapture: ((snapshot: unknown) => void) | undefined;
+  let captureStarted!: () => void;
+  const started = new Promise<void>(resolve => { captureStarted = resolve; });
+  let now = Date.now();
+  let wireReads = 0;
+  const frames = NativeFrameDecoder.prototype.frames;
+  context.mock.method(Date, "now", () => now);
+  context.mock.method(NativeFrameDecoder.prototype, "frames", function*(this: NativeFrameDecoder, chunk: Buffer) {
+    for (const value of frames.call(this, chunk)) {
+      if (typeof value === "object" && value !== null && "kind" in value && value.kind === "read_approved_snapshot") wireReads++;
+      yield value;
+    }
+  });
+  context.mock.method(PendingConnectionRequests.prototype, "requestFreshStableRead", () => {
+    const result = new Promise(resolve => { releaseCapture = resolve; });
+    captureStarted();
+    return { result } as never;
+  });
+  try {
+    facade = await connectBroker("facade", directory);
+    relay = await connectBroker("relay", directory);
+    const pending = await facade.requestConnection();
+    assert.ok(pending.kind === "connection_requested");
+    await relay.approveFixture(pending.payload.requestId, { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha",
+      tabId: 3, documentId: "synthetic-document" });
+    const grant = await facade.getConnection(pending.payload.requestId);
+    assert.ok(grant.kind === "connection_state" && grant.payload.state === "ready_readonly");
+    const first = facade.readApprovedSnapshot(grant.payload.connectionId);
+    await started;
+    const deadlineMs = now + 1000;
+    const queued = facade.readApprovedSnapshot(grant.payload.connectionId, undefined, deadlineMs)
+      .then(reply => ({ reply, error: undefined }), (error: unknown) => ({ reply: undefined, error }));
+    const snapshot = { coverage: "rendered_only", generation: 1, capturedAt: now,
+      cursor: { epoch: randomUUID(), sequence: 1 }, messages: [{ id: "synthetic-row", direction: "incoming", text: "Synthetic reply" }],
+      omittedBefore: false };
+    now = deadlineMs - 10;
+    assert.ok(releaseCapture);
+    releaseCapture(snapshot);
+    assert.equal((await first).kind, "fixture_snapshot");
+    const refused = await queued;
+    assert.equal(wireReads, 1, "A queued read inside the response reserve must not write a broker frame");
+    assert.ok(refused.error instanceof Error);
+    assert.match(refused.error.message, /Invalid autonomous request deadline/);
+    assert.equal(facade.closed, false);
+    const state = await facade.getConnection(pending.payload.requestId);
+    assert.ok(state.kind === "connection_state" && state.payload.state === "ready_readonly");
+  } finally {
+    releaseCapture?.(null);
+    facade?.close();
+    relay?.close();
+    await broker.close();
+    context.mock.restoreAll();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("broker observation replies preserve bounded flags and refuse extra fields", { timeout: 5000 }, async (context) => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-observation-replies-"));
   const directory = join(home, "broker");
@@ -566,11 +683,11 @@ test("broker observation replies preserve bounded flags and refuse extra fields"
   let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
   let observed: unknown;
   let eventPage: unknown;
-  context.mock.method(PendingConnectionRequests.prototype, "requestFreshFixtureRead", () =>
+  context.mock.method(PendingConnectionRequests.prototype, "requestFreshStableRead", () =>
     ({ result: Promise.resolve(observed) }) as never);
   context.mock.method(PendingConnectionRequests.prototype, "requestFreshGeminiRead", () =>
     ({ result: Promise.resolve(observed) }) as never);
-  context.mock.method(PendingConnectionRequests.prototype, "readFixtureEvents", () => eventPage as never);
+  context.mock.method(PendingConnectionRequests.prototype, "readStableEvents", () => eventPage as never);
   context.mock.method(PendingConnectionRequests.prototype, "readGeminiEvents", () => eventPage as never);
   const cursor = { epoch: "c66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 };
   try {

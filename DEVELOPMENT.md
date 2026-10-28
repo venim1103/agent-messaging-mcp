@@ -135,7 +135,7 @@ Build/verify failure is not a new archive: an older ZIP may remain at the same f
 
 ## Databag Compatibility
 
-Databag support is under development; the origin configuration and DOM adapter are not yet connected public tools. D14/D15 in [DESIGN.md](DESIGN.md#17-decisions) record the selected browser-only approach and permission to prepare a minimal frontend patch. The stock reviewed web client does not expose a stable selected-channel identity.
+Databag is experimental and requires the reviewed DOM contract below. The configured-origin adapter connects trusted popup approval, owned public pickup, fresh reads and events through shared policy/transport. Sending remains explicitly refused and generic read/send connection metadata is not a working-send claim. D14/D15 in [DESIGN.md](DESIGN.md#17-decisions) record the browser-only approach and approved minimal frontend patch. See the [current capability dashboard](HANDOFF.md#current-state-dashboard) for source/synthetic evidence and installed limits.
 
 The [compatibility patch](integrations/databag/compatibility.patch) targets public upstream commit `45343338582b394f4f5fdb4b7e271ea1dc8dd5fd`. Apply it to a clean checkout of that revision, then use Databag's normal frontend/container build and deployment procedure. Do not apply it blindly to a mutable image or an unrelated version:
 
@@ -148,6 +148,9 @@ git apply /path/to/agent-messaging-mcp/integrations/databag/compatibility.patch
 - Identity is unavailable while a focus change loads. Old listener results cannot restore a previous channel's ready binding. The adapter hashes the account/contact/channel tuple and never reads React state, SDK stores, credentials or message-source attributes.
 - The initial adapter supports only plain rendered text. Locked, unconfirmed, edited, attachment-only or structurally ambiguous rows refuse capture; there is no attachment or media extraction. Hidden/unsupported descendants also refuse rather than exposing their text. The existing 32-row, 16,000-unit and 96 KiB bounds remain.
 - Configure one canonical HTTPS server origin using `BROWSER_CHAT_DATABAG_ORIGIN` in the extension's ignored local environment file, or the build environment. The build declares only that exact optional host origin, never an HTTPS wildcard. Keep real deployment addresses out of tracked files. Unset means no Databag host permission.
+- Only that exact origin's `/#/session` can be selected. The stored grant also pins the hashed account/contact/channel identity. Same-URL account/channel changes end it; same-chat reload suspends reads and requires fresh new-document identity before rebinding. Legacy fixture/Gemini commands cannot admit or read a Databag target.
+- Neutral `list_chat_read_challenges`, `publish_chat_snapshot` and `mark_chat_observation_gap` are relay-only. Databag reuses the bounded stable-ID observation buffer and existing stable-row wire envelopes; there is no Databag command family. The shared saved-chat watcher keeps the original response/read deadlines and restart backoff; Databag polls reads only until write jobs are connected.
+- Approved snapshot requests must retain the broker's existing 25 ms response reserve when leaving the client queue, not merely when the public wait begins. Late queued reads refuse before a frame is written; original timers, expiry and owner cleanup are unchanged.
 - Frontend deployment, browser login, extension/MCP reload and exact-chat trusted popup approval are human steps. A source build or synthetic test grants no installed account access; follow [AGENTS.md](AGENTS.md#safety-boundaries).
 
 ## Agent Workflow

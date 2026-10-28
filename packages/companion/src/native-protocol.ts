@@ -1,9 +1,9 @@
 import * as z from "zod/v4";
 import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureFillResultSchema,
   fixturePreflightResultSchema, geminiFillResultSchema, geminiDispatchCheckResultSchema,
-  chatTargetSchema, chatJobSchema, chatJobCompletionSchema } from "./message-operations.js";
+  chatTargetSchema, chatJobSchema, chatJobCompletionSchema, databagTargetSchema } from "./message-operations.js";
 import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
-  MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES } from "./pending-connections.js";
+  MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES, isGeminiTarget } from "./pending-connections.js";
 
 export const NATIVE_HOST_NAME = "com.agent_messaging_mcp.bridge";
 export const PROTOCOL_VERSION = 1;
@@ -248,7 +248,7 @@ function isValidGeminiTarget(target: z.infer<typeof geminiTargetSchema>): boolea
   }
 }
 
-const chatAgentTargetSchema = z.union([fixtureTargetSchema, geminiTargetSchema.refine(isValidGeminiTarget)]);
+const chatAgentTargetSchema = z.union([fixtureTargetSchema, geminiTargetSchema.refine(isValidGeminiTarget), databagTargetSchema]);
 const chatJobTargetSchema = chatTargetSchema.refine(target => target.provider === "fixture"
   || (isValidGeminiTarget(target) && new URL(target.url).pathname === `/app/${target.conversationId}`));
 const chatJobRequestSchema = z.discriminatedUnion("kind", [
@@ -492,6 +492,31 @@ const fixtureSnapshotSchema = z.strictObject({
     challengeId: z.uuid().optional(), omittedBefore: z.boolean().optional()
   })
 });
+
+export const chatReadProviderSchema = z.enum(["fixture", "gemini", "databag"]);
+export const chatReadListPayloadSchema = z.strictObject({ provider: chatReadProviderSchema });
+export const chatSnapshotPayloadSchema = z.union([
+  fixtureSnapshotSchema.shape.payload,
+  geminiSnapshotSchema.shape.payload.refine(payload => isValidGeminiTarget(payload.target)),
+  fixtureSnapshotSchema.shape.payload.extend({ target: databagTargetSchema })
+]).refine(payload => Buffer.byteLength(JSON.stringify({ messages: payload.messages,
+  omittedBefore: payload.omittedBefore ?? false }), "utf8") <= MAX_FIXTURE_SNAPSHOT_BYTES
+  && (isGeminiTarget(payload.target)
+    || new Set(payload.messages.map(message => "id" in message ? message.id : null)).size === payload.messages.length));
+export const chatGapPayloadSchema = z.strictObject({ target: chatAgentTargetSchema });
+const chatObservationRequestSchema = z.discriminatedUnion("kind", [
+  pendingListSchema.extend({ kind: z.literal("list_chat_read_challenges"), payload: chatReadListPayloadSchema }),
+  pendingListSchema.extend({ kind: z.literal("publish_chat_snapshot"), payload: chatSnapshotPayloadSchema }),
+  pendingListSchema.extend({ kind: z.literal("mark_chat_observation_gap"), payload: chatGapPayloadSchema })
+]);
+
+export function parseNativeChatObservationRequest(message: unknown, now = Date.now()) {
+  const result = chatObservationRequestSchema.safeParse(message);
+  if (!result.success || result.data.deadlineMs <= now || result.data.deadlineMs > now + 30_000) {
+    throw new Error("Invalid native chat observation request");
+  }
+  return result.data;
+}
 
 export function parseNativeFixtureSnapshot(message: unknown, now = Date.now()) {
   const result = fixtureSnapshotSchema.safeParse(message);

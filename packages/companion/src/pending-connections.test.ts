@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FIXTURE_READ_TIMEOUT_MS, GEMINI_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_GEMINI_SNAPSHOT_AGE_MS,
   MAX_AUTONOMOUS_CONNECTIONS, MAX_CONNECTION_WAIT_MS, MAX_CONNECTED_AGENTS, MAX_PENDING_REQUESTS, PendingConnectionRequests,
-  PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS, ReplyObservation, type ApprovedTarget }
+  PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS, ReplyObservation, isGeminiTarget, type ApprovedTarget, type DatabagTarget }
   from "./pending-connections.js";
 
 for (const provider of ["fixture", "gemini"]) {
@@ -73,6 +73,99 @@ test("Gemini explicit UI completion is fresh, incoming and untruncated without a
   assert.equal(observation.observe(snapshot(6000), 6000)?.generationState, "complete");
 });
 
+test("Databag autonomous admission pins exact HTTPS session identity and rejects legacy grants", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("Databag owner");
+  const stranger = Symbol("other owner");
+  const agent = requests.registerAgent(owner);
+  const selected = { provider: "databag", origin: "https://databag.example", url: "https://databag.example/#/session",
+    conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
+  const target = selected as unknown as ApprovedTarget;
+  const grant = requests.approveAgent(agent.agentId, target, 1000);
+  assert.ok(grant);
+  assert.equal(grant.state, "ready");
+  assert.deepEqual(grant.capabilities, ["read", "send"]);
+  assert.deepEqual(requests.getAutonomousTarget(owner, grant.connectionId, 1000), target);
+  assert.equal(requests.getAutonomousTarget(stranger, grant.connectionId, 1000), null);
+  assert.equal(requests.getApprovedTarget(owner, grant.connectionId, 1000), null);
+  assert.equal(requests.getGeminiTarget(owner, grant.connectionId, 1000), null);
+  for (const changes of [
+    { provider: "gemini" }, { provider: undefined }, { origin: "http://databag.example" },
+    { origin: "https://databag.example/" }, { origin: "https://user@databag.example" },
+    { origin: "https://*.example" }, { origin: "https://gemini.google.com" },
+    { url: "https://databag.example/#/session?other" }, { url: "https://other.example/#/session" },
+    { conversationId: "fixture-alpha" }, { conversationId: `databag_${"A".repeat(64)}` },
+    { documentId: "" }, { tabId: 0 }
+  ]) {
+    assert.equal(requests.approveAgent(agent.agentId, { ...selected, ...changes } as unknown as ApprovedTarget, 1000), null);
+  }
+  assert.equal(requests.removeChatAgent(agent.agentId,
+    { ...selected, url: `${selected.url}?other` } as unknown as ApprovedTarget, 1000), 0);
+  assert.equal(requests.disconnectChat({ ...target, documentId: "wrong-document" }, 1000), 0);
+  const pending = requests.create(owner, 1000);
+  assert.equal(requests.approve(pending.requestId,
+    target as Parameters<PendingConnectionRequests["approve"]>[1], 1000), null);
+  assert.equal(requests.approveGemini(pending.requestId,
+    target as Parameters<PendingConnectionRequests["approveGemini"]>[1], 1000), null);
+  assert.equal(requests.beginChatReload(target, 1001), 1);
+  assert.equal(requests.getAutonomousTarget(owner, grant.connectionId, 1001), null);
+  const updated = { ...target, documentId: "reloaded-document" };
+  assert.equal(requests.rebindChat(target,
+    { ...selected, documentId: updated.documentId, conversationId: `databag_${"b".repeat(64)}` } as unknown as ApprovedTarget, 1001), 0);
+  assert.equal(requests.rebindChat(target, updated, 1002), 1);
+  assert.equal(requests.get(owner, grant.requestId, 1002)?.state, "ready");
+  assert.deepEqual(requests.getAutonomousTarget(owner, grant.connectionId, 1002), updated);
+  assert.equal(requests.disconnectChat(target, 1002), 0);
+  assert.equal(requests.disconnectChat(updated, 1002), 1);
+  assert.equal(requests.get(owner, grant.requestId, 1002)?.state, "stale");
+  requests.disconnect(owner);
+});
+
+test("Databag stable DOM reads share bounded challenges and revoke old-document evidence", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("Databag reader");
+  const other = Symbol("other reader");
+  const target: DatabagTarget = { provider: "databag", origin: "https://databag.example", url: "https://databag.example/#/session",
+    conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
+  const first = requests.approveAgent(requests.registerAgent(owner).agentId, target, 1000);
+  const second = requests.approveAgent(requests.registerAgent(other).agentId, target, 1000);
+  assert.ok(first && second);
+  assert.equal(requests.getStableSnapshot(owner, first.connectionId, 1000), "not_ready");
+  assert.equal(requests.getFixtureSnapshot(owner, first.connectionId, 1000), null);
+  assert.equal(requests.requestFreshFixtureRead(owner, first.connectionId, 1000), null);
+  assert.equal(requests.requestFreshStableRead(other, first.connectionId, 1000), null);
+  const read = requests.requestFreshStableRead(owner, first.connectionId, 1000, 1050);
+  assert.ok(read && read !== "busy");
+  assert.equal(requests.listFixtureReadChallenges(1000).length, 0);
+  assert.deepEqual(requests.listStableReadChallenges(1000), [{ challengeId: read.challengeId, target, expiresAt: 1050 }]);
+  const rows = [{ id: "synthetic-row", direction: "incoming" as const, text: "Synthetic reply" }];
+  assert.equal(requests.publishStableSnapshot({ ...target, url: `${target.url}?other` }, rows, 1001, read.challengeId), 0);
+  assert.equal(requests.publishStableSnapshot({ ...target, documentId: "other-document" }, rows, 1001, read.challengeId), 0);
+  assert.equal(requests.publishStableSnapshot(target, rows, 1001, read.challengeId), 2);
+  const snapshot = await read.result;
+  assert.ok(snapshot && snapshot !== "not_ready");
+  assert.deepEqual(snapshot.messages, rows);
+  assert.equal(requests.readFixtureEvents(owner, first.connectionId, snapshot.cursor, 2, 1001), null);
+  const pending = requests.requestFreshStableRead(owner, first.connectionId, 1002, 1050);
+  assert.ok(pending && pending !== "busy");
+  assert.equal(requests.markStableObservationGap({ ...target, url: `${target.url}?other` }, 1002), 0);
+  assert.equal(requests.beginChatReload(target, 1002), 2);
+  assert.equal(await pending.result, "not_ready");
+  assert.equal(requests.publishStableSnapshot(target, rows, 1002), 0);
+  const updated = { ...target, documentId: "new-document" };
+  assert.equal(requests.rebindChat(target, updated, 1003), 2);
+  assert.equal(requests.publishStableSnapshot(target, rows, 1003), 0);
+  assert.equal(requests.publishStableSnapshot(updated, rows, 1003), 2);
+  const events = requests.readStableEvents(owner, first.connectionId, snapshot.cursor, 2, 1003);
+  assert.ok(events && typeof events === "object");
+  assert.equal(events.state, "expired");
+  assert.equal(requests.removeChatAgent(requests.listChatAgents(updated, 1003)[0]!.agentId, updated, 1003), 1);
+  assert.equal(requests.getStableSnapshot(owner, first.connectionId, 1003), null);
+  assert.ok(requests.getStableSnapshot(other, second.connectionId, 1003));
+  requests.disconnect(owner);
+  requests.disconnect(other);
+});
+
 for (const target of [
   { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
   { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
@@ -88,8 +181,9 @@ for (const target of [
     const firstPending = requests.create(first, 1000);
     const secondPending = requests.create(second, 1000);
     const otherPending = requests.create(first, 1000);
-    const approve = (requestId: string, selected: ApprovedTarget, now: number) => selected.origin === "https://gemini.google.com"
-      ? requests.approveGemini(requestId, selected, now) : requests.approve(requestId, selected, now);
+    const approve = (requestId: string, selected: ApprovedTarget, now: number) => isGeminiTarget(selected)
+      ? requests.approveGemini(requestId, selected, now)
+      : selected.origin === "http://127.0.0.1:8787" ? requests.approve(requestId, selected, now) : null;
     const firstGrant = approve(firstPending.requestId, target, 1000);
     const secondGrant = approve(secondPending.requestId, target, 1000);
     const otherGrant = approve(otherPending.requestId, { ...target, tabId: 4 }, 1000);
@@ -214,9 +308,10 @@ for (const target of [
     assert.ok(firstGrant && secondGrant && legacyGrant);
     const updated = { ...target, documentId: "reloaded-document" };
     assert.equal(requests.rebindChat(target, updated, 1000), 0);
-    const publish = (selected: ApprovedTarget, now: number) => selected.origin === "https://gemini.google.com"
+    const publish = (selected: ApprovedTarget, now: number) => isGeminiTarget(selected)
       ? requests.publishGeminiSnapshot(selected, [{ direction: "incoming", text: "Synthetic reply" }], now)
-      : requests.publishFixtureSnapshot(selected, [{ id: "row", direction: "incoming", text: "Synthetic reply" }], now);
+      : selected.origin === "http://127.0.0.1:8787"
+        ? requests.publishFixtureSnapshot(selected, [{ id: "row", direction: "incoming", text: "Synthetic reply" }], now) : 0;
     assert.equal(publish(target, 1000), 3);
     const snapshot = target.origin === "https://gemini.google.com"
       ? requests.getGeminiSnapshot(first, firstGrant.connectionId, 1000)

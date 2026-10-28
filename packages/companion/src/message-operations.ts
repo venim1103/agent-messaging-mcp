@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
-import { MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget,
+import { isDatabagOrigin, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget,
   type FixtureSnapshot, type GeminiSnapshot } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
@@ -67,6 +67,11 @@ export const geminiDispatchResultSchema = z.discriminatedUnion("ok", [
   fixtureDispatchResultSchema.options[1]
 ]);
 export type GeminiDispatchResult = z.infer<typeof geminiDispatchResultSchema>;
+export const databagTargetSchema = z.strictObject({ provider: z.literal("databag"),
+  origin: z.custom<`https://${string}`>(isDatabagOrigin), conversationId: z.string().regex(/^databag_[a-f0-9]{64}$/),
+  url: z.string().min(1).max(512), tabId: z.number().int().safe().positive(),
+  documentId: z.string().regex(/^[!-~]{1,128}$/)
+}).refine(target => target.url === `${target.origin}/#/session`);
 export const chatTargetSchema = z.discriminatedUnion("provider", [
   z.strictObject({ provider: z.literal("fixture"), origin: z.literal("http://127.0.0.1:8787"),
     conversationId: z.literal("fixture-alpha"), tabId: z.number().int().safe().positive(),
@@ -361,12 +366,12 @@ export class PreparedMessageOperations {
     return createHmac("sha256", this.digestKey).update(value).digest("hex");
   }
 
-  private conversationKey(target: Pick<FixtureTarget | GeminiTarget, "origin" | "conversationId">): string {
+  private conversationKey(target: Pick<ApprovedTarget, "origin" | "conversationId">): string {
     return createHmac("sha256", this.conversationDigestKey)
       .update(JSON.stringify([target.origin, target.conversationId])).digest("hex");
   }
 
-  private hasUnresolvedDispatch(target: Pick<FixtureTarget | GeminiTarget, "origin" | "conversationId">): boolean {
+  private hasUnresolvedDispatch(target: Pick<ApprovedTarget, "origin" | "conversationId">): boolean {
     return Boolean(this.database.prepare(`SELECT 1 FROM message_dispatch_attempts AS attempt
       LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
       LEFT JOIN message_dispatch_resolutions AS resolution ON resolution.operation_id = attempt.operation_id
@@ -375,7 +380,7 @@ export class PreparedMessageOperations {
       .get(this.conversationKey(target)));
   }
 
-  private isSendRateLimited(target: Pick<FixtureTarget | GeminiTarget, "origin" | "conversationId">, now: number): boolean {
+  private isSendRateLimited(target: Pick<ApprovedTarget, "origin" | "conversationId">, now: number): boolean {
     const count = this.database.prepare(`SELECT count(*) AS count FROM message_dispatch_attempts
       WHERE conversation_key = ? AND started_at > ?`)
       .get(this.conversationKey(target), now - SEND_RATE_WINDOW_MS)?.count;
@@ -636,6 +641,7 @@ export class PreparedMessageOperations {
   private prepareBound<TargetLabel extends "fixture-alpha" | "gemini">(owner: symbol, connectionId: string,
     expectedGeneration: number, target: ApprovedTarget, label: TargetLabel, text: string,
     idempotencyKey: string, now: number, autonomousExpiresAt?: number): PreparedMessage<TargetLabel> {
+    if (target.provider === "databag") throw new Error("CONNECTION_NOT_FOUND");
     if (expectedGeneration !== 1) throw new Error("GENERATION_MISMATCH");
     if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > MAX_PREPARED_MESSAGE_BYTES || !text.trim()) {
       throw new Error("INVALID_MESSAGE_TEXT");
@@ -2085,6 +2091,7 @@ export class PreparedMessageOperations {
 
   completeChatSubmitJob(target: ApprovedTarget, operationId: string, jobId: string,
     observation: FixtureDispatchResult | GeminiDispatchResult, now = Date.now()) {
+    if (target.provider === "databag") return false;
     if (target.origin === "https://gemini.google.com") {
       const parsed = geminiDispatchResultSchema.safeParse(observation);
       return parsed.success && this.completeGeminiDispatch(target, operationId, jobId, parsed.data, now);

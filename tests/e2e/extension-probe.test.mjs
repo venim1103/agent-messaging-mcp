@@ -6,7 +6,7 @@ import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeF
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -20,10 +20,36 @@ import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 import { createNativeRequestChannel, requestNativeGrantCount } from "../../packages/extension/lib/native-channel.ts";
-import { configuredDatabagOrigins, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
+import { configuredDatabagOrigins, isEligibleDatabagUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
 import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
+let databagBuildSource;
+let databagTestBuild;
+after(async () => { if (databagBuildSource) await rm(databagBuildSource, { recursive: true, force: true }); });
+
+function buildDatabagTestExtension(signal) {
+  databagTestBuild ??= (async () => {
+    const sourceRoot = fileURLToPath(new URL("../../packages/extension/", import.meta.url));
+    const source = await mkdtemp(join(tmpdir(), "agent-messaging-databag-build-"));
+    databagBuildSource = source;
+    await cp(sourceRoot, source, { recursive: true, filter: entry => !relative(sourceRoot, entry).split("/")
+      .some(part => ["node_modules", ".output", ".wxt"].includes(part) || part.startsWith(".env")) });
+    await symlink(fileURLToPath(new URL("../../node_modules", import.meta.url)), join(source, "node_modules"), "dir");
+    const cli = fileURLToPath(new URL("../../node_modules/wxt/bin/wxt.mjs", import.meta.url));
+    await promisify(execFile)(process.execPath, [cli, "build"], { cwd: source, signal,
+      env: { ...process.env, BROWSER_CHAT_DATABAG_ORIGIN: "https://databag.example" } });
+    return join(source, ".output/chrome-mv3");
+  })();
+  return databagTestBuild;
+}
+
 test("Databag configuration admits one exact HTTPS origin without widening host permission", () => {
+  assert.equal(isEligibleDatabagUrl("https://databag.example/#/session"), false);
+  assert.equal(isEligibleDatabagUrl("https://databag.example/#/session", ["https://databag.example"]), true);
+  for (const url of ["https://databag.example/", "https://databag.example/#/session?other",
+    "https://other.example/#/session", "http://databag.example/#/session", "https://user@databag.example/#/session"]) {
+    assert.equal(isEligibleDatabagUrl(url, ["https://databag.example"]), false);
+  }
   assert.deepEqual(configuredDatabagOrigins(undefined), []);
   assert.deepEqual(configuredDatabagOrigins(""), []);
   for (const origin of ["https://databag.example", "https://databag.example:8443"]) {
@@ -1901,16 +1927,19 @@ for (const provider of ["fixture", "gemini"]) {
   });
 }
 
-for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
+for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(provider =>
   ["failure", "lifetime", "reload", "reload-failure"].map(scenario => ({ provider, scenario })))) {
   test(`${provider} popup autonomous admission (${scenario}) is per agent and preserves other owners`, { timeout: 20000 }, async (testContext) => {
     const setPhase = trackTestPhase(testContext, `${provider} admission ${scenario}`);
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-autonomous-test-"));
     const unpacked = join(profile, "unpacked-extension");
-    await cp(extensionDirectory, unpacked, { recursive: true });
+    await cp(provider === "databag" ? await buildDatabagTestExtension(testContext.signal) : extensionDirectory, unpacked, { recursive: true });
     const manifestPath = join(unpacked, "manifest.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    manifest.host_permissions = ["http://127.0.0.1:8787/*", "https://gemini.google.com/*"];
+    if (provider === "databag") assert.deepEqual(manifest.optional_host_permissions,
+      ["http://127.0.0.1:8787/*", "https://gemini.google.com/*", "https://databag.example/*"]);
+    manifest.host_permissions = provider === "databag" ? ["https://databag.example/*"]
+      : ["http://127.0.0.1:8787/*", "https://gemini.google.com/*"];
     await writeFile(manifestPath, JSON.stringify(manifest));
     const directory = join(profile, ".config/agent-messaging-mcp/broker");
     const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
@@ -1983,12 +2012,15 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
           { connections: [], timedOut: true });
       }
       const page = await context.newPage();
-      const url = provider === "fixture" ? "http://127.0.0.1:8787/" : "https://gemini.google.com/app/synthetic-autonomous";
+      const url = provider === "fixture" ? "http://127.0.0.1:8787/"
+        : provider === "databag" ? "https://databag.example/#/session" : "https://gemini.google.com/app/synthetic-autonomous";
       const html = provider === "fixture" ? await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8")
+        : provider === "databag" ? await readFile(fileURLToPath(new URL("../fixtures/databag.html", import.meta.url)), "utf8")
         : `<!doctype html><main><infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic user row</p></user-query-content></user-query>
           <model-response><model-response-content>Synthetic reply</model-response-content></model-response></infinite-scroller>
           <div contenteditable="true" aria-label="Enter a prompt for Gemini"></div><button type="submit" aria-label="Send message">Send</button></main>`;
-      await page.route(url, route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
+      await page.route(provider === "databag" ? "https://databag.example/**" : url,
+        route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
       await page.goto(url);
       const selected = await worker.evaluate(async () => {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -2057,6 +2089,24 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
       setPhase("approved owner reads");
       const firstRead = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: first.connectionId } });
       assert.equal(firstRead.isError, undefined);
+      if (provider === "databag") {
+        assert.match(JSON.stringify(firstRead.structuredContent), /Synthetic incoming message/);
+        assert.doesNotMatch(JSON.stringify(firstRead.structuredContent), /synthetic-account|synthetic-channel/);
+        assert.equal(await page.locator("textarea").inputValue(), "");
+        assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+        const supervisedReview = popup.locator("#view-fixture-fill-reviews");
+        assert.equal(await supervisedReview.count(), 1);
+        assert.equal(await supervisedReview.isVisible(), false);
+        if (scenario === "failure") {
+          await page.locator("[data-chat-direction=incoming] [data-chat-text]").evaluate(row => { row.textContent = "Synthetic incoming revision"; });
+          const events = await clients[0].callTool({ name: "chat_wait_for_events", arguments: {
+            connectionId: first.connectionId, cursor: firstRead.structuredContent.cursor, timeoutMs: 2000
+          } });
+          assert.equal(events.isError, undefined);
+          assert.equal(events.structuredContent.events.length, 1);
+          assert.match(JSON.stringify(events.structuredContent.events), /Synthetic incoming revision/);
+        }
+      }
       await row("Autonomous two").getByRole("button", { name: "Connect this chat" }).click();
       await waitCount(2);
       const otherPickup = await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
@@ -2070,17 +2120,19 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
         const originalDocument = await worker.evaluate(async key => (await chrome.storage.session.get(key))[key].documentId, key);
         let oldRead;
         if (scenario !== "reload-failure") {
-          await worker.evaluate(documentId => {
+          await worker.evaluate(({ documentId, provider }) => {
             const execute = chrome.scripting.executeScript.bind(chrome.scripting);
             chrome.scripting.executeScript = async options => {
               const result = await execute(options);
-              if (options.target.documentIds?.[0] === documentId && options.func.toString().includes("omittedBefore")) {
+              if (options.target.documentIds?.[0] === documentId && (provider === "databag"
+                ? options.func.toString().includes("agentDatabagAdapter") && options.func.toString().includes(".capture")
+                : options.func.toString().includes("omittedBefore"))) {
                 chrome.scripting.executeScript = execute;
                 return new Promise(resolve => { globalThis.releaseOldCapture = () => resolve(result); });
               }
               return result;
             };
-          }, originalDocument);
+          }, { documentId: originalDocument, provider });
           oldRead = clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: first.connectionId } });
           let captureHeld = false;
           for (let attempt = 0; attempt < 80; attempt++) {
@@ -2092,21 +2144,23 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
           assert.equal(captureHeld, true, "Old-document capture was not held before reload");
         }
         let delayedReloadRoute;
-        if (provider === "gemini") {
+        if (provider !== "fixture") {
           delayedReloadRoute = route => route.fulfill({ contentType: "text/html; charset=utf-8", body: "<!doctype html><div>Loading synthetic chat</div>" });
-          await page.route(url, delayedReloadRoute);
-          await worker.evaluate(({ tabId, originalDocument }) => {
+          await page.route(provider === "databag" ? "https://databag.example/**" : url, delayedReloadRoute);
+          await worker.evaluate(({ tabId, originalDocument, provider }) => {
             globalThis.syntheticReloadMissingIdentity = false;
             const execute = chrome.scripting.executeScript.bind(chrome.scripting);
             chrome.scripting.executeScript = async options => {
               const result = await execute(options);
-              if (options.target.tabId === tabId && !options.target.documentIds
+              if (options.target.tabId === tabId && (provider === "databag"
+                ? options.func.toString().includes("agentDatabagAdapter") && options.func.toString().includes(".identify")
+                : !options.target.documentIds)
                 && result[0]?.documentId !== originalDocument && result[0]?.result === null) {
                 globalThis.syntheticReloadMissingIdentity = true;
               }
               return result;
             };
-          }, { tabId: selected.tabId, originalDocument });
+          }, { tabId: selected.tabId, originalDocument, provider });
         }
         await page.reload();
         if (delayedReloadRoute) {
@@ -2121,7 +2175,7 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
           assert.equal((await clients[1].callTool({ name: "chat_read_messages",
             arguments: { connectionId: second.connectionId } })).isError, true, "Reloading chat must not serve reads before identity is available");
           await page.evaluate(markup => { document.body.innerHTML = markup; }, html);
-          await page.unroute(url, delayedReloadRoute);
+          await page.unroute(provider === "databag" ? "https://databag.example/**" : url, delayedReloadRoute);
         }
         let reloaded = false;
         for (let attempt = 0; attempt < 80; attempt++) {
@@ -2216,6 +2270,22 @@ for (const { provider, scenario } of ["fixture", "gemini"].flatMap(provider =>
         assert.equal(laterPermissions.length, 4);
         assert.ok(laterPermissions.every(request => request.gesture === true
           && JSON.stringify(request.origins) === JSON.stringify([`${new URL(url).origin}/*`])));
+      }
+      if (provider === "databag" && (scenario === "failure" || scenario === "lifetime")) {
+        setPhase("same-URL identity revocation");
+        await page.locator(scenario === "failure" ? "#switch-channel" : "#switch-account").click();
+        assert.equal(page.url(), url);
+        let revoked = false;
+        for (let attempt = 0; attempt < 80; attempt++) {
+          testContext.signal.throwIfAborted();
+          const pickup = await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+          revoked = pickup.structuredContent.connections.length === 0;
+          if (revoked) break;
+          await setTimeout(25);
+        }
+        assert.equal(revoked, true, "Same-URL account/channel change must end the selected chat connection");
+        assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).isError, true);
+        assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
       }
       setPhase("tab-close revocation");
       await page.close();

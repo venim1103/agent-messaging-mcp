@@ -7,6 +7,67 @@ import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS }
   from "./pending-connections.js";
 
+test("Databag neutral approval is relay-only and refuses broadened targets", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("Databag owner");
+  const agent = requests.registerAgent(owner);
+  const envelope = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+    connectionGeneration: 0, deadlineMs: 6000 };
+  const target = { provider: "databag", origin: "https://databag.example", url: "https://databag.example/#/session",
+    conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
+  const message = { ...envelope, kind: "approve_chat_agent", payload: { target, agentId: agent.agentId } };
+  assert.deepEqual(handleBrokerRequest(message, "facade", owner, requests, 1000).payload, { code: "PERMISSION_DENIED" });
+  for (const changes of [{ url: `${target.url}?other` }, { origin: "https://*.example" },
+    { origin: "http://databag.example" }, { conversationId: "fixture-alpha" }, { selector: "textarea" }]) {
+    assert.throws(() => handleBrokerRequest({ ...message, payload: { ...message.payload, target: { ...target, ...changes } } },
+      "relay", Symbol("relay"), requests, 1000));
+  }
+  assert.equal(handleBrokerRequest(message, "relay", Symbol("relay"), requests, 1000).kind, "chat_agent_approved");
+  const roster = handleBrokerRequest({ ...envelope, kind: "list_chat_agents", payload: { target } }, "relay", Symbol("relay"), requests, 1000);
+  assert.equal(roster.kind, "chat_agents");
+  assert.deepEqual(roster.payload, { agents: [{ ...agent, connectionCount: 1, autonomous: true }] });
+  requests.disconnect(owner);
+});
+
+test("Databag neutral observations preserve read ownership, challenges and legacy refusal", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("Databag reader");
+  const target = { provider: "databag", origin: "https://databag.example", url: "https://databag.example/#/session",
+    conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" } as const;
+  const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target, 1000)!;
+  const envelope = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+    connectionGeneration: 0, deadlineMs: 6000 };
+  const reading = { ...envelope, kind: "read_approved_snapshot", payload: { connectionId: grant.connectionId } };
+  assert.equal(handleBrokerRequest(reading, "facade", owner, requests, 1000).kind, "fixture_read_authorized");
+  assert.deepEqual(handleBrokerRequest(reading, "facade", Symbol("other owner"), requests, 1000).payload, { code: "CONNECTION_NOT_FOUND" });
+  assert.deepEqual(handleBrokerRequest({ ...reading, kind: "read_fixture_snapshot" }, "facade", owner, requests, 1000).payload,
+    { code: "CONNECTION_NOT_FOUND" });
+  const read = requests.requestFreshStableRead(owner, grant.connectionId, 1000, 1050);
+  assert.ok(read && read !== "busy");
+  const list = { ...envelope, kind: "list_chat_read_challenges", payload: { provider: "databag" } };
+  const publish = { ...envelope, kind: "publish_chat_snapshot", payload: { target,
+    messages: [{ id: "synthetic-row", direction: "incoming", text: "Synthetic reply" }], challengeId: read.challengeId } };
+  const gap = { ...envelope, kind: "mark_chat_observation_gap", payload: { target } };
+  for (const message of [list, publish, gap]) {
+    assert.deepEqual(handleBrokerRequest(message, "facade", owner, requests, 1001).payload, { code: "PERMISSION_DENIED" });
+    assert.throws(() => handleBrokerRequest({ ...message, payload: { ...message.payload, approved: true } },
+      "relay", Symbol("relay"), requests, 1001));
+  }
+  assert.deepEqual(handleBrokerRequest(list, "relay", Symbol("relay"), requests, 1001).payload, {
+    challenges: [{ challengeId: read.challengeId, target, expiresAt: 1050 }], activeTabIds: [3] });
+  assert.deepEqual(handleBrokerRequest({ ...list, payload: { provider: "fixture" } }, "relay", Symbol("relay"), requests, 1001).payload,
+    { challenges: [], activeTabIds: [] });
+  assert.deepEqual(handleBrokerRequest(publish, "relay", Symbol("relay"), requests, 1001).payload, { count: 1 });
+  const snapshot = await read.result;
+  assert.ok(snapshot && snapshot !== "not_ready");
+  assert.deepEqual(snapshot.messages, publish.payload.messages);
+  const events = { ...envelope, kind: "read_approved_events", payload: { connectionId: grant.connectionId, cursor: snapshot.cursor } };
+  assert.equal(handleBrokerRequest(events, "facade", owner, requests, 1001).kind, "fixture_events");
+  assert.deepEqual(handleBrokerRequest(gap, "relay", Symbol("relay"), requests, 1002).payload, { count: 1 });
+  assert.equal(requests.getStableSnapshot(owner, grant.connectionId, 1002), "not_ready");
+  requests.disconnect(owner);
+});
+
 test("neutral autonomous preparation is facade-owned and returns its receipt before commit authority", () => {
   for (const provider of ["fixture", "gemini"] as const) {
     const requests = new PendingConnectionRequests();

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
 import { autonomousFailureStageSchema, fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
-  geminiFillStatusSchema, chatJobSchema, type ChatJob, type ChatTarget, type ChatJobObservation,
+  geminiFillStatusSchema, chatJobSchema, databagTargetSchema, type ChatJob, type ChatTarget, type ChatJobObservation,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureDispatchCheckResult,
@@ -15,7 +15,7 @@ import { autonomousFailureStageSchema, fixtureDispatchStatusSchema, resolvedDisp
 import type { ApprovedTarget, FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_EVENTS_PER_READ,
+import { isDatabagOrigin, MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_EVENTS_PER_READ,
   MAX_GEMINI_SNAPSHOT_MESSAGES,
   MAX_AUTONOMOUS_CONNECTIONS, MAX_CONNECTION_WAIT_MS, MAX_CONNECTED_AGENTS,
   MAX_PENDING_FIXTURE_READS, MAX_PENDING_GEMINI_READS, MAX_PENDING_REQUESTS }
@@ -57,10 +57,12 @@ const geminiReview = z.strictObject({
 });
 
 const autonomousConnection = z.strictObject({ requestId: z.uuid(), state: z.literal("ready"), connectionId: z.uuid(),
-  generation: z.literal(1), origin: z.enum(["http://127.0.0.1:8787", "https://gemini.google.com"]),
+  generation: z.literal(1), origin: z.union([z.enum(["http://127.0.0.1:8787", "https://gemini.google.com"]),
+    z.custom<`https://${string}`>(isDatabagOrigin)]),
   conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), expiresAt: z.null(),
   capabilities: z.tuple([z.literal("read"), z.literal("send")])
-}).refine(connection => connection.origin !== "http://127.0.0.1:8787" || connection.conversationId === "fixture-alpha");
+}).refine(connection => connection.origin === "http://127.0.0.1:8787" ? connection.conversationId === "fixture-alpha"
+  : connection.origin === "https://gemini.google.com" || /^databag_[a-f0-9]{64}$/.test(connection.conversationId));
 
 const replySchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("chat_reload_started"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -154,6 +156,24 @@ const replySchema = z.discriminatedUnion("kind", [
     kind: z.literal("gemini_snapshot_published"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
+  }),
+  z.strictObject({
+    kind: z.literal("chat_snapshot_published"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
+  }),
+  z.strictObject({
+    kind: z.literal("chat_gap_marked"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ count: z.number().int().safe().nonnegative() })
+  }),
+  z.strictObject({
+    kind: z.literal("chat_read_challenges"), protocolVersion: z.literal(PROTOCOL_VERSION),
+    requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
+    payload: z.strictObject({ challenges: z.array(z.strictObject({
+      challengeId: z.uuid(), target: z.union([fixtureTarget, geminiTarget, databagTargetSchema]), expiresAt: z.number().int().safe()
+    })).max(Math.max(MAX_PENDING_FIXTURE_READS, MAX_PENDING_GEMINI_READS)),
+    activeTabIds: z.array(z.number().int().safe().positive()).max(MAX_AUTONOMOUS_CONNECTIONS + MAX_PENDING_REQUESTS) })
   }),
   z.strictObject({
     kind: z.literal("fixture_read_challenges"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -589,6 +609,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "request_connection" | "get_connection" | "read_fixture_snapshot" | "read_fixture_events"
       | "read_approved_events"
       | "read_gemini_snapshot" | "read_approved_snapshot"
+      | "list_chat_read_challenges" | "publish_chat_snapshot" | "mark_chat_observation_gap"
       | "disconnect_fixture" | "prepare_fixture_message" | "get_prepared_operation"
       | "prepare_gemini_message" | "prepare_chat_message"
       | "check_fixture_preflight" | "complete_fixture_preflight"
@@ -611,6 +632,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       | "revoke_fixture" | "revoke_all_fixture" | "mark_fixture_observation_gap"
       | "mark_gemini_observation_gap", payload: object, originalDeadlineMs?: number) => {
       if (kind === "list_chat_agents" || kind === "remove_chat_agent" || kind === "disconnect_chat" || kind === "approve_chat_agent"
+        || kind === "list_chat_read_challenges" || kind === "publish_chat_snapshot" || kind === "mark_chat_observation_gap"
         || kind === "list_unconfirmed_dispatches" || kind === "resolve_unconfirmed_dispatch"
         || kind === "list_available_agents" || kind === "begin_chat_reload" || kind === "rebind_chat"
         || kind === "list_pending" || kind === "list_fixture_read_challenges"
@@ -652,7 +674,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         const budgetMs = kind === "wait_for_connection" ? MAX_CONNECTION_WAIT_MS + 250 : 5000;
         const deadlineMs = originalDeadlineMs === undefined ? brokerRequestDeadline(startedAt, upstreamDeadlineMs, budgetMs)
           : Math.min(originalDeadlineMs, upstreamDeadlineMs ?? originalDeadlineMs);
-        if (deadlineMs <= startedAt) throw new Error("Invalid autonomous request deadline");
+        if (deadlineMs - startedAt <= (kind === "read_approved_snapshot" ? 25 : 0)) {
+          throw new Error("Invalid autonomous request deadline");
+        }
         const frame = encodeNativeFrame({ kind, protocolVersion: PROTOCOL_VERSION, requestId,
           connectionGeneration: 0, deadlineMs, payload });
         const responseStartedAt = Date.now();
@@ -754,6 +778,11 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       completeFixtureFill: (target: FixtureTarget, attemptId: string, observation: FixtureFillResult) =>
         request("complete_fixture_fill", { target, attemptId, observation }),
       listPending: () => request("list_pending", {}),
+      listChatReadChallenges: (provider: "fixture" | "gemini" | "databag") => request("list_chat_read_challenges", { provider }),
+      publishChatSnapshot: (target: ApprovedTarget, messages: ReadonlyArray<FixtureMessage | GeminiRenderedMessage>,
+        challengeId?: string, omittedBefore = false) => request("publish_chat_snapshot", { target, messages, omittedBefore,
+        ...(challengeId === undefined ? {} : { challengeId }) }),
+      markChatObservationGap: (target: ApprovedTarget) => request("mark_chat_observation_gap", { target }),
       listFixtureReadChallenges: () => request("list_fixture_read_challenges", {}),
       listFixturePreparedReviews: (target: FixtureTarget) => request("list_fixture_prepared_reviews", { target }),
       approveFixtureReview: (target: FixtureTarget, operationId: string, reviewId: string) =>

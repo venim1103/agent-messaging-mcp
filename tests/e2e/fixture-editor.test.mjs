@@ -10,7 +10,7 @@ import { PreparedMessageOperations } from "../../packages/companion/dist/message
 import { PendingConnectionRequests } from "../../packages/companion/dist/pending-connections.js";
 import { createFixtureServer } from "../fixtures/server.mjs";
 import { installDraftOwnershipTracker } from "../../packages/extension/lib/draft-ownership.ts";
-import { installDatabagAdapter, identifyDatabagConversation, captureDatabagSnapshot }
+import { installDatabagAdapter, identifyDatabagConversation, captureDatabagSnapshot, observeDatabagMessages }
   from "../../packages/extension/lib/databag-observation.ts";
 
 test("Databag DOM identity binds account and channel without reading internal state", { timeout: 15000 }, async () => {
@@ -29,7 +29,21 @@ test("Databag DOM identity binds account and channel without reading internal st
       { id: "synthetic-1", direction: "incoming", text: "Synthetic incoming message" },
       { id: "synthetic-2", direction: "outgoing", text: "Synthetic outgoing message" }
     ] });
+    await page.evaluate(() => {
+      window.syntheticNotifications = [];
+      window.chrome = { runtime: { sendMessage: message => {
+        window.syntheticNotifications.push(message);
+        return Promise.resolve();
+      } } };
+    });
+    assert.equal(await page.evaluate(observeDatabagMessages, baseline.conversationId), true);
+    await page.locator("[data-chat-text]").first().evaluate(region => { region.textContent = "Synthetic revision"; });
+    await page.waitForFunction(() => window.syntheticNotifications.some(message => message.kind === "chat_changed"));
+    assert.equal((await page.evaluate(captureDatabagSnapshot, baseline.conversationId)).messages[0].text, "Synthetic revision");
     await page.getByRole("button", { name: "Switch channel" }).click();
+    await page.waitForFunction(() => window.syntheticNotifications.some(message => message.kind === "chat_identity_changed"));
+    assert.equal(await page.evaluate(() => window.syntheticNotifications.every(message =>
+      Object.keys(message).length === 3 && message.provider === "databag" && /^databag_[a-f0-9]{64}$/.test(message.conversationId))), true);
     const changed = await page.evaluate(identifyDatabagConversation);
     assert.notEqual(changed.conversationId, baseline.conversationId);
     assert.equal(changed.url, baseline.url);
@@ -71,6 +85,12 @@ test("Databag capture refuses unreadable rows and preserves original privacy and
       await page.locator("[data-chat-text]").first().evaluate((region, style) => {
         region.insertAdjacentHTML("beforeend", `<span style="${style}">Synthetic hidden text</span>`);
       }, style);
+      assert.equal(await page.evaluate(captureDatabagSnapshot, identity), null);
+    }
+    for (const markup of ["<strong>Synthetic unsupported text</strong>",
+      "<svg><text>Synthetic unsupported text</text></svg>", "<math><mi>Synthetic unsupported text</mi></math>"]) {
+      identity = await reset();
+      await page.locator("[data-chat-text]").first().evaluate((region, markup) => region.insertAdjacentHTML("beforeend", markup), markup);
       assert.equal(await page.evaluate(captureDatabagSnapshot, identity), null);
     }
     identity = await reset();

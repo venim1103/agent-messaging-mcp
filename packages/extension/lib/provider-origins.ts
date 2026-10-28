@@ -20,3 +20,9 @@ export function configuredDatabagOrigins(value: string | undefined): readonly st
 declare const __DATABAG_ORIGINS__: readonly string[];
 export const databagOrigins: readonly string[] = Object.freeze(
   typeof __DATABAG_ORIGINS__ === "undefined" ? [] : [...__DATABAG_ORIGINS__]);
+
+export function isEligibleDatabagUrl(value: unknown, origins = databagOrigins): value is string {
+  if (typeof value !== "string" || value.length > 512 || origins.length !== 1) return false;
+  const origin = parseDatabagOrigin(origins[0]);
+  return origin !== null && value === `${origin}/#/session`;
+}

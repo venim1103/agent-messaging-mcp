@@ -201,7 +201,7 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                 return;
               }
               const pending = reply.kind === "fixture_read_authorized"
-                ? requests.requestFreshFixtureRead(owner, reply.payload.connectionId, readNow, readDeadline)
+                ? requests.requestFreshStableRead(owner, reply.payload.connectionId, readNow, readDeadline)
                 : requests.requestFreshGeminiRead(owner, reply.payload.connectionId, readNow, readDeadline);
               if (!pending || pending === "busy") {
                 await writeBrokerResponse(socket, { ...reply, kind: "error",

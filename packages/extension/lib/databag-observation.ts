@@ -5,6 +5,8 @@ type DatabagAdapter = {
   origins: string;
   identify: () => Promise<DatabagIdentity | null>;
   capture: (conversationId: string) => Promise<DatabagCapture | null>;
+  observe: (conversationId: string) => Promise<boolean>;
+  stop: () => void;
 };
 type DatabagScope = { agentDatabagAdapter?: DatabagAdapter };
 
@@ -79,8 +81,9 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
       let nodes = 0;
       while (walker.nextNode()) {
         if (++nodes > 4096) return null;
-        if (walker.currentNode instanceof HTMLElement
-          && (!visible(walker.currentNode) || !["span", "a", "br"].includes(walker.currentNode.localName))) return null;
+        if (walker.currentNode instanceof Element
+          && (!(walker.currentNode instanceof HTMLElement) || !visible(walker.currentNode)
+            || !["span", "a", "br"].includes(walker.currentNode.localName))) return null;
         let depth = 0;
         for (let ancestor = walker.currentNode.parentNode; ancestor && ancestor !== region; ancestor = ancestor.parentNode) {
           if (++depth > 64) return null;
@@ -111,7 +114,60 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     return after?.root === current.root && after.timeline === current.timeline && after.identity === current.identity
       ? { messages, omittedBefore } : null;
   };
-  scope.agentDatabagAdapter = { origins: signature, identify, capture };
+  let stopObservation = () => {};
+  const observe = async (conversationId: string): Promise<boolean> => {
+    const starting = context();
+    const identity = await identify();
+    let watched = context();
+    const runtime = (globalThis as typeof globalThis & { chrome?: { runtime?: {
+      sendMessage: (message: { kind: string; provider: string; conversationId: string }) => Promise<unknown>
+    } } }).chrome?.runtime;
+    if (!starting || !identity || identity.conversationId !== conversationId || !watched || !runtime
+      || starting.root !== watched.root || starting.timeline !== watched.timeline || starting.identity !== watched.identity) return false;
+    stopObservation();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stopped = false;
+    const notify = (kind: "chat_changed" | "chat_identity_changed") => {
+      void runtime.sendMessage({ kind, provider: "databag", conversationId }).catch(() => {});
+    };
+    const changed = () => {
+      if (stopped || timer !== undefined) return;
+      timer = setTimeout(() => { timer = undefined; if (!stopped) notify("chat_changed"); }, 200);
+    };
+    const rows = new MutationObserver(changed);
+    const guard = () => {
+      if (stopped) return;
+      const current = context();
+      if (location.href !== identity.url || (current && current.identity !== watched!.identity)) {
+        notify("chat_identity_changed");
+        stop();
+      } else if (current && (current.root !== watched!.root || current.timeline !== watched!.timeline)) {
+        watched = current;
+        rows.disconnect();
+        rows.observe(current.timeline, { subtree: true, childList: true, characterData: true, attributes: true });
+        changed();
+      } else if (!current) changed();
+    };
+    const identityObserver = new MutationObserver(guard);
+    const stop = () => {
+      stopped = true;
+      clearTimeout(timer);
+      rows.disconnect();
+      identityObserver.disconnect();
+      window.removeEventListener("hashchange", guard);
+      window.removeEventListener("pagehide", stop);
+    };
+    stopObservation = stop;
+    rows.observe(watched.timeline, { subtree: true, childList: true, characterData: true, attributes: true });
+    identityObserver.observe(document.documentElement, { subtree: true, childList: true, attributes: true,
+      attributeFilter: ["data-chat-contract", "data-chat-ready", "data-chat-account", "data-chat-peer", "data-chat-channel",
+        "data-chat-timeline", "hidden", "inert", "aria-hidden", "class", "style"] });
+    window.addEventListener("hashchange", guard);
+    window.addEventListener("pagehide", stop, { once: true });
+    changed();
+    return true;
+  };
+  scope.agentDatabagAdapter = { origins: signature, identify, capture, observe, stop: () => stopObservation() };
   return true;
 }
 
@@ -121,4 +177,12 @@ export function identifyDatabagConversation(): Promise<DatabagIdentity | null> {
 
 export function captureDatabagSnapshot(conversationId: string): Promise<DatabagCapture | null> {
   return (globalThis as typeof globalThis & DatabagScope).agentDatabagAdapter?.capture(conversationId) ?? Promise.resolve(null);
+}
+
+export function observeDatabagMessages(conversationId: string): Promise<boolean> {
+  return (globalThis as typeof globalThis & DatabagScope).agentDatabagAdapter?.observe(conversationId) ?? Promise.resolve(false);
+}
+
+export function stopDatabagObservation(): void {
+  (globalThis as typeof globalThis & DatabagScope).agentDatabagAdapter?.stop();
 }

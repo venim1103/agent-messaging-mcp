@@ -3,10 +3,10 @@ import { join } from "node:path";
 import { connectBroker } from "./broker-client.js";
 import { MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
 import { NativeFrameDecoder, writeNativeFrame } from "./native-framing.js";
-import type { ChatAgent } from "./pending-connections.js";
+import type { ApprovedTarget, ChatAgent } from "./pending-connections.js";
 import type { ChatJob } from "./message-operations.js";
 import { handleNativeHandshake, isNativeCaller, nativeBrokerFailureReason, parseNativeFixtureApproval, parseNativeFixtureGap,
-  parseNativeChatAgentRequest, parseNativeChatJobRequest,
+  parseNativeChatAgentRequest, parseNativeChatJobRequest, parseNativeChatObservationRequest,
   parseNativeGeminiGap,
   parseNativeFixtureReadChallenges, parseNativeGeminiApproval, parseNativeGeminiReadChallenges,
   parseNativeFixturePreparedReviews, parseNativeFixtureReviewApproval,
@@ -82,6 +82,10 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
           continue;
         }
         const request = typeof message === "object" && message !== null && "kind" in message
+          && (message.kind === "list_chat_read_challenges" || message.kind === "publish_chat_snapshot"
+            || message.kind === "mark_chat_observation_gap")
+          ? parseNativeChatObservationRequest(message)
+          : typeof message === "object" && message !== null && "kind" in message
           && (message.kind === "list_chat_jobs" || message.kind === "complete_chat_job")
           ? parseNativeChatJobRequest(message)
           : typeof message === "object" && message !== null && "kind" in message
@@ -158,6 +162,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               queueNativeReply(async () => {
           let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
           let kind: "chat_agents" | "chat_agent_removed" | "chat_agent_approved" | "pending_list" | "fixture_read_challenges" | "fixture_prepared_reviews" | "gemini_read_challenges"
+            | "chat_read_challenges" | "chat_snapshot_published" | "chat_gap_marked"
             | "chat_reload_started" | "chat_rebound"
             | "fixture_approved" | "fixture_review_approved" | "gemini_approved" | "fixture_revoked"
             | "fixture_fill_reviews" | "fixture_fill_review_approved"
@@ -173,6 +178,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | "fixture_snapshot_published" | "gemini_snapshot_published"
             | "fixture_gap_marked" | "gemini_gap_marked" | "unconfirmed_dispatches" | "dispatch_resolved" | "error";
           let payload: { requests: ReadonlyArray<{ requestId: string; expiresAt: number }> }
+            | { challenges: ReadonlyArray<{ challengeId: string; target: ApprovedTarget; expiresAt: number }>; activeTabIds: ReadonlyArray<number> }
             | { jobs: ReadonlyArray<ChatJob> }
             | { attempts: ReadonlyArray<{ operationId: string; startedAt: number }>; hasMore: boolean }
             | { operationId: string; state: "resolved"; startedAt: number;
@@ -206,7 +212,23 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
             | { requestId: string; expiresAt: number } | { count: number } | { code: string };
           try {
             client = await connectBroker("relay", join(homedir(), ".config/agent-messaging-mcp/broker"), request.deadlineMs);
-            if (request.kind === "list_chat_jobs") {
+            if (request.kind === "list_chat_read_challenges") {
+              const result = await client.listChatReadChallenges(request.payload.provider);
+              if (result.kind !== "chat_read_challenges" && result.kind !== "error") throw new Error("Broker refused chat read challenges");
+              kind = result.kind;
+              payload = result.payload;
+            } else if (request.kind === "publish_chat_snapshot") {
+              const result = await client.publishChatSnapshot(request.payload.target, request.payload.messages,
+                request.payload.challengeId, request.payload.omittedBefore);
+              if (result.kind !== "chat_snapshot_published" && result.kind !== "error") throw new Error("Broker refused chat snapshot");
+              kind = result.kind;
+              payload = result.payload;
+            } else if (request.kind === "mark_chat_observation_gap") {
+              const result = await client.markChatObservationGap(request.payload.target);
+              if (result.kind !== "chat_gap_marked" && result.kind !== "error") throw new Error("Broker refused chat observation gap");
+              kind = result.kind;
+              payload = result.payload;
+            } else if (request.kind === "list_chat_jobs") {
               const result = await client.listChatJobs(request.payload.phase, request.payload.provider);
               if (result.kind !== "chat_jobs" && result.kind !== "error") throw new Error("Broker refused chat job list");
               kind = result.kind;
