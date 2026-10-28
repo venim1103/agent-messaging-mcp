@@ -214,6 +214,8 @@ async function inspectDatabagTab(target: InspectionTarget): Promise<InspectionRe
   const counts = shape.counts;
   return { title: "Chat structure (diagnostic)", details: [
     ["Bounds", `${shape.visitedElements} visited elements; ${shape.limited ? "limit reached" : "within limits"}`],
+    ["Native elements", `${shape.nativeElements.textareas} visible textareas; ${shape.nativeElements.contenteditables} visible contenteditables; `
+      + `${shape.nativeElements.buttons} visible buttons; ${shape.nativeElements.fileInputs} visited file inputs; ${shape.nativeElements.iframes} visible iframes`],
     ["Regions", `${counts.conversationRegions} conversation candidates; ${counts.timelines} timeline candidates`],
     ["Selection and account", `${counts.focusedRows} focused row candidates; ${counts.accountRegions} account regions; ${counts.accountHandles} handle regions`],
     ["Rendered structure", `${counts.messageRows} row candidates; ${counts.messageTexts} text-region candidates`],

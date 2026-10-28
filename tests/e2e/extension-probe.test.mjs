@@ -147,6 +147,10 @@ test("shared popup inspection is contract-free, document-bound and never approve
     const diagnostic = await popup.locator("#messages").textContent();
     assert.ok(diagnostic.includes("No experimental contract marker"));
     assert.ok(diagnostic.includes("1 composer candidates"));
+    assert.ok(diagnostic.includes("Native elements"));
+    assert.ok(diagnostic.includes("1 visible textareas"));
+    assert.ok(diagnostic.includes("0 visible contenteditables"));
+    assert.ok(diagnostic.includes("0 visible iframes"));
     assert.doesNotMatch(diagnostic, /Synthetic incoming message|synthetic-account|synthetic-channel|https:\/\//);
     assert.equal(await page.content(), beforeMarkup);
     assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), beforeStorage);

@@ -18,6 +18,7 @@ export type DatabagStructure = {
   counts: { conversationRegions: number; timelines: number; focusedRows: number; accountRegions: number;
     accountHandles: number; composers: number; messageRows: number; messageTexts: number; fileInputs: number;
     stagedAssetChildren: number; editorCandidates: number; sendButtons: number };
+  nativeElements: { textareas: number; contenteditables: number; buttons: number; fileInputs: number; iframes: number };
   editors: { disabled: boolean; readOnly: boolean }[];
   sends: { disabled: boolean; ariaDisabled: boolean }[];
 };
@@ -47,7 +48,8 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
   const result: DatabagStructure = { visitedElements: 0, limited: false, markerContractPresent: false,
     counts: { conversationRegions: 0, timelines: 0, focusedRows: 0, accountRegions: 0, accountHandles: 0,
       composers: 0, messageRows: 0, messageTexts: 0, fileInputs: 0, stagedAssetChildren: 0,
-      editorCandidates: 0, sendButtons: 0 }, editors: [], sends: [] };
+      editorCandidates: 0, sendButtons: 0 },
+    nativeElements: { textareas: 0, contenteditables: 0, buttons: 0, fileInputs: 0, iframes: 0 }, editors: [], sends: [] };
   const ancestry: { conversation: boolean; composer: boolean; send: boolean; account: boolean }[] = [];
   let element: Element | null = body;
   let depth = 0;
@@ -68,8 +70,15 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
     const style = getComputedStyle(element);
     const hidden = element.hasAttribute("hidden") || element.hasAttribute("inert") || element.getAttribute("aria-hidden") === "true"
       || style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0;
+    if (element instanceof HTMLInputElement && element.type === "file") result.nativeElements.fileInputs++;
     if (parent?.composer && element instanceof HTMLInputElement && element.type === "file") result.counts.fileInputs++;
     if (!hidden && element.getClientRects().length) {
+      if (element instanceof HTMLTextAreaElement) result.nativeElements.textareas++;
+      if (element instanceof HTMLElement && element.hasAttribute("contenteditable") && element.isContentEditable) {
+        result.nativeElements.contenteditables++;
+      }
+      if (element instanceof HTMLButtonElement) result.nativeElements.buttons++;
+      if (element instanceof HTMLIFrameElement) result.nativeElements.iframes++;
       if (names.has("conversation")) result.counts.conversationRegions++;
       if (names.has("focused")) result.counts.focusedRows++;
       if (names.has("identity")) result.counts.accountRegions++;

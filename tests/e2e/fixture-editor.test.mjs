@@ -30,6 +30,9 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
         <div class="_send_native_1"><button disabled>Send</button></div>
       </div></div>
       <div style="opacity: 0"><div class="_focused_native_1">Hidden selection</div></div>
+      <div contenteditable="true">Synthetic editable</div>
+      <iframe srcdoc="<textarea>Synthetic framed draft</textarea>"></iframe>
+      <button hidden>Hidden action</button>
     </body></html>`;
     await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html", body: html }));
     await page.goto(input.expectedUrl);
@@ -47,7 +50,8 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
         adapterInstalled: Object.hasOwn(globalThis, "agentDatabagAdapter"), storedKeys: Object.keys(sessionStorage).length });
       for (const [prototype, property] of [[Node.prototype, "textContent"], [HTMLElement.prototype, "innerText"],
         [Element.prototype, "innerHTML"], [Element.prototype, "outerHTML"], [HTMLTextAreaElement.prototype, "value"],
-        [HTMLInputElement.prototype, "value"], [HTMLInputElement.prototype, "files"], [HTMLImageElement.prototype, "src"]]) {
+        [HTMLInputElement.prototype, "value"], [HTMLInputElement.prototype, "files"], [HTMLImageElement.prototype, "src"],
+        [HTMLIFrameElement.prototype, "contentDocument"], [HTMLIFrameElement.prototype, "contentWindow"]]) {
         Object.defineProperty(prototype, property, { configurable: true, get() { throw new Error("Synthetic private getter accessed"); } });
       }
     });
@@ -63,6 +67,17 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
     assert.deepEqual(await page.evaluate(() => window.syntheticInspectionState()), { interactions: 0, mutations: 0,
       draftUnchanged: true, htmlUnchanged: true, adapterInstalled: false, storedKeys: 0 });
     assert.equal(JSON.stringify(structure).includes("Synthetic"), false);
+    assert.deepEqual(structure.nativeElements, { textareas: 1, contenteditables: 1, buttons: 1, fileInputs: 1, iframes: 1 });
+    await page.evaluate(() => {
+      for (const element of document.querySelectorAll("[class]")) element.removeAttribute("class");
+    });
+    const unclassifiedBefore = { ...await page.evaluate(() => window.syntheticInspectionState()), mutations: 0 };
+    const unclassified = await page.evaluate(inspectDatabagStructure, input);
+    assert.equal(unclassified.limited, false);
+    assert.deepEqual(unclassified.nativeElements, structure.nativeElements);
+    assert.deepEqual(unclassified.counts, Object.fromEntries(Object.keys(structure.counts).map(name => [name, 0])));
+    assert.deepEqual(await page.evaluate(() => window.syntheticInspectionState()), unclassifiedBefore);
+    assert.equal(JSON.stringify(unclassified).includes("Synthetic"), false);
     for (const origin of ["https://databag.example/", "http://databag.example", "https://gemini.google.com"]) {
       assert.equal(await page.evaluate(inspectDatabagStructure, { ...input, origin }), null);
     }
