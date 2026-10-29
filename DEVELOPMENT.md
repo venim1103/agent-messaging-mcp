@@ -213,6 +213,19 @@ The person has designated one direct conversation for AI0 to report work, reques
 
 This procedure operates only while the host permits an active turn. It does not keep a finished Copilot session running or demonstrate idle wake-up; see [the host boundary](DESIGN.md#receiving-does-not-automatically-wake-an-agent). Changing agent instructions alone requires no extension reload or MCP restart. Separate acceptance tests retain their explicitly bounded scopes and do not inherit permission for unrelated side effects.
 
+### Chat tool not invoked
+
+Follow [tool invocation recovery](AGENTS.md#tool-invocation-recovery), not a broker or website workaround. Separate these observations:
+
+- No chat tool call: an intended send/wait followed by another tool is an agent invocation failure, not a rejected send. Stop after the first mismatch; do not loop through memory/directory reads or claim an attempt occurred.
+- No matching tool from host discovery: report that exact lookup result. Enabled tool selection does not itself prove discoverability in this turn. Do not retry alternate search terms or infer that the approved browser connection expired.
+- A real chat tool error/result: retain its bounded code/status and diagnose that layer. Host tool completion alone is not `sent`; page-observed `sent` is not provider delivery. Never automatically replay an uncertain send.
+- If a correctly exposed no-browser diagnostic or owned status tool is available, use it to distinguish server reachability from browser authority; do not invent tool aliases or use the private broker from a terminal. Otherwise request the smallest host-side check through Copilot's question UI and wait.
+
+- If tools are enabled but invocation/discovery still fails, ask the person to type `#` in the same chat input and select the actual chat send/event tools from the menu for a follow-up request. Use the host's listed references, not guessed names. The documented [explicit tool reference](https://code.visualstudio.com/docs/agents/run/tools#reference-a-tool-explicitly) steers selection without a server restart; it is not proof of a repaired tool index or a successful call.
+
+For Local sessions, check **Configure Tools**, then **MCP: List Servers** and the selected server's **Show Output**. The official [host troubleshooting guidance](https://code.visualstudio.com/docs/agents/run/manage-mcp-servers#troubleshoot-mcp-servers) distinguishes unavailable tools from available tools the agent does not call. Check only non-sensitive status/error metadata. Do not restart, reset trust, change configuration or recreate approval automatically; a necessary owner restart ends its grants and requires fresh trusted popup approval. After a repair, verify an actual intended-tool result, not narration or startup alone. The finish gate remains in force throughout recovery.
+
 ### Legacy connection and shared read tools
 
 1. `chat_request_connection` returns `{ requestId, state: "pending", expiresAt }`. The request expires after 60 seconds.
