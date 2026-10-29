@@ -11,9 +11,202 @@ import { PreparedMessageOperations } from "../../packages/companion/dist/message
 import { PendingConnectionRequests } from "../../packages/companion/dist/pending-connections.js";
 import { createFixtureServer } from "../fixtures/server.mjs";
 import { installDraftOwnershipTracker } from "../../packages/extension/lib/draft-ownership.ts";
+import { installDatabagIdentityBridge } from "../../packages/extension/lib/databag-identity.ts";
 import { installDatabagAdapter, identifyDatabagConversation, captureDatabagSnapshot, observeDatabagMessages,
   inspectDatabagDraft, fillDatabagDraft, submitDatabagDraft, inspectDatabagStructure }
   from "../../packages/extension/lib/databag-observation.ts";
+
+test("Databag React identity bridge is read-only, bounded and rejects stale or foreign account state", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    await page.route("**/*", route => route.fulfill({ contentType: "text/html",
+      body: '<!doctype html><html><body><div class="_conversation_synthetic_1"><textarea>Synthetic human draft</textarea></div></body></html>' }));
+    await page.goto("https://databag.example/#/session");
+    assert.equal(await page.evaluate(installDatabagIdentityBridge, ["https://databag.example"]), true);
+    await page.evaluate(() => {
+      const element = document.querySelector("div");
+      const focus = { guid: "synthetic-account", cardId: null, channelId: "synthetic-channel",
+        getFocused() { const { cardId, channelId } = this; return { cardId, channelId }; } };
+      const session = { guid: "synthetic-account" };
+      const app = { state: { session, focus } };
+      const dependencies = () => ({ firstContext: { memoizedValue: app, next: null } });
+      const state = { loaded: true, detailSet: true, access: true, cardId: null,
+        profile: { guid: "synthetic-account" }, detail: { locked: false }, assets: [] };
+      const owner = { dependencies: dependencies(), lanes: 0, return: null,
+        memoizedState: { memoizedState: state, next: null }, alternate: { dependencies: dependencies() } };
+      const host = { stateNode: element, return: owner };
+      const root = { child: owner, return: null, stateNode: { current: null, pendingLanes: 0 } };
+      root.stateNode.current = root;
+      owner.return = root;
+      owner.child = host;
+      Object.defineProperty(element, "__reactFiber$synthetic", { value: host });
+      let prohibited = 0;
+      for (const object of [session, focus]) for (const key of ["credentials", "token", "store", "actions"]) {
+        Object.defineProperty(object, key, { get() { prohibited++; throw new Error("Synthetic private field"); } });
+      }
+      window.syntheticBridge = { focus, session, state, owner, root, app, prohibited: () => prohibited,
+        read: (rows = false) => {
+          const element = document.querySelector("div");
+          const nonce = crypto.randomUUID();
+          let identity = null;
+          const response = event => {
+            if (typeof event.detail !== "string" || event.detail.length > 2048) return;
+            const result = JSON.parse(event.detail);
+            if (result.nonce === nonce) identity = result.identity;
+          };
+          element.addEventListener("agent-databag-identity-response-v1", response);
+          try { element.dispatchEvent(new CustomEvent(rows ? "agent-databag-rows-v1" : "agent-databag-identity-v1", { detail: nonce })); }
+          finally { element.removeEventListener("agent-databag-identity-response-v1", response); }
+          return identity;
+        } };
+    });
+    const baseline = await page.evaluate(() => window.syntheticBridge.read());
+    assert.equal(baseline.ready, true);
+    assert.equal(baseline.accountId, "synthetic-account");
+    assert.equal(baseline.channelId, "synthetic-channel");
+    const client = await page.context().newCDPSession(page);
+    const { frameTree } = await client.send("Page.getFrameTree");
+    const { executionContextId } = await client.send("Page.createIsolatedWorld", {
+      frameId: frameTree.frame.id, worldName: "synthetic-databag-isolated" });
+    const identityReader = await page.evaluate(() => window.syntheticBridge.read.toString());
+    const isolated = await client.send("Runtime.evaluate", { contextId: executionContextId, returnByValue: true,
+      expression: `(() => {
+        const element = document.querySelector("div");
+        return { identity: (${identityReader})(),
+          reactProperties: Object.getOwnPropertyNames(element).filter(name => name.startsWith("__reactFiber$")).length,
+          adapterInstalled: Object.hasOwn(window, "agentDatabagAdapter") };
+      })()` });
+    assert.deepEqual(isolated.result.value, { identity: baseline, reactProperties: 0, adapterInstalled: false });
+    await page.evaluate(() => {
+      const fixture = window.syntheticBridge;
+      const element = document.querySelector("div");
+      const timeline = document.createElement("div");
+      timeline.className = "_thread_synthetic_1";
+      const row = document.createElement("div");
+      row.className = "_topic_synthetic_1";
+      const text = document.createElement("span");
+      text.className = "_text_synthetic_1";
+      text.append(document.createTextNode("Synthetic rendered message"));
+      row.append(text);
+      timeline.append(row);
+      element.prepend(timeline);
+      const composer = document.createElement("div");
+      composer.className = "_staging_synthetic_1";
+      composer.append(document.querySelector("textarea"));
+      for (let index = 0; index < 4; index++) {
+        const file = document.createElement("input");
+        file.type = "file";
+        file.hidden = true;
+        composer.append(file);
+      }
+      const assets = document.createElement("div");
+      assets.className = "_files_synthetic_1";
+      composer.append(assets);
+      const send = document.createElement("div");
+      send.className = "_send_synthetic_1";
+      const button = document.createElement("button");
+      button.append(document.createTextNode("Send"));
+      send.append(button);
+      composer.append(send);
+      composer.querySelector("textarea").addEventListener("input", event => { button.disabled = event.target.value.length === 0; });
+      fixture.activations = 0;
+      button.addEventListener("click", () => { fixture.activations++; });
+      element.append(composer);
+      const topic = { topicId: "synthetic-message", guid: "synthetic-peer", locked: false, blocked: false };
+      Object.defineProperty(topic, "data", { get() { throw new Error("Synthetic message payload accessed"); } });
+      const timelineHost = { stateNode: timeline, return: fixture.owner.child };
+      const messageOwner = { memoizedProps: { topic }, return: timelineHost };
+      const rowHost = { stateNode: row, return: messageOwner };
+      fixture.owner.child.child = timelineHost;
+      timelineHost.child = messageOwner;
+      messageOwner.child = rowHost;
+      fixture.topic = topic;
+    });
+    assert.deepEqual(await page.evaluate(() => window.syntheticBridge.read(true)), { ...baseline,
+      rows: [{ id: "synthetic-message", direction: "incoming" }], rowCount: 1 });
+    const isolatedRows = await client.send("Runtime.evaluate", { contextId: executionContextId, returnByValue: true,
+      expression: `(${identityReader})(true)` });
+    assert.deepEqual(isolatedRows.result.value, { ...baseline,
+      rows: [{ id: "synthetic-message", direction: "incoming" }], rowCount: 1 });
+    await client.detach();
+    await page.evaluate(() => { window.syntheticBridge.topic.guid = "synthetic-account"; });
+    assert.deepEqual((await page.evaluate(() => window.syntheticBridge.read(true))).rows,
+      [{ id: "synthetic-message", direction: "outgoing" }]);
+    await page.evaluate(() => { window.syntheticBridge.topic.locked = true; });
+    assert.equal(await page.evaluate(() => window.syntheticBridge.read(true)), null);
+    await page.evaluate(() => { window.syntheticBridge.topic.locked = false; });
+    assert.equal(await page.evaluate(installDatabagAdapter, ["https://databag.example"]), true);
+    const nativeIdentity = await page.evaluate(identifyDatabagConversation);
+    assert.match(nativeIdentity.conversationId, /^databag_[a-f0-9]{64}$/);
+    assert.deepEqual(await page.evaluate(captureDatabagSnapshot, nativeIdentity.conversationId), {
+      messages: [{ id: "synthetic-message", direction: "outgoing", text: "Synthetic rendered message" }], omittedBefore: false });
+    const draft = { expectedUrl: "https://databag.example/#/session", conversationId: nativeIdentity.conversationId,
+      text: "Synthetic native insertion" };
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, draft), { ok: false, code: "DRAFT_PRESENT" });
+    assert.equal(await page.locator("textarea").inputValue(), "Synthetic human draft");
+    await page.locator("textarea").fill("");
+    await page.locator("textarea").evaluate(editor => { editor.disabled = true; });
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, draft), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+    await page.locator("textarea").evaluate(editor => { editor.disabled = false; });
+    await page.evaluate(() => { window.syntheticBridge.state.assets = [{ get file() { throw new Error("Synthetic asset data read"); } }]; });
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, draft), { ok: false, code: "COMPOSER_UNAVAILABLE" });
+    await page.evaluate(() => { window.syntheticBridge.state.assets = []; });
+    const filling = { ...draft, operationId: randomUUID(), attemptId: randomUUID(), expiresAt: Date.now() + 4000 };
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, filling), { ok: true, editor: "textarea" });
+    assert.equal(await page.locator("textarea").inputValue(), draft.text);
+    const submitting = { ...filling, attemptId: filling.operationId, expiresAt: Date.now() + 4000 };
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, submitting), { ok: true, editor: "textarea", activated: true });
+    assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
+    assert.deepEqual(await page.evaluate(submitDatabagDraft, submitting), { ok: false, code: "DISPATCH_UNAVAILABLE" });
+    assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
+    await page.evaluate(() => {
+      window.syntheticBridge.events = [];
+      window.chrome = { runtime: { sendMessage: async message => { window.syntheticBridge.events.push(message); } } };
+    });
+    assert.equal(await page.evaluate(observeDatabagMessages, nativeIdentity.conversationId), true);
+    const unchangedDom = await page.locator("body").evaluate(element => element.innerHTML);
+    await page.evaluate(() => {
+      const fixture = window.syntheticBridge;
+      fixture.focus = { guid: "synthetic-account", cardId: null, channelId: "synthetic-channel", getFocused: fixture.focus.getFocused };
+      fixture.app.state.focus = fixture.focus;
+    });
+    assert.equal(await page.evaluate(captureDatabagSnapshot, nativeIdentity.conversationId), null);
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, { ...draft, draftState: "prepared" }), { ok: false, code: "TARGET_CHANGED" });
+    assert.equal(await page.evaluate(observeDatabagMessages, nativeIdentity.conversationId), false,
+      "A later owner must not reset an existing continuity anchor after a same-ID focus change");
+    await page.waitForFunction(() => window.syntheticBridge.events.some(event => event.kind === "chat_identity_changed"));
+    assert.equal(await page.locator("body").evaluate(element => element.innerHTML), unchangedDom);
+    await page.evaluate(() => globalThis.agentDatabagAdapter.stop());
+    assert.equal(await page.evaluate(observeDatabagMessages, nativeIdentity.conversationId), true,
+      "An explicit end of the old connection must permit a new continuity anchor");
+    await page.evaluate(() => { window.syntheticBridge.state.loaded = false; });
+    assert.equal((await page.evaluate(() => window.syntheticBridge.read())).ready, false);
+    await page.evaluate(() => { window.syntheticBridge.state.loaded = true; window.syntheticBridge.state.detail.locked = true; });
+    assert.equal((await page.evaluate(() => window.syntheticBridge.read())).ready, false);
+    await page.evaluate(() => { window.syntheticBridge.state.detail.locked = false; window.syntheticBridge.state.profile.guid = "synthetic-other"; });
+    assert.equal((await page.evaluate(() => window.syntheticBridge.read())).ready, false);
+    await page.evaluate(() => { window.syntheticBridge.state.profile.guid = "synthetic-account";
+      window.syntheticBridge.safeGetter = window.syntheticBridge.focus.getFocused;
+      window.syntheticBridge.focus.getFocused = function () { throw new Error("Unreviewed getter invoked"); }; });
+    assert.equal(await page.evaluate(() => window.syntheticBridge.read()), null);
+    await page.evaluate(() => { window.syntheticBridge.focus.getFocused = window.syntheticBridge.safeGetter; });
+    await page.evaluate(() => { window.syntheticBridge.owner.alternate.dependencies.firstContext.memoizedValue = {
+      state: { session: window.syntheticBridge.session, focus: {} } }; });
+    assert.equal((await page.evaluate(() => window.syntheticBridge.read())).ready, false);
+    await page.evaluate(() => { window.syntheticBridge.owner.alternate.dependencies.firstContext.memoizedValue = window.syntheticBridge.app;
+      window.syntheticBridge.root.stateNode.pendingLanes = 1; });
+    assert.equal((await page.evaluate(() => window.syntheticBridge.read())).ready, false);
+    await page.evaluate(() => { window.syntheticBridge.root.stateNode.pendingLanes = 0; window.syntheticBridge.session.guid = "synthetic-other"; });
+    assert.equal(await page.evaluate(() => window.syntheticBridge.read()), null);
+    await page.evaluate(() => { window.syntheticBridge.session.guid = "synthetic-account";
+      Object.defineProperty(window.syntheticBridge.focus, "guid", { get() { throw new Error("Synthetic GUID accessor"); } }); });
+    assert.equal(await page.evaluate(() => window.syntheticBridge.read()), null);
+    assert.equal(await page.evaluate(() => window.syntheticBridge.prohibited()), 0);
+    assert.equal(await page.locator("textarea").inputValue(), "Synthetic native insertion");
+    assert.equal(await page.evaluate(() => Object.hasOwn(window, "agentDatabagAdapter")), true);
+  } finally { await browser.close(); }
+});
 
 test("Databag stock structure inspection is bounded, metadata-only and never grants access", { timeout: 15000 }, async () => {
   const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });

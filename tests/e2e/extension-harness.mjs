@@ -28,13 +28,14 @@ function trackTestPhase(testContext, label) {
   };
 }
 
-async function traceBrowserJobs(worker) {
-  await worker.evaluate(() => {
+async function traceBrowserJobs(worker, emit = false) {
+  await worker.evaluate(emit => {
     globalThis.browserJobTrace = [];
     const started = performance.now();
     const record = event => {
       globalThis.browserJobTrace.push({ ...event, atMs: Math.round(performance.now() - started) });
       if (globalThis.browserJobTrace.length > 32) globalThis.browserJobTrace.shift();
+      if (emit) console.info(`synthetic-browser-job:${JSON.stringify(globalThis.browserJobTrace.at(-1))}`);
     };
     const connect = chrome.runtime.connectNative.bind(chrome.runtime);
     chrome.runtime.connectNative = (...args) => {
@@ -46,19 +47,22 @@ async function traceBrowserJobs(worker) {
           kind: reply.kind, remainingMs: challenge.expiresAt - Date.now() });
         if (reply.kind.endsWith("_recorded") && typeof reply.payload?.accepted === "boolean") record({ event: "acknowledgement",
           kind: reply.kind, accepted: reply.payload.accepted, remainingMs: reply.deadlineMs - Date.now() });
+        if (reply.kind === "chat_snapshot_published") record({ event: "snapshot_acknowledgement",
+          count: reply.payload.count, remainingMs: reply.deadlineMs - Date.now() });
       });
       const post = port.postMessage.bind(port);
       port.postMessage = message => {
         const observation = message.payload?.observation ?? message.payload?.result;
         if (message.kind.startsWith("complete_") && observation) record({ event: "completion", kind: message.kind,
           phase: message.payload.phase, ok: observation.ok, code: observation.code, remainingMs: message.deadlineMs - Date.now() });
-        if (message.kind === "publish_fixture_snapshot" || message.kind === "publish_gemini_snapshot") record({ event: "snapshot",
+        if (message.kind === "publish_fixture_snapshot" || message.kind === "publish_gemini_snapshot"
+          || message.kind === "publish_chat_snapshot") record({ event: "snapshot",
           challenged: !!message.payload.challengeId, rows: message.payload.messages?.length });
         post(message);
       };
       return port;
     };
-  });
+  }, emit);
 }
 
 function installSyntheticGeminiProof() {

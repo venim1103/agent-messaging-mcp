@@ -137,7 +137,7 @@ Build/verify failure is not a new archive: an older ZIP may remain at the same f
 
 Stock Databag is not currently supported. Integrations must work with the existing website, without patches, custom frontend builds or redeployment. D14/D15 in [DESIGN.md](DESIGN.md#17-decisions) record the browser-only scope and superseded patch direction; D16 records the open stock-UI binding/lifetime question. See the [current capability dashboard](HANDOFF.md#current-state-dashboard) for evidence and limits.
 
-The native adapter has synthetic coverage, but its source checkpoint gate and installed compatibility are not accepted; see the [current dashboard](HANDOFF.md#current-state-dashboard). The default origin remains unset; configuring it does not prove stock compatibility. The historical marker path remains for its fixtures. Do not modify the website to satisfy either adapter.
+The native adapter has synthetic coverage; deployed/installed compatibility is not accepted. See the [current dashboard](HANDOFF.md#current-state-dashboard) for source checkpoint verification. The default origin remains unset; configuring it does not prove stock compatibility. The historical marker path remains for its fixtures. Do not modify the website to satisfy either adapter.
 
 ### Shared popup inspection
 
@@ -196,6 +196,8 @@ The retained [compatibility patch](integrations/databag/compatibility.patch) tar
 5. `chat_disconnect` ends that owned grant. Human **Remove access** affects only that agent on this chat; **Disconnect all** affects all matching owners. Tab/chat/browser/owner termination ends access. Exact same-chat reload preserves autonomous handles after new-document verification and requires a fresh snapshot/cursor; old-document reads are unavailable during reload. Legacy grants still end on reload. Cancelling pickup closes the facade socket and ends all grants belonging to that owner.
 
 Owned `chat_disconnect` bypasses an in-flight read/send in both private client and broker queues, without closing the owner's other connections. Ordinary requests remain serialized; the same 16-pending-request cap and original deadlines apply. The client correlates concurrent replies by request ID and exact deadline before strict per-request payload validation. Unknown/duplicate IDs, changed deadlines or transport loss close the socket and reject pending work; a malformed payload retains the existing per-request rejection behavior. Disconnect cannot undo an already activated send, clear its draft, restore authority or authorize retry. A subsequent trusted roster refresh clears the unchanged local grant after a validated zero-owner result.
+
+Shared supervised/autonomous commit and fixture dispatch execution end 25 ms before the original broker reply deadline, retaining the existing response reserve. Browser leases are clipped to that earlier execution deadline; wire deadlines, uncertainty/no-retry handling and grant authority do not change.
 
 ### Legacy connection and shared read tools
 

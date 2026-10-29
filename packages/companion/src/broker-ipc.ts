@@ -101,14 +101,15 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                     await writeBrokerResponse(socket, { ...reply, kind: "error", payload: { code: "DISPATCH_UNAVAILABLE" } });
                     return;
                   }
+                  const executionDeadlineMs = reply.deadlineMs - 25;
                   const status = reply.kind === "chat_autonomous_commit_authorized"
-                    ? await operations.commitAutonomousMessage(owner, reply.payload.operationId, reply.deadlineMs)
+                    ? await operations.commitAutonomousMessage(owner, reply.payload.operationId, executionDeadlineMs)
                     : reply.kind === "chat_commit_authorized"
-                    ? await operations.commitPreparedMessage(owner, reply.payload.operationId, reply.deadlineMs)
+                    ? await operations.commitPreparedMessage(owner, reply.payload.operationId, executionDeadlineMs)
                     : reply.kind === "fixture_commit_authorized"
-                      ? await operations.commitFixtureMessage(owner, reply.payload.operationId, reply.deadlineMs)
+                      ? await operations.commitFixtureMessage(owner, reply.payload.operationId, executionDeadlineMs)
                     : await operations.requestFixtureDispatch(owner, reply.payload.operationId, reply.payload.checkId,
-                      Date.now(), reply.deadlineMs).result;
+                      Date.now(), executionDeadlineMs).result;
                   if (!socket.destroyed) await writeBrokerResponse(socket, { ...reply,
                     kind: reply.kind === "chat_commit_authorized" || reply.kind === "chat_autonomous_commit_authorized"
                       ? "chat_dispatch" : "fixture_dispatch", payload: status });

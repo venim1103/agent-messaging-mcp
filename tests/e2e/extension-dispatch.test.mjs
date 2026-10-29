@@ -147,6 +147,24 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
     facade = await connectBroker("facade", directory, undefined, undefined,
       autonomous === true ? "Synthetic autonomous browser owner" : undefined);
     relay = await connectBroker("relay", directory);
+    if (provider === "gemini" && !autonomous && testContext) {
+      for (const [client, methods] of [[facade, ["requestConnection", "getConnection", "prepareGeminiMessage",
+        "fillGeminiDraft", "commitPreparedMessage", "getPreparedOperation"]], [relay, ["listChatJobs"]]]) {
+        for (const method of methods) {
+          const request = client[method];
+          client[method] = async (...args) => {
+            const startedAt = performance.now();
+            try { return await request(...args); }
+            catch (error) {
+              testContext.diagnostic(`Synthetic broker failure ${JSON.stringify({ method,
+                elapsedMs: Math.round(performance.now() - startedAt),
+                timedOut: error instanceof Error && error.message === "Broker request timed out" })}`);
+              throw error;
+            }
+          };
+        }
+      }
+    }
     mcpClient = new Client({ name: autonomous === "public" ? "Synthetic autonomous browser owner" : "fixture-browser-commit-test", version: "0.0.1" });
     const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
     const traceReplies = autonomous === "public" && outcome === "observed";
@@ -1568,6 +1586,6 @@ test("worker and broker crashes after fixture activation never restore submit au
 for (const outcome of ["observed", "lost_script", "lost_native_completion", "blocked_after_reservation", "worker_crash", "broker_crash"]) {
   test(`neutral Gemini worker submits once without restoring authority (${outcome})`, { timeout: 25000 }, async testContext => {
     testContext.signal.throwIfAborted();
-    await exerciseChatDispatch(outcome, "gemini");
+    await exerciseChatDispatch(outcome, "gemini", testContext);
   });
 }

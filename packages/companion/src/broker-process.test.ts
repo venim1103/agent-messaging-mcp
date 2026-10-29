@@ -47,6 +47,7 @@ test("broker process readiness refuses a socket before private permissions", asy
 test("spawned broker keeps role credentials private and exits cleanly", { timeout: 10000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-home-"));
   const entry = fileURLToPath(new URL("./broker-process.js", import.meta.url));
+  const startedAt = performance.now();
   const broker = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: ["ignore", "pipe", "pipe"] });
   const directory = join(home, ".config/agent-messaging-mcp/broker");
   const exit = once(broker, "exit");
@@ -58,7 +59,9 @@ test("spawned broker keeps role credentials private and exits cleanly", { timeou
       if (ready) break;
       await setTimeout(25);
     }
-    assert.equal(ready, true, "Broker did not start");
+    assert.equal(ready, true, `Broker did not start: ${JSON.stringify({
+      elapsedMs: Math.round(performance.now() - startedAt), exitCode: broker.exitCode, signalCode: broker.signalCode
+    })}`);
     assert.equal((await stat(directory)).mode & 0o777, 0o700);
     assert.equal((await stat(join(directory, "facade.key"))).mode & 0o777, 0o600);
     const databasePath = join(home, ".config/agent-messaging-mcp/operations.sqlite");
@@ -354,6 +357,7 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-broker-restart-"));
   const entry = fileURLToPath(new URL("./broker-process.js", import.meta.url));
   const directory = join(home, ".config/agent-messaging-mcp/broker");
+  const startedAt = performance.now();
   const first = spawn(process.execPath, [entry], { env: { ...process.env, HOME: home }, stdio: "ignore" });
   const firstExit = once(first, "exit");
   let second: ReturnType<typeof spawn> | undefined;
@@ -366,7 +370,9 @@ test("broker replaces its own stale runtime after an abrupt exit", { timeout: 60
       if (ready) break;
       await setTimeout(25);
     }
-    assert.equal(ready, true, "First broker did not start");
+    assert.equal(ready, true, `First broker did not start: ${JSON.stringify({
+      elapsedMs: Math.round(performance.now() - startedAt), exitCode: first.exitCode, signalCode: first.signalCode
+    })}`);
     const oldKey = await readFile(join(directory, "facade.key"), "utf8");
     first.kill("SIGKILL");
     const [, signal] = await firstExit;

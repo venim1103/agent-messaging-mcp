@@ -19,6 +19,87 @@ const editor = root.querySelector('textarea');
 const send = root.querySelector('[data-chat-send]');
 const timeline = root.querySelector('[role=log]');
 let messageCount = 2;
+const nativeMode = document.body.hasAttribute('data-synthetic-native');
+let nativeOwner;
+let nativeApp;
+const nativeTopics = new WeakMap();
+const nativeRows = () => {
+  const timelineHost = { stateNode: timeline, return: nativeOwner.child };
+  nativeOwner.child.child = timelineHost;
+  let previous;
+  for (const row of timeline.children) {
+    if (row.className === 'topicPad') continue;
+    const messageOwner = { memoizedProps: { topic: nativeTopics.get(row) }, return: timelineHost };
+    messageOwner.child = { stateNode: row, return: messageOwner };
+    if (previous) previous.sibling = messageOwner;
+    else timelineHost.child = messageOwner;
+    previous = messageOwner;
+  }
+};
+const nativeRow = (row, id, direction) => {
+  row.className = '_topic_synthetic_1';
+  row.querySelector('span').className = '_text_synthetic_1';
+  nativeTopics.set(row, { topicId: id, guid: direction === 'outgoing' ? 'synthetic-account' : 'synthetic-peer',
+    locked: false, blocked: false });
+  for (const element of [row, ...row.querySelectorAll('*')]) {
+    for (const name of element.getAttributeNames()) if (name.startsWith('data-chat-')) element.removeAttribute(name);
+  }
+};
+const nativeFocus = (guid, channelId) => ({ guid, cardId: null, channelId,
+  getFocused() { const { cardId, channelId } = this; return { cardId, channelId }; } });
+if (nativeMode) {
+  root.className = '_conversation_synthetic_1';
+  timeline.className = '_thread_synthetic_1';
+  timeline.removeAttribute('role');
+  const composer = editor.parentElement;
+  composer.className = '_staging_synthetic_1';
+  for (let index = 0; index < 4; index++) {
+    const file = document.createElement('input');
+    file.type = 'file';
+    file.hidden = true;
+    composer.append(file);
+  }
+  const assets = document.createElement('div');
+  assets.className = '_files_synthetic_1';
+  composer.append(assets);
+  const sendRegion = document.createElement('div');
+  sendRegion.className = '_send_synthetic_1';
+  sendRegion.append(send);
+  composer.append(sendRegion);
+  for (const row of timeline.querySelectorAll('[data-chat-message-id]')) {
+    nativeRow(row, row.dataset.chatMessageId, row.dataset.chatDirection);
+  }
+  for (const element of [root, timeline, composer, send]) {
+    for (const name of element.getAttributeNames()) if (name.startsWith('data-chat-')) element.removeAttribute(name);
+  }
+  const session = { guid: 'synthetic-account' };
+  nativeApp = { state: { session, focus: nativeFocus(session.guid, 'synthetic-channel') } };
+  const dependencies = () => ({ firstContext: { memoizedValue: nativeApp, next: null } });
+  const state = { loaded: true, detailSet: true, access: true, cardId: null, assets: [],
+    profile: { guid: session.guid }, detail: { locked: false } };
+  nativeOwner = { dependencies: dependencies(), lanes: 0, return: null,
+    memoizedState: { memoizedState: state, next: null }, alternate: { dependencies: dependencies() } };
+  const host = { stateNode: root, return: nativeOwner };
+  const fiberRoot = { child: nativeOwner, return: null, stateNode: { current: null, pendingLanes: 0 } };
+  fiberRoot.stateNode.current = fiberRoot;
+  nativeOwner.return = fiberRoot;
+  nativeOwner.child = host;
+  Object.defineProperty(root, '__reactFiber$synthetic', { value: host });
+  nativeRows();
+}
+const appendMessage = (id, direction, value) => {
+  const row = document.createElement('div');
+  row.dataset.chatMessageId = id;
+  row.dataset.chatDirection = direction;
+  row.dataset.chatReadable = 'true';
+  const text = document.createElement('span');
+  text.dataset.chatText = 'true';
+  text.textContent = value;
+  row.append(text);
+  timeline.append(row);
+  if (nativeMode) { nativeRow(row, id, direction); nativeRows(); }
+};
+window.syntheticAppendIncoming = text => appendMessage('synthetic-worker-reply', 'incoming', text);
 window.syntheticActivations = 0;
 window.syntheticTrustedInputs = 0;
 editor.addEventListener('input', event => {
@@ -28,20 +109,21 @@ editor.addEventListener('input', event => {
 send.addEventListener('click', () => {
   window.syntheticActivations++;
   if (!editor.value) return;
-  const row = document.createElement('div');
-  row.dataset.chatMessageId = `synthetic-${++messageCount}`;
-  row.dataset.chatDirection = 'outgoing';
-  row.dataset.chatReadable = 'true';
-  const text = document.createElement('span');
-  text.dataset.chatText = 'true';
-  text.textContent = editor.value;
-  row.append(text);
-  timeline.append(row);
+  appendMessage(`synthetic-${++messageCount}`, 'outgoing', editor.value);
   editor.value = '';
   send.disabled = true;
 });
-document.querySelector('#switch-channel').addEventListener('click', () => { root.dataset.chatChannel = 'other-channel'; });
-document.querySelector('#switch-account').addEventListener('click', () => { root.dataset.chatAccount = 'other-account'; });
+document.querySelector('#switch-channel').addEventListener('click', () => {
+  if (nativeMode) nativeApp.state.focus = nativeFocus(nativeApp.state.session.guid, 'other-channel');
+  else root.dataset.chatChannel = 'other-channel';
+});
+document.querySelector('#switch-account').addEventListener('click', () => {
+  if (nativeMode) {
+    nativeApp.state.session = { guid: 'other-account' };
+    nativeApp.state.focus = nativeFocus('other-account', 'synthetic-channel');
+    nativeOwner.memoizedState.memoizedState.profile = { guid: 'other-account' };
+  } else root.dataset.chatAccount = 'other-account';
+});
 </script>
 </body>
 </html>

@@ -1,3 +1,5 @@
+import type { DatabagReactIdentity } from "./databag-identity";
+
 export type DatabagIdentity = { url: string; conversationId: string };
 export type DatabagCapture = { messages: { id: string; direction: "incoming" | "outgoing";
   text: string; truncated?: true }[]; omittedBefore: boolean };
@@ -206,9 +208,62 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     }
     return true;
   };
-  const context = () => {
+  const nativeRegion = (element: HTMLElement, name: string) => typeof element.className === "string"
+    && element.className.length <= 512 && element.className.split(/\s+/).some(token => new RegExp(`^_${name}_[A-Za-z0-9_-]+$`).test(token));
+  let nativeContinuity: string | null = null;
+  const nativeIdentity = (root: HTMLElement, includeRows = false): DatabagReactIdentity | null => {
+    const nonce = crypto.randomUUID();
+    let response: unknown;
+    let count = 0;
+    const receive = (event: Event) => {
+      if (!(event instanceof CustomEvent) || typeof event.detail !== "string" || event.detail.length > 16_384) return;
+      try {
+        const payload = JSON.parse(event.detail);
+        if (payload?.nonce !== nonce || Object.keys(payload).sort().join() !== "identity,nonce") return;
+        count++;
+        response = payload.identity;
+      } catch {}
+    };
+    root.addEventListener("agent-databag-identity-response-v1", receive);
+    try { root.dispatchEvent(new CustomEvent(includeRows ? "agent-databag-rows-v1" : "agent-databag-identity-v1", { detail: nonce })); }
+    finally { root.removeEventListener("agent-databag-identity-response-v1", receive); }
+    if (count !== 1 || !response || typeof response !== "object" || Array.isArray(response)) return null;
+    const value = response as Record<string, unknown>;
+    const keys = includeRows ? "accountId,available,channelId,draftSafe,focusToken,peerId,ready,rowCount,rows,sessionToken"
+      : "accountId,available,channelId,draftSafe,focusToken,peerId,ready,sessionToken";
+    const id = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(value);
+    const token = (value: unknown) => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+    if (Object.keys(value).sort().join() !== keys || !id(value.accountId) || !id(value.channelId)
+      || (value.peerId !== null && !id(value.peerId)) || !token(value.sessionToken) || !token(value.focusToken)
+      || typeof value.ready !== "boolean" || typeof value.available !== "boolean" || typeof value.draftSafe !== "boolean") return null;
+    if (includeRows && (!Array.isArray(value.rows) || value.rows.length > 32 || !Number.isSafeInteger(value.rowCount)
+      || (value.rowCount as number) < value.rows.length || (value.rowCount as number) > 4096
+      || !value.rows.every(row => row && typeof row === "object" && !Array.isArray(row)
+        && Object.keys(row).sort().join() === "direction,id" && typeof row.id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(row.id)
+        && (row.direction === "incoming" || row.direction === "outgoing")))) return null;
+    return value as DatabagReactIdentity;
+  };
+  const context = (requireReady = true) => {
     if (location.href !== `${origin}/#/session` || window.top !== window) return null;
     const roots = document.querySelectorAll<HTMLElement>('[data-chat-contract="databag-dom-v1"]');
+    if (roots.length === 0) {
+      const editors = [...document.querySelectorAll<HTMLTextAreaElement>("textarea")].filter(visible);
+      const editor = editors[0];
+      if (editors.length !== 1 || !editor) return null;
+      let composer: HTMLElement | null = editor.parentElement;
+      for (let depth = 0; composer && !nativeRegion(composer, "staging") && depth < 64; depth++) composer = composer.parentElement;
+      if (!composer || !nativeRegion(composer, "staging")) return null;
+      let root = composer.parentElement;
+      for (let depth = 0; root && !nativeRegion(root, "conversation") && depth < 64; depth++) root = root.parentElement;
+      if (!root || !nativeRegion(root, "conversation") || !visible(root)) return null;
+      const timelines = [...root.querySelectorAll<HTMLElement>('[class*="_thread_"]')]
+        .filter(element => nativeRegion(element, "thread") && visible(element));
+      const timeline = timelines[0];
+      const identity = nativeIdentity(root);
+      if (timelines.length !== 1 || !timeline || !identity?.available || (requireReady && !identity.ready)) return null;
+      return { root, timeline, identity: JSON.stringify([identity.accountId, identity.peerId ?? "self", identity.channelId]),
+        continuity: `${identity.sessionToken}:${identity.focusToken}`, native: identity };
+    }
     const root = roots[0];
     if (roots.length !== 1 || !root || !visible(root) || root.dataset.chatReady !== "true") return null;
     const values = [root.dataset.chatAccount, root.dataset.chatPeer, root.dataset.chatChannel];
@@ -216,14 +271,15 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     const timelines = root.querySelectorAll<HTMLElement>('[data-chat-timeline="true"][role="log"]');
     const timeline = timelines[0];
     if (timelines.length !== 1 || !timeline || !visible(timeline)) return null;
-    return { root, timeline, identity: JSON.stringify(values) };
+    return { root, timeline, identity: JSON.stringify(values), continuity: null, native: null };
   };
   const identify = async (): Promise<DatabagIdentity | null> => {
     const before = context();
     if (!before) return null;
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(before.identity));
     const after = context();
-    if (!after || after.root !== before.root || after.timeline !== before.timeline || after.identity !== before.identity) return null;
+    if (!after || after.root !== before.root || after.timeline !== before.timeline || after.identity !== before.identity
+      || after.continuity !== before.continuity) return null;
     const hash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
     return { url: location.href, conversationId: `databag_${hash}` };
   };
@@ -232,7 +288,8 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     const identity = await identify();
     const after = context();
     return before && identity?.conversationId === conversationId && after
-      && after.root === before.root && after.timeline === before.timeline && after.identity === before.identity ? after : null;
+      && after.root === before.root && after.timeline === before.timeline && after.identity === before.identity
+      && after.continuity === before.continuity ? after : null;
   };
   const validDraft = (input: DatabagDraftInput) => input && input.expectedUrl === `${origin}/#/session`
     && location.href === input.expectedUrl && /^databag_[a-f0-9]{64}$/.test(input.conversationId)
@@ -249,15 +306,25 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     return Boolean(hit && (hit === element || element.contains(hit)));
   };
   const composer = (binding: NonNullable<ReturnType<typeof context>>, allowHidden?: true) => {
-    const current = context();
+    const current = context(false);
     if (!current || current.root !== binding.root || current.timeline !== binding.timeline || current.identity !== binding.identity
+      || current.continuity !== binding.continuity
+      || (nativeContinuity !== null && current.continuity !== nativeContinuity)
       || (document.visibilityState !== "visible" && allowHidden !== true)) return { ok: false as const, code: "TARGET_CHANGED" as const };
     const root = current.root;
-    const regions = root.querySelectorAll<HTMLElement>('[data-chat-composer="true"]');
+    const regions = current.native ? [...root.querySelectorAll<HTMLElement>('[class*="_staging_"]')]
+      .filter(element => nativeRegion(element, "staging") && visible(element))
+      : [...root.querySelectorAll<HTMLElement>('[data-chat-composer="true"]')];
     const region = regions[0];
-    if (root.dataset.chatDraftSafe !== "true" || regions.length !== 1 || !region || !visible(region)
+    if ((current.native ? !current.native.draftSafe : root.dataset.chatDraftSafe !== "true") || regions.length !== 1 || !region || !visible(region)
       || current.timeline.contains(region)) return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
     const files = region.querySelectorAll<HTMLInputElement>('input[type="file"]');
+    if (current.native) {
+      const assets = [...region.querySelectorAll<HTMLElement>('[class*="_files_"]')].filter(element => nativeRegion(element, "files"));
+      if (files.length !== 4 || assets.length !== 1 || assets[0]?.childElementCount !== 0) {
+        return { ok: false as const, code: "DRAFT_PRESENT" as const };
+      }
+    }
     if ([...files].some(file => !(file instanceof HTMLInputElement) || !file.files || file.files.length > 0)) {
       return { ok: false as const, code: "DRAFT_PRESENT" as const };
     }
@@ -267,7 +334,11 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
       || editor.closest('[inert], [aria-disabled="true"], [aria-readonly="true"], fieldset:disabled') || !unobstructed(editor)) {
       return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
     }
-    const buttons = region.querySelectorAll<HTMLElement>('[data-chat-send="true"]');
+    const sends = current.native ? [...region.querySelectorAll<HTMLElement>('[class*="_send_"]')]
+      .filter(element => nativeRegion(element, "send") && visible(element)) : [];
+    if (current.native && sends.length !== 1) return { ok: false as const, code: "SUBMIT_UNAVAILABLE" as const };
+    const buttons = current.native ? [...sends[0]!.querySelectorAll<HTMLElement>("button")].filter(visible)
+      : [...region.querySelectorAll<HTMLElement>('[data-chat-send="true"]')];
     const button = buttons[0];
     if (buttons.length !== 1 || !(button instanceof HTMLButtonElement) || !unobstructed(button)
       || button.closest('[inert], [aria-disabled="true"]')) return { ok: false as const, code: "SUBMIT_UNAVAILABLE" as const };
@@ -382,12 +453,16 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     const identity = await identify();
     const current = context();
     if (!starting || !identity || identity.conversationId !== conversationId || !current
-      || starting.root !== current.root || starting.timeline !== current.timeline || starting.identity !== current.identity) return null;
+      || starting.root !== current.root || starting.timeline !== current.timeline || starting.identity !== current.identity
+      || starting.continuity !== current.continuity || (nativeContinuity !== null && current.continuity !== nativeContinuity)) return null;
+    const native = current.native ? nativeIdentity(current.root, true) : null;
+    if (current.native && (!native?.ready || native.sessionToken !== current.native.sessionToken
+      || native.focusToken !== current.native.focusToken)) return null;
     if (current.timeline.childElementCount > 4096) return null;
     const rows: HTMLElement[] = [];
     for (const child of current.timeline.children) {
       if (!(child instanceof HTMLElement)) return null;
-      if (!child.hasAttribute("data-chat-message-id")) {
+      if (current.native ? !nativeRegion(child, "topic") : !child.hasAttribute("data-chat-message-id")) {
         if (child.className !== "topicPad") return null;
         continue;
       }
@@ -395,12 +470,14 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     }
     const messages: DatabagCapture["messages"] = [];
     const ids = new Set<string>();
-    for (const row of rows.slice(-32)) {
-      const id = row.dataset.chatMessageId;
-      const direction = row.dataset.chatDirection;
-      const regions = row.querySelectorAll<HTMLElement>('[data-chat-text="true"]');
+    if (native && (native.rowCount !== rows.length || native.rows?.length !== Math.min(rows.length, 32))) return null;
+    for (const [index, row] of rows.slice(-32).entries()) {
+      const id = native ? native.rows?.[index]?.id : row.dataset.chatMessageId;
+      const direction = native ? native.rows?.[index]?.direction : row.dataset.chatDirection;
+      const regions = native ? [...row.querySelectorAll<HTMLElement>('[class*="_text_"]')].filter(element => nativeRegion(element, "text"))
+        : [...row.querySelectorAll<HTMLElement>('[data-chat-text="true"]')];
       const region = regions[0];
-      if (!id || !/^[A-Za-z0-9_-]{1,128}$/.test(id) || ids.has(id) || row.dataset.chatReadable !== "true"
+      if (!id || !/^[A-Za-z0-9_-]{1,128}$/.test(id) || ids.has(id) || (!native && row.dataset.chatReadable !== "true")
         || (direction !== "incoming" && direction !== "outgoing") || regions.length !== 1 || !region || !visible(region)) return null;
       const walker = document.createTreeWalker(region, NodeFilter.SHOW_ALL);
       let nodes = 0;
@@ -437,6 +514,7 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     }
     const after = context();
     return after?.root === current.root && after.timeline === current.timeline && after.identity === current.identity
+      && after.continuity === current.continuity
       ? { messages, omittedBefore } : null;
   };
   let stopObservation = () => {};
@@ -448,9 +526,14 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
       sendMessage: (message: { kind: string; provider: string; conversationId: string }) => Promise<unknown>
     } } }).chrome?.runtime;
     if (!starting || !identity || identity.conversationId !== conversationId || !watched || !runtime
-      || starting.root !== watched.root || starting.timeline !== watched.timeline || starting.identity !== watched.identity) return false;
+      || starting.root !== watched.root || starting.timeline !== watched.timeline || starting.identity !== watched.identity
+      || starting.continuity !== watched.continuity
+      || (nativeContinuity !== null && watched.continuity !== nativeContinuity)) return false;
     stopObservation();
+    nativeContinuity = watched.continuity;
+    let rowSignature = watched.native ? JSON.stringify(nativeIdentity(watched.root, true)?.rows ?? null) : null;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let identityTimer: ReturnType<typeof setInterval> | undefined;
     let stopped = false;
     const notify = (kind: "chat_changed" | "chat_identity_changed") => {
       void runtime.sendMessage({ kind, provider: "databag", conversationId }).catch(() => {});
@@ -463,7 +546,7 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     const guard = () => {
       if (stopped) return;
       const current = context();
-      if (location.href !== identity.url || (current && current.identity !== watched!.identity)) {
+      if (location.href !== identity.url || (current && (current.identity !== watched!.identity || current.continuity !== watched!.continuity))) {
         notify("chat_identity_changed");
         stop();
       } else if (current && (current.root !== watched!.root || current.timeline !== watched!.timeline)) {
@@ -472,11 +555,16 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
         rows.observe(current.timeline, { subtree: true, childList: true, characterData: true, attributes: true });
         changed();
       } else if (!current) changed();
+      else if (current.native) {
+        const next = JSON.stringify(nativeIdentity(current.root, true)?.rows ?? null);
+        if (next !== rowSignature) { rowSignature = next; changed(); }
+      }
     };
     const identityObserver = new MutationObserver(guard);
     const stop = () => {
       stopped = true;
       clearTimeout(timer);
+      clearInterval(identityTimer);
       rows.disconnect();
       identityObserver.disconnect();
       window.removeEventListener("hashchange", guard);
@@ -489,10 +577,12 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
         "data-chat-timeline", "hidden", "inert", "aria-hidden", "class", "style"] });
     window.addEventListener("hashchange", guard);
     window.addEventListener("pagehide", stop, { once: true });
+    if (watched.native) identityTimer = setInterval(guard, 200);
     changed();
     return true;
   };
-  scope.agentDatabagAdapter = { origins: signature, identify, capture, inspect, fill, submit, observe, stop: () => stopObservation() };
+  scope.agentDatabagAdapter = { origins: signature, identify, capture, inspect, fill, submit, observe,
+    stop: () => { stopObservation(); nativeContinuity = null; } };
   return true;
 }
 

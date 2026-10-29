@@ -216,6 +216,8 @@ for (const target of [
       assert.equal(result.deadlineMs, deadlineMs);
       assert.equal(result.payload.state, provider === "gemini" ? "resolved" : "observed_in_ui");
       assert.equal(lateError.mock.calls.length, 1);
+      assert.equal(lateError.mock.calls[0]?.arguments[2], deadlineMs - 25,
+        "Autonomous execution must preserve the existing broker response reserve");
       assert.deepEqual((await facade.prepareChatMessage(connection.connectionId, prepared.payload.preview.text, key, deadlineMs)).payload, result.payload);
       assert.deepEqual((await facade.prepareChatMessage(connection.connectionId, "Synthetic changed IPC replay", key, deadlineMs)).payload,
         { code: "IDEMPOTENCY_CONFLICT" });
@@ -1304,7 +1306,7 @@ test("resolved dispatch status IPC preserves owner and receipt boundaries withou
   }
 });
 
-test("authenticated private Gemini preparation remains owner-bound without fixture or recovery authority", async () => {
+test("authenticated private Gemini preparation remains owner-bound without fixture or recovery authority", async (context) => {
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-gemini-prepare-ipc-"));
   const directory = join(home, "broker");
   const database = new DatabaseSync(":memory:");
@@ -1452,6 +1454,17 @@ test("authenticated private Gemini preparation remains owner-bound without fixtu
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_operation_recovery").get()?.count, 1);
     assert.deepEqual((await facade.getPreparedOperation(operationId, prepared.payload.recoveryToken)).payload, { state: "unknown" });
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
+    let executionDeadline: number | undefined;
+    context.mock.method(PreparedMessageOperations.prototype, "commitPreparedMessage",
+      async function(_owner: symbol, _operationId: string, deadlineMs: number) {
+        executionDeadline = deadlineMs;
+        throw new Error("DISPATCH_UNAVAILABLE");
+      });
+    const replyDeadline = Date.now() + 1000;
+    const refusedCommit = await facade.commitPreparedMessage(operationId, replyDeadline);
+    assert.deepEqual(refusedCommit.payload, { code: "DISPATCH_UNAVAILABLE" });
+    assert.equal(refusedCommit.deadlineMs, replyDeadline);
+    assert.equal(executionDeadline, replyDeadline - 25, "Commit must preserve the existing broker response reserve");
   } finally {
     for (const client of clients) client.close();
     await broker.close();

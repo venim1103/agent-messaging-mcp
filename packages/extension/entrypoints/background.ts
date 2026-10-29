@@ -6,6 +6,7 @@ import { captureGeminiSnapshot, fillGeminiDraft, identifyGeminiConversation, ins
   from "../lib/gemini-observation";
 import { createNativeRequestChannel, requestNativeGrantCount, type GrantCountRequest } from "../lib/native-channel";
 import { installDraftOwnershipTracker } from "../lib/draft-ownership";
+import { installDatabagIdentityBridge } from "../lib/databag-identity";
 import { captureDatabagSnapshot, fillDatabagDraft, identifyDatabagConversation, inspectDatabagDraft, installDatabagAdapter,
   observeDatabagMessages, stopDatabagObservation, submitDatabagDraft } from "../lib/databag-observation";
 import { databagOrigins, isEligibleDatabagUrl } from "../lib/provider-origins";
@@ -141,6 +142,11 @@ async function recordGeminiGrantStatus(tabId: number, code: GeminiGrantStatus["c
   await browser.storage.session.set({ [key]: { code, recordedAt: Date.now() } satisfies GeminiGrantStatus });
 }
 
+async function stopDatabagTargetObservation(tabId: number, documentId: string): Promise<void> {
+  await browser.scripting.executeScript({ target: { tabId, documentIds: [documentId] },
+    func: stopDatabagObservation }).catch(() => {});
+}
+
 async function revokeChangedChatGrant(key: string, tabId: number, documentId: string): Promise<void> {
   const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
   if (grant?.documentId !== documentId || grant.reloadPending || chatTabUpdates.has(tabId)) return;
@@ -155,6 +161,7 @@ async function revokeChangedChatGrant(key: string, tabId: number, documentId: st
     const latest = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
     if (latest?.documentId !== grant.documentId || latest.revision !== grant.revision) return;
     await browser.storage.session.remove(key);
+    if (target.provider === "databag" && reply.payload.remainingAgents === 0) await stopDatabagTargetObservation(tabId, documentId);
     if (target.origin === geminiOrigin) await recordGeminiGrantStatus(tabId, "target_changed").catch(() => {});
   });
 }
@@ -208,6 +215,8 @@ async function revokeTrackedFixture(tabId: number, geminiReason?: GeminiGrantSta
       await recordGeminiGrantStatus(tabId, geminiReason).catch(() => {});
     }
     await browser.storage.session.remove(active);
+    const databag = stored[databagGrantKey(tabId)] as StoredGeminiGrant | undefined;
+    if (active.includes(databagGrantKey(tabId)) && databag) await stopDatabagTargetObservation(tabId, databag.documentId);
   }
 }
 
@@ -1629,8 +1638,12 @@ async function chatDocumentTarget(tabId: number, expectedUrl: string, documentId
     target = { origin: "https://gemini.google.com", conversationId: identity.result.conversationId,
       url: expectedUrl, tabId, documentId: identity.documentId };
   } else if (isEligibleDatabagUrl(expectedUrl)) {
-    const [installed] = await browser.scripting.executeScript({ target: scriptTarget, func: installDatabagAdapter, args: [databagOrigins] });
-    if (installed?.frameId !== 0 || installed.result !== true) return null;
+    const [bridge] = await browser.scripting.executeScript({ target: scriptTarget, world: "MAIN",
+      func: installDatabagIdentityBridge, args: [databagOrigins] });
+    if (bridge?.frameId !== 0 || bridge.result !== true || (documentId && bridge.documentId !== documentId)) return null;
+    const [installed] = await browser.scripting.executeScript({ target: { tabId, documentIds: [bridge.documentId] },
+      func: installDatabagAdapter, args: [databagOrigins] });
+    if (installed?.frameId !== 0 || installed.documentId !== bridge.documentId || installed.result !== true) return null;
     const [identity] = await browser.scripting.executeScript({ target: { tabId, documentIds: [installed.documentId] }, func: identifyDatabagConversation });
     if (identity?.frameId !== 0 || identity.documentId !== installed.documentId || identity.result?.url !== expectedUrl
       || !/^databag_[a-f0-9]{64}$/.test(identity.result.conversationId)) return null;
@@ -1751,7 +1764,10 @@ async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agen
           const latest = (await browser.storage.session.get(grantKey))[grantKey] as StoredFixtureGrant | StoredGeminiGrant | undefined;
           if (Date.now() >= deadlineMs) throw new Error();
           if (latest?.documentId === stored.documentId && latest.expiresAt === null && latest.revision === stored.revision
-            && latest.url === expectedUrl) await browser.storage.session.remove(grantKey);
+            && latest.url === expectedUrl) {
+            await browser.storage.session.remove(grantKey);
+            if (target.provider === "databag") await stopDatabagTargetObservation(tabId, target.documentId);
+          }
         });
       }
       return { ok: true, agents: agents as ChatAgent[], countsKnown: target !== null };
@@ -1780,6 +1796,7 @@ async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agen
         if (Date.now() >= deadlineMs) throw new Error();
         if (latest?.documentId === stored.documentId && latest.expiresAt === stored.expiresAt && latest.revision === stored.revision) {
           await browser.storage.session.remove(grantKey);
+          if (target?.provider === "databag") await stopDatabagTargetObservation(tabId, target.documentId);
         }
       });
     }

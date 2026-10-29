@@ -1080,6 +1080,12 @@ test("spawned native relay replies with a framed version and no other stdout", a
 });
 
 test("native relay lists only live broker pending IDs over real framing", { timeout: 8000 }, async (context) => {
+  const startedAt = performance.now();
+  const phases = [{ phase: "broker startup", elapsedMs: 0 }];
+  let exchangeCount = 0;
+  const markPhase = (phase: string) => {
+    phases.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) });
+  };
   const home = await mkdtemp(join(tmpdir(), "agent-messaging-native-pending-"));
   const brokerEntry = fileURLToPath(new URL("./broker-process.js", import.meta.url));
   const relayEntry = fileURLToPath(new URL("./native-relay.js", import.meta.url));
@@ -1088,7 +1094,13 @@ test("native relay lists only live broker pending IDs over real framing", { time
   let facade: Awaited<ReturnType<typeof connectBroker>> | undefined;
   let reviewPort: ReturnType<typeof spawn> | undefined;
   let reviewPortClose: ReturnType<typeof once> | undefined;
+  const reportFailure = () => context.diagnostic(JSON.stringify({
+    phases, exchangeCount, elapsedMs: Math.round(performance.now() - startedAt),
+    brokerExitCode: broker.exitCode, brokerSignalCode: broker.signalCode,
+    relayExitCode: reviewPort?.exitCode ?? null, relaySignalCode: reviewPort?.signalCode ?? null
+  }));
   const stopReviewHost = () => { reviewPort?.kill(); };
+  context.signal.addEventListener("abort", reportFailure, { once: true });
   context.signal.addEventListener("abort", stopReviewHost, { once: true });
 
   try {
@@ -1105,11 +1117,13 @@ test("native relay lists only live broker pending IDs over real framing", { time
       await setTimeout(25);
     }
     assert.equal(ready, true, "Broker did not start");
+    markPhase("facade connection");
     facade = await connectBroker("facade", join(home, ".config/agent-messaging-mcp/broker"));
     const created = await facade.requestConnection();
     assert.equal(created.kind, "connection_requested");
     if (created.kind !== "connection_requested") throw new Error("Expected pending request");
 
+    markPhase("pending relay startup");
     const host = spawn(process.execPath, [relayEntry, origin, origin], {
       stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
     });
@@ -1133,6 +1147,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
       requestId: created.payload.requestId, expiresAt: created.payload.expiresAt
     }]);
 
+    markPhase("approval relay startup");
     const approvalHost = spawn(process.execPath, [relayEntry, origin, origin], {
       stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
     });
@@ -1168,6 +1183,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const prepared = await facade.prepareFixtureMessage(granted.payload.connectionId, 1,
       "Synthetic fixture review", "b66b3997-9d43-4554-8399-267d1fe9f75c");
     if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture review");
+    markPhase("review relay startup");
     const reviewHost = spawn(process.execPath, [relayEntry, origin, origin], {
       stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
     });
@@ -1190,6 +1206,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.deepEqual(reviewReply.payload, { reviews: [{ operationId: prepared.payload.operationId,
       reviewId, expiresAt: prepared.payload.expiresAt, preview: prepared.payload.preview }], hasMore: false });
 
+    markPhase("review approval relay startup");
     const approvalReviewHost = spawn(process.execPath, [relayEntry, origin, origin], {
       stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
     });
@@ -1210,6 +1227,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(approvalReviewReply.payload.state, "approved");
 
     let lastExchangeDiagnostic = "";
+    markPhase("persistent review relay");
     const fillHost = spawn(process.execPath, [relayEntry, origin, origin], {
       stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
     });
@@ -1219,6 +1237,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     fillHost.stderr.on("data", (chunk: Buffer) => fillErrors.push(chunk));
     fillHost.stdin.on("error", stopReviewHost);
     const exchangeFillReview = async (message: unknown) => {
+      exchangeCount++;
       const diagnosticOffset = fillErrors.length;
       const decoder = new NativeFrameDecoder();
       const chunks = on(fillHost.stdout, "data", { close: ["end", "close"], signal: context.signal });
@@ -1976,7 +1995,11 @@ test("native relay lists only live broker pending IDs over real framing", { time
     }];
     assert.equal(replayedGemini.kind, "gemini_snapshot_published");
     assert.deepEqual(replayedGemini.payload, { count: 0 });
+  } catch (error) {
+    if (!context.signal.aborted) reportFailure();
+    throw error;
   } finally {
+    context.signal.removeEventListener("abort", reportFailure);
     context.signal.removeEventListener("abort", stopReviewHost);
     stopReviewHost();
     if (reviewPortClose) await reviewPortClose;

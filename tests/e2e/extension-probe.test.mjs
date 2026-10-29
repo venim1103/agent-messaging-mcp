@@ -2081,10 +2081,10 @@ for (const provider of ["fixture", "gemini"]) {
   });
 }
 
-for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(provider =>
+for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].flatMap(provider =>
   ["failure", "lifetime", "reload", "reload-failure", ...(provider === "databag" ? ["fill-result-loss", "submit-result-loss"] : [])]
-    .map(scenario => ({ provider, scenario })))) {
-  test(`${provider} popup autonomous admission (${scenario}) is per agent and preserves other owners`, { timeout: 20000 }, async (testContext) => {
+    .flatMap(scenario => (provider === "databag" ? [false, true] : [false]).map(native => ({ provider, scenario, native }))))) {
+  test(`${provider}${native ? " native" : ""} popup autonomous admission (${scenario}) is per agent and preserves other owners`, { timeout: 20000 }, async (testContext) => {
     const setPhase = trackTestPhase(testContext, `${provider} admission ${scenario}`);
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-autonomous-test-"));
     const unpacked = join(profile, "unpacked-extension");
@@ -2120,6 +2120,12 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
         await setTimeout(25);
       }
       assert.equal(ready, true, "Autonomous broker did not start");
+      if (native) {
+        worker.on("console", message => {
+          if (message.text().startsWith("synthetic-browser-job:")) testContext.diagnostic(message.text());
+        });
+        await traceBrowserJobs(worker, true);
+      }
       if (scenario === "failure") {
         await worker.evaluate(() => {
           globalThis.syntheticInvalidApprovalAgent = null;
@@ -2169,14 +2175,16 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
       const page = await context.newPage();
       const url = provider === "fixture" ? "http://127.0.0.1:8787/"
         : provider === "databag" ? "https://databag.example/#/session" : "https://gemini.google.com/app/synthetic-autonomous";
-      const html = provider === "fixture" ? await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8")
+      const fixtureHtml = provider === "fixture" ? await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8")
         : provider === "databag" ? await readFile(fileURLToPath(new URL("../fixtures/databag.html", import.meta.url)), "utf8")
         : `<!doctype html><main><infinite-scroller><user-query><user-query-content><p class="query-text-line">Synthetic user row</p></user-query-content></user-query>
           <model-response><model-response-content>Synthetic reply</model-response-content></model-response></infinite-scroller>
           <div contenteditable="true" aria-label="Enter a prompt for Gemini"></div><button type="submit" aria-label="Send message">Send</button></main>`;
+      const html = native ? fixtureHtml.replace("<body>", "<body data-synthetic-native>") : fixtureHtml;
       await page.route(provider === "databag" ? "https://databag.example/**" : url,
         route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
       await page.goto(url);
+      if (native) assert.equal(await page.locator("[data-chat-contract]").count(), 0);
       const selected = await worker.evaluate(async () => {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         const execute = chrome.scripting.executeScript.bind(chrome.scripting);
@@ -2243,6 +2251,22 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
       const key = `${provider}-grant-${selected.tabId}`;
       assert.equal(await worker.evaluate(async key => (await chrome.storage.session.get(key))[key].expiresAt, key), null);
       setPhase("approved owner reads");
+      if (native) {
+        setPhase("native direct capture");
+        const capture = await worker.evaluate(async ({ key, tabId }) => {
+          const grant = (await chrome.storage.session.get(key))[key];
+          const [result] = await chrome.scripting.executeScript({ target: { tabId, documentIds: [grant.documentId] },
+            func: async conversationId => {
+              const identity = await globalThis.agentDatabagAdapter.identify();
+              const snapshot = await globalThis.agentDatabagAdapter.capture(conversationId);
+              return { identityMatches: identity?.conversationId === conversationId, captured: !!snapshot,
+                rows: snapshot?.messages.length ?? 0 };
+            }, args: [grant.conversationId] });
+          return result.result;
+        }, { key, tabId: selected.tabId });
+        assert.deepEqual(capture, { identityMatches: true, captured: true, rows: 2 });
+      }
+      setPhase("public owner read");
       const firstRead = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: first.connectionId } });
       assert.equal(firstRead.isError, undefined);
       if (provider === "databag") {
@@ -2279,17 +2303,7 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
           assert.equal(observed.isError, undefined);
           assert.match(JSON.stringify(observed.structuredContent), /Synthetic Databag autonomous worker message/);
           const replyText = "Synthetic Databag worker reply";
-          await page.locator("[data-chat-timeline]").evaluate((timeline, text) => {
-            const row = document.createElement("div");
-            row.dataset.chatMessageId = "synthetic-worker-reply";
-            row.dataset.chatDirection = "incoming";
-            row.dataset.chatReadable = "true";
-            const region = document.createElement("span");
-            region.dataset.chatText = "true";
-            region.textContent = text;
-            row.append(region);
-            timeline.append(row);
-          }, replyText);
+          await page.evaluate(text => window.syntheticAppendIncoming(text), replyText);
           const reply = await clients[0].callTool({ name: "chat_wait_for_reply", arguments: { connectionId: first.connectionId, timeoutMs: 4000 } });
           assert.equal(reply.isError, undefined, JSON.stringify({ code: reply.structuredContent.code, timedOut: reply.structuredContent.timedOut }));
           assert.equal(reply.structuredContent.timedOut, false);
@@ -2356,7 +2370,8 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
           } finally { relay.close(); }
         }
         if (scenario === "failure") {
-          await page.locator("[data-chat-direction=incoming] [data-chat-text]").evaluate(row => { row.textContent = "Synthetic incoming revision"; });
+          await page.locator(native ? "._thread_synthetic_1 > ._topic_synthetic_1 ._text_synthetic_1"
+            : "[data-chat-direction=incoming] [data-chat-text]").first().evaluate(row => { row.textContent = "Synthetic incoming revision"; });
           const events = await clients[0].callTool({ name: "chat_wait_for_events", arguments: {
             connectionId: first.connectionId, cursor: firstRead.structuredContent.cursor, timeoutMs: 2000
           } });
@@ -2432,7 +2447,17 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
           assert.equal(missingIdentity, true, "Reload identity was not checked before the synthetic chat rendered");
           assert.equal((await clients[1].callTool({ name: "chat_read_messages",
             arguments: { connectionId: second.connectionId } })).isError, true, "Reloading chat must not serve reads before identity is available");
-          await page.evaluate(markup => { document.body.innerHTML = markup; }, html);
+          await page.evaluate(({ markup, native }) => {
+            document.body.innerHTML = markup;
+            if (native) {
+              document.body.setAttribute("data-synthetic-native", "");
+              for (const original of document.querySelectorAll("script")) {
+                const script = document.createElement("script");
+                script.textContent = original.textContent;
+                original.replaceWith(script);
+              }
+            }
+          }, { markup: html, native });
           await page.unroute(provider === "databag" ? "https://databag.example/**" : url, delayedReloadRoute);
         }
         let reloaded = false;
@@ -2544,6 +2569,21 @@ for (const { provider, scenario } of ["fixture", "gemini", "databag"].flatMap(pr
         assert.equal(revoked, true, "Same-URL account/channel change must end the selected chat connection");
         assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).isError, true);
         assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+        if (native && scenario === "lifetime") {
+          setPhase("fresh approval after identity revocation");
+          await popup.getByRole("button", { name: "Refresh agents" }).click();
+          await waitCount(0);
+          setPhase("fresh connection approval");
+          await row("Autonomous two").getByRole("button", { name: "Connect this chat" }).press("Enter");
+          await waitCount(1);
+          setPhase("fresh connection read");
+          const renewed = await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+          const replacement = renewed.structuredContent.connections[0];
+          assert.notEqual(replacement.connectionId, second.connectionId);
+          assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: replacement.connectionId } })).isError, undefined);
+          assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).isError, true);
+          assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+        }
       }
       setPhase("tab-close revocation");
       await page.close();
