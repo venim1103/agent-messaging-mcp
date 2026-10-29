@@ -71,7 +71,7 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
         : /^[A-Za-z][A-Za-z0-9_-]*_(conversation|thread|focused|identity|handle|staging|send|files|topic|text)__[A-Za-z0-9_-]+$/.exec(token);
       const match = scoped ?? prefixed;
       result.cssNaming[scoped ? "scoped" : prefixed ? "componentPrefixed" : "other"]++;
-      if (match) names.add(match[1]);
+      if (match?.[1]) names.add(match[1]);
     }
     const parent = ancestry[depth - 1];
     const current = { conversation: names.has("conversation") || Boolean(parent?.conversation),
