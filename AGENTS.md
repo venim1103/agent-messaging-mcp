@@ -4,9 +4,14 @@ Build communication between an MCP agent and a browser chat explicitly selected 
 
 ## Start With Context
 
-- Read the **Current State Dashboard** at the top of [HANDOFF.md](HANDOFF.md) first, then the newest relevant checkpoint below it. Older dated entries are history; when they disagree with the dashboard, the dashboard wins. Use [DEVELOPMENT.md](DEVELOPMENT.md) for setup, tool usage and technical reference, and [DESIGN.md](DESIGN.md) for architecture, authority contracts and open decisions (section 17).
+- For a new conversation, start with the [fresh-conversation handover](HANDOFF.md#fresh-conversation-start), then the **Current State Dashboard** and newest relevant checkpoint. Older dated entries are history; when they disagree with the dashboard, the dashboard wins. Use [DEVELOPMENT.md](DEVELOPMENT.md) for setup, tool usage and technical reference, and [DESIGN.md](DESIGN.md) for architecture, authority contracts and open decisions (section 17).
 - Check the actual worktree and nearby implementation/tests. Preserve user changes; do not assume services, grants or approvals survived a restart.
 - After an interrupted tool call with unknown outcome, verify whether it applied before repeating it. Distinguish completed, tested, staged and connected work.
+
+## Portable Project Skill
+
+- For browser-chat operation, invocation recovery, acceptance testing or session pickup, load [browser-chat-workflow](.agents/skills/browser-chat-workflow/SKILL.md) when relevant. It is an original repository skill in Agent Skills format; supported hosts can discover it under `.agents/skills`, and other models can read it explicitly.
+- AGENTS.md remains the canonical workflow/safety reference, HANDOFF.md owns changing status, and DEVELOPMENT.md describes host setup. Skill discovery and tool exposure vary by host; a skill does not install MCP, grant access, transfer another owner's approval or enforce host execution. Do not load unrelated skills or copy bundled editor instructions into the project.
 
 ## Documentation Audience
 

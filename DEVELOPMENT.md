@@ -12,6 +12,14 @@ Dated test reports that used to fill this file were removed in the 2026-10-09 re
 
 The decided target is one **Connect this chat** approval per agent, after which each approved agent chats on its own until its connection ends. Several agents may share a chat (DESIGN.md sections 2 and 17). Popup-first admission, owned pickup, no-expiry grants, exact same-chat reload and autonomous sending are implemented and synthetic-tested. Implementation and synthetic coverage do not substitute for installed/live acceptance; see HANDOFF.md for current evidence.
 
+## Agent Instructions And Skills
+
+- [AGENTS.md](AGENTS.md) contains shared project rules. [The fresh-conversation handover](HANDOFF.md#fresh-conversation-start) is the short restart brief; changing evidence stays in HANDOFF.md rather than being copied into skills.
+- [browser-chat-workflow](.agents/skills/browser-chat-workflow/SKILL.md) is the original project skill for safe operation, invocation recovery, bounded tests and handovers. Its directory has the standard SKILL.md `name`/`description` metadata and portable Markdown procedures, with links to canonical project documents.
+- Hosts supporting `.agents/skills/<name>/SKILL.md` can discover it there. Other AI assistants can be asked to read that exact file explicitly alongside AGENTS.md. Automatic loading, slash commands, available tools and enabled selections depend on the host; identical behavior across models is not established by storing a skill.
+- The editor-bundled customization/setup/history skills used during development are supplied by VS Code, not authored or redistributed by this repository. Private session memory, live handles, cursors, transcripts, grants and profile state are not project skill resources.
+- Configure this MCP server separately for each supported host using its documented mechanism. Skills do not install dependencies, create approval, inherit another owner's grants, bypass required host permissions or wake an idle agent. A fresh conversation can reduce accumulated-context effects, but the diagnosis remains unproven until an actual controlled check runs.
+
 ## Architecture in Brief
 
 ```text
