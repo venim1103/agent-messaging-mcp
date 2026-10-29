@@ -212,6 +212,7 @@ async function inspectDatabagTab(target: InspectionTarget): Promise<InspectionRe
   const shape = await inspectPage(target, inspectDatabagStructure, [{ expectedUrl: target.url, origin: new URL(target.url).origin }]);
   if (!shape) return null;
   const counts = shape.counts;
+  const outline = shape.editorNeighborhood;
   return { title: "Chat structure (diagnostic)", details: [
     ["Bounds", `${shape.visitedElements} visited elements; ${shape.limited ? "limit reached" : "within limits"}`],
     ["Native elements", `${shape.nativeElements.textareas} visible textareas; ${shape.nativeElements.contenteditables} visible contenteditables; `
@@ -226,6 +227,12 @@ async function inspectDatabagTab(target: InspectionTarget): Promise<InspectionRe
     ["Composer", `${counts.composers} composer candidates; ${counts.fileInputs} file inputs; ${counts.stagedAssetChildren} staged elements`],
     ["Editors", `${counts.editorCandidates} candidates; ` + (shape.editors.map(editor =>
       `${editor.disabled ? "disabled" : "enabled"}; ${editor.readOnly ? "read-only" : "writable"}`).join("\n") || "None visible")],
+    ["Editor outline", outline.anchor === null ? "No visible native textarea" : [
+      `anchor ${outline.anchor}; before omitted ${outline.beforeOmitted}; after omitted ${outline.afterOmitted}`,
+      ...outline.nodes.map((node, index) => `${index}: depth ${node.depth}; ${node.kind}; visible ${node.visible}; role ${node.role}; `
+        + `pointer ${node.pointer}; title ${node.title}; children ${node.children}; class tokens ${node.classCount}; class keys `
+        + (node.classes.map(value => `${value.key}:${value.shape}`).join(", ") || "none"))
+    ].join("\n")],
     ["Send region elements", `${shape.sendRegions.buttons} buttons; ${shape.sendRegions.labels} labels; ${shape.sendRegions.divs} divs; `
       + `${shape.sendRegions.spans} spans; ${shape.sendRegions.svgs} SVG roots; ${shape.sendRegions.other} other elements`],
     ["Send controls", `${counts.sendButtons} native button candidates; ` + (shape.sends.map(send =>

@@ -29,7 +29,7 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
         <div class="_files_native_1"></div><textarea>Synthetic human draft</textarea>
         <label class="send SyntheticPrivateIdentifier" title="Synthetic attachment tooltip">
           <svg width="24" height="24"><path d="M0 0 L24 24"></path></svg>
-        </label><span role="button">Synthetic toolbar action</span>
+        </label><span class="SyntheticPrivateIdentifier" role="button" style="cursor: pointer">Synthetic toolbar action</span>
         <div class="_send_native_1"><button disabled>Send</button></div>
       </div></div>
       <div style="opacity: 0"><div class="_focused_native_1">Hidden selection</div></div>
@@ -78,9 +78,23 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
       draftUnchanged: true, htmlUnchanged: true, adapterInstalled: false, storedKeys: 0 });
     assert.equal(JSON.stringify(structure).includes("Synthetic"), false);
     assert.deepEqual(structure.nativeElements, { textareas: 1, contenteditables: 1, buttons: 1, fileInputs: 1, iframes: 1 });
-    assert.deepEqual(structure.cssNaming, { scoped: 10, componentPrefixed: 0, other: 2 });
+    assert.deepEqual(structure.cssNaming, { scoped: 10, componentPrefixed: 0, other: 3 });
     assert.deepEqual(structure.controlElements, { labels: 1, roleButtons: 1, svgRoots: 1 });
     assert.deepEqual(structure.sendRegions, { buttons: 0, labels: 0, divs: 1, spans: 0, svgs: 0, other: 0 });
+    const outline = structure.editorNeighborhood;
+    assert.ok(outline.nodes.length > 0 && outline.nodes.length <= 32);
+    assert.deepEqual(outline.nodes[outline.anchor], { depth: 3, kind: "textarea", visible: true, role: "none",
+      pointer: false, title: false, children: 0, classCount: 0, classes: [] });
+    assert.equal(outline.beforeOmitted, false);
+    assert.equal(outline.afterOmitted, false);
+    assert.ok(outline.nodes.some(node => node.kind === "file-input" && !node.visible));
+    const label = outline.nodes.find(node => node.kind === "label" && node.visible);
+    const action = outline.nodes.find(node => node.kind === "span" && node.role === "button");
+    assert.equal(label.title, true);
+    assert.equal(action.pointer, true);
+    assert.deepEqual(label.classes[1], action.classes[0]);
+    assert.ok(outline.nodes.every(node => node.classes.length <= 4 && node.classes.every(value => Number.isInteger(value.key)
+      && value.key >= 1 && value.key <= 128 && ["plain", "underscore", "hyphen", "mixed", "other"].includes(value.shape))));
     await page.evaluate(() => {
       for (const element of document.querySelectorAll("[class]")) {
         element.setAttribute("class", element.getAttribute("class").replace(/^_([a-z]+)_/, "Synthetic_$1__"));
@@ -90,7 +104,7 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
     const prefixed = await page.evaluate(inspectDatabagStructure, input);
     assert.deepEqual(prefixed.counts, structure.counts);
     assert.deepEqual(prefixed.nativeElements, structure.nativeElements);
-    assert.deepEqual(prefixed.cssNaming, { scoped: 0, componentPrefixed: 10, other: 2 });
+    assert.deepEqual(prefixed.cssNaming, { scoped: 0, componentPrefixed: 10, other: 3 });
     assert.deepEqual(prefixed.controlElements, structure.controlElements);
     assert.deepEqual(prefixed.sendRegions, structure.sendRegions);
     assert.deepEqual(await page.evaluate(() => window.syntheticInspectionState()), prefixedBefore);
@@ -135,12 +149,63 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
     assert.deepEqual(unclassified.controlElements, structure.controlElements);
     assert.deepEqual(unclassified.sendRegions, Object.fromEntries(Object.keys(structure.sendRegions).map(key => [key, 0])));
     assert.deepEqual(unclassified.counts, Object.fromEntries(Object.keys(structure.counts).map(name => [name, 0])));
+    assert.equal(unclassified.editorNeighborhood.nodes[unclassified.editorNeighborhood.anchor].kind, "textarea");
+    assert.ok(unclassified.editorNeighborhood.nodes.every(node => node.classCount === 0 && node.classes.length === 0));
     assert.deepEqual(await page.evaluate(() => window.syntheticInspectionState()), unclassifiedBefore);
     assert.equal(JSON.stringify(unclassified).includes("Synthetic"), false);
     for (const origin of ["https://databag.example/", "http://databag.example", "https://gemini.google.com"]) {
       assert.equal(await page.evaluate(inspectDatabagStructure, { ...input, origin }), null);
     }
     assert.equal(await page.evaluate(inspectDatabagStructure, { ...input, expectedUrl: `${input.expectedUrl}?other` }), null);
+    await page.reload();
+    await page.evaluate(() => {
+      document.body.replaceChildren();
+      for (let index = 0; index < 40; index++) {
+        const element = document.createElement("div");
+        element.className = `SyntheticPrivateBefore${index}`;
+        document.body.append(element);
+      }
+      const hidden = document.createElement("textarea");
+      hidden.hidden = true;
+      const editor = document.createElement("textarea");
+      editor.className = "shared plain_name plain-name mixed_name-other unsafe:private SyntheticPrivateExtra";
+      editor.setAttribute("role", "SyntheticPrivateRole");
+      document.body.append(hidden, editor);
+      for (let index = 0; index < 40; index++) {
+        const element = document.createElement(index === 0 ? "synthetic-private-element" : index === 1 ? "img" : "div");
+        element.className = index === 0 ? "shared unsafe:private" : `SyntheticPrivateAfter${index}`;
+        element.setAttribute("title", "SyntheticPrivateTooltip");
+        element.setAttribute("style", "display: block; width: 24px; height: 24px");
+        document.body.append(element);
+      }
+      document.body.append(document.createElement("textarea"));
+    });
+    const clipped = await page.evaluate(inspectDatabagStructure, input);
+    assert.equal(clipped.nativeElements.textareas, 2);
+    assert.equal(clipped.editorNeighborhood.anchor, 16);
+    assert.equal(clipped.editorNeighborhood.nodes.length, 32);
+    assert.equal(clipped.editorNeighborhood.beforeOmitted, true);
+    assert.equal(clipped.editorNeighborhood.afterOmitted, true);
+    const anchor = clipped.editorNeighborhood.nodes[16];
+    assert.equal(anchor.kind, "textarea");
+    assert.equal(anchor.visible, true);
+    assert.equal(anchor.role, "other");
+    assert.equal(anchor.classCount, 6);
+    assert.deepEqual(anchor.classes.map(value => value.shape), ["plain", "underscore", "hyphen", "mixed"]);
+    assert.equal(clipped.editorNeighborhood.nodes[15].kind, "textarea");
+    assert.equal(clipped.editorNeighborhood.nodes[15].visible, false);
+    const following = clipped.editorNeighborhood.nodes[17];
+    assert.equal(following.kind, "other");
+    assert.equal(following.title, true);
+    assert.equal(following.classes[0].key, anchor.classes[0].key);
+    assert.equal(following.classes[1].shape, "other");
+    assert.equal(clipped.editorNeighborhood.nodes[18].kind, "img");
+    assert.ok(clipped.editorNeighborhood.nodes.every(node => node.classes.length <= 4 && node.classes.every(value => value.key <= 128)));
+    assert.doesNotMatch(JSON.stringify(clipped), /Synthetic|synthetic-private|unsafe:private|plain_name|plain-name|mixed_name-other|shared/);
+    await page.evaluate(() => { for (const editor of document.querySelectorAll("textarea:not([hidden])")) editor.remove(); });
+    const absent = await page.evaluate(inspectDatabagStructure, input);
+    assert.equal(absent.nativeElements.textareas, 0);
+    assert.deepEqual(absent.editorNeighborhood, { anchor: null, beforeOmitted: false, afterOmitted: false, nodes: [] });
     await page.reload();
     await page.evaluate(() => {
       for (const element of document.querySelectorAll("[class]")) element.removeAttribute("class");
@@ -156,6 +221,8 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
     assert.equal(oversizedClass.limited, true);
     assert.equal(oversizedClass.visitedElements, 1);
     assert.deepEqual(oversizedClass.cssNaming, { scoped: 0, componentPrefixed: 0, other: 0 });
+    assert.equal(oversizedClass.editorNeighborhood.anchor, null);
+    assert.deepEqual(oversizedClass.editorNeighborhood.nodes, []);
     assert.equal(JSON.stringify(oversizedClass).includes("Synthetic"), false);
     await page.reload();
     await page.evaluate(() => {
@@ -166,6 +233,8 @@ test("Databag stock structure inspection is bounded, metadata-only and never gra
     const limited = await page.evaluate(inspectDatabagStructure, input);
     assert.equal(limited.limited, true);
     assert.equal(limited.visitedElements, 4096);
+    assert.ok(limited.editorNeighborhood.nodes.length <= 32);
+    assert.equal(limited.editorNeighborhood.afterOmitted, true);
     await page.reload();
     await page.evaluate(() => {
       let parent = document.body;

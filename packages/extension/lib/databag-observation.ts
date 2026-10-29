@@ -11,6 +11,17 @@ export type DatabagFill = DatabagPreflight | { ok: false; code: "FILL_UNAVAILABL
 export type DatabagSubmitInput = Omit<DatabagFillInput, "leftover">;
 export type DatabagSubmit = { ok: true; editor: "textarea"; activated: true } | { ok: false;
   code: "TARGET_CHANGED" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE" | "DISPATCH_UNAVAILABLE" | "DISPATCH_UNCERTAIN" };
+type DatabagOutlineNode = {
+  depth: number;
+  kind: "body" | "div" | "span" | "textarea" | "button" | "file-input" | "input" | "label" | "img" | "svg" | "iframe" | "form" | "other";
+  visible: boolean;
+  role: "none" | "button" | "textbox" | "toolbar" | "other";
+  pointer: boolean;
+  title: boolean;
+  children: number;
+  classCount: number;
+  classes: { key: number; shape: "plain" | "underscore" | "hyphen" | "mixed" | "other" }[];
+};
 export type DatabagStructure = {
   visitedElements: number;
   limited: boolean;
@@ -22,6 +33,7 @@ export type DatabagStructure = {
   cssNaming: { scoped: number; componentPrefixed: number; other: number };
   controlElements: { labels: number; roleButtons: number; svgRoots: number };
   sendRegions: { buttons: number; labels: number; divs: number; spans: number; svgs: number; other: number };
+  editorNeighborhood: { anchor: number | null; beforeOmitted: boolean; afterOmitted: boolean; nodes: DatabagOutlineNode[] };
   editors: { disabled: boolean; readOnly: boolean }[];
   sends: { disabled: boolean; ariaDisabled: boolean }[];
 };
@@ -54,7 +66,21 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
       editorCandidates: 0, sendButtons: 0 },
     nativeElements: { textareas: 0, contenteditables: 0, buttons: 0, fileInputs: 0, iframes: 0 },
     cssNaming: { scoped: 0, componentPrefixed: 0, other: 0 }, controlElements: { labels: 0, roleButtons: 0, svgRoots: 0 },
-    sendRegions: { buttons: 0, labels: 0, divs: 0, spans: 0, svgs: 0, other: 0 }, editors: [], sends: [] };
+    sendRegions: { buttons: 0, labels: 0, divs: 0, spans: 0, svgs: 0, other: 0 },
+    editorNeighborhood: { anchor: null, beforeOmitted: false, afterOmitted: false, nodes: [] }, editors: [], sends: [] };
+  const preceding: { node: DatabagOutlineNode; tokens: string[] }[] = [];
+  const classKeys = new Map<string, number>();
+  let precedingOmitted = false;
+  const appendOutline = (sample: { node: DatabagOutlineNode; tokens: string[] }) => {
+    const classes = sample.tokens.map(token => {
+      let key = classKeys.get(token);
+      if (key === undefined) { key = classKeys.size + 1; classKeys.set(token, key); }
+      const shape: DatabagOutlineNode["classes"][number]["shape"] = !/^[A-Za-z0-9_-]+$/.test(token) ? "other" : token.includes("_")
+        ? token.includes("-") ? "mixed" : "underscore" : token.includes("-") ? "hyphen" : "plain";
+      return { key, shape };
+    });
+    result.editorNeighborhood.nodes.push({ ...sample.node, classes });
+  };
   const ancestry: { conversation: boolean; composer: boolean; send: boolean; account: boolean }[] = [];
   let element: Element | null = body;
   let depth = 0;
@@ -63,9 +89,9 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
     result.visitedElements++;
     const classes = element.getAttribute("class") ?? "";
     if (classes.length > 512) { result.limited = true; break; }
+    const tokens = classes.split(/\s+/).filter(Boolean);
     const names = new Set<string>();
-    for (const token of classes.split(/\s+/)) {
-      if (!token) continue;
+    for (const token of tokens) {
       const scoped = /^_(conversation|thread|focused|identity|handle|staging|send|files|topic|text)_[A-Za-z0-9_-]+$/.exec(token);
       const prefixed = scoped ? null
         : /^[A-Za-z][A-Za-z0-9_-]*_(conversation|thread|focused|identity|handle|staging|send|files|topic|text)__[A-Za-z0-9_-]+$/.exec(token);
@@ -81,9 +107,34 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
     const style = getComputedStyle(element);
     const hidden = element.hasAttribute("hidden") || element.hasAttribute("inert") || element.getAttribute("aria-hidden") === "true"
       || style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0;
+    const visible = !hidden && element.getClientRects().length > 0;
+    const neighborhood = result.editorNeighborhood;
+    if (neighborhood.anchor === null || neighborhood.nodes.length < 32) {
+      const role = element.getAttribute("role");
+      const tag = element.localName;
+      const kind = element instanceof HTMLInputElement ? element.type === "file" ? "file-input" : "input"
+        : (["body", "div", "span", "textarea", "button", "label", "img", "svg", "iframe", "form"] as const)
+          .find(kind => kind === tag) ?? "other";
+      const sample: (typeof preceding)[number] = { node: { depth, kind, visible, role: !role ? "none"
+        : role === "button" || role === "textbox" || role === "toolbar" ? role : "other",
+      pointer: style.cursor === "pointer", title: element.hasAttribute("title"), children: element.childElementCount,
+      classCount: tokens.length, classes: [] }, tokens: tokens.slice(0, 4) };
+      if (neighborhood.anchor === null) {
+        if (visible && element instanceof HTMLTextAreaElement) {
+          neighborhood.anchor = preceding.length;
+          neighborhood.beforeOmitted = precedingOmitted;
+          for (const previous of preceding) appendOutline(previous);
+          preceding.length = 0;
+          appendOutline(sample);
+        } else {
+          preceding.push(sample);
+          if (preceding.length > 16) { preceding.shift(); precedingOmitted = true; }
+        }
+      } else appendOutline(sample);
+    } else neighborhood.afterOmitted = true;
     if (element instanceof HTMLInputElement && element.type === "file") result.nativeElements.fileInputs++;
     if (parent?.composer && element instanceof HTMLInputElement && element.type === "file") result.counts.fileInputs++;
-    if (!hidden && element.getClientRects().length) {
+    if (visible) {
       if (element instanceof HTMLTextAreaElement) result.nativeElements.textareas++;
       if (element instanceof HTMLElement && element.hasAttribute("contenteditable") && element.isContentEditable) {
         result.nativeElements.contenteditables++;
@@ -128,6 +179,7 @@ export function inspectDatabagStructure(input: { expectedUrl: string; origin: st
     if (element === body) break;
     element = element.nextElementSibling;
   }
+  if (result.limited && result.editorNeighborhood.anchor !== null) result.editorNeighborhood.afterOmitted = true;
   return location.href === input.expectedUrl && document.visibilityState === "visible" && body === document.body ? result : null;
 }
 

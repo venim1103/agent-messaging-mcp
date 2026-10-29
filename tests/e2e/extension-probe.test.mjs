@@ -170,6 +170,11 @@ test("shared popup inspection is contract-free, document-bound and never approve
     assert.ok(diagnostic.includes("Send region elements"));
     assert.ok(diagnostic.includes("1 buttons; 0 labels; 0 divs; 0 spans; 0 SVG roots; 0 other elements"));
     assert.ok(diagnostic.includes("1 native button candidates"));
+    assert.ok(diagnostic.includes("Editor outline"));
+    assert.match(diagnostic, /anchor [0-9]+; before omitted (?:true|false); after omitted (?:true|false)/);
+    assert.ok(diagnostic.includes("textarea; visible true; role none"));
+    assert.ok(diagnostic.includes("title true"));
+    assert.match(diagnostic, /class keys [0-9]+:plain/);
     assert.doesNotMatch(diagnostic, /Synthetic|synthetic-account|synthetic-channel|https:\/\//);
     assert.equal(await page.content(), beforeMarkup);
     assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), beforeStorage);
