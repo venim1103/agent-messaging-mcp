@@ -199,6 +199,19 @@ Owned `chat_disconnect` bypasses an in-flight read/send in both private client a
 
 Shared supervised/autonomous commit and fixture dispatch execution end 25 ms before the original broker reply deadline, retaining the existing response reserve. Browser leases are clipped to that earlier execution deadline; wire deadlines, uncertainty/no-retry handling and grant authority do not change.
 
+### Databag work-channel operation
+
+The person has designated one direct conversation for AI0 to report work, request input and receive their delegated task instructions. Follow [the work-channel rules](AGENTS.md#databag-work-channel) and DESIGN.md D21; a display name is not an authenticated binding.
+
+1. Human: select that direct chat and use **Connect this chat** for this agent. Pick up only the owned connection and verify it matches the designated target; never select an arbitrary available chat. A prior disconnected test handle is not authority.
+2. Take a fresh `chat_read_messages` baseline and retain its cursor/handled row IDs in active context, not repository files. Existing rows provide context, not new executable requests.
+3. Use `chat_wait_for_events` with the last cursor at work checkpoints and when waiting for input. Its events contain full snapshots; process new incoming rows in order and ignore outgoing echoes. On cursor expiry, resnapshot; if newness is ambiguous, ask instead of replaying commands. Rendered windows and omissions do not provide durable or gap-free inbox delivery.
+4. Send concise progress or one necessary question through `chat_send_message`, one at a time with a fresh idempotency key. Continue independent agreed work, or use bounded waits for a new answer. Never retry an uncertain send or let a stale incoming row qualify as that answer.
+5. Keep a valid grant open when a wait times out or a work/Copilot checkpoint ends. `expiresAt: null` means no fixed connection expiry, not a bypass of lifecycle checks. The old one-hour coordination/test cap does not apply to ordinary authorized work-channel use. Existing per-call deadlines/send limits remain; human or agent can disconnect as needed. Identity change, closure, revocation or owner/browser restart still ends access. Same-chat reload requires fresh document verification; installed Databag reload acceptance remains separate.
+6. If the owner/grant ends, stop chat operations and report the need for fresh trusted approval in Copilot. Do not silently reconnect. Preserve pause/stop requests from either channel.
+
+This procedure operates only while the host permits an active turn. It does not keep a finished Copilot session running or demonstrate idle wake-up; see [the host boundary](DESIGN.md#receiving-does-not-automatically-wake-an-agent). Changing agent instructions alone requires no extension reload or MCP restart. Separate acceptance tests retain their explicitly bounded scopes and do not inherit permission for unrelated side effects.
+
 ### Legacy connection and shared read tools
 
 1. `chat_request_connection` returns `{ requestId, state: "pending", expiresAt }`. The request expires after 60 seconds.
