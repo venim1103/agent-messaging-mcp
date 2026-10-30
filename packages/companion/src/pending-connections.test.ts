@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FIXTURE_READ_TIMEOUT_MS, GEMINI_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_AGE_MS, MAX_GEMINI_SNAPSHOT_AGE_MS,
   MAX_AUTONOMOUS_CONNECTIONS, MAX_CONNECTION_WAIT_MS, MAX_CONNECTED_AGENTS, MAX_PENDING_REQUESTS, PendingConnectionRequests,
-  PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS, ReplyObservation, isGeminiTarget, type ApprovedTarget, type DatabagTarget }
+  PENDING_REQUEST_TTL_MS, READONLY_CONNECTION_TTL_MS, ReplyObservation, isGeminiTarget, type ApprovedTarget, type DatabagTarget,
+  type FixtureMessage }
   from "./pending-connections.js";
 
 for (const provider of ["fixture", "gemini"]) {
@@ -165,6 +166,112 @@ test("Databag stable DOM reads share bounded challenges and revoke old-document 
   requests.disconnect(owner);
   requests.disconnect(other);
 });
+
+for (const provider of ["fixture", "databag"] as const) {
+  test(`${provider} compact incoming changes preserve newness, edits, omissions and owned cursor continuity`, () => {
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("compact reader");
+    const stranger = Symbol("other reader");
+    const target = provider === "fixture"
+      ? { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
+        tabId: 3, documentId: "synthetic-document" }
+      : { provider: "databag" as const, origin: "https://databag.example" as const,
+        url: "https://databag.example/#/session", conversationId: `databag_${"a".repeat(64)}`,
+        tabId: 3, documentId: "synthetic-document" };
+    const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target, 1000)!;
+    requests.registerAgent(stranger);
+    const publish = (messages: FixtureMessage[], omittedBefore = false) =>
+      requests.publishStableSnapshot(target, messages, 1001, undefined, omittedBefore);
+    const snapshot = () => {
+      const value = requests.getStableSnapshot(owner, grant.connectionId, 1001);
+      assert.ok(value && value !== "not_ready");
+      return value;
+    };
+    const changes = (cursor: ReturnType<typeof snapshot>["cursor"], limit = 2) =>
+      requests.readStableIncomingChanges(owner, grant.connectionId, cursor, limit, 1001);
+    const initial: FixtureMessage[] = [
+      { id: "old-in", direction: "incoming", text: "Historical instruction" },
+      { id: "old-out", direction: "outgoing", text: "Historical echo" }
+    ];
+    publish(initial);
+    const baseline = snapshot();
+    assert.deepEqual(changes(baseline.cursor), { state: "ok", cursor: baseline.cursor, events: [] });
+    assert.equal(requests.readStableIncomingChanges(stranger, grant.connectionId, baseline.cursor, 2, 1001), null);
+    const echo: FixtureMessage = { id: "echo", direction: "outgoing", text: "Private outgoing text" };
+    publish([...initial, echo]);
+    const afterEcho = snapshot();
+    assert.deepEqual(changes(baseline.cursor), { state: "ok", cursor: afterEcho.cursor, events: [] });
+    const incoming: FixtureMessage[] = [
+      { id: "new-one", direction: "incoming", text: "Same reply" },
+      { id: "new-two", direction: "incoming", text: "Same reply", truncated: true }
+    ];
+    publish([...initial, echo, ...incoming]);
+    const afterIncoming = snapshot();
+    const page = changes(baseline.cursor);
+    assert.deepEqual(page, { state: "ok", cursor: afterIncoming.cursor, events: [{
+      ...afterIncoming.cursor, payload: { kind: "incoming_changes", coverage: "rendered_only",
+        messages: incoming.map(message => ({ ...message, change: "new" })), omittedBefore: false }
+    }] });
+    assert.deepEqual(changes(baseline.cursor, 1), { state: "ok", cursor: afterEcho.cursor, events: [] });
+    assert.deepEqual(changes(afterEcho.cursor), page);
+    assert.equal(JSON.stringify(page).includes("Historical"), false);
+    assert.equal(JSON.stringify(page).includes(echo.text), false);
+    const revisions: FixtureMessage[] = [
+      { ...incoming[0]!, text: "Edited reply" }, { id: "new-two", direction: "incoming", text: "Whole reply" }
+    ];
+    publish([...initial, echo, ...revisions]);
+    const afterRevision = snapshot();
+    assert.deepEqual(changes(afterIncoming.cursor), { state: "ok", cursor: afterRevision.cursor, events: [{
+      ...afterRevision.cursor, payload: { kind: "incoming_changes", coverage: "rendered_only",
+        messages: revisions.map(message => ({ ...message, change: "revision" })), omittedBefore: false }
+    }] });
+    const newest: FixtureMessage = { id: "new-three", direction: "incoming", text: "Later instruction" };
+    publish([echo, ...revisions, newest], true);
+    const afterRolling = snapshot();
+    assert.deepEqual(changes(afterRevision.cursor), { state: "ok", cursor: afterRolling.cursor, events: [{
+      ...afterRolling.cursor, payload: { kind: "incoming_changes", coverage: "rendered_only",
+        messages: [{ ...newest, change: "new" }], omittedBefore: true }
+    }] });
+    publish([echo, ...revisions, newest, initial[0]!], true);
+    assert.deepEqual(changes(afterRolling.cursor), { state: "expired", resnapshot: true });
+    for (const ambiguous of [
+      [initial[1]!, initial[0]!], [newest, ...initial], [initial[0]!], [newest],
+      [{ ...initial[0]!, direction: "outgoing" as const }, initial[1]!]
+    ]) {
+      publish(initial);
+      const before = snapshot();
+      publish(ambiguous);
+      assert.deepEqual(changes(before.cursor), { state: "expired", resnapshot: true });
+    }
+    publish([]);
+    const empty = snapshot();
+    publish([{ ...newest, id: "fresh-after-empty" }]);
+    const fromEmpty = changes(empty.cursor);
+    assert.ok(fromEmpty && fromEmpty !== "not_ready" && fromEmpty.state === "ok");
+    assert.equal(fromEmpty.events[0]?.payload.messages[0]?.change, "new");
+    const beforeOmission = snapshot();
+    publish(beforeOmission.messages.slice(), true);
+    assert.deepEqual(changes(beforeOmission.cursor), { state: "ok", cursor: snapshot().cursor, events: [{
+      ...snapshot().cursor, payload: { kind: "incoming_changes", coverage: "rendered_only", messages: [], omittedBefore: true }
+    }] });
+    publish([], true);
+    const missingAnchor = snapshot();
+    publish([{ ...newest, id: "unanchored-row" }], true);
+    assert.deepEqual(changes(missingAnchor.cursor), { state: "expired", resnapshot: true });
+    publish(initial);
+    const retained = snapshot();
+    for (let index = 0; index < 128; index++) publish([{ ...initial[0]!, text: `Revision ${index}` }, initial[1]!]);
+    assert.deepEqual(changes(retained.cursor), { state: "expired", resnapshot: true });
+    const ordinary = requests.readStableEvents(owner, grant.connectionId, retained.cursor, 2, 1001);
+    assert.ok(ordinary && ordinary !== "not_ready" && ordinary.state === "ok");
+    const beforeGap = snapshot();
+    assert.equal(requests.markStableObservationGap(target, 1001), 1);
+    assert.deepEqual(changes(beforeGap.cursor), { state: "expired", resnapshot: true });
+    requests.disconnect(owner);
+    assert.equal(changes(beforeGap.cursor), null);
+    requests.disconnect(stranger);
+  });
+}
 
 for (const target of [
   { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },

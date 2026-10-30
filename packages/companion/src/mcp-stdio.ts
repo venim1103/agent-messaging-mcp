@@ -198,20 +198,27 @@ server.registerTool("chat_read_messages", {
 });
 
 server.registerTool("chat_wait_for_events", {
-  description: "Wait for later rendered-only fixture, Gemini or configured Databag snapshots from an owned cursor, with a bounded timeout and explicit resnapshot on cursor expiry. Gemini row identity remains uncertain; generation state describes observed page UI, not provider acceptance or delivery.",
+  description: "Wait up to 20 seconds for owned rendered-only chat events. Defaults to full snapshots. For fixture/Databag stable rows, view incoming_changes returns new incoming rows and marked revisions, skips outgoing text while advancing the cursor, and requires explicit resnapshot on expired or ambiguous continuity. Gemini supports snapshots only; its row identity remains uncertain. Page observations never establish provider acceptance or delivery.",
   inputSchema: z.object({
     connectionId: z.uuid(),
     cursor: z.object({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() }).strict(),
     timeoutMs: z.number().int().min(0).max(20_000).optional(),
-    limit: z.number().int().min(1).max(2).optional()
+    limit: z.number().int().min(1).max(2).optional(),
+    view: z.enum(["snapshots", "incoming_changes"]).optional()
   }).strict(),
   annotations: { readOnlyHint: true }
-}, async ({ connectionId, cursor, timeoutMs, limit }, extra) => {
+}, async ({ connectionId, cursor, timeoutMs, limit, view }, extra) => {
   const deadline = Date.now() + (timeoutMs ?? 20_000);
+  let currentCursor = cursor;
   try {
     while (true) {
       if (extra.mcpReq.signal.aborted) return blocked("CANCELLED");
-      const result = await (await pendingBroker()).readApprovedEvents(connectionId, cursor, limit);
+      const result = await (await pendingBroker()).readApprovedEvents(connectionId, currentCursor, limit, view);
+      if (result.kind === "error" && result.payload.code === "VIEW_UNSUPPORTED") return {
+        isError: true,
+        content: [{ type: "text" as const, text: "VIEW_UNSUPPORTED: incoming_changes requires stable row IDs. Use snapshots for this connection." }],
+        structuredContent: { code: "VIEW_UNSUPPORTED" }
+      };
       if (result.kind === "error") return blocked(result.payload.code);
       if (result.kind !== "fixture_events" && result.kind !== "gemini_events") return unavailable();
       if (result.payload.state === "expired") return {
@@ -219,6 +226,9 @@ server.registerTool("chat_wait_for_events", {
         content: [{ type: "text" as const, text: "CURSOR_EXPIRED: Call chat_read_messages for a new snapshot." }],
         structuredContent: { code: "CURSOR_EXPIRED", resnapshot: true }
       };
+      if (view === "incoming_changes" && (result.kind !== "fixture_events"
+        || result.payload.events.some(event => event.payload.kind !== "incoming_changes"))) return unavailable();
+      currentCursor = result.payload.cursor;
       const timedOut = result.payload.events.length === 0 && Date.now() >= deadline;
       if (result.payload.events.length || timedOut) {
         const payload = { ...result.payload, timedOut };
@@ -296,7 +306,8 @@ server.registerTool("chat_wait_for_reply", {
 });
 
 server.registerTool("chat_send_message", {
-  description: "Send once in an owned autonomous fixture, Gemini or configured Databag chat approved for this agent through Connect this chat. Databag requires its reviewed DOM contract and a plain-text, attachment-free composer. One original deadline spans preparation, fill, fresh proof, durable intent, one activation and bounded evidence. Returns sent, not_sent or unresolved, always retryAllowed false; sent is a page or person assessment, not provider acceptance or delivery. The same key and arguments return existing status without another submission. Never automatically resend an unresolved result or clear a person's draft. Recovery tokens permit status only.",
+  description: "Send once in an owned autonomous fixture, Gemini or configured Databag chat approved for this agent through Connect this chat. Databag requires its reviewed DOM contract and a plain-text, attachment-free composer. One original deadline spans preparation, fill, fresh proof, durable intent, one activation and bounded evidence. Returns sent, not_sent or unresolved, always retryAllowed false; sent is a page or person assessment, not provider acceptance or delivery. The same key and arguments return existing status without another submission. Never automatically resend an unresolved result or clear a person's draft. Recovery tokens permit status only."
+    + " A composer refusal with failureReason unconfirmed_send requires the person to review Unconfirmed Sends in the trusted popup and record the actual outcome; never retry the blocked operation.",
   inputSchema: z.object({ connectionId: z.uuid(), text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES),
     idempotencyKey: z.uuid() }).strict(),
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true }
@@ -322,7 +333,8 @@ server.registerTool("chat_send_message", {
     const result = await client.commitPreparedMessage(operationId, Math.min(deadlineMs, expiresAt));
     if (result.kind === "error") return sendResult(result.payload.code === "DISPATCH_UNAVAILABLE" ? "not_sent" : "unresolved",
       result.payload.code, { operationId, recoveryToken,
-        ...(result.payload.failureStage ? { failureStage: result.payload.failureStage } : {}) });
+        ...(result.payload.failureStage ? { failureStage: result.payload.failureStage } : {}),
+        ...(result.payload.failureReason ? { failureReason: result.payload.failureReason } : {}) });
     if (result.kind !== "chat_dispatch") throw new Error("Unexpected autonomous commit reply");
     return sendStatus(result.payload, recoveryToken);
   } catch {

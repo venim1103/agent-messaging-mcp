@@ -1150,6 +1150,20 @@ test("autonomous commits share one owned deadline across neutral fill, proof, in
       if (outcome === "uncertain") {
         assert.equal(await waiting, null);
         assert.deepEqual(ledger.listChatJobs("fill", provider), []);
+        const blockedDeadline = Date.now() + 1000;
+        const blocked = ledger.prepareAutonomous(waitingOwner, waitingConnection.connectionId,
+          "Synthetic blocked autonomous commit", randomUUID(), blockedDeadline);
+        await assert.rejects(ledger.commitAutonomousMessage(waitingOwner, blocked.operationId, blockedDeadline), error => {
+          assert.ok(error instanceof AutonomousCommitFailure);
+          assert.equal(error.message, "DISPATCH_UNAVAILABLE");
+          assert.equal(error.failureStage, "composer");
+          assert.ok("failureReason" in error);
+          assert.equal(error.failureReason, "unconfirmed_send");
+          return true;
+        });
+        assert.equal(ledger.getOperation(waitingOwner, blocked.operationId).state, "prepared");
+        assert.deepEqual(ledger.listChatJobs("fill", provider), []);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
         const resolved = ledger.resolveUnconfirmedDispatch(target, prepared.operationId, "not_sent", result.startedAt + 4_000);
         assert.deepEqual(ledger.getOperation(owner, prepared.operationId), resolved);
         await assert.rejects(ledger.commitAutonomousMessage(waitingOwner, waitingPrepared.operationId, deadlineMs), /DISPATCH_UNAVAILABLE/);
@@ -1193,6 +1207,7 @@ test("autonomous pre-intent refusals retain bounded failure stages without submi
         assert.ok(error instanceof AutonomousCommitFailure);
         assert.equal(error.message, "DISPATCH_UNAVAILABLE");
         assert.equal(error.failureStage, stage);
+        assert.equal(error.failureReason, undefined);
         return true;
       };
       const rejected = assert.rejects(committing, checkFailure);

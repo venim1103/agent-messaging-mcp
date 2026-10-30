@@ -4,8 +4,59 @@ import { test } from "node:test";
 import { handleBrokerRequest } from "./broker-requests.js";
 import { FIXTURE_REVIEW_APPROVAL_TTL_MS, PreparedMessageOperations } from "./message-operations.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS }
+import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS,
+  isGeminiTarget, type ApprovedTarget }
   from "./pending-connections.js";
+
+for (const provider of ["fixture", "databag", "gemini"] as const) {
+  test(`${provider} compact event view is owned, role-restricted and explicitly supported`, () => {
+    const requests = new PendingConnectionRequests();
+    const owner = Symbol("compact owner");
+    const envelope = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+      connectionGeneration: 0, deadlineMs: 6000 };
+    const target: ApprovedTarget = provider === "fixture"
+      ? { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" }
+      : provider === "gemini"
+      ? { origin: "https://gemini.google.com", url: "https://gemini.google.com/app/synthetic-chat",
+        conversationId: "synthetic-chat", tabId: 3, documentId: "synthetic-document" }
+      : { provider: "databag", origin: "https://databag.example", url: "https://databag.example/#/session",
+        conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
+    const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target, 1000)!;
+    const before = [{ id: "old", direction: "incoming" as const, text: "Historical instruction" }];
+    const publish = (rows: typeof before) => isGeminiTarget(target)
+      ? requests.publishGeminiSnapshot(target, rows.map(({ direction, text }) => ({ direction, text })), 1001)
+      : requests.publishStableSnapshot(target, rows, 1001);
+    publish(before);
+    const baseline = isGeminiTarget(target) ? requests.getGeminiSnapshot(owner, grant.connectionId, 1001)
+      : requests.getStableSnapshot(owner, grant.connectionId, 1001);
+    assert.ok(baseline && baseline !== "not_ready");
+    publish([...before, { id: "new", direction: "incoming", text: "New instruction" }]);
+    const message = { ...envelope, kind: "read_approved_events", payload: {
+      connectionId: grant.connectionId, cursor: baseline.cursor, limit: 1, view: "incoming_changes"
+    } };
+    const compact = handleBrokerRequest(message, "facade", owner, requests, 1001);
+    if (provider === "gemini") assert.deepEqual(compact.payload, { code: "VIEW_UNSUPPORTED" });
+    else {
+      assert.equal(compact.kind, "fixture_events");
+      assert.equal(JSON.stringify(compact.payload).includes("Historical instruction"), false);
+      assert.equal(JSON.stringify(compact.payload).includes('"change":"new"'), true);
+    }
+    assert.deepEqual(handleBrokerRequest(message, "facade", Symbol("other"), requests, 1001).payload,
+      { code: "CONNECTION_NOT_FOUND" });
+    assert.deepEqual(handleBrokerRequest(message, "relay", owner, requests, 1001).payload, { code: "PERMISSION_DENIED" });
+    assert.throws(() => handleBrokerRequest({ ...message, payload: { ...message.payload, view: "latest" } },
+      "facade", owner, requests, 1001));
+    for (const view of [undefined, "snapshots"]) {
+      const { view: ignored, ...payload } = message.payload;
+      const ordinary = handleBrokerRequest({ ...message, payload: { ...payload, ...(view ? { view } : {}) } },
+        "facade", owner, requests, 1001);
+      assert.equal(ordinary.kind, provider === "gemini" ? "gemini_events" : "fixture_events");
+      assert.equal(JSON.stringify(ordinary.payload).includes("Historical instruction"), true);
+    }
+    requests.disconnect(owner);
+    assert.deepEqual(handleBrokerRequest(message, "facade", owner, requests, 1001).payload, { code: "CONNECTION_NOT_FOUND" });
+  });
+}
 
 test("Databag neutral approval is relay-only and refuses broadened targets", () => {
   const requests = new PendingConnectionRequests();

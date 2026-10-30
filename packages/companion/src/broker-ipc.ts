@@ -128,7 +128,8 @@ export async function startBrokerSocket(runtimeDirectory: string, credentials: B
                   if (!socket.destroyed) await writeBrokerResponse(socket, { ...reply, kind: "error",
                     payload: { code: error.message === "DISPATCH_UNCERTAIN" ? "DISPATCH_UNCERTAIN" : "DISPATCH_UNAVAILABLE",
                       ...(reply.kind === "chat_autonomous_commit_authorized" && error instanceof AutonomousCommitFailure
-                        && error.message !== "DISPATCH_UNCERTAIN" ? { failureStage: error.failureStage } : {}) } });
+                        && error.message !== "DISPATCH_UNCERTAIN" ? { failureStage: error.failureStage,
+                          ...(error.failureStage === "composer" && error.failureReason ? { failureReason: error.failureReason } : {}) } : {}) } });
                 }
                 return;
               }

@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { brokerRequestDeadline, connectBroker } from "./broker-client.js";
 import { BROKER_IDLE_TIMEOUT_MS, startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials, MAX_BROKER_PENDING_REQUESTS } from "./broker-roles.js";
-import { MAX_PREPARED_REVIEWS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS, PreparedMessageOperations } from "./message-operations.js";
+import { AutonomousCommitFailure, MAX_PREPARED_REVIEWS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS, PreparedMessageOperations } from "./message-operations.js";
 import { encodeNativeFrame, MAX_NATIVE_FRAME_BYTES, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { PendingConnectionRequests, PENDING_REQUEST_TTL_MS } from "./pending-connections.js";
@@ -164,6 +164,28 @@ for (const target of [
       assert.deepEqual((await facade.prepareChatMessage(connection.connectionId, prepared.payload.preview.text, key, deadlineMs + 1000)).payload, prepared.payload);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
       assert.deepEqual((await relay.listChatJobs("fill", target.origin === "https://gemini.google.com" ? "gemini" : "fixture")).payload, { jobs: [] });
+      const diagnosticProbe = await facade.prepareChatMessage(connection.connectionId,
+        "Synthetic IPC diagnostic probe", randomUUID(), deadlineMs);
+      assert.ok(diagnosticProbe.kind === "chat_message_prepared");
+      const invalidReason = testContext.mock.method(PreparedMessageOperations.prototype, "commitAutonomousMessage", async () => {
+        throw new AutonomousCommitFailure("DISPATCH_UNAVAILABLE", "composer", "unsupported" as never);
+      });
+      try {
+        await assert.rejects(facade.commitPreparedMessage(diagnosticProbe.payload.operationId, deadlineMs),
+          error => error instanceof Error && error.name === "ZodError");
+      } finally {
+        invalidReason.mock.restore();
+      }
+      const misplacedReason = testContext.mock.method(PreparedMessageOperations.prototype, "commitAutonomousMessage", async () => {
+        throw new AutonomousCommitFailure("DISPATCH_UNAVAILABLE", "fill", "unconfirmed_send");
+      });
+      try {
+        assert.deepEqual((await facade.commitPreparedMessage(diagnosticProbe.payload.operationId, deadlineMs)).payload,
+          { code: "DISPATCH_UNAVAILABLE", failureStage: "fill" });
+      } finally {
+        misplacedReason.mock.restore();
+      }
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
       const originalCommit = PreparedMessageOperations.prototype.commitAutonomousMessage;
       const lateError = testContext.mock.method(PreparedMessageOperations.prototype, "commitAutonomousMessage",
         async function(this: PreparedMessageOperations, owner: symbol, operationId: string, originalDeadline: number) {
@@ -690,6 +712,7 @@ test("broker observation replies preserve bounded flags and refuse extra fields"
   context.mock.method(PendingConnectionRequests.prototype, "requestFreshGeminiRead", () =>
     ({ result: Promise.resolve(observed) }) as never);
   context.mock.method(PendingConnectionRequests.prototype, "readStableEvents", () => eventPage as never);
+  context.mock.method(PendingConnectionRequests.prototype, "readStableIncomingChanges", () => eventPage as never);
   context.mock.method(PendingConnectionRequests.prototype, "readGeminiEvents", () => eventPage as never);
   const cursor = { epoch: "c66b3997-9d43-4554-8399-267d1fe9f75c", sequence: 1 };
   try {
@@ -747,6 +770,24 @@ test("broker observation replies preserve bounded flags and refuse extra fields"
         eventPage = { state: "ok", cursor: { ...cursor, sequence: 2 }, events: [{ ...event, payload }] };
         await assert.rejects(ownedFacade.readApprovedEvents(grant.payload.connectionId, cursor, 2),
           error => error instanceof Error && error.name === "ZodError");
+      }
+      if (provider === "fixture") {
+        const compactPayload = { kind: "incoming_changes", coverage: "rendered_only", omittedBefore: true,
+          messages: [{ id: "row-1", direction: "incoming", text: "New reply", change: "new", truncated: true }] };
+        const compactEvent = { ...event, payload: compactPayload };
+        eventPage = { state: "ok", cursor: { ...cursor, sequence: 2 }, events: [compactEvent] };
+        assert.deepEqual((await facade.readApprovedEvents(grant.payload.connectionId, cursor, 1, "incoming_changes")).payload,
+          eventPage);
+        for (const messages of [[{ ...compactPayload.messages[0], direction: "outgoing" }],
+          [{ ...compactPayload.messages[0], change: "unknown" }], [...compactPayload.messages, ...compactPayload.messages]]) {
+          eventPage = { state: "ok", cursor: { ...cursor, sequence: 2 },
+            events: [{ ...compactEvent, payload: { ...compactPayload, messages } }] };
+          await assert.rejects(ownedFacade.readApprovedEvents(grant.payload.connectionId, cursor, 1, "incoming_changes"),
+            error => error instanceof Error && error.name === "ZodError");
+        }
+      } else {
+        const unsupported = await facade.readApprovedEvents(grant.payload.connectionId, cursor, 1, "incoming_changes");
+        assert.deepEqual(unsupported.payload, { code: "VIEW_UNSUPPORTED" });
       }
     }
   } finally {

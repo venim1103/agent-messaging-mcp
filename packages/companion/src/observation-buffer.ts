@@ -95,4 +95,13 @@ export class ObservationBuffer {
       events
     };
   }
+
+  readWithBaseline(cursor: Cursor, limit = MAX_RETURNED_EVENTS) {
+    const result = this.read(cursor, limit);
+    if (result.state === "expired") return result;
+    const baseline = this.events.find(event => event.sequence === cursor.sequence);
+    if (!baseline) return { state: "expired" as const, resnapshot: true as const };
+    const priorEvents = this.events.filter(event => event.sequence < cursor.sequence);
+    return { ...result, baseline, priorEvents };
+  }
 }

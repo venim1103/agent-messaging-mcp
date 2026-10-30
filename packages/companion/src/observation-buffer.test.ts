@@ -25,6 +25,13 @@ test("two readers retain independent cursors and published events cannot be chan
   assert.deepEqual(nextPage.events, [revision]);
   assert.deepEqual(buffer.read(secondReader).events, [first, revision]);
   assert.equal(nextPage.cursor.sequence, revision.sequence);
+  assert.deepEqual(buffer.readWithBaseline(nextCursor, 1), {
+    state: "ok", cursor: nextPage.cursor, events: [revision], baseline: first, priorEvents: []
+  });
+  assert.deepEqual(buffer.readWithBaseline(nextPage.cursor), {
+    state: "ok", cursor: nextPage.cursor, events: [], baseline: revision, priorEvents: [first]
+  });
+  assert.deepEqual(buffer.readWithBaseline(firstReader), { state: "expired", resnapshot: true });
 
   const repeated = buffer.append({ messageId: "fixture-2", text: "second", revision: 1 });
   assert.notEqual(repeated.sequence, revision.sequence);
@@ -172,6 +179,10 @@ test("eviction or epoch changes expire cursors with a resnapshot path", () => {
 
   assert.deepEqual(buffer.read(before), { state: "expired", resnapshot: true });
   assert.deepEqual(buffer.read(afterFirst).events, [second, third]);
+  assert.deepEqual(buffer.readWithBaseline(afterFirst), { state: "expired", resnapshot: true });
+  assert.deepEqual(buffer.readWithBaseline({ epoch: buffer.epoch, sequence: second.sequence }, 1), {
+    state: "ok", cursor: buffer.bookmark(), events: [third], baseline: second, priorEvents: []
+  });
   assert.deepEqual(buffer.read({ epoch: "unknown", sequence: first.sequence }), { state: "expired", resnapshot: true });
   assert.deepEqual(buffer.read({ epoch: buffer.epoch, sequence: 99 }), { state: "expired", resnapshot: true });
   assert.throws(() => buffer.read(afterFirst, 101), /Invalid observation read limit/);

@@ -26,8 +26,10 @@ export const CHAT_SETTLE_TIMEOUT_MS = 5_000;
 export const DEFAULT_MAX_SENDS_PER_HOUR = 60;
 const SEND_RATE_WINDOW_MS = 60 * 60_000;
 export const autonomousFailureStageSchema = z.enum(["composer", "fill", "read", "proof", "dispatch"]);
+export const autonomousFailureReasonSchema = z.enum(["unconfirmed_send"]);
 export class AutonomousCommitFailure extends Error {
-  constructor(message: string, readonly failureStage: z.infer<typeof autonomousFailureStageSchema>) {
+  constructor(message: string, readonly failureStage: z.infer<typeof autonomousFailureStageSchema>,
+    readonly failureReason?: z.infer<typeof autonomousFailureReasonSchema>) {
     super(message);
   }
 }
@@ -1836,8 +1838,15 @@ export class PreparedMessageOperations {
     if (!authorization) throw new Error("DISPATCH_UNAVAILABLE");
     const expiresAt = Math.min(deadlineMs, authorization.expiresAt);
     let failureStage: z.infer<typeof autonomousFailureStageSchema> = "composer";
+    let failureReason: z.infer<typeof autonomousFailureReasonSchema> | undefined;
     const result = (async () => {
-      if (!await this.acquireComposer(owner, operationId, expiresAt)) throw new Error("DISPATCH_UNAVAILABLE");
+      if (!await this.acquireComposer(owner, operationId, expiresAt)) {
+        const refusedAt = Date.now();
+        if (refusedAt < expiresAt && this.getAutonomousAuthorization(owner, operationId, refusedAt)
+          && this.hasUnresolvedDispatch(operation.target)
+          && !this.hasOccupiedComposer(operationId, operation.target, refusedAt)) failureReason = "unconfirmed_send";
+        throw new Error("DISPATCH_UNAVAILABLE");
+      }
       try {
         failureStage = "fill";
         const filling = this.requestChatFill(owner, operationId, Date.now(), expiresAt);
@@ -1864,7 +1873,7 @@ export class PreparedMessageOperations {
         this.releaseComposer(owner, operationId);
       }
     })().catch(error => {
-      if (error instanceof Error) throw new AutonomousCommitFailure(error.message, failureStage);
+      if (error instanceof Error) throw new AutonomousCommitFailure(error.message, failureStage, failureReason);
       throw error;
     }).then(completed => {
       this.autonomousCommits.delete(operationId);

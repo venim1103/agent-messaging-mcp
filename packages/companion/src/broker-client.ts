@@ -5,7 +5,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
-import { autonomousFailureStageSchema, fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
+import { autonomousFailureReasonSchema, autonomousFailureStageSchema, fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
   geminiFillStatusSchema, chatJobSchema, databagTargetSchema, type ChatJob, type ChatTarget, type ChatJobObservation,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
@@ -470,8 +470,15 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ state: z.literal("expired"), resnapshot: z.literal(true) }),
       z.strictObject({ state: z.literal("ok"), cursor: fixtureCursor,
         events: z.array(z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().positive(),
-          payload: z.strictObject({ kind: z.literal("fixture_snapshot"),
-            messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES), omittedBefore: z.boolean() })
+          payload: z.discriminatedUnion("kind", [
+            z.strictObject({ kind: z.literal("fixture_snapshot"),
+              messages: z.array(fixtureMessage).max(MAX_FIXTURE_SNAPSHOT_MESSAGES), omittedBefore: z.boolean() }),
+            z.strictObject({ kind: z.literal("incoming_changes"), coverage: z.literal("rendered_only"),
+              messages: z.array(fixtureMessage.extend({ direction: z.literal("incoming"),
+                change: z.enum(["new", "revision"]) })).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
+                .refine(messages => new Set(messages.map(message => message.id)).size === messages.length),
+              omittedBefore: z.boolean() })
+          ])
         })).max(MAX_FIXTURE_EVENTS_PER_READ) })
     ])
   }),
@@ -491,14 +498,16 @@ const replySchema = z.discriminatedUnion("kind", [
     kind: z.literal("error"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ code: z.enum(["PERMISSION_DENIED", "TOO_MANY_PENDING", "APPROVAL_INVALID",
-      "OBSERVATION_UNAVAILABLE", "CONNECTION_NOT_FOUND", "PREPARATION_UNAVAILABLE", "GENERATION_MISMATCH",
+      "OBSERVATION_UNAVAILABLE", "VIEW_UNSUPPORTED", "CONNECTION_NOT_FOUND", "PREPARATION_UNAVAILABLE", "GENERATION_MISMATCH",
       "INVALID_MESSAGE_TEXT", "INVALID_IDEMPOTENCY_KEY", "IDEMPOTENCY_CONFLICT", "OPERATION_EXPIRED",
       "OPERATION_UNAVAILABLE", "TOO_MANY_PREPARED", "REVIEW_UNAVAILABLE", "FILL_REVIEW_UNAVAILABLE",
       "SEND_REVIEW_UNAVAILABLE",
       "DISPATCH_CHECK_UNAVAILABLE", "DISPATCH_UNAVAILABLE",
       "DISPATCH_UNCERTAIN", "DISPATCH_RESOLUTION_UNAVAILABLE", "PREFLIGHT_UNAVAILABLE", "FILL_UNAVAILABLE"]),
-      failureStage: autonomousFailureStageSchema.optional()
-    }).refine(payload => payload.failureStage === undefined || payload.code === "DISPATCH_UNAVAILABLE")
+      failureStage: autonomousFailureStageSchema.optional(),
+      failureReason: autonomousFailureReasonSchema.optional()
+    }).refine(payload => (payload.failureStage === undefined || payload.code === "DISPATCH_UNAVAILABLE")
+      && (payload.failureReason === undefined || payload.failureStage === "composer"))
   })
 ]);
 
@@ -738,8 +747,10 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         request("read_approved_snapshot", { connectionId, ...(limit === undefined ? {} : { limit }) }, deadlineMs),
       readFixtureEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>
         request("read_fixture_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }) }),
-      readApprovedEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number) =>
-        request("read_approved_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }) }),
+      readApprovedEvents: (connectionId: string, cursor: { epoch: string; sequence: number }, limit?: number,
+        view?: "snapshots" | "incoming_changes") =>
+        request("read_approved_events", { connectionId, cursor, ...(limit === undefined ? {} : { limit }),
+          ...(view === undefined ? {} : { view }) }),
       disconnectFixture: (connectionId: string) => request("disconnect_fixture", { connectionId }),
       prepareFixtureMessage: (connectionId: string, expectedGeneration: 1, text: string, idempotencyKey: string) =>
         request("prepare_fixture_message", { connectionId, expectedGeneration, text, idempotencyKey }),

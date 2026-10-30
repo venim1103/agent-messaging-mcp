@@ -14,9 +14,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { connectBroker } from "./broker-client.js";
 import { startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials } from "./broker-roles.js";
-import { openPrivateOperationDatabase, PreparedMessageOperations } from "./message-operations.js";
+import { AutonomousCommitFailure, openPrivateOperationDatabase, PreparedMessageOperations } from "./message-operations.js";
 import { NativeFrameDecoder } from "./native-framing.js";
-import { PendingConnectionRequests } from "./pending-connections.js";
+import { PendingConnectionRequests, type FixtureMessage } from "./pending-connections.js";
 
 const brokerStartupObserver = `import { appendFileSync } from "node:fs";
   import { join } from "node:path";
@@ -383,7 +383,7 @@ for (const target of [
     }
   });
 
-  test(`${target.origin} SDK picks up only its individually approved autonomous connection`, { timeout: 5000 }, async () => {
+  test(`${target.origin} SDK picks up only its individually approved autonomous connection`, { timeout: 5000 }, async testContext => {
     const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-pickup-"));
     const directory = join(home, ".config/agent-messaging-mcp/broker");
     let broker: Awaited<ReturnType<typeof startBrokerSocket>> | undefined;
@@ -437,6 +437,71 @@ for (const target of [
       assert.deepEqual(foreign.structuredContent, { state: "unknown" });
       assert.deepEqual((await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
         { connections: [], timedOut: true });
+      const provider = "provider" in target && target.provider === "databag" ? "databag"
+        : target.origin === "https://gemini.google.com" ? "gemini" : "fixture";
+      const history: FixtureMessage[] = [{ id: "history-in", direction: "incoming", text: "Historical instruction" },
+        { id: "history-out", direction: "outgoing", text: "Historical outgoing text" }];
+      const publishRows = (rows: FixtureMessage[], challengeId?: string) => relay!.publishChatSnapshot(target,
+        provider === "gemini" ? rows.map(({ direction, text }) => ({ direction, text })) : rows, challengeId);
+      const reading = clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+      let challengeId: string | undefined;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const listed = await relay.listChatReadChallenges(provider);
+        if (listed.kind !== "chat_read_challenges") throw new Error("Expected synthetic read challenge");
+        challengeId = listed.payload.challenges[0]?.challengeId;
+        if (challengeId) break;
+        await setTimeout(10);
+      }
+      assert.ok(challengeId);
+      assert.deepEqual((await publishRows(history, challengeId)).payload, { count: 1 });
+      const baseline = (await reading).structuredContent as { cursor: { epoch: string; sequence: number } };
+      const eventArguments = { connectionId: connection.connectionId, cursor: baseline.cursor,
+        view: "incoming_changes", timeoutMs: 0, limit: 1 };
+      assert.equal((await clients[1].callTool({ name: "chat_wait_for_events", arguments: eventArguments })).isError, true);
+      assert.equal((await clients[0].callTool({ name: "chat_wait_for_events",
+        arguments: { ...eventArguments, view: "latest" } })).isError, true);
+      if (provider === "gemini") {
+        assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_events", arguments: eventArguments })).structuredContent,
+          { code: "VIEW_UNSUPPORTED" });
+      } else {
+        const echo: FixtureMessage = { id: "echo-one", direction: "outgoing", text: "New outgoing echo" };
+        await publishRows([...history, echo]);
+        const empty = await clients[0].callTool({ name: "chat_wait_for_events", arguments: eventArguments });
+        const afterEcho = empty.structuredContent as { state: string; cursor: typeof baseline.cursor; events: unknown[]; timedOut: boolean };
+        assert.deepEqual(afterEcho, { state: "ok", cursor: { ...baseline.cursor, sequence: baseline.cursor.sequence + 1 },
+          events: [], timedOut: true });
+        const secondEcho: FixtureMessage = { id: "echo-two", direction: "outgoing", text: "Another outgoing echo" };
+        await publishRows([...history, echo, secondEcho]);
+        const incoming: FixtureMessage = { id: "new-answer", direction: "incoming", text: "New answer" };
+        await publishRows([...history, echo, secondEcho, incoming]);
+        const observed = await clients[0].callTool({ name: "chat_wait_for_events", arguments: {
+          ...eventArguments, cursor: afterEcho.cursor, timeoutMs: 1000
+        } });
+        const page = observed.structuredContent as { state: string; cursor: typeof baseline.cursor;
+          events: { payload: { kind: string; messages: unknown[]; coverage: string; omittedBefore: boolean } }[]; timedOut: boolean };
+        assert.equal(observed.isError, undefined);
+        assert.equal(page.timedOut, false);
+        assert.equal(page.cursor.sequence, afterEcho.cursor.sequence + 2);
+        assert.deepEqual(page.events.map(event => event.payload), [{ kind: "incoming_changes", coverage: "rendered_only",
+          messages: [{ ...incoming, change: "new" }], omittedBefore: false }]);
+        assert.equal(JSON.stringify(page).includes("Historical"), false);
+        assert.equal(JSON.stringify(page).includes(echo.text), false);
+        const { view: ignored, ...snapshotArguments } = eventArguments;
+        const ordinary = await clients[0].callTool({ name: "chat_wait_for_events", arguments: snapshotArguments });
+        assert.equal(JSON.stringify(ordinary.structuredContent).includes("Historical instruction"), true);
+        assert.ok(Buffer.byteLength(JSON.stringify(page)) < Buffer.byteLength(JSON.stringify(ordinary.structuredContent)));
+        assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_events",
+          arguments: { ...snapshotArguments, view: "snapshots" } })).structuredContent, ordinary.structuredContent);
+        const edited = { ...incoming, text: "Edited answer", truncated: true as const };
+        await publishRows([...history, echo, secondEcho, edited]);
+        const revision = await clients[0].callTool({ name: "chat_wait_for_events", arguments: {
+          ...eventArguments, cursor: page.cursor
+        } });
+        assert.deepEqual((revision.structuredContent as typeof page).events[0]?.payload.messages, [{ ...edited, change: "revision" }]);
+        await relay.markChatObservationGap(target);
+        assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_events", arguments: eventArguments })).structuredContent,
+          { code: "CURSOR_EXPIRED", resnapshot: true });
+      }
       const sendArguments = { connectionId: connection.connectionId, text: "Synthetic SDK autonomous draft",
         idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" };
       const foreignSend = await clients[1].callTool({ name: "chat_send_message", arguments: sendArguments });
@@ -445,8 +510,6 @@ for (const target of [
         assert.equal((await clients[0].callTool({ name: "chat_send_message", arguments: { ...sendArguments, ...extra } })).isError, true);
       }
       const sending = clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
-      const provider = "provider" in target && target.provider === "databag" ? "databag"
-        : target.origin === "https://gemini.google.com" ? "gemini" : "fixture";
       let offered: Awaited<ReturnType<typeof relay.listChatJobs>> | undefined;
       for (let attempt = 0; attempt < 40; attempt++) {
         if (provider === "databag") {
@@ -469,11 +532,31 @@ for (const target of [
       assert.equal(refusedStatus.state, "not_sent");
       assert.equal(refusedStatus.code, "DISPATCH_UNAVAILABLE");
       assert.equal(refusedStatus.failureStage, "fill");
+      assert.equal("failureReason" in refusedStatus, false);
       assert.equal(refusedStatus.retryAllowed, false);
       assert.match(refusedStatus.recoveryToken, /^[0-9a-f]{64}$/);
       assert.deepEqual((await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments })).structuredContent, refusedStatus);
       assert.deepEqual((await relay.listChatJobs("fill", provider)).payload, { jobs: [] });
       assert.equal((await clients[0].callTool({ name: "chat_send_message", arguments: { ...sendArguments, text: "Synthetic changed SDK draft" } })).isError, true);
+      const composerFailure = testContext.mock.method(PreparedMessageOperations.prototype, "commitAutonomousMessage", async () => {
+        throw new AutonomousCommitFailure("DISPATCH_UNAVAILABLE", "composer", "unconfirmed_send");
+      });
+      try {
+        const composerRefused = await clients[0].callTool({ name: "chat_send_message", arguments: {
+          ...sendArguments, text: "Synthetic SDK blocked composer", idempotencyKey: "87453763-09b0-4602-9bf5-f026f512d840"
+        } });
+        const composerStatus = composerRefused.structuredContent as typeof refusedStatus & { failureReason: string };
+        assert.equal(composerRefused.isError, true);
+        assert.equal(composerStatus.state, "not_sent");
+        assert.equal(composerStatus.code, "DISPATCH_UNAVAILABLE");
+        assert.equal(composerStatus.failureStage, "composer");
+        assert.equal(composerStatus.failureReason, "unconfirmed_send");
+        assert.equal(composerStatus.retryAllowed, false);
+        assert.equal(composerFailure.mock.callCount(), 1);
+        assert.deepEqual((await relay.listChatJobs("fill", provider)).payload, { jobs: [] });
+      } finally {
+        composerFailure.mock.restore();
+      }
       assert.equal((await relay.approveChatAgent(target, second.agentId)).kind, "chat_agent_approved");
       const other = await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
       const otherPickup = other.structuredContent as typeof pickup;

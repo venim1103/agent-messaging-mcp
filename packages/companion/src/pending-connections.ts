@@ -560,6 +560,55 @@ export class PendingConnectionRequests {
     return grant.observations?.read(cursor, limit) ?? "not_ready";
   }
 
+  readStableIncomingChanges(owner: symbol, connectionId: string,
+    cursor: { epoch: string; sequence: number }, limit = MAX_FIXTURE_EVENTS_PER_READ, now = Date.now()) {
+    const grant = this.liveGrant(owner, connectionId, now);
+    if (!grant || isGeminiTarget(grant.target)) return null;
+    const result = grant.observations?.readWithBaseline(cursor, limit);
+    if (!result) return "not_ready" as const;
+    if (result.state === "expired") return result;
+    type Window = Pick<FixtureSnapshot, "messages" | "omittedBefore">;
+    type Change = FixtureMessage & { change: "new" | "revision" };
+    const events: Array<{ epoch: string; sequence: number; payload: {
+      kind: "incoming_changes"; coverage: "rendered_only"; messages: Change[]; omittedBefore: boolean
+    } }> = [];
+    let previous = result.baseline.payload as unknown as Window;
+    const seen = new Set([...result.priorEvents, result.baseline].flatMap(event =>
+      (event.payload as unknown as Window).messages.map(message => message.id)));
+    for (const event of result.events) {
+      const current = event.payload as unknown as Window;
+      const start = previous.messages.findIndex(message => message.id === current.messages[0]?.id);
+      const overlap = previous.messages.length ? previous.messages.length - start : 0;
+      if ((previous.messages.length && (start < 0 || current.messages.length < overlap))
+        || (!previous.messages.length && (previous.omittedBefore || current.omittedBefore))
+        || (start > 0 && !current.omittedBefore)
+        || (previous.omittedBefore && !current.omittedBefore)) {
+        return { state: "expired" as const, resnapshot: true as const };
+      }
+      const known = new Map(previous.messages.map(message => [message.id, message]));
+      const changes: Change[] = [];
+      for (const [index, message] of current.messages.entries()) {
+        const before = known.get(message.id);
+        if (index < overlap ? previous.messages[start + index]?.id !== message.id
+          || before?.direction !== message.direction : seen.has(message.id)) {
+          return { state: "expired" as const, resnapshot: true as const };
+        }
+        if (message.direction === "incoming" && (!before || message.text !== before.text
+          || message.truncated !== before.truncated)) {
+          changes.push({ ...message, change: before ? "revision" : "new" });
+        }
+      }
+      if (changes.length || previous.omittedBefore !== current.omittedBefore) {
+        events.push({ epoch: event.epoch, sequence: event.sequence, payload: {
+          kind: "incoming_changes", coverage: "rendered_only", messages: changes, omittedBefore: current.omittedBefore
+        } });
+      }
+      for (const message of current.messages) seen.add(message.id);
+      previous = current;
+    }
+    return { state: "ok" as const, cursor: result.cursor, events };
+  }
+
   readFixtureEvents(owner: symbol, connectionId: string,
     cursor: { epoch: string; sequence: number }, limit = MAX_FIXTURE_EVENTS_PER_READ, now = Date.now()) {
     return this.getApprovedTarget(owner, connectionId, now) ? this.readStableEvents(owner, connectionId, cursor, limit, now) : null;

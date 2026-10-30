@@ -87,7 +87,8 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("read_approved_events"), payload: z.strictObject({
     connectionId: z.uuid(), cursor: z.strictObject({
       epoch: z.uuid(), sequence: z.number().int().safe().nonnegative()
-    }), limit: z.number().int().min(1).max(2).optional()
+    }), limit: z.number().int().min(1).max(2).optional(),
+    view: z.enum(["snapshots", "incoming_changes"]).optional()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("prepare_fixture_message"), payload: z.strictObject({
     connectionId: z.uuid(), expectedGeneration: z.literal(1),
@@ -747,8 +748,13 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     const target = requests.getApprovedTarget(owner, request.payload.connectionId, now)
       ?? requests.getGeminiTarget(owner, request.payload.connectionId, now)
       ?? requests.getAutonomousTarget(owner, request.payload.connectionId, now);
+    if (target && isGeminiTarget(target) && request.payload.view === "incoming_changes") {
+      return { ...response, kind: "error" as const, payload: { code: "VIEW_UNSUPPORTED" } };
+    }
     const events = !target ? null : isGeminiTarget(target)
       ? requests.readGeminiEvents(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now)
+      : request.payload.view === "incoming_changes"
+      ? requests.readStableIncomingChanges(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now)
       : requests.readStableEvents(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now);
     return events && events !== "not_ready"
       ? { ...response, kind: target && isGeminiTarget(target) ? "gemini_events" as const : "fixture_events" as const, payload: events }
