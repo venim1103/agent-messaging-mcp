@@ -44,6 +44,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
   let publicSendCancellation;
   const replyObservations = [];
   const profile = await mkdtemp(join(tmpdir(), `agent-messaging-${provider}-dispatch-test-`));
+  const nativeEnvironment = { ...process.env, HOME: profile, NODE_COMPILE_CACHE: join(profile, "compile-cache") };
   const unpacked = join(profile, "unpacked-extension");
   await cp(extensionDirectory, unpacked, { recursive: true });
   const manifestPath = join(unpacked, "manifest.json");
@@ -63,7 +64,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
   try {
     let brokerStderr = "";
     const started = performance.now();
-    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: ["ignore", "ignore", "pipe"] });
+    broker = spawn(process.execPath, [brokerEntry], { env: nativeEnvironment, stdio: ["ignore", "ignore", "pipe"] });
     broker.stderr.on("data", chunk => { brokerStderr = `${brokerStderr}${chunk}`.slice(0, 1024); });
     brokerExit = once(broker, "exit");
     let ready = false;
@@ -85,7 +86,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       visibilityBrowser = spawn("/usr/bin/chromium", ["--headless=new", "--remote-debugging-address=127.0.0.1",
         "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check",
         "--disable-background-networking", `--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`, "about:blank"],
-      { env: { ...process.env, HOME: profile }, stdio: ["ignore", "ignore", "pipe"] });
+      { env: nativeEnvironment, stdio: ["ignore", "ignore", "pipe"] });
       visibilityBrowserExit = once(visibilityBrowser, "exit");
       const endpoint = await new Promise((resolve, reject) => {
         const timer = globalThis.setTimeout(() => reject(new Error("Disposable visibility browser did not start")), 5000);
@@ -102,7 +103,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       visibilityBrowserControl = await browser.newBrowserCDPSession();
       context = browser.contexts()[0];
     } else context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
-      executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+      executablePath: "/usr/bin/chromium", headless: true, env: nativeEnvironment,
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
     let worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
@@ -192,7 +193,7 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
       };`;
     const transport = new StdioClientTransport({ command: process.execPath,
       args: traceReplies ? ["--import", `data:text/javascript,${encodeURIComponent(replyTraceImport)}`, mcpEntry] : [mcpEntry],
-      ...(traceReplies ? { stderr: "pipe" } : {}), env: { ...process.env, HOME: profile } });
+      ...(traceReplies ? { stderr: "pipe" } : {}), env: nativeEnvironment });
     if (traceReplies) {
       let remaining = "";
       transport.stderr.on("data", chunk => {

@@ -160,6 +160,51 @@ test("Databag React identity bridge is read-only, bounded and rejects stale or f
     assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
     assert.deepEqual(await page.evaluate(submitDatabagDraft, submitting), { ok: false, code: "DISPATCH_UNAVAILABLE" });
     assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
+    await page.locator("textarea").fill("");
+    await page.locator("textarea").evaluate(editor => editor.addEventListener("input", () => {
+      window.syntheticBridge.root.stateNode.pendingLanes = 1;
+    }, { once: true }));
+    const pendingRenderFill = { ...filling, operationId: randomUUID(), attemptId: randomUUID(), expiresAt: Date.now() + 4000 };
+    const pendingRenderResult = page.evaluate(async input => {
+      const result = await globalThis.agentDatabagAdapter.fill(input);
+      window.syntheticBridge.fillResult = result;
+      return result;
+    }, pendingRenderFill);
+    await page.waitForFunction(() => window.syntheticBridge.root.stateNode.pendingLanes === 1);
+    assert.equal(await page.evaluate(() => window.syntheticBridge.fillResult), undefined);
+    assert.equal(await page.locator("textarea").inputValue(), draft.text);
+    assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
+    assert.equal(await page.evaluate(identifyDatabagConversation), null);
+    await page.evaluate(() => { window.syntheticBridge.root.stateNode.pendingLanes = 0; });
+    assert.deepEqual(await pendingRenderResult, { ok: true, editor: "textarea" });
+    assert.deepEqual(await page.evaluate(identifyDatabagConversation), nativeIdentity);
+    await page.locator("textarea").fill("");
+    await page.locator("textarea").evaluate(editor => editor.addEventListener("input", () => {
+      window.syntheticBridge.root.stateNode.pendingLanes = 1;
+    }, { once: true }));
+    const interruptedFill = { ...filling, operationId: randomUUID(), attemptId: randomUUID(), expiresAt: Date.now() + 4000 };
+    const interruptedResult = page.evaluate(fillDatabagDraft, interruptedFill);
+    await page.waitForFunction(() => window.syntheticBridge.root.stateNode.pendingLanes === 1);
+    await page.locator("button").focus();
+    assert.deepEqual(await interruptedResult, { ok: false, code: "FILL_UNCERTAIN" });
+    assert.equal(await page.locator("textarea").inputValue(), draft.text);
+    assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...interruptedFill, expiresAt: Date.now() + 4000 }),
+      { ok: false, code: "FILL_UNAVAILABLE" });
+    await page.evaluate(() => { window.syntheticBridge.root.stateNode.pendingLanes = 0; });
+    await page.locator("textarea").fill("");
+    await page.locator("textarea").evaluate(editor => editor.addEventListener("input", () => {
+      window.syntheticBridge.root.stateNode.pendingLanes = 1;
+    }, { once: true }));
+    const expiredRenderFill = { ...filling, operationId: randomUUID(), attemptId: randomUUID(), expiresAt: Date.now() + 500 };
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, expiredRenderFill), { ok: false, code: "FILL_UNCERTAIN" });
+    assert.ok(Date.now() >= expiredRenderFill.expiresAt);
+    assert.equal(await page.locator("textarea").inputValue(), draft.text);
+    assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...expiredRenderFill, expiresAt: Date.now() + 4000 }),
+      { ok: false, code: "FILL_UNAVAILABLE" });
+    await page.evaluate(() => { window.syntheticBridge.root.stateNode.pendingLanes = 0; });
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, { ...draft, draftState: "prepared" }), { ok: true, editor: "textarea" });
     await page.evaluate(() => {
       window.syntheticBridge.events = [];
       window.chrome = { runtime: { sendMessage: async message => { window.syntheticBridge.events.push(message); } } };

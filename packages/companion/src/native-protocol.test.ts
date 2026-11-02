@@ -1125,7 +1125,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
 
     markPhase("pending relay startup");
     const host = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -1149,7 +1150,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
 
     markPhase("approval relay startup");
     const approvalHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const approvalOutput: Buffer[] = [];
     const approvalErrors: Buffer[] = [];
@@ -1185,7 +1187,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     if (prepared.kind !== "message_prepared") throw new Error("Expected prepared fixture review");
     markPhase("review relay startup");
     const reviewHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const reviewOutput: Buffer[] = [];
     const reviewErrors: Buffer[] = [];
@@ -1208,7 +1211,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
 
     markPhase("review approval relay startup");
     const approvalReviewHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const approvalReviewOutput: Buffer[] = [];
     const approvalReviewErrors: Buffer[] = [];
@@ -1229,7 +1233,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     let lastExchangeDiagnostic = "";
     markPhase("persistent review relay");
     const fillHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     reviewPort = fillHost;
     reviewPortClose = once(fillHost, "close");
@@ -1600,6 +1605,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const [fillExit] = await reviewPortClose;
     assert.equal(fillExit, 0, Buffer.concat(fillErrors).toString());
 
+    markPhase("native preflight queue");
     const checking = facade.checkFixturePreflight(prepared.payload.operationId);
     const preflightObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
     try {
@@ -1614,8 +1620,10 @@ test("native relay lists only live broker pending IDs over real framing", { time
     } finally {
       preflightObserver.close();
     }
+    markPhase("native preflight watch relay");
     const preflightWatchHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const preflightWatchOutput: Buffer[] = [];
     const preflightWatchErrors: Buffer[] = [];
@@ -1636,8 +1644,10 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.deepEqual(preflight.target, approval.payload.target);
     assert.equal(JSON.stringify(preflightWatch).includes(prepared.payload.recoveryToken), false);
 
+    markPhase("native preflight completion relay");
     const completionHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const completionOutput: Buffer[] = [];
     const completionErrors: Buffer[] = [];
@@ -1664,8 +1674,10 @@ test("native relay lists only live broker pending IDs over real framing", { time
     if (operationAfterCheck.kind !== "prepared_operation_state") throw new Error("Expected operation status");
     assert.equal(operationAfterCheck.payload.state, "approved");
 
+    markPhase("fixture publication relay");
     const publicationHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const publicationOutput: Buffer[] = [];
     const publicationErrors: Buffer[] = [];
@@ -1685,6 +1697,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(published.requestId, publication.requestId);
     assert.deepEqual(published.payload, { count: 1 });
 
+    markPhase("fixture challenged read");
     const reading = facade.readFixtureSnapshot(granted.payload.connectionId);
     const challengeObserver = await connectBroker("relay", join(home, ".config/agent-messaging-mcp/broker"));
     try {
@@ -1700,7 +1713,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
       challengeObserver.close();
     }
     const challengeHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const challengeOutput: Buffer[] = [];
     const challengeErrors: Buffer[] = [];
@@ -1723,7 +1737,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.deepEqual(challenge.target, publication.payload.target);
 
     const responseHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const responseOutput: Buffer[] = [];
     const responseErrors: Buffer[] = [];
@@ -1744,7 +1759,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.deepEqual(snapshot.payload.messages, publication.payload.messages);
 
     const gapHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const gapOutput: Buffer[] = [];
     const gapErrors: Buffer[] = [];
@@ -1770,7 +1786,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.deepEqual(afterGap.payload.observation, { state: "not_observed", capturedAt: null });
 
     const revokeHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const revokeOutput: Buffer[] = [];
     const revokeErrors: Buffer[] = [];
@@ -1810,7 +1827,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal(freshState.payload.state, "ready_readonly");
 
     const resetHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const resetOutput: Buffer[] = [];
     const resetErrors: Buffer[] = [];
@@ -1833,7 +1851,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     const geminiPending = await facade.requestConnection();
     if (geminiPending.kind !== "connection_requested") throw new Error("Expected Gemini pending request");
     const geminiHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const geminiOutput: Buffer[] = [];
     const geminiErrors: Buffer[] = [];
@@ -1867,7 +1886,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.equal("documentId" in geminiState.payload, false);
 
     const publishHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const publishOutput: Buffer[] = [];
     const publishErrors: Buffer[] = [];
@@ -1908,7 +1928,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
       geminiObserver.close();
     }
     const geminiChallengeHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const geminiChallengeOutput: Buffer[] = [];
     const geminiChallengeErrors: Buffer[] = [];
@@ -1928,7 +1949,8 @@ test("native relay lists only live broker pending IDs over real framing", { time
     assert.deepEqual(geminiChallenge.target, geminiPublication.payload.target);
 
     const challengedHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const challengedOutput: Buffer[] = [];
     const challengedErrors: Buffer[] = [];
@@ -1952,8 +1974,10 @@ test("native relay lists only live broker pending IDs over real framing", { time
       identityQuality: "uncertain", generationState: "unknown" });
     assert.equal("url" in freshGemini.payload, false);
 
+    markPhase("Gemini gap relay");
     const geminiGapHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const geminiGapOutput: Buffer[] = [];
     const geminiGapErrors: Buffer[] = [];
@@ -1980,8 +2004,10 @@ test("native relay lists only live broker pending IDs over real framing", { time
     } finally {
       geminiRelay.close();
     }
+    markPhase("revoked Gemini publication relay");
     const replayHost = spawn(process.execPath, [relayEntry, origin, origin], {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" }
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin",
+        NODE_COMPILE_CACHE: join(home, "compile-cache") }
     });
     const replayOutput: Buffer[] = [];
     const replayErrors: Buffer[] = [];
@@ -1999,6 +2025,7 @@ test("native relay lists only live broker pending IDs over real framing", { time
     if (!context.signal.aborted) reportFailure();
     throw error;
   } finally {
+    markPhase("cleanup");
     context.signal.removeEventListener("abort", reportFailure);
     context.signal.removeEventListener("abort", stopReviewHost);
     stopReviewHost();

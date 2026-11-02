@@ -342,7 +342,7 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     const button = buttons[0];
     if (buttons.length !== 1 || !(button instanceof HTMLButtonElement) || !unobstructed(button)
       || button.closest('[inert], [aria-disabled="true"]')) return { ok: false as const, code: "SUBMIT_UNAVAILABLE" as const };
-    return { ok: true as const, root, region, editor, button };
+    return { ok: true as const, root, region, editor, button, ready: current.native?.ready ?? true };
   };
   const inspect = async (input: DatabagDraftInput): Promise<DatabagPreflight> => {
     if (!validDraft(input)) return { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" };
@@ -403,10 +403,14 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
         ready.replacing ? input.leftover : undefined);
       if (ready.replacing && !recorded) return { ok: false, code: "FILL_UNAVAILABLE" };
       if (!Document.prototype.execCommand.call(document, "insertText", false, input.text)) return { ok: false, code: "FILL_UNCERTAIN" };
-      const after = composer(binding, input.allowHidden);
-      if (!after.ok || after.root !== ready.root || after.region !== ready.region || after.editor !== ready.editor
-        || after.button !== ready.button || document.activeElement !== ready.editor || ready.editor.value !== input.text
-        || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNCERTAIN" };
+      for (;;) {
+        const after = composer(binding, input.allowHidden);
+        if (!after.ok || after.root !== ready.root || after.region !== ready.region || after.editor !== ready.editor
+          || after.button !== ready.button || document.activeElement !== ready.editor || ready.editor.value !== input.text
+          || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNCERTAIN" };
+        if (after.ready) break;
+        await new Promise<void>(resolve => setTimeout(resolve, 16));
+      }
       ownership?.confirm(input.operationId);
       return { ok: true, editor: "textarea" };
     } catch { return { ok: false, code: "FILL_UNCERTAIN" }; }

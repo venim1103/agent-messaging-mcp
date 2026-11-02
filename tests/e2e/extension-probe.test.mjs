@@ -1206,6 +1206,7 @@ test("worker wake marks a gap; reload, tab close, denied reads, and disconnect r
 test("trusted fixture popup separates consent from one-shot exact-document draft fill", { timeout: 30000 }, async testContext => {
   const setPhase = trackTestPhase(testContext, "Fixture consent");
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-fixture-review-test-"));
+  const nativeEnvironment = { ...process.env, HOME: profile, NODE_COMPILE_CACHE: join(profile, "compile-cache") };
   const nativeWatch = await createNativeWatchHarness(profile, "list_fixture_read_challenges");
   let mcpClient;
   const unpacked = join(profile, "unpacked-extension");
@@ -1224,13 +1225,13 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
   try {
     context = await chromium.launchPersistentContext(profile, {
       chromiumSandbox: true,
-      executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+      executablePath: "/usr/bin/chromium", headless: true, env: nativeEnvironment,
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`]
     });
     const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeWatch.relayPath, profile));
-    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+    broker = spawn(process.execPath, [brokerEntry], { env: nativeEnvironment, stdio: "ignore" });
     brokerExit = once(broker, "exit");
     let ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
@@ -1243,6 +1244,10 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
       await setTimeout(25);
     }
     assert.equal(ready, true, "Broker did not start");
+    mcpClient = new Client({ name: "fixture-browser-fill-test", version: "0.0.1" });
+    const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
+    const mcpConnected = mcpClient.connect(new StdioClientTransport({ command: process.execPath, args: [mcpEntry],
+      env: nativeEnvironment })).then(() => null, error => error);
     facade = await connectBroker("facade", brokerDirectory);
 
     const fixture = await context.newPage();
@@ -1643,10 +1648,8 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
     setPhase("MCP rich fill");
     assert.equal((await facade.disconnectFixture(lostConnection.payload.connectionId)).payload.disconnected, true);
     assert.equal((await facade.getPreparedOperation(lostPrepared.payload.operationId)).payload.state, "stale");
-    mcpClient = new Client({ name: "fixture-browser-fill-test", version: "0.0.1" });
-    const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
-    await mcpClient.connect(new StdioClientTransport({ command: process.execPath, args: [mcpEntry],
-      env: { ...process.env, HOME: profile } }));
+    const mcpConnectionError = await mcpConnected;
+    if (mcpConnectionError) throw mcpConnectionError;
     const mcpPending = await mcpClient.callTool({ name: "chat_request_connection", arguments: {} });
     assert.equal(mcpPending.isError, undefined);
     const mcpGrant = await popup.evaluate((args) => chrome.runtime.sendMessage({ kind: "approve_fixture", ...args }), {
@@ -1695,7 +1698,9 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
 
 for (const provider of ["fixture", "gemini"]) {
   test(`${provider} trusted popup resolves uncertainty without composer or authority changes`, { timeout: 20000 }, async (testContext) => {
+    const setPhase = trackTestPhase(testContext, `${provider} uncertainty resolution`);
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-resolution-popup-"));
+    const nativeEnvironment = { ...process.env, HOME: profile, NODE_COMPILE_CACHE: join(profile, "compile-cache") };
     const unpacked = join(profile, "unpacked-extension");
     await cp(extensionDirectory, unpacked, { recursive: true });
     const manifestPath = join(unpacked, "manifest.json");
@@ -1711,12 +1716,29 @@ for (const provider of ["fixture", "gemini"]) {
     try {
       testContext.signal.throwIfAborted();
       context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
-        executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+        executablePath: "/usr/bin/chromium", headless: true, env: nativeEnvironment,
         args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
       const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+      await worker.evaluate(() => {
+        globalThis.malformedResolutionListing = false;
+        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+        chrome.runtime.connectNative = (...args) => {
+          const port = connect(...args);
+          const listen = port.onMessage.addListener.bind(port.onMessage);
+          port.onMessage.addListener = listener => listen(reply => {
+            if (reply.kind === "unconfirmed_dispatches" && globalThis.holdResolutionListing) {
+              globalThis.holdResolutionListing = false;
+              globalThis.releaseResolutionListing = () => listener(reply);
+            } else listener(reply.kind === "unconfirmed_dispatches" && globalThis.malformedResolutionListing
+              ? { ...reply, payload: { ...reply.payload, retryAllowed: true } } : reply);
+          });
+          return port;
+        };
+      });
       const extensionId = new URL(worker.url()).hostname;
+      setPhase("native registration and broker startup");
       await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
-      broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+      broker = spawn(process.execPath, [brokerEntry], { env: nativeEnvironment, stdio: "ignore" });
       brokerExit = once(broker, "exit");
       let ready = false;
       for (let attempt = 0; attempt < 80; attempt++) {
@@ -1765,13 +1787,19 @@ for (const provider of ["fixture", "gemini"]) {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         return { tabId: tab.id, expectedUrl: tab.url };
       });
+      setPhase("popup status");
       const popup = await context.newPage();
       await popup.setViewportSize({ width: 360, height: 900 });
       await page.bringToFront();
       await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+      const activateControl = async control => {
+        assert.equal(await control.isVisible(), true);
+        assert.equal(await control.isEnabled(), true);
+        await control.press("Enter");
+      };
       await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Not checked",
         undefined, { timeout: 4000 });
-      await popup.getByRole("button", { name: "Refresh status", exact: true }).click();
+      await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
       await popup.waitForFunction(() => document.querySelectorAll("#unconfirmed-list li[data-operation-id]").length === 2,
         undefined, { timeout: 4000 });
       const storageBefore = await worker.evaluate(() => chrome.storage.session.get(null));
@@ -1789,8 +1817,9 @@ for (const provider of ["fixture", "gemini"]) {
         assert.equal(forged?.ok === true, false);
       }
       assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_resolutions").get().count, 0);
+      setPhase("person resolution controls");
       for (const [index, label, outcome] of [[0, "Not sent", "not_sent"], [1, "Sent", "sent"]]) {
-        await popup.locator(`[data-operation-id="${operationIds[index]}"]`).getByRole("button", { name: label, exact: true }).click();
+        await activateControl(popup.locator(`[data-operation-id="${operationIds[index]}"]`).getByRole("button", { name: label, exact: true }));
         await popup.waitForFunction(operationId => !document.querySelector(`[data-operation-id="${operationId}"]`),
           operationIds[index], { timeout: 4000 });
         const resolution = journal.prepare("SELECT outcome, source, resolved_at FROM message_dispatch_resolutions WHERE operation_id = ?").get(operationIds[index]);
@@ -1814,23 +1843,9 @@ for (const provider of ["fixture", "gemini"]) {
       assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), storageBefore);
       assert.equal(await editor.evaluate(element => element.value ?? element.textContent), "A person's synthetic unsent draft");
       assert.deepEqual(await page.evaluate(() => globalThis.resolutionEvents), { input: 0, click: 0, submit: 0 });
-      await worker.evaluate(() => {
-        globalThis.malformedResolutionListing = true;
-        const connect = chrome.runtime.connectNative.bind(chrome.runtime);
-        chrome.runtime.connectNative = (...args) => {
-          const port = connect(...args);
-          const listen = port.onMessage.addListener.bind(port.onMessage);
-          port.onMessage.addListener = listener => listen(reply => {
-            if (reply.kind === "unconfirmed_dispatches" && globalThis.holdResolutionListing) {
-              globalThis.holdResolutionListing = false;
-              globalThis.releaseResolutionListing = () => listener(reply);
-            } else listener(reply.kind === "unconfirmed_dispatches" && globalThis.malformedResolutionListing
-              ? { ...reply, payload: { ...reply.payload, retryAllowed: true } } : reply);
-          });
-          return port;
-        };
-      });
-      await popup.getByRole("button", { name: "Refresh status", exact: true }).click();
+      setPhase("malformed and held listing boundaries");
+      await worker.evaluate(() => { globalThis.malformedResolutionListing = true; });
+      await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
       await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Unavailable",
         undefined, { timeout: 4000 });
       assert.equal(await popup.locator("#unconfirmed-list li").count(), 0);
@@ -1847,7 +1862,7 @@ for (const provider of ["fixture", "gemini"]) {
           return response;
         };
       });
-      await popup.getByRole("button", { name: "Refresh status", exact: true }).click();
+      await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
       let held = false;
       for (let attempt = 0; attempt < 80; attempt++) {
         testContext.signal.throwIfAborted();
@@ -2110,16 +2125,6 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
         args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
       const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
       const extensionId = new URL(worker.url()).hostname;
-      await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
-      broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
-      brokerExit = once(broker, "exit");
-      let ready = false;
-      for (let attempt = 0; attempt < 80; attempt++) {
-        ready = await brokerSocketReady(join(directory, "broker.sock"));
-        if (ready) break;
-        await setTimeout(25);
-      }
-      assert.equal(ready, true, "Autonomous broker did not start");
       if (native) {
         worker.on("console", message => {
           if (message.text().startsWith("synthetic-browser-job:")) testContext.diagnostic(message.text());
@@ -2163,6 +2168,16 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
           };
         });
       }
+      await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+      broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+      brokerExit = once(broker, "exit");
+      let ready = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        ready = await brokerSocketReady(join(directory, "broker.sock"));
+        if (ready) break;
+        await setTimeout(25);
+      }
+      assert.equal(ready, true, "Autonomous broker did not start");
       const options = { command: process.execPath, args: [mcpEntry],
         env: { ...process.env, HOME: profile, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
       delete options.env.BROWSER_CHAT_AGENT_LABEL;
@@ -2226,7 +2241,12 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
       const waitCount = (count, available = 2) => popup.waitForFunction(({ count, available }) =>
         document.querySelector("#agent-count")?.textContent === `${count} connected / ${available} available`,
       { count, available }, { timeout: 4000 });
-      await row("Autonomous one").getByRole("button", { name: "Connect this chat" }).click();
+      const activateControl = async control => {
+        assert.equal(await control.isVisible(), true);
+        assert.equal(await control.isEnabled(), true);
+        await control.press("Enter");
+      };
+      await activateControl(row("Autonomous one").getByRole("button", { name: "Connect this chat" }));
       await popup.getByText("Site access denied; no connection created.", { exact: true }).waitFor({ timeout: 4000 });
       await waitCount(0);
       assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
@@ -2234,7 +2254,7 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
       const waitStartedAt = performance.now();
       const waiting = clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 2000 } })
         .then(reply => ({ reply, elapsedMs: performance.now() - waitStartedAt }));
-      await row("Autonomous one").getByRole("button", { name: "Connect this chat" }).click();
+      await activateControl(row("Autonomous one").getByRole("button", { name: "Connect this chat" }));
       await waitCount(1);
       const boundedWait = await waiting;
       assert.equal(boundedWait.reply.isError, undefined);
@@ -2394,7 +2414,7 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
           assert.match(JSON.stringify(events.structuredContent.events), /Synthetic incoming revision/);
         }
       }
-      await row("Autonomous two").getByRole("button", { name: "Connect this chat" }).click();
+      await activateControl(row("Autonomous two").getByRole("button", { name: "Connect this chat" }));
       await waitCount(2);
       const otherPickup = await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
       const second = otherPickup.structuredContent.connections[0];
@@ -2512,7 +2532,7 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
           kind: "approve_chat_agent", tabId: selected.tabId, expectedUrl: url, agentId: firstAgentId, ...extra
         }), undefined);
       }
-      await row("Autonomous one").getByRole("button", { name: "Remove access" }).click();
+      await activateControl(row("Autonomous one").getByRole("button", { name: "Remove access" }));
       await waitCount(1);
       assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
         { connections: [], timedOut: true });
@@ -2529,7 +2549,7 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
         await page.goto(`${url}?changed`);
       } else if (scenario === "failure") {
         await worker.evaluate(agentId => { globalThis.syntheticInvalidApprovalAgent = agentId; }, firstAgentId);
-        await row("Autonomous one").getByRole("button", { name: "Connect this chat" }).click();
+        await activateControl(row("Autonomous one").getByRole("button", { name: "Connect this chat" }));
         await popup.getByText("Agent management invalid, unavailable or selected chat changed", { exact: true }).waitFor({ timeout: 4000 });
         assert.equal(await worker.evaluate(() => globalThis.syntheticInvalidApprovals), 1);
         await waitCount(1);
