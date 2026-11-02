@@ -1,5 +1,6 @@
-import { McpServer } from "@modelcontextprotocol/server";
-import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -8,10 +9,15 @@ import { setTimeout as waitForBroker } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import * as z from "zod/v4";
 import { connectBroker } from "./broker-client.js";
+import { IncomingTaskStore } from "./incoming-task-store.js";
 import { fixtureDispatchStatusSchema, MAX_PREPARED_MESSAGE_BYTES } from "./message-operations.js";
 import { ReplyObservation } from "./pending-connections.js";
 
-const server = new McpServer({ name: "browser-chat-feasibility", version: "0.0.1" });
+const taskStore = new IncomingTaskStore();
+const server = new McpServer({ name: "browser-chat-feasibility", version: "0.0.1" }, {
+  taskStore, capabilities: { tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } } }
+});
+const incomingWaiters = new Set<string>();
 const runtimeDirectory = join(homedir(), ".config/agent-messaging-mcp/broker");
 let broker: Awaited<ReturnType<typeof connectBroker>> | undefined;
 let connectingBroker: ReturnType<typeof connectBroker> | undefined;
@@ -54,6 +60,7 @@ async function connectFacadeBroker() {
 
 function closeFacadeBroker() {
   facadeClosed = true;
+  taskStore.cleanup();
   broker?.close();
   broker = undefined;
   void connectingBroker?.then((client) => client.close(), () => {});
@@ -165,20 +172,20 @@ server.registerTool("chat_wait_for_connection", {
   annotations: { readOnlyHint: true, idempotentHint: true }
 }, async ({ timeoutMs }, extra) => {
   const cancel = () => { broker?.close(); };
-  extra.mcpReq.signal.addEventListener("abort", cancel, { once: true });
+  extra.signal.addEventListener("abort", cancel, { once: true });
   try {
-    if (extra.mcpReq.signal.aborted) return blocked("CANCELLED");
+    if (extra.signal.aborted) return blocked("CANCELLED");
     const client = await pendingBroker();
-    if (extra.mcpReq.signal.aborted) { client.close(); return blocked("CANCELLED"); }
+    if (extra.signal.aborted) { client.close(); return blocked("CANCELLED"); }
     const result = await client.waitForConnection(timeoutMs);
-    if (extra.mcpReq.signal.aborted) return blocked("CANCELLED");
+    if (extra.signal.aborted) return blocked("CANCELLED");
     if (result.kind === "error") return blocked(result.payload.code);
     if (result.kind !== "connection_pickup") return unavailable();
     return { content: [{ type: "text", text: JSON.stringify(result.payload) }], structuredContent: result.payload };
   } catch {
-    return extra.mcpReq.signal.aborted ? blocked("CANCELLED") : unavailable();
+    return extra.signal.aborted ? blocked("CANCELLED") : unavailable();
   } finally {
-    extra.mcpReq.signal.removeEventListener("abort", cancel);
+    extra.signal.removeEventListener("abort", cancel);
   }
 });
 
@@ -197,23 +204,23 @@ server.registerTool("chat_read_messages", {
   }
 });
 
-server.registerTool("chat_wait_for_events", {
-  description: "Wait up to 20 seconds for owned rendered-only chat events. Defaults to full snapshots. For fixture/Databag stable rows, view incoming_changes returns new incoming rows and marked revisions, skips outgoing text while advancing the cursor, and requires explicit resnapshot on expired or ambiguous continuity. Gemini supports snapshots only; its row identity remains uncertain. Page observations never establish provider acceptance or delivery.",
-  inputSchema: z.object({
-    connectionId: z.uuid(),
-    cursor: z.object({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() }).strict(),
-    timeoutMs: z.number().int().min(0).max(20_000).optional(),
-    limit: z.number().int().min(1).max(2).optional(),
-    view: z.enum(["snapshots", "incoming_changes"]).optional()
-  }).strict(),
-  annotations: { readOnlyHint: true }
-}, async ({ connectionId, cursor, timeoutMs, limit, view }, extra) => {
+const eventWaitSchema = z.object({
+  connectionId: z.uuid(),
+  cursor: z.object({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() }).strict(),
+  timeoutMs: z.number().int().min(0).max(20_000).optional(),
+  limit: z.number().int().min(1).max(2).optional(),
+  view: z.enum(["snapshots", "incoming_changes"]).optional()
+}).strict();
+
+async function waitForEvents({ connectionId, cursor, timeoutMs, limit, view }: z.infer<typeof eventWaitSchema>,
+  signal: AbortSignal, client?: Awaited<ReturnType<typeof connectBroker>>) {
   const deadline = Date.now() + (timeoutMs ?? 20_000);
   let currentCursor = cursor;
   try {
     while (true) {
-      if (extra.mcpReq.signal.aborted) return blocked("CANCELLED");
-      const result = await (await pendingBroker()).readApprovedEvents(connectionId, currentCursor, limit, view);
+      if (signal.aborted) return blocked("CANCELLED");
+      const result = await (client ?? await pendingBroker()).readApprovedEvents(connectionId, currentCursor, limit, view);
+      if (signal.aborted) return blocked("CANCELLED");
       if (result.kind === "error" && result.payload.code === "VIEW_UNSUPPORTED") return {
         isError: true,
         content: [{ type: "text" as const, text: "VIEW_UNSUPPORTED: incoming_changes requires stable row IDs. Use snapshots for this connection." }],
@@ -234,11 +241,68 @@ server.registerTool("chat_wait_for_events", {
         const payload = { ...result.payload, timedOut };
         return { content: [{ type: "text" as const, text: JSON.stringify(payload) }], structuredContent: payload };
       }
-      await waitForPoll(Math.min(200, deadline - Date.now()), extra.mcpReq.signal);
+      await waitForPoll(Math.min(200, deadline - Date.now()), signal);
     }
   } catch {
-    return unavailable();
+    return signal.aborted ? blocked("CANCELLED") : client ? blocked("BROKER_UNAVAILABLE") : unavailable();
   }
+}
+
+server.experimental.tasks.registerToolTask("chat_wait_for_events", {
+  description: "Ordinary calls wait up to 20 seconds for owned rendered-only chat events, defaulting to full snapshots. Explicit MCP task execution with view incoming_changes stays pending across bounded reads until an event, cancellation or loss of the original connection; only one incoming waiter per connection is allowed. Task state is memory-only, capped at 16 retained tasks with terminal results removed after five minutes. For fixture/Databag stable rows, incoming_changes returns ordered new incoming rows and marked revisions, skipping outgoing text while advancing the cursor; expired or ambiguous continuity requires explicit resnapshot. Gemini supports snapshots only. No idle-turn wake-up, reconnect, approval renewal or provider-delivery guarantee.",
+  inputSchema: eventWaitSchema,
+  execution: { taskSupport: "optional" },
+  annotations: { readOnlyHint: true }
+}, {
+  async createTask(rawArguments, extra) {
+    const args = eventWaitSchema.parse(rawArguments);
+    const task = await extra.taskStore.createTask({ ttl: null, pollInterval: 1000 });
+    if (!taskStore.isAugmented(task.taskId)) {
+      const incoming = args.view === "incoming_changes";
+      const reserved = incoming && !incomingWaiters.has(args.connectionId);
+      if (reserved) incomingWaiters.add(args.connectionId);
+      try {
+        const result = incoming && !reserved ? blocked("INCOMING_WAIT_ACTIVE") : await waitForEvents(args, extra.signal);
+        await extra.taskStore.storeTaskResult(task.taskId, result.isError ? "failed" : "completed", result);
+        return { task: await extra.taskStore.getTask(task.taskId) };
+      } finally {
+        if (reserved) incomingWaiters.delete(args.connectionId);
+      }
+    }
+    const reserved = args.view === "incoming_changes" && !incomingWaiters.has(args.connectionId);
+    if (reserved) incomingWaiters.add(args.connectionId);
+    const run = async () => {
+      try {
+        if (args.view === "incoming_changes" && !reserved) return blocked("INCOMING_WAIT_ACTIVE");
+        const client = await pendingBroker();
+        const signal = taskStore.signal(task.taskId);
+        if (args.view !== "incoming_changes") return waitForEvents(args, signal, client);
+        let cursor = args.cursor;
+        while (!signal.aborted) {
+          const result = await waitForEvents({ ...args, cursor }, signal, client);
+          if (result.isError || !("structuredContent" in result) || !("timedOut" in result.structuredContent)
+            || !result.structuredContent.timedOut) return result;
+          cursor = result.structuredContent.cursor;
+          await waitForPoll(200, signal);
+        }
+        return blocked("CANCELLED");
+      } finally {
+        if (reserved) incomingWaiters.delete(args.connectionId);
+      }
+    };
+    void run().then(async result => {
+      if ((await taskStore.getTask(task.taskId))?.status === "working") {
+        await taskStore.storeTaskResult(task.taskId, result.isError ? "failed" : "completed", result);
+      }
+    }).catch(async () => {
+      if ((await taskStore.getTask(task.taskId))?.status === "working") {
+        await taskStore.storeTaskResult(task.taskId, "failed", blocked("BROKER_UNAVAILABLE"));
+      }
+    });
+    return { task };
+  },
+  async getTask(_arguments, extra) { return extra.taskStore.getTask(extra.taskId); },
+  async getTaskResult(_arguments, extra) { return CallToolResultSchema.parse(await extra.taskStore.getTaskResult(extra.taskId)); }
 });
 
 server.registerTool("chat_wait_for_reply", {
@@ -258,28 +322,28 @@ server.registerTool("chat_wait_for_reply", {
     const finished = new AbortController();
     try {
       return await Promise.race([pending, waitForPoll(Math.max(0, remaining()),
-        AbortSignal.any([extra.mcpReq.signal, finished.signal])).then(() => null)]);
+        AbortSignal.any([extra.signal, finished.signal])).then(() => null)]);
     } finally { finished.abort(); }
   };
   let client: Awaited<ReturnType<typeof connectBroker>> | null = null;
   const cancel = () => client?.close();
-  extra.mcpReq.signal.addEventListener("abort", cancel, { once: true });
+  extra.signal.addEventListener("abort", cancel, { once: true });
   try {
-    if (extra.mcpReq.signal.aborted) return output({ code: "CANCELLED" }, true);
+    if (extra.signal.aborted) return output({ code: "CANCELLED" }, true);
     if (remaining() <= 0) return timedOut();
     client = await bounded(pendingBroker());
-    if (extra.mcpReq.signal.aborted) { cancel(); return output({ code: "CANCELLED" }, true); }
+    if (extra.signal.aborted) { cancel(); return output({ code: "CANCELLED" }, true); }
     if (!client || remaining() <= 25) return timedOut();
     let observation = new ReplyObservation();
     while (remaining() > 25) {
       const readDeadline = Math.min(deadlineMs, Date.now() + Math.min(5000, Math.ceil(remaining())));
       const read = await bounded(client.readApprovedSnapshot(connectionId, 32, readDeadline));
-      if (extra.mcpReq.signal.aborted) return output({ code: "CANCELLED" }, true);
+      if (extra.signal.aborted) return output({ code: "CANCELLED" }, true);
       if (!read || remaining() <= 0) return timedOut();
       if (read.kind === "error") {
         if (read.payload.code === "OBSERVATION_UNAVAILABLE") {
           observation = new ReplyObservation();
-          await waitForPoll(Math.min(500, Math.max(0, remaining())), extra.mcpReq.signal);
+          await waitForPoll(Math.min(500, Math.max(0, remaining())), extra.signal);
           continue;
         }
         return output({ code: read.payload.code }, true);
@@ -290,18 +354,18 @@ server.registerTool("chat_wait_for_reply", {
         const { coverage, generation, capturedAt, cursor, omittedBefore } = read.payload;
         return output({ timedOut: false, coverage, generation, capturedAt, cursor, omittedBefore, reply });
       }
-      await waitForPoll(Math.min(500, Math.max(0, remaining())), extra.mcpReq.signal);
+      await waitForPoll(Math.min(500, Math.max(0, remaining())), extra.signal);
     }
     return timedOut();
   } catch (error) {
-    if (extra.mcpReq.signal.aborted) return output({ code: "CANCELLED" }, true);
+    if (extra.signal.aborted) return output({ code: "CANCELLED" }, true);
     if (remaining() <= 0 || (remaining() <= 25 && error instanceof Error
       && error.message === "Invalid autonomous request deadline")) return timedOut();
     client?.close();
     if (broker === client) broker = undefined;
     return output({ code: "BROKER_UNAVAILABLE" }, true);
   } finally {
-    extra.mcpReq.signal.removeEventListener("abort", cancel);
+    extra.signal.removeEventListener("abort", cancel);
   }
 });
 
@@ -316,11 +380,11 @@ server.registerTool("chat_send_message", {
   let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
   let prepared: { operationId: string; expiresAt: number; recoveryToken: string } | undefined;
   const cancel = () => client?.close();
-  extra.mcpReq.signal.addEventListener("abort", cancel, { once: true });
+  extra.signal.addEventListener("abort", cancel, { once: true });
   try {
-    if (extra.mcpReq.signal.aborted) return sendResult("not_sent", "CANCELLED");
+    if (extra.signal.aborted) return sendResult("not_sent", "CANCELLED");
     client = await pendingBroker();
-    if (extra.mcpReq.signal.aborted) { cancel(); return sendResult("not_sent", "CANCELLED"); }
+    if (extra.signal.aborted) { cancel(); return sendResult("not_sent", "CANCELLED"); }
     const preparation = await client.prepareChatMessage(connectionId, text, idempotencyKey, deadlineMs);
     if (preparation.kind === "error") return sendResult(preparation.payload.code === "DISPATCH_UNCERTAIN" ? "unresolved" : "not_sent",
       preparation.payload.code);
@@ -328,8 +392,8 @@ server.registerTool("chat_send_message", {
     if (preparation.kind !== "chat_message_prepared") throw new Error("Unexpected autonomous preparation reply");
     const { operationId, expiresAt, recoveryToken } = preparation.payload;
     prepared = { operationId, expiresAt, recoveryToken };
-    if (extra.mcpReq.signal.aborted || expiresAt <= Date.now()) return sendResult("not_sent",
-      extra.mcpReq.signal.aborted ? "CANCELLED" : "OPERATION_EXPIRED", { operationId, recoveryToken });
+    if (extra.signal.aborted || expiresAt <= Date.now()) return sendResult("not_sent",
+      extra.signal.aborted ? "CANCELLED" : "OPERATION_EXPIRED", { operationId, recoveryToken });
     const result = await client.commitPreparedMessage(operationId, Math.min(deadlineMs, expiresAt));
     if (result.kind === "error") return sendResult(result.payload.code === "DISPATCH_UNAVAILABLE" ? "not_sent" : "unresolved",
       result.payload.code, { operationId, recoveryToken,
@@ -343,7 +407,7 @@ server.registerTool("chat_send_message", {
     return sendResult("unresolved", "DISPATCH_UNCERTAIN",
       prepared ? { operationId: prepared.operationId, recoveryToken: prepared.recoveryToken } : {});
   } finally {
-    extra.mcpReq.signal.removeEventListener("abort", cancel);
+    extra.signal.removeEventListener("abort", cancel);
   }
 });
 
@@ -389,10 +453,10 @@ server.registerTool("chat_commit_message", {
   let client: Awaited<ReturnType<typeof connectBroker>> | undefined;
   const cancel = () => client?.close();
   try {
-    if (extra.mcpReq.signal.aborted) return commitFailure(operationId, "DISPATCH_UNAVAILABLE");
+    if (extra.signal.aborted) return commitFailure(operationId, "DISPATCH_UNAVAILABLE");
     client = await pendingBroker();
-    extra.mcpReq.signal.addEventListener("abort", cancel, { once: true });
-    if (extra.mcpReq.signal.aborted) { cancel(); return commitFailure(operationId, "DISPATCH_UNCERTAIN"); }
+    extra.signal.addEventListener("abort", cancel, { once: true });
+    if (extra.signal.aborted) { cancel(); return commitFailure(operationId, "DISPATCH_UNCERTAIN"); }
     const result = await client.commitFixtureMessage(operationId);
     if (result.kind === "error") return commitFailure(operationId,
       result.payload.code === "DISPATCH_UNCERTAIN" ? "DISPATCH_UNCERTAIN" : "DISPATCH_UNAVAILABLE");
@@ -406,7 +470,7 @@ server.registerTool("chat_commit_message", {
     if (broker === client) broker = undefined;
     return commitFailure(operationId, "DISPATCH_UNCERTAIN");
   } finally {
-    extra.mcpReq.signal.removeEventListener("abort", cancel);
+    extra.signal.removeEventListener("abort", cancel);
   }
 });
 

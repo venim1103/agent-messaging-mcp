@@ -11,9 +11,13 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client as TaskClient } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport as TaskTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { CallToolResultSchema, CreateTaskResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { connectBroker } from "./broker-client.js";
 import { startBrokerSocket } from "./broker-ipc.js";
 import { createBrokerCredentials } from "./broker-roles.js";
+import { IncomingTaskStore } from "./incoming-task-store.js";
 import { AutonomousCommitFailure, openPrivateOperationDatabase, PreparedMessageOperations } from "./message-operations.js";
 import { NativeFrameDecoder } from "./native-framing.js";
 import { PendingConnectionRequests, type FixtureMessage } from "./pending-connections.js";
@@ -244,6 +248,37 @@ test("SDK reply wait distinguishes fresh quiet from delayed final captures", { t
   }
 });
 
+test("incoming task store bounds retained tasks, isolates sessions and expires only terminal results", async context => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const store = new IncomingTaskStore();
+  const request = { method: "tools/call" as const, params: { name: "chat_wait_for_events", task: {}, arguments: {} } };
+  try {
+    const first = await store.createTask({}, 1, request, "owner");
+    assert.equal(await store.getTask(first.taskId, "foreign"), null);
+    await assert.rejects(store.updateTaskStatus(first.taskId, "cancelled", undefined, "foreign"));
+    for (let index = 1; index < 16; index++) await store.createTask({}, index + 1, request, "owner");
+    await assert.rejects(store.createTask({}, 17, request, "owner"), /TASK_LIMIT/);
+    assert.equal((await store.listTasks(undefined, "foreign")).tasks.length, 0);
+    context.mock.timers.tick(6 * 60_000);
+    assert.equal((await store.getTask(first.taskId))?.status, "working");
+    await store.storeTaskResult(first.taskId, "completed", { content: [] }, "owner");
+    await assert.rejects(store.updateTaskStatus(first.taskId, "cancelled"));
+    const second = (await store.listTasks()).tasks[1]!;
+    await store.updateTaskStatus(second.taskId, "cancelled");
+    assert.equal(store.signal(second.taskId).aborted, true);
+    await assert.rejects(store.storeTaskResult(second.taskId, "completed", { content: [] }));
+    context.mock.timers.tick(5 * 60_000);
+    assert.equal(await store.getTask(first.taskId), null);
+    assert.equal(await store.getTask(second.taskId), null);
+    assert.equal((await store.listTasks()).tasks.length, 14);
+    const ordinary = await store.createTask({}, 18, { method: "tools/call", params: { name: "chat_wait_for_events" } });
+    assert.equal(store.isAugmented(ordinary.taskId), false);
+    await store.storeTaskResult(ordinary.taskId, "completed", { content: [] });
+    assert.deepEqual(await store.getTaskResult(ordinary.taskId), { content: [] });
+    assert.equal(await store.getTask(ordinary.taskId), null);
+  } finally { store.cleanup(); }
+});
+
 for (const target of [
   { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" },
   { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
@@ -251,6 +286,110 @@ for (const target of [
   { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 3,
     documentId: "synthetic-document", url: "https://databag.example/#/session" }
 ] as const) {
+  test(`${target.origin} SDK task waits preserve owner, ordered incoming events and terminal safeguards`, { timeout: 10000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-tasks-"));
+    const directory = join(home, ".config/agent-messaging-mcp/broker");
+    const client = new TaskClient({ name: "Synthetic incoming task owner", version: "0.0.1" },
+      { capabilities: { tasks: { list: {}, cancel: {} } } });
+    let broker: Awaited<ReturnType<typeof startBrokerSocket>> | undefined;
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    const provider = "provider" in target ? "databag" : target.origin.includes("gemini") ? "gemini" : "fixture";
+    try {
+      await mkdir(join(home, ".config/agent-messaging-mcp"), { recursive: true, mode: 0o700 });
+      broker = await startBrokerSocket(directory, createBrokerCredentials());
+      await client.connect(new TaskTransport({ command: process.execPath,
+        args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+        env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "0" } }));
+      const { tools } = await client.listTools();
+      assert.equal(tools.find(tool => tool.name === "chat_wait_for_events")?.execution?.taskSupport, "optional");
+      await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      relay = await connectBroker("relay", directory);
+      const roster = await relay.listChatAgents(target);
+      if (roster.kind !== "chat_agents") throw new Error("Expected task owner roster");
+      const owner = roster.payload.agents.find(agent => agent.label === "Synthetic incoming task owner");
+      assert.ok(owner);
+      await relay.approveChatAgent(target, owner.agentId);
+      const picked = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      let connectionId = (picked.structuredContent as { connections: { connectionId: string }[] }).connections[0]!.connectionId;
+      const history: FixtureMessage[] = [{ id: "old-in", direction: "incoming", text: "Synthetic history" }];
+      const publish = (rows: FixtureMessage[], challengeId?: string) => relay!.publishChatSnapshot(target,
+        provider === "gemini" ? rows.map(({ direction, text }) => ({ direction, text })) : rows, challengeId);
+      const snapshot = async (rows: FixtureMessage[]) => {
+        const reading = client.callTool({ name: "chat_read_messages", arguments: { connectionId } });
+        let challengeId: string | undefined;
+        for (let attempt = 0; attempt < 40; attempt++) {
+          const challenges = await relay!.listChatReadChallenges(provider);
+          if (challenges.kind !== "chat_read_challenges") throw new Error("Expected task baseline challenge");
+          challengeId = challenges.payload.challenges[0]?.challengeId;
+          if (challengeId) break;
+          await setTimeout(10);
+        }
+        assert.ok(challengeId);
+        await publish(rows, challengeId);
+        return (await reading).structuredContent as { cursor: { epoch: string; sequence: number } };
+      };
+      const baseline = await snapshot(history);
+      const args = { connectionId, cursor: baseline.cursor, timeoutMs: 1, limit: 2, view: "incoming_changes" };
+      const begin = async (overrides = {}) => (await client.request({ method: "tools/call",
+        params: { name: "chat_wait_for_events", arguments: { ...args, ...overrides }, task: {} } }, CreateTaskResultSchema)).task;
+      const result = (taskId: string) => client.experimental.tasks.getTaskResult(taskId, CallToolResultSchema);
+      const foreign = await begin({ connectionId: "d66b3997-9d43-4554-8399-267d1fe9f75c" });
+      assert.match(JSON.stringify(await result(foreign.taskId)), /CONNECTION_NOT_FOUND/);
+      const snapshots = await begin({ view: "snapshots" });
+      assert.equal((await result(snapshots.taskId)).structuredContent?.timedOut, true);
+      const pending = await begin();
+      if (provider === "gemini") {
+        assert.deepEqual((await result(pending.taskId)).structuredContent, { code: "VIEW_UNSUPPORTED" });
+        return;
+      }
+      const competing = await begin();
+      assert.match(JSON.stringify(await result(competing.taskId)), /INCOMING_WAIT_ACTIVE/);
+      const ordinary = await client.callTool({ name: "chat_wait_for_events", arguments: args });
+      assert.match(JSON.stringify(ordinary), /INCOMING_WAIT_ACTIVE/);
+      const echo: FixtureMessage = { id: "new-out", direction: "outgoing", text: "Synthetic outgoing echo" };
+      await publish([...history, echo]);
+      await setTimeout(250);
+      assert.equal((await client.experimental.tasks.getTask(pending.taskId)).status, "working");
+      const first: FixtureMessage = { id: "answer-one", direction: "incoming", text: "Synthetic first instruction" };
+      const second: FixtureMessage = { id: "answer-two", direction: "incoming", text: "Synthetic second instruction" };
+      await publish([...history, echo, first, second]);
+      const completed = await result(pending.taskId);
+      const page = completed.structuredContent as { cursor: typeof baseline.cursor; events: { payload: { messages: unknown[] } }[] };
+      assert.deepEqual(page.events.flatMap(event => event.payload.messages),
+        [{ ...first, change: "new" }, { ...second, change: "new" }]);
+      assert.equal(JSON.stringify(completed).includes(echo.text), false);
+      assert.equal(JSON.stringify(completed).includes(history[0]!.text), false);
+      const cancellation = await begin({ cursor: page.cursor });
+      assert.equal((await client.experimental.tasks.cancelTask(cancellation.taskId)).status, "cancelled");
+      assert.equal((await client.experimental.tasks.getTask(cancellation.taskId)).status, "cancelled");
+      const revisionTask = await begin({ cursor: page.cursor });
+      const revised = { ...second, text: "Synthetic revised instruction" };
+      await publish([...history, echo, first, revised]);
+      const revision = (await result(revisionTask.taskId)).structuredContent as typeof page;
+      assert.deepEqual(revision.events.flatMap(event => event.payload.messages), [{ ...revised, change: "revision" }]);
+      const gap = await begin({ cursor: revision.cursor });
+      await relay.markChatObservationGap(target);
+      assert.deepEqual((await result(gap.taskId)).structuredContent, { code: "CURSOR_EXPIRED", resnapshot: true });
+      const refreshed = await snapshot([...history, echo, first, revised]);
+      const disconnected = await begin({ cursor: refreshed.cursor });
+      await client.callTool({ name: "chat_disconnect", arguments: { connectionId } });
+      assert.match(JSON.stringify(await result(disconnected.taskId)), /CONNECTION_NOT_FOUND/);
+      await relay.approveChatAgent(target, owner.agentId);
+      const reapproved = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      connectionId = (reapproved.structuredContent as { connections: { connectionId: string }[] }).connections[0]!.connectionId;
+      const newBaseline = await snapshot(history);
+      const lost = await begin({ connectionId, cursor: newBaseline.cursor });
+      await broker.close();
+      broker = undefined;
+      assert.match(JSON.stringify(await result(lost.taskId)), /BROKER_UNAVAILABLE/);
+    } finally {
+      relay?.close();
+      await client.close();
+      await broker?.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   test(`${target.origin} SDK reply wait is bounded, owned and conservative`, { timeout: 10000 }, async context => {
     const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-reply-"));
     const directory = join(home, ".config/agent-messaging-mcp/broker");
