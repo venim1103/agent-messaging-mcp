@@ -110,6 +110,110 @@ test("Databag autonomous preparation and composer reservations remain exact, own
   }
 });
 
+test("Databag full-window dispatch evidence requires unique unchanged stable-ID alignment", async () => {
+  for (const omittedBaseline of [false, true]) for (const provider of ["databag", "fixture"] as const) {
+    for (const mode of provider === "fixture" ? ["outgoing", "reply"] : ["outgoing", "reply", "intermediate", "omission-only", "same-text",
+      "unchanged", "wrong-text", "retained-edit", "direction-edit", "transient-edit", "extra-outgoing", "transient-outgoing",
+      "incoming-first", "drop-three", "short-window", "short-baseline", "unmarked-shift", "backward-window", "outgoing-disappears",
+      "truncated-baseline", "truncated-retained", "truncated-outgoing", "transient-truncation", "duplicate-id", "baseline-id",
+      "reappearing-id", "reply-edit", "reply-id-change", "future-capture", "gap", "event-overflow", "expired-baseline"]) {
+      const requests = new PendingConnectionRequests();
+      const database = new DatabaseSync(":memory:");
+      const ledger = new PreparedMessageOperations(requests, database);
+      const owner = Symbol("Databag bounded evidence owner");
+      const agent = requests.registerAgent(owner, "Synthetic bounded evidence owner");
+      const target = provider === "databag"
+        ? { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`,
+          url: "https://databag.example/#/session", tabId: 3, documentId: "synthetic-document" } as const
+        : { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" } as const;
+      const now = Date.now();
+      const context = `${provider}; ${mode}; omitted baseline: ${omittedBaseline}`;
+      try {
+        const connection = requests.approveAgent(agent.agentId, target)!;
+        const prepared = ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic bounded outgoing", randomUUID(), now + 30_000);
+        assert.equal(await ledger.acquireComposer(owner, prepared.operationId, prepared.expiresAt), true);
+        const filling = ledger.requestChatFill(owner, prepared.operationId, now + 2, prepared.expiresAt);
+        assert.ok(filling && filling !== "busy");
+        const fill = ledger.listChatJobs("fill", provider, now + 2)[0]!;
+        assert.equal(ledger.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill",
+          { ok: true, editor: "textarea" }, now + 3), true);
+        await filling.result;
+        const baseline = Array.from({ length: mode === "short-baseline" ? 31 : 32 }, (_, index) => ({ id: `retained-${index}`,
+          direction: index % 2 === 0 ? "outgoing" as const : "incoming" as const,
+          text: mode === "same-text" ? prepared.preview.text : `Synthetic retained ${index}`,
+          ...(mode === "truncated-baseline" && index === 10 ? { truncated: true as const } : {}) }));
+        const outgoing = { id: mode === "baseline-id" ? baseline[0]!.id : "unique-outgoing", direction: "outgoing" as const,
+          text: mode === "wrong-text" ? "Synthetic different text" : prepared.preview.text,
+          ...(mode === "truncated-outgoing" ? { truncated: true as const } : {}) };
+        const reply = { id: "unique-reply", direction: "incoming" as const, text: "Synthetic bounded reply" };
+        const rolled = [...baseline.slice(1), outgoing];
+        const replied = [...baseline.slice(2), outgoing, reply];
+        if (mode === "reappearing-id") requests.publishStableSnapshot(target,
+          [outgoing, ...baseline.slice(0, 31)], now + 3, undefined, true);
+        requests.publishStableSnapshot(target, baseline, now + 4, undefined, omittedBaseline);
+        const inspecting = ledger.requestChatProof(owner, prepared.operationId, now + 5, prepared.expiresAt);
+        assert.ok(inspecting && inspecting !== "busy");
+        const proof = ledger.listChatJobs("proof", provider, now + 5)[0]!;
+        assert.equal(ledger.completeChatJob(proof.target, proof.operationId, proof.jobId, "proof",
+          { ok: true, editor: "textarea", draftText: prepared.preview.text, selected: true, writable: true, submitReady: true }, now + 6), true);
+        assert.equal(await inspecting.result, true);
+        const dispatch = ledger.requestFixtureDispatch(owner, prepared.operationId, inspecting.checkId, now + 7);
+        const submit = ledger.listChatJobs("submit", provider, now + 7)[0]!;
+        if (["intermediate", "outgoing-disappears"].includes(mode)) requests.publishStableSnapshot(target, rolled, now + 7, undefined, true);
+        if (["backward-window", "reply-edit", "reply-id-change"].includes(mode)) requests.publishStableSnapshot(target, replied, now + 7, undefined, true);
+        if (mode === "omission-only") requests.publishStableSnapshot(target, baseline, now + 7, undefined, true);
+        if (mode === "transient-edit" || mode === "transient-truncation") requests.publishStableSnapshot(target,
+          rolled.map((row, index) => index === 10 ? { ...row,
+            ...(mode === "transient-edit" ? { text: "Synthetic transient edit" } : { truncated: true as const }) } : row), now + 7, undefined, true);
+        if (mode === "transient-outgoing") requests.publishStableSnapshot(target,
+          [...baseline.slice(1), { ...outgoing, id: "different-outgoing" }], now + 7, undefined, true);
+        if (mode === "gap") requests.markStableObservationGap(target, now + 7);
+        if (mode === "event-overflow" || mode === "expired-baseline") {
+          for (let index = 0; index < (mode === "event-overflow" ? 101 : 1002); index++) requests.publishStableSnapshot(target,
+            baseline.map((row, position) => position === 31 ? { ...row, text: `Synthetic intervening edit ${index}` } : row), now + 7, undefined, omittedBaseline);
+        }
+        const rows = ["unchanged", "outgoing-disappears"].includes(mode) ? baseline
+          : ["reply", "intermediate", "reply-edit", "reply-id-change"].includes(mode) ? replied.map(row => row.id !== reply.id ? row
+            : mode === "reply-edit" ? { ...row, text: "Synthetic changed reply" } : mode === "reply-id-change" ? { ...row, id: "replacement-reply" } : row)
+          : mode === "extra-outgoing" ? [...baseline.slice(2), outgoing, { ...outgoing, id: "extra-outgoing" }]
+          : mode === "incoming-first" ? [...baseline.slice(2), reply, outgoing]
+          : mode === "drop-three" ? [...baseline.slice(3), outgoing, reply, { ...reply, id: "another-reply" }]
+          : mode === "short-window" ? [...baseline.slice(2), outgoing]
+          : mode === "duplicate-id" ? [...baseline.slice(2), outgoing, outgoing]
+          : rolled.map((row, index) => index !== 10 ? row : mode === "retained-edit" ? { ...row, text: "Synthetic changed row" }
+            : mode === "direction-edit" ? { ...row, direction: "outgoing" as const }
+            : mode === "truncated-retained" ? { ...row, truncated: true as const } : row);
+        const publish = () => requests.publishStableSnapshot(target, rows, now + (mode === "future-capture" ? 20 : 8), undefined,
+          ["unchanged", "outgoing-disappears"].includes(mode) ? omittedBaseline : mode !== "unmarked-shift");
+        if (mode === "duplicate-id") {
+          assert.throws(publish, /Invalid fixture snapshot/, context);
+          requests.markStableObservationGap(target, now + 8);
+        } else publish();
+        assert.equal(ledger.reconcileFixtureObservation(Symbol("foreign owner"), prepared.operationId, now + 9).state, "unknown", context);
+        assert.equal(ledger.completeChatJob(submit.target, submit.operationId, submit.jobId, "submit",
+          { ok: true, editor: "textarea", activated: true }, now + 9), true);
+        const result = await dispatch.result;
+        const positive = provider === "databag" && ["outgoing", "reply", "intermediate", "omission-only", "same-text"].includes(mode);
+        assert.equal(result.state, positive ? "observed_in_ui" : "dispatch_uncertain", context);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, positive ? 1 : 0, context);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()?.count, 0, context);
+        assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, now + 9), null);
+        assert.throws(() => ledger.requestFixtureDispatch(owner, prepared.operationId, inspecting.checkId, now + 9), /DISPATCH_UNCERTAIN/);
+        assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+        if (!positive && provider === "databag") {
+          requests.publishStableSnapshot(target, rolled, now + 21, undefined, true);
+          assert.equal(ledger.reconcileFixtureObservation(owner, prepared.operationId, now + 22).state,
+            mode === "unchanged" || mode === "future-capture" ? "observed_in_ui" : "dispatch_uncertain", context);
+        }
+      } finally {
+        ledger.disconnect(owner);
+        requests.disconnect(owner);
+        database.close();
+      }
+    }
+  }
+});
+
 test("Databag neutral job contracts bind exact sessions, bounded plain text and textarea results", () => {
   const operationId = randomUUID();
   const target = { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`,

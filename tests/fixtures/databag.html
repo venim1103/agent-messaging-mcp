@@ -99,7 +99,7 @@ const appendMessage = (id, direction, value) => {
   timeline.append(row);
   if (nativeMode) { nativeRow(row, id, direction); nativeRows(); }
 };
-window.syntheticAppendIncoming = text => appendMessage('synthetic-worker-reply', 'incoming', text);
+window.syntheticAppendIncoming = (text, id = 'synthetic-worker-reply') => appendMessage(id, 'incoming', text);
 window.syntheticActivations = 0;
 window.syntheticTrustedInputs = 0;
 editor.addEventListener('input', event => {

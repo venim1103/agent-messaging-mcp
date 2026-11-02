@@ -2186,19 +2186,68 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     const baseline = this.dispatchBaselines.get(operationId);
     const live = operation && this.requests.getStableTarget(owner, operation.connectionId, now);
-    if (!operation || operation.owner !== owner || !baseline || baseline.omittedBefore || !live || this.ambiguousEvidence.has(operationId)
+    if (!operation || operation.owner !== owner || !baseline || !live || this.ambiguousEvidence.has(operationId)
       || !this.sameComposerTarget(live, operation.target)) return status;
     const snapshot = this.requests.getStableSnapshot(owner, operation.connectionId, now);
-    if (!snapshot || snapshot === "not_ready" || snapshot.omittedBefore
+    if (!snapshot || snapshot === "not_ready"
       || snapshot.capturedAt < status.startedAt || snapshot.capturedAt > now
       || snapshot.cursor.epoch !== baseline.cursor.epoch || snapshot.cursor.sequence <= baseline.cursor.sequence) return status;
     const events = this.requests.readStableEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
     if (!events || events === "not_ready" || events.state !== "ok"
       || events.cursor.sequence !== snapshot.cursor.sequence) return status;
+    const captures = events.events.map(event => fixtureObservationSchema.safeParse(event.payload));
+    const omitted = baseline.omittedBefore || snapshot.omittedBefore
+      || captures.some(capture => capture.success && capture.data.omittedBefore);
+    if (omitted || (targetProvider(operation.target) === "databag" && baseline.messages.length === MAX_FIXTURE_SNAPSHOT_MESSAGES)) {
+      if (targetProvider(operation.target) !== "databag") return status;
+      const refuse = () => { this.ambiguousEvidence.add(operationId); return status; };
+      const continuity = this.requests.readStableIncomingChanges(owner, operation.connectionId,
+        baseline.cursor, MAX_RETURNED_EVENTS, now);
+      if (!continuity || continuity === "not_ready" || continuity.state !== "ok"
+        || continuity.cursor.sequence !== snapshot.cursor.sequence
+        || baseline.messages.length !== MAX_FIXTURE_SNAPSHOT_MESSAGES
+        || new Set(baseline.messageIds).size !== baseline.messages.length
+        || baseline.messages.some(message => message.truncated)) return refuse();
+      const seen = new Map(baseline.messages.map(message => [message.id, message]));
+      let droppedRows = 0;
+      let outgoingId: string | undefined;
+      for (const capture of [...captures,
+        fixtureObservationSchema.safeParse({ kind: "fixture_snapshot", omittedBefore: snapshot.omittedBefore, messages: snapshot.messages })]) {
+        if (!capture.success || capture.data.messages.length !== MAX_FIXTURE_SNAPSHOT_MESSAGES
+          || capture.data.messages.some(message => message.truncated)
+          || new Set(capture.data.messages.map(message => message.id)).size !== capture.data.messages.length) return refuse();
+        const rows = capture.data.messages;
+        const offset = baseline.messages.findIndex(message => message.id === rows[0]?.id);
+        if (offset < droppedRows || offset > 2 || offset < 0
+          || (offset > 0 && !capture.data.omittedBefore)
+          || (baseline.omittedBefore && !capture.data.omittedBefore)
+          || baseline.messages.slice(offset).some((message, index) => message.id !== rows[index]?.id
+            || message.direction !== rows[index]?.direction || message.text !== rows[index]?.text)) return refuse();
+        for (const message of rows) {
+          const previous = seen.get(message.id);
+          if (previous && (previous.direction !== message.direction || previous.text !== message.text
+            || previous.truncated !== message.truncated)) return refuse();
+          seen.set(message.id, message);
+        }
+        droppedRows = offset;
+        const added = rows.slice(baseline.messages.length - offset);
+        if (!added.length) {
+          if (outgoingId) return refuse();
+          continue;
+        }
+        const outgoing = added[0]!;
+        if (outgoing.direction !== "outgoing" || outgoing.text !== operation.text || baseline.messageIds.includes(outgoing.id)
+          || (outgoingId && outgoingId !== outgoing.id) || added.slice(1).some(message => message.direction !== "incoming")) return refuse();
+        outgoingId = outgoing.id;
+      }
+      if (!outgoingId) return status;
+      this.database.prepare(`INSERT INTO message_dispatch_evidence (operation_id, observed_at, message_id)
+        VALUES (?, ?, ?) ON CONFLICT (operation_id) DO NOTHING`).run(operationId, snapshot.capturedAt, outgoingId);
+      return this.dispatchStatus(operationId) ?? status;
+    }
     const known = new Set(baseline.messageIds);
     const matchingIds = new Set<string>();
-    for (const event of events.events) {
-      const observation = fixtureObservationSchema.safeParse(event.payload);
+    for (const observation of captures) {
       if (!observation.success || observation.data.omittedBefore) return status;
       for (const message of observation.data.messages) {
         if (!message.truncated && !known.has(message.id) && message.direction === "outgoing" && message.text === operation.text) {

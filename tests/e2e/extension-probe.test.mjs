@@ -2185,6 +2185,16 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
         route => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
       await page.goto(url);
       if (native) assert.equal(await page.locator("[data-chat-contract]").count(), 0);
+      if (provider === "databag" && scenario === "reload-failure") {
+        await page.addStyleTag({ content: "[data-chat-timeline], ._thread_synthetic_1 { max-height: 240px; overflow: auto; }" });
+        await page.evaluate(() => {
+          for (let index = 0; index < 31; index++) window.syntheticAppendIncoming(
+            `Synthetic incoming message bounded ${index}`, `synthetic-bounded-${index}`);
+        });
+        const composerBounds = await page.locator("textarea").boundingBox();
+        assert.ok(composerBounds && composerBounds.y >= 0
+          && composerBounds.y + composerBounds.height <= page.viewportSize().height);
+      }
       const selected = await worker.evaluate(async () => {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         const execute = chrome.scripting.executeScript.bind(chrome.scripting);
@@ -2264,7 +2274,7 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
             }, args: [grant.conversationId] });
           return result.result;
         }, { key, tabId: selected.tabId });
-        assert.deepEqual(capture, { identityMatches: true, captured: true, rows: 2 });
+        assert.deepEqual(capture, { identityMatches: true, captured: true, rows: scenario === "reload-failure" ? 32 : 2 });
       }
       setPhase("public owner read");
       const firstRead = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: first.connectionId } });
@@ -2279,6 +2289,8 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
         assert.equal(await supervisedReview.isVisible(), false);
         if (scenario === "reload-failure") {
           setPhase("public Databag send and reply");
+          assert.equal(firstRead.structuredContent.messages.length, 32);
+          assert.equal(firstRead.structuredContent.omittedBefore, true);
           const text = "Synthetic Databag autonomous worker message";
           const sendArguments = { connectionId: first.connectionId, text, idempotencyKey: crypto.randomUUID() };
           const sent = await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
@@ -2301,6 +2313,8 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
           assert.equal(await page.evaluate(() => window.syntheticActivations), 1);
           const observed = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: first.connectionId } });
           assert.equal(observed.isError, undefined);
+          assert.equal(observed.structuredContent.messages.length, 32);
+          assert.equal(observed.structuredContent.omittedBefore, true);
           assert.match(JSON.stringify(observed.structuredContent), /Synthetic Databag autonomous worker message/);
           const replyText = "Synthetic Databag worker reply";
           await page.evaluate(text => window.syntheticAppendIncoming(text), replyText);
