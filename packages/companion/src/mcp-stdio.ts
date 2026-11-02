@@ -263,7 +263,7 @@ server.experimental.tasks.registerToolTask("chat_wait_for_events", {
       if (reserved) incomingWaiters.add(args.connectionId);
       try {
         const result = incoming && !reserved ? blocked("INCOMING_WAIT_ACTIVE") : await waitForEvents(args, extra.signal);
-        await extra.taskStore.storeTaskResult(task.taskId, result.isError ? "failed" : "completed", result);
+        await extra.taskStore.storeTaskResult(task.taskId, "completed", result);
         return { task: await extra.taskStore.getTask(task.taskId) };
       } finally {
         if (reserved) incomingWaiters.delete(args.connectionId);
@@ -292,11 +292,11 @@ server.experimental.tasks.registerToolTask("chat_wait_for_events", {
     };
     void run().then(async result => {
       if ((await taskStore.getTask(task.taskId))?.status === "working") {
-        await taskStore.storeTaskResult(task.taskId, result.isError ? "failed" : "completed", result);
+        await taskStore.storeTaskResult(task.taskId, "completed", result);
       }
     }).catch(async () => {
       if ((await taskStore.getTask(task.taskId))?.status === "working") {
-        await taskStore.storeTaskResult(task.taskId, "failed", blocked("BROKER_UNAVAILABLE"));
+        await taskStore.storeTaskResult(task.taskId, "completed", blocked("BROKER_UNAVAILABLE"));
       }
     });
     return { task };

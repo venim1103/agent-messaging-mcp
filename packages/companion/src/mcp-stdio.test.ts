@@ -334,7 +334,10 @@ for (const target of [
         params: { name: "chat_wait_for_events", arguments: { ...args, ...overrides }, task: {} } }, CreateTaskResultSchema)).task;
       const result = (taskId: string) => client.experimental.tasks.getTaskResult(taskId, CallToolResultSchema);
       const foreign = await begin({ connectionId: "d66b3997-9d43-4554-8399-267d1fe9f75c" });
-      assert.match(JSON.stringify(await result(foreign.taskId)), /CONNECTION_NOT_FOUND/);
+      const foreignResult = await result(foreign.taskId);
+      assert.equal(foreignResult.isError, true);
+      assert.match(JSON.stringify(foreignResult), /CONNECTION_NOT_FOUND/);
+      assert.equal((await client.experimental.tasks.getTask(foreign.taskId)).status, "completed");
       const snapshots = await begin({ view: "snapshots" });
       assert.equal((await result(snapshots.taskId)).structuredContent?.timedOut, true);
       const pending = await begin();
@@ -369,7 +372,10 @@ for (const target of [
       assert.deepEqual(revision.events.flatMap(event => event.payload.messages), [{ ...revised, change: "revision" }]);
       const gap = await begin({ cursor: revision.cursor });
       await relay.markChatObservationGap(target);
-      assert.deepEqual((await result(gap.taskId)).structuredContent, { code: "CURSOR_EXPIRED", resnapshot: true });
+      const gapResult = await result(gap.taskId);
+      assert.equal(gapResult.isError, true);
+      assert.deepEqual(gapResult.structuredContent, { code: "CURSOR_EXPIRED", resnapshot: true });
+      assert.equal((await client.experimental.tasks.getTask(gap.taskId)).status, "completed");
       const refreshed = await snapshot([...history, echo, first, revised]);
       const disconnected = await begin({ cursor: refreshed.cursor });
       await client.callTool({ name: "chat_disconnect", arguments: { connectionId } });
