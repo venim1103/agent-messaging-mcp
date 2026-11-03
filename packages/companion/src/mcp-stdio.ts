@@ -217,6 +217,7 @@ const answerWaitSchema = eventWaitSchema.omit({ view: true, cursor: true }).exte
 
 async function runEventWait(args: z.infer<typeof eventWaitSchema> | z.infer<typeof answerWaitSchema>,
   signal: AbortSignal, pending: boolean) {
+  const deadline = Date.now() + (args.timeoutMs ?? 20_000);
   const failure = (code: string) => "operationId" in args
     ? { ...blocked(code), structuredContent: { code } } : blocked(code);
   try {
@@ -239,7 +240,7 @@ async function runEventWait(args: z.infer<typeof eventWaitSchema> | z.infer<type
       eventArgs = { ...args, cursor: args.cursor ?? anchor.cursor, view: "incoming_changes" };
     } else eventArgs = args;
     if (!pending || eventArgs.view !== "incoming_changes" || eventArgs.timeoutMs === 0) {
-      return waitForEvents(eventArgs, signal, client);
+      return waitForEvents(eventArgs, signal, client, deadline);
     }
     let cursor = eventArgs.cursor;
     while (!signal.aborted) {
@@ -256,8 +257,7 @@ async function runEventWait(args: z.infer<typeof eventWaitSchema> | z.infer<type
 }
 
 async function waitForEvents({ connectionId, cursor, timeoutMs, limit, view }: z.infer<typeof eventWaitSchema>,
-  signal: AbortSignal, client?: Awaited<ReturnType<typeof connectBroker>>) {
-  const deadline = Date.now() + (timeoutMs ?? 20_000);
+  signal: AbortSignal, client?: Awaited<ReturnType<typeof connectBroker>>, deadline = Date.now() + (timeoutMs ?? 20_000)) {
   let currentCursor = cursor;
   try {
     while (true) {

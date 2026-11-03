@@ -34,15 +34,25 @@ const replyWaitClock = `import { readFileSync, renameSync, writeFileSync } from 
   import { join } from "node:path";
   import { performance } from "node:perf_hooks";
   const clockPath = join(process.env.HOME, "reply-clock.json");
-  const now = () => JSON.parse(readFileSync(clockPath, "utf8")).now;
+  const realNow = Date.now;
+  const now = () => {
+    const clock = JSON.parse(readFileSync(clockPath, "utf8"));
+    return clock.live === true ? realNow() : clock.now;
+  };
   const startedAt = now();
   Date.now = now;
   Object.defineProperty(performance, "now", { value: () => now() - startedAt });
   const stringify = JSON.stringify;
   JSON.stringify = (value, ...options) => {
-    if (value?.kind === "read_approved_snapshot") {
+    if (["read_approved_snapshot", "get_prepared_operation", "read_approved_events"].includes(value?.kind)) {
       const clock = JSON.parse(readFileSync(clockPath, "utf8"));
-      if (Number.isSafeInteger(clock.encodeUntil)) {
+      if (value.kind === "read_approved_events" && Number.isSafeInteger(clock.eventStep)) {
+        clock.now += clock.eventStep;
+        clock.eventReads++;
+        writeFileSync(clockPath + ".next", stringify(clock), { mode: 0o600 });
+        renameSync(clockPath + ".next", clockPath);
+      }
+      if (value.kind === (clock.encodeKind ?? "read_approved_snapshot") && Number.isSafeInteger(clock.encodeUntil)) {
         const encodeError = clock.encodeError === true;
         clock.now = clock.encodeUntil;
         delete clock.encodeUntil;
@@ -434,9 +444,13 @@ for (const target of [
     const provider = "provider" in target ? "databag" : "fixture";
     try {
       await mkdir(join(home, ".config/agent-messaging-mcp"), { recursive: true, mode: 0o700 });
+      const clockPath = join(home, "reply-clock.json");
+      const clockObserver = join(home, "reply-wait-clock.mjs");
+      await writeFile(clockPath, JSON.stringify({ now: Date.now(), live: true }), { mode: 0o600 });
+      await writeFile(clockObserver, replyWaitClock, { mode: 0o600 });
       database = openPrivateOperationDatabase(join(home, ".config/agent-messaging-mcp"));
       broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
-      const options = { command: process.execPath, args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+      const options = { command: process.execPath, args: ["--import", clockObserver, fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
         env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
       await Promise.all([client.connect(new TaskTransport(options)), peer.connect(new TaskTransport(options))]);
       await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
@@ -522,6 +536,18 @@ for (const target of [
       for (const cursor of [{ ...baseline.cursor, sequence: 0 }, { ...baseline.cursor, epoch: "d66b3997-9d43-4554-8399-267d1fe9f75c" }]) {
         assert.deepEqual((await client.callTool({ name: "chat_wait_for_answer", arguments: { ...answerArgs, cursor } })).structuredContent,
           { code: "INVALID_ANSWER_CURSOR" });
+      }
+      const budgetStart = Date.now();
+      await writeFile(clockPath, JSON.stringify({ now: budgetStart, encodeKind: "get_prepared_operation",
+        encodeUntil: budgetStart + 200, eventStep: 50, eventReads: 0 }), { mode: 0o600 });
+      try {
+        const exhausted = await client.callTool({ name: "chat_wait_for_answer", arguments: {
+          ...answerArgs, cursor: page.cursor, timeoutMs: 100 } });
+        assert.equal((exhausted.structuredContent as Page).timedOut, true);
+        assert.equal(JSON.parse(await readFile(clockPath, "utf8")).eventReads, 1,
+          "Anchor validation must consume the original ordinary wait budget, not restart it");
+      } finally {
+        await writeFile(clockPath, JSON.stringify({ now: Date.now(), live: true }), { mode: 0o600 });
       }
       const pending = await begin({ cursor: page.cursor });
       const checkArgs = { connectionId, cursor: page.cursor, limit: 2 };
