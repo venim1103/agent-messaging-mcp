@@ -250,6 +250,46 @@ test("Databag React identity bridge is read-only, bounded and rejects stale or f
     await page.evaluate(() => { window.syntheticBridge.root.stateNode.pendingLanes = 0; });
     assert.deepEqual(await pendingRenderResult, { ok: true, editor: "textarea" });
     assert.deepEqual(await page.evaluate(identifyDatabagConversation), nativeIdentity);
+    for (const change of ["ready", "focus", "text", "continuity", "expiry"]) {
+      await page.locator("textarea").fill(draft.text);
+      await page.locator("textarea").focus();
+      await page.evaluate(() => {
+        const fixture = window.syntheticBridge;
+        fixture.root.stateNode.pendingLanes = 1;
+        fixture.identityWaitStarted = false;
+        delete fixture.identityWaitResult;
+      });
+      const expiresAt = Date.now() + (change === "expiry" ? 500 : 4000);
+      const confirmation = page.evaluate(async wait => {
+        window.syntheticBridge.identityWaitStarted = true;
+        const result = await globalThis.agentDatabagAdapter.identify(wait);
+        window.syntheticBridge.identityWaitResult = result;
+        return result;
+      }, { expiresAt });
+      await page.waitForFunction(() => window.syntheticBridge.identityWaitStarted === true);
+      assert.equal(await page.evaluate(() => window.syntheticBridge.identityWaitResult), undefined);
+      assert.equal(await page.evaluate(identifyDatabagConversation), null);
+      if (change === "ready") await page.evaluate(() => { window.syntheticBridge.root.stateNode.pendingLanes = 0; });
+      if (change === "focus") await page.locator("button").focus();
+      if (change === "text") await page.locator("textarea").fill("Synthetic changed confirmation draft");
+      if (change === "continuity") await page.evaluate(() => {
+        const fixture = window.syntheticBridge;
+        fixture.app.state.focus = { ...fixture.focus };
+      });
+      assert.deepEqual(await confirmation, change === "ready" ? nativeIdentity : null);
+      if (change === "expiry") assert.ok(Date.now() >= expiresAt);
+      assert.equal(await page.locator("textarea").inputValue(), change === "text" ? "Synthetic changed confirmation draft" : draft.text);
+      assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
+      await page.evaluate(() => {
+        const fixture = window.syntheticBridge;
+        fixture.root.stateNode.pendingLanes = 0;
+        fixture.app.state.focus = fixture.focus;
+      });
+    }
+    for (const wait of [{ expiresAt: 0 }, { expiresAt: Date.now() + 10000 },
+      { expiresAt: Date.now() + 4000, allowHidden: false }, { expiresAt: Date.now() + 4000, approved: true }]) {
+      assert.equal(await page.evaluate(identifyDatabagConversation, wait), null);
+    }
     await page.locator("textarea").fill("");
     await page.locator("textarea").evaluate(editor => editor.addEventListener("input", () => {
       window.syntheticBridge.root.stateNode.pendingLanes = 1;

@@ -2214,8 +2214,10 @@ for (const provider of ["fixture", "gemini"]) {
 }
 
 for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].flatMap(provider =>
-  ["failure", "lifetime", "reload", "reload-failure", ...(provider === "databag" ? ["fill-result-loss", "submit-result-loss"] : [])]
-    .flatMap(scenario => (provider === "databag" ? [false, true] : [false]).map(native => ({ provider, scenario, native }))))) {
+  ["failure", "lifetime", "reload", "reload-failure", ...(provider === "databag"
+    ? ["fill-result-loss", "submit-result-loss", "fill-result-readiness"] : [])]
+    .flatMap(scenario => (provider === "databag" ? scenario === "fill-result-readiness" ? [true] : [false, true] : [false])
+      .map(native => ({ provider, scenario, native }))))) {
   test(`${provider}${native ? " native" : ""} popup autonomous admission (${scenario}) is per agent and preserves other owners`, { timeout: 20000 }, async (testContext) => {
     const setPhase = trackTestPhase(testContext, `${provider} admission ${scenario}`);
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-autonomous-test-"));
@@ -2469,35 +2471,59 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
           assert.equal(await page.locator("textarea").inputValue(), "Synthetic Databag human draft");
           assert.equal(await page.evaluate(() => window.syntheticActivations), 1);
         }
-        if (scenario === "fill-result-loss" || scenario === "submit-result-loss") {
+        if (scenario === "fill-result-loss" || scenario === "submit-result-loss" || scenario === "fill-result-readiness") {
           setPhase(`public Databag ${scenario}`);
           const fillLoss = scenario === "fill-result-loss";
-          await worker.evaluate(fillLoss => {
+          const readiness = scenario === "fill-result-readiness";
+          await worker.evaluate(({ fillLoss, readiness }) => {
             globalThis.syntheticDatabagJobCalls = 0;
             globalThis.syntheticDatabagDroppedResults = 0;
+            globalThis.syntheticDatabagPendingChecks = 0;
+            globalThis.syntheticDatabagPending = false;
             const execute = chrome.scripting.executeScript.bind(chrome.scripting);
             chrome.scripting.executeScript = async options => {
               const results = await execute(options);
               const source = options.func?.toString() ?? "";
-              if (source.includes("agentDatabagAdapter") && source.includes(fillLoss ? ".fill(" : ".submit(")) {
+              if (source.includes("agentDatabagAdapter") && source.includes(fillLoss || readiness ? ".fill(" : ".submit(")) {
                 globalThis.syntheticDatabagJobCalls++;
-                if (results[0]?.result?.ok && globalThis.syntheticDatabagDroppedResults === 0) {
+                if (readiness && results[0]?.result?.ok) {
+                  await execute({ target: options.target, world: "MAIN", func: () => {
+                    const root = document.querySelector("._conversation_synthetic_1");
+                    const host = Object.getOwnPropertyDescriptor(root, "__reactFiber$synthetic").value;
+                    host.return.return.stateNode.pendingLanes = 1;
+                    globalThis.syntheticDatabagPendingChecks = 0;
+                    root.addEventListener("agent-databag-identity-v1", () => {
+                      if (host.return.return.stateNode.pendingLanes !== 1) return;
+                      globalThis.syntheticDatabagPendingChecks++;
+                      setTimeout(() => { host.return.return.stateNode.pendingLanes = 0; }, 0);
+                    }, { once: true });
+                  } });
+                  globalThis.syntheticDatabagPending = true;
+                } else if (results[0]?.result?.ok && globalThis.syntheticDatabagDroppedResults === 0) {
                   globalThis.syntheticDatabagDroppedResults++;
                   return [];
                 }
               }
+              if (readiness && globalThis.syntheticDatabagPending && source.includes("agentDatabagAdapter")
+                && source.includes(".identify(")) {
+                const [metadata] = await execute({ target: options.target, world: "MAIN",
+                  func: () => globalThis.syntheticDatabagPendingChecks });
+                globalThis.syntheticDatabagPendingChecks = metadata.result;
+                globalThis.syntheticDatabagPending = false;
+              }
               return results;
             };
-          }, fillLoss);
+          }, { fillLoss, readiness });
           const text = "Synthetic Databag lost-result message";
           const sendArguments = { connectionId: first.connectionId, text, idempotencyKey: crypto.randomUUID() };
           const result = await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
+          if (readiness) assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagPendingChecks), 1);
           assert.equal(result.isError, fillLoss, JSON.stringify({ state: result.structuredContent.state,
             code: result.structuredContent.code, failureStage: result.structuredContent.failureStage }));
           assert.equal(result.structuredContent.state, fillLoss ? "not_sent" : "sent");
           assert.equal(result.structuredContent.retryAllowed, false);
           if (fillLoss) assert.equal(result.structuredContent.failureStage, "fill");
-          assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagDroppedResults), 1);
+          assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagDroppedResults), readiness ? 0 : 1);
           assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagJobCalls), 1);
           assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 1);
           assert.equal(await page.evaluate(() => window.syntheticActivations), fillLoss ? 0 : 1);

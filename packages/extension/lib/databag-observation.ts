@@ -1,6 +1,7 @@
 import type { DatabagReactIdentity } from "./databag-identity";
 
 export type DatabagIdentity = { url: string; conversationId: string };
+type DatabagReadinessWait = { expiresAt: number; allowHidden?: true };
 export type DatabagCapture = { messages: { id: string; direction: "incoming" | "outgoing";
   text: string; truncated?: true }[]; omittedBefore: boolean };
 export type DatabagDraftInput = { expectedUrl: string; conversationId: string; text: string;
@@ -41,7 +42,7 @@ export type DatabagStructure = {
 };
 type DatabagAdapter = {
   origins: string;
-  identify: () => Promise<DatabagIdentity | null>;
+  identify: (wait?: DatabagReadinessWait) => Promise<DatabagIdentity | null>;
   capture: (conversationId: string) => Promise<DatabagCapture | null>;
   inspect: (input: DatabagDraftInput) => Promise<DatabagPreflight>;
   fill: (input: DatabagFillInput) => Promise<DatabagFill>;
@@ -273,13 +274,32 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     if (timelines.length !== 1 || !timeline || !visible(timeline)) return null;
     return { root, timeline, identity: JSON.stringify(values), continuity: null, native: null };
   };
-  const identify = async (): Promise<DatabagIdentity | null> => {
-    const before = context();
+  const identify = async (wait?: DatabagReadinessWait): Promise<DatabagIdentity | null> => {
+    if (wait !== undefined && (!wait || Object.keys(wait).some(key => key !== "expiresAt" && key !== "allowHidden")
+      || !Number.isSafeInteger(wait.expiresAt) || wait.expiresAt <= Date.now() || wait.expiresAt > Date.now() + 4000
+      || (wait.allowHidden !== undefined && wait.allowHidden !== true))) return null;
+    const before = context(wait === undefined);
     if (!before) return null;
+    const controls = wait ? composer(before, wait.allowHidden) : null;
+    if (wait && (!controls?.ok || document.activeElement !== controls.editor)) return null;
+    const text = controls?.ok ? controls.editor.value : null;
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(before.identity));
-    const after = context();
-    if (!after || after.root !== before.root || after.timeline !== before.timeline || after.identity !== before.identity
-      || after.continuity !== before.continuity) return null;
+    for (;;) {
+      const after = context(wait === undefined);
+      if (!after || after.root !== before.root || after.timeline !== before.timeline || after.identity !== before.identity
+        || after.continuity !== before.continuity) return null;
+      if (wait && controls?.ok) {
+        const current = composer(before, wait.allowHidden);
+        if (!current.ok || current.region !== controls.region || current.editor !== controls.editor
+          || current.button !== controls.button || document.activeElement !== controls.editor
+          || controls.editor.value !== text || Date.now() >= wait.expiresAt) return null;
+        if (!current.ready) {
+          await new Promise<void>(resolve => setTimeout(resolve, Math.min(16, wait.expiresAt - Date.now())));
+          continue;
+        }
+      }
+      break;
+    }
     const hash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
     return { url: location.href, conversationId: `databag_${hash}` };
   };
@@ -590,8 +610,8 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
   return true;
 }
 
-export function identifyDatabagConversation(): Promise<DatabagIdentity | null> {
-  return (globalThis as typeof globalThis & DatabagScope).agentDatabagAdapter?.identify() ?? Promise.resolve(null);
+export function identifyDatabagConversation(wait?: DatabagReadinessWait): Promise<DatabagIdentity | null> {
+  return (globalThis as typeof globalThis & DatabagScope).agentDatabagAdapter?.identify(wait) ?? Promise.resolve(null);
 }
 
 export function captureDatabagSnapshot(conversationId: string): Promise<DatabagCapture | null> {

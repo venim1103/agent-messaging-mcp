@@ -692,7 +692,7 @@ async function checkTrackedGeminiDraft(check: GeminiDispatchChallenge): Promise<
   await completeFixtureBrowserCheck(check, proof);
 }
 
-async function chatJobBinding(check: ChatBrowserJob) {
+async function chatJobBinding(check: ChatBrowserJob, waitForDatabagReadiness = false) {
   const target = check.target;
   if (check.expiresAt <= Date.now() || chatTabUpdates.has(target.tabId)) return null;
   const key = chatGrantKey(target);
@@ -709,7 +709,9 @@ async function chatJobBinding(check: ChatBrowserJob) {
       .then(([identity]) => identity?.frameId === 0 && identity.documentId === target.documentId
         && identity.result?.conversationId === target.conversationId && identity.result.url === expectedUrl)
     : target.provider === "databag"
-      ? await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] }, func: identifyDatabagConversation })
+      ? await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] }, func: identifyDatabagConversation,
+          ...(waitForDatabagReadiness && check.phase === "fill" ? { args: [{ expiresAt: Math.min(check.expiresAt, grant.expiresAt ?? Infinity),
+            ...(grant.expiresAt === null ? { allowHidden: true as const } : {}) }] } : {}) })
         .then(([identity]) => identity?.frameId === 0 && identity.documentId === target.documentId
           && identity.result?.conversationId === target.conversationId && identity.result.url === expectedUrl)
     : await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] }, func: readFixtureIdentity })
@@ -798,7 +800,7 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
               func: fillFixtureDraft, args: [input] });
           const completed = filled[0];
           if (completed?.frameId === 0 && completed.documentId === check.target.documentId && completed.result
-            && await chatJobBinding(check)) observation = completed.result;
+            && await chatJobBinding(check, completed.result.ok && check.target.provider === "databag")) observation = completed.result;
         }
       }
     }
