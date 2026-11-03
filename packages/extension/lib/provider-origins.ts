@@ -26,3 +26,15 @@ export function isEligibleDatabagUrl(value: unknown, origins = databagOrigins): 
   const origin = parseDatabagOrigin(origins[0]);
   return origin !== null && value === `${origin}/#/session`;
 }
+
+export function isRecognizedCompanyAIChatUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 512) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.port && !url.username && !url.password
+      && /^chat\.app\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.com$/.test(url.hostname)
+      && (value === url.href || value === url.origin);
+  } catch {
+    return false;
+  }
+}

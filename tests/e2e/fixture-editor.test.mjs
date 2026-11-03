@@ -15,6 +15,78 @@ import { installDatabagIdentityBridge } from "../../packages/extension/lib/datab
 import { installDatabagAdapter, identifyDatabagConversation, captureDatabagSnapshot, observeDatabagMessages,
   inspectDatabagDraft, fillDatabagDraft, submitDatabagDraft, inspectDatabagStructure }
   from "../../packages/extension/lib/databag-observation.ts";
+import { inspectCompanyAIChatStructure } from "../../packages/extension/lib/company-ai-observation.ts";
+
+test("Company AI Chat inspection is bounded, metadata-only and leaves private content untouched", { timeout: 15000 }, async () => {
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage();
+    const input = { expectedUrl: "https://chat.app.example.com/chat/synthetic" };
+    await page.route("**/*", route => route.fulfill({ contentType: "text/html", body: `<!doctype html><html><body>
+      <main><div role="log"><article>Synthetic private reply</article></div>
+        <form><textarea readonly>Synthetic human draft</textarea><button disabled>Synthetic action</button></form>
+        <div contenteditable="true">Synthetic editable</div><div role="textbox" aria-disabled="true">Synthetic editor</div>
+        <a href="/synthetic-private-path" aria-label="Synthetic private label">Synthetic chat</a>
+        <input type="password" role="textbox" value="Synthetic private input">
+        <div style="opacity:0"><textarea>Synthetic hidden draft</textarea></div>
+        <iframe srcdoc="<main><textarea>Synthetic framed draft</textarea></main>"></iframe>
+      </main></body></html>` }));
+    await page.goto(input.expectedUrl);
+    await page.evaluate(() => {
+      const originalValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").get;
+      const originalHtml = Object.getOwnPropertyDescriptor(Element.prototype, "outerHTML").get;
+      const before = originalHtml.call(document.body);
+      const editor = document.querySelector("textarea");
+      let interactions = 0;
+      for (const kind of ["input", "change", "focus", "click"]) document.addEventListener(kind, () => { interactions++; }, true);
+      const observer = new MutationObserver(() => {});
+      observer.observe(document.body, { childList: true, attributes: true, characterData: true, subtree: true });
+      window.syntheticCompanyInspectionState = () => ({ interactions, mutations: observer.takeRecords().length,
+        draftUnchanged: originalValue.call(editor) === "Synthetic human draft", htmlUnchanged: originalHtml.call(document.body) === before,
+        storedKeys: Object.keys(sessionStorage).length });
+      for (const [prototype, property] of [[Node.prototype, "textContent"], [HTMLElement.prototype, "innerText"],
+        [Element.prototype, "innerHTML"], [Element.prototype, "outerHTML"], [HTMLTextAreaElement.prototype, "value"],
+        [HTMLInputElement.prototype, "value"], [HTMLInputElement.prototype, "files"],
+        [HTMLIFrameElement.prototype, "contentDocument"], [HTMLIFrameElement.prototype, "contentWindow"]]) {
+        Object.defineProperty(prototype, property, { configurable: true, get() { throw new Error("Synthetic private getter accessed"); } });
+      }
+      const getAttribute = Element.prototype.getAttribute;
+      Element.prototype.getAttribute = function (name) {
+        if (["id", "href", "src", "title", "aria-label", "data-testid"].includes(name)) throw new Error("Synthetic private attribute accessed");
+        return getAttribute.call(this, name);
+      };
+    });
+    const shape = await page.evaluate(inspectCompanyAIChatStructure, input);
+    assert.equal(shape.limited, false);
+    assert.equal(shape.editorsOmitted, false);
+    assert.deepEqual(shape.counts, { mainRegions: 1, timelines: 1, articles: 1, forms: 1, lists: 0,
+      textareas: 1, contenteditables: 1, buttons: 1, links: 1, iframes: 1 });
+    assert.deepEqual(shape.editors, [{ kind: "textarea", disabled: false, readOnly: true },
+      { kind: "contenteditable", disabled: false, readOnly: false }, { kind: "textbox", disabled: true, readOnly: false }]);
+    assert.doesNotMatch(JSON.stringify(shape), /Synthetic|https:|example|private/);
+    assert.deepEqual(await page.evaluate(() => window.syntheticCompanyInspectionState()),
+      { interactions: 0, mutations: 0, draftUnchanged: true, htmlUnchanged: true, storedKeys: 0 });
+    assert.equal(await page.evaluate(inspectCompanyAIChatStructure, { expectedUrl: `${input.expectedUrl}?other` }), null);
+    await page.goto(input.expectedUrl);
+    await page.evaluate(() => {
+      document.body.replaceChildren();
+      for (let index = 0; index < 5000; index++) document.body.append(document.createElement("button"));
+    });
+    const clipped = await page.evaluate(inspectCompanyAIChatStructure, input);
+    assert.equal(clipped.visitedElements, 4096);
+    assert.equal(clipped.limited, true);
+    await page.evaluate(() => {
+      document.body.replaceChildren();
+      let parent = document.body;
+      for (let depth = 0; depth < 70; depth++) { const child = document.createElement("div"); parent.append(child); parent = child; }
+    });
+    const deep = await page.evaluate(inspectCompanyAIChatStructure, input);
+    assert.equal(deep.visitedElements, 65);
+    assert.equal(deep.limited, true);
+  } finally {
+    await browser.close();
+  }
+});
 
 test("Databag React identity bridge is read-only, bounded and rejects stale or foreign account state", { timeout: 15000 }, async () => {
   const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true, chromiumSandbox: true });

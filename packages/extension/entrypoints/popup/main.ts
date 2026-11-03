@@ -1,7 +1,8 @@
 import { browser } from "wxt/browser";
 import { captureGeminiSnapshot, inspectGeminiMathLayout, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl } from "../../lib/gemini-observation";
 import { inspectDatabagStructure } from "../../lib/databag-observation";
-import { isEligibleDatabagUrl } from "../../lib/provider-origins";
+import { inspectCompanyAIChatStructure } from "../../lib/company-ai-observation";
+import { isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl } from "../../lib/provider-origins";
 
 type FixturePreview = {
   conversationId: string;
@@ -239,6 +240,19 @@ async function inspectDatabagTab(target: InspectionTarget): Promise<InspectionRe
       `${send.disabled ? "disabled" : "enabled"}; ${send.ariaDisabled ? "aria-disabled" : "no aria-disabled"}`).join("\n") || "None visible")],
     ["Contract markers", shape.markerContractPresent ? "Experimental markers present" : "No experimental contract marker"]
   ], status: "Layout metadata only. No message or draft text read, connection approval, or input actions." };
+}
+
+async function inspectCompanyAIChatTab(target: InspectionTarget): Promise<InspectionResult | null> {
+  const shape = await inspectPage(target, inspectCompanyAIChatStructure, [{ expectedUrl: target.url }]);
+  if (!shape) return null;
+  const counts = shape.counts;
+  return { title: "Company AI Chat (diagnostic)", details: [
+    ["Bounds", `${shape.visitedElements} visited elements; ${shape.limited ? "limit reached" : "within limits"}`],
+    ["Regions", `${counts.mainRegions} main; ${counts.timelines} log/feed; ${counts.articles} article; ${counts.forms} form; ${counts.lists} list`],
+    ["Controls", `${counts.textareas} textarea; ${counts.contenteditables} contenteditable; ${counts.buttons} button; ${counts.links} link; ${counts.iframes} iframe`],
+    ["Editors", shape.editors.map(editor => `${editor.kind}; ${editor.disabled ? "disabled" : "enabled"}; `
+      + `${editor.readOnly ? "read-only" : "writable"}`).concat(shape.editorsOmitted ? ["Additional editors omitted"] : []).join("\n") || "None visible"]
+  ], status: "Layout metadata only. Company AI Chat connection and messaging are not enabled." };
 }
 
 if (!inspectButton || !agentPanel || !agentCount || !agentList || !refreshAgentsButton || !disconnectChatButton
@@ -525,15 +539,17 @@ const geminiReviewCommands = {
 const chatAdapters = [
   { provider: "fixture", matches: (url: string) => new URL(url).origin === fixtureOrigin,
     canConnect: (url: string) => new URL(url).origin === fixtureOrigin,
-    inspect: inspectFixtureTab,
+    inspect: inspectFixtureTab, inspectionAccess: "optionalHost",
     supervised: { target: "fixture-alpha", pending: (tab: ChatTab) => ({ kind: "list_fixture_pending", tabId: tab.id }),
       approve: "approve_fixture", reviews: fixtureReviewCommands } },
   { provider: "gemini", matches: (url: string) => new URL(url).origin === geminiOrigin, canConnect: isEligibleGeminiUrl,
-    inspect: inspectGeminiTab,
+    inspect: inspectGeminiTab, inspectionAccess: "optionalHost",
     supervised: { target: "gemini", pending: (tab: ChatTab) => ({ kind: "list_gemini_pending", tabId: tab.id, expectedUrl: tab.url }),
       approve: "approve_gemini", reviews: geminiReviewCommands } },
   { provider: "databag", matches: isEligibleDatabagUrl, canConnect: isEligibleDatabagUrl,
-    inspect: inspectDatabagTab, supervised: null }
+    inspect: inspectDatabagTab, inspectionAccess: "optionalHost", supervised: null },
+  { provider: "company_ai", matches: isRecognizedCompanyAIChatUrl, canConnect: () => false,
+    inspect: inspectCompanyAIChatTab, inspectionAccess: "activeTab", supervised: null }
 ] as const;
 
 const reviewDrafts = async (purpose: keyof typeof reviewActions) => {
@@ -722,10 +738,12 @@ inspectButton.addEventListener("click", async () => {
       status.textContent = "Selected chat changed. No inspection returned.";
       return;
     }
-    const site = { origins: [`${new URL(selected.url).origin}/*`] };
-    if (!await browser.permissions.contains(site) && !await browser.permissions.request(site)) {
-      status.textContent = "Site access denied; no inspection returned.";
-      return;
+    if (selected.adapter.inspectionAccess === "optionalHost") {
+      const site = { origins: [`${new URL(selected.url).origin}/*`] };
+      if (!await browser.permissions.contains(site) && !await browser.permissions.request(site)) {
+        status.textContent = "Site access denied; no inspection returned.";
+        return;
+      }
     }
     if (!await isCurrent()) return;
     const [binding] = await browser.scripting.executeScript({

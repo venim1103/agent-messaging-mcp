@@ -207,6 +207,12 @@ Owned `chat_disconnect` bypasses an in-flight read/send in both private client a
 
 Shared supervised/autonomous commit and fixture dispatch execution end 25 ms before the original broker reply deadline, retaining the existing response reserve. Browser leases are clipped to that earlier execution deadline; wire deadlines, uncertainty/no-retry handling and grant authority do not change.
 
+### Company AI Chat diagnostic
+
+Hosts shaped like `https://chat.app.example.com/` are recognized for the shared **Inspect this chat** diagnostic only. No deployment address is configured or persisted; recognition adds no host permission or chat authority. After agreeing a bounded installed diagnostic scope, open the selected tab through the trusted toolbar popup and inspect once using temporary `activeTab` access.
+
+Only fixed layout counts/control states are returned; no labels, URLs, message/draft text, authentication configuration or framework state is read. Account/chat binding is unverified, so connection and messaging stay disabled. Keep real deployment details, screenshots and configuration values out of Git and diagnostic reports.
+
 ### Databag work-channel operation
 
 The person has designated one direct conversation for AI0 to report work, request input and receive their delegated task instructions. Follow [the work-channel rules](AGENTS.md#databag-work-channel) and DESIGN.md D21; a display name is not an authenticated binding.

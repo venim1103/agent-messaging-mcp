@@ -20,7 +20,7 @@ import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 import { createNativeRequestChannel, requestNativeGrantCount } from "../../packages/extension/lib/native-channel.ts";
-import { configuredDatabagOrigins, isEligibleDatabagUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
+import { configuredDatabagOrigins, isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
 import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
 let databagBuildSource;
@@ -76,6 +76,123 @@ test("Databag configuration admits one exact HTTPS origin without widening host 
     " https://databag.example", "https://databag.example\n", "not a URL"]) {
     assert.equal(parseDatabagOrigin(value), null);
     assert.throws(() => configuredDatabagOrigins(value), /canonical HTTPS origin/);
+  }
+});
+
+test("Company AI Chat recognition uses a hostname pattern, not browser authority", () => {
+  for (const url of ["https://chat.app.example.com", "https://chat.app.example.com/",
+    "https://chat.app.example.com/chat/synthetic", "https://chat.app.example-team.com/#/chat/synthetic"]) {
+    assert.equal(isRecognizedCompanyAIChatUrl(url), true);
+  }
+  for (const url of [undefined, null, {}, "not a URL", "http://chat.app.example.com/",
+    "https://chat.app.example.com:8443/", "https://chat.app.example.com:443/",
+    "https://user@chat.app.example.com/", "https://chat.app.example.com.evil.test/",
+    "https://other.chat.app.example.com/", "https://chat.app.sub.example.com/",
+    "https://chat.app.example.org/", "https://chat.app.-example.com/", "https://chat.app.example-.com/",
+    "https://chat.app.example.com./", "https://chat.app.%65xample.com/", "https://CHAT.app.example.com/",
+    " https://chat.app.example.com/", "https://chat.app.example.com/\n",
+    `https://chat.app.example.com/${"a".repeat(512)}`]) {
+    assert.equal(isRecognizedCompanyAIChatUrl(url), false);
+  }
+});
+
+test("Company AI Chat popup exposes document-bound diagnostics without host requests or chat authority", { timeout: 15000 }, async testContext => {
+  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-company-ai-probe-"));
+  let context;
+  try {
+    const unpacked = join(profile, "unpacked-extension");
+    await cp(await buildDatabagTestExtension(testContext.signal), unpacked, { recursive: true });
+    const manifestPath = join(unpacked, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    assert.deepEqual(manifest.optional_host_permissions,
+      ["http://127.0.0.1:8787/*", "https://gemini.google.com/*", "https://databag.example/*"]);
+    manifest.host_permissions = ["https://chat.app.example.com/*"];
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true,
+      executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: profile },
+      args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
+    const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+    const extensionId = new URL(worker.url()).hostname;
+    const page = await context.newPage();
+    await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
+      body: '<!doctype html><html><body><main><div role="log"><article>Synthetic private reply</article></div><form><textarea>Synthetic human draft</textarea><button disabled>Send</button></form></main></body></html>' }));
+    await page.goto("https://chat.app.example.com/chat/synthetic");
+    const popup = await context.newPage();
+    await page.bringToFront();
+    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+    await popup.evaluate(() => {
+      globalThis.syntheticCompanyHostRequests = 0;
+      globalThis.syntheticCompanyDocuments = [];
+      chrome.permissions.contains = async () => false;
+      chrome.permissions.request = async () => { globalThis.syntheticCompanyHostRequests++; throw new Error("Unexpected host request"); };
+      const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+      chrome.scripting.executeScript = async options => {
+        const result = await execute(options);
+        if (options.target.documentIds) {
+          globalThis.syntheticCompanyDocuments.push(options.target.documentIds);
+          if (globalThis.holdSyntheticCompanyInspection) {
+            globalThis.syntheticCompanyInspectionHeld = true;
+            await new Promise(resolve => { globalThis.releaseSyntheticCompanyInspection = resolve; });
+          }
+        }
+        return result;
+      };
+    });
+    const beforeMarkup = await page.content();
+    const beforeStorage = await worker.evaluate(() => chrome.storage.session.get(null));
+    await popup.evaluate(() => document.getElementById("inspect").click());
+    await popup.getByText("Layout metadata only. Company AI Chat connection and messaging are not enabled.",
+      { exact: true }).waitFor({ timeout: 4000 });
+    await assertSharedPopupControls(popup, false);
+    assert.equal(await popup.locator("#agent-panel").isHidden(), true);
+    assert.equal(await popup.locator("#unconfirmed-panel").isHidden(), true);
+    const diagnostic = await popup.locator("#messages").textContent();
+    assert.ok(diagnostic.includes("1 textarea"));
+    assert.ok(diagnostic.includes("1 log/feed"));
+    assert.doesNotMatch(diagnostic, /Synthetic|https:|example|private/);
+    assert.equal(await popup.evaluate(() => globalThis.syntheticCompanyHostRequests), 0);
+    const documents = await popup.evaluate(() => globalThis.syntheticCompanyDocuments);
+    assert.equal(documents.length, 1);
+    assert.equal(documents[0].length, 1);
+    assert.equal(typeof documents[0][0], "string");
+    assert.equal(await page.content(), beforeMarkup);
+    assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), beforeStorage);
+    await popup.evaluate(() => { globalThis.holdSyntheticCompanyInspection = true; document.getElementById("inspect").click(); });
+    await popup.waitForFunction(() => globalThis.syntheticCompanyInspectionHeld === true, undefined, { timeout: 4000 });
+    await page.reload();
+    await popup.evaluate(() => { globalThis.holdSyntheticCompanyInspection = false; globalThis.releaseSyntheticCompanyInspection(); });
+    await popup.waitForFunction(() => document.getElementById("inspect").disabled === false, undefined, { timeout: 4000 });
+    assert.equal(await popup.locator("#result").isHidden(), true);
+    assert.equal(await popup.evaluate(() => globalThis.syntheticCompanyHostRequests), 0);
+    assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), beforeStorage);
+    await context.close();
+    context = undefined;
+    delete manifest.host_permissions;
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const unapprovedProfile = join(profile, "unapproved");
+    context = await chromium.launchPersistentContext(unapprovedProfile, { chromiumSandbox: true,
+      executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: unapprovedProfile },
+      args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
+    const unapprovedWorker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+    const unapprovedPage = await context.newPage();
+    await unapprovedPage.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
+      body: '<!doctype html><html><body><main><textarea>Synthetic human draft</textarea></main></body></html>' }));
+    await unapprovedPage.goto("https://chat.app.example.com/chat/synthetic");
+    const unapprovedPopup = await context.newPage();
+    await unapprovedPage.bringToFront();
+    await unapprovedPopup.goto(`chrome-extension://${new URL(unapprovedWorker.url()).hostname}/popup.html`);
+    await unapprovedPopup.evaluate(() => {
+      globalThis.syntheticCompanyHostRequests = 0;
+      chrome.permissions.request = async () => { globalThis.syntheticCompanyHostRequests++; throw new Error("Unexpected host request"); };
+      document.getElementById("inspect").click();
+    });
+    await unapprovedPopup.waitForFunction(() => document.getElementById("inspect").disabled === false, undefined, { timeout: 4000 });
+    assert.equal(await unapprovedPopup.locator("#result").isHidden(), true);
+    assert.equal(await unapprovedPopup.locator("#agent-panel").isHidden(), true);
+    assert.equal(await unapprovedPopup.evaluate(() => globalThis.syntheticCompanyHostRequests), 0);
+  } finally {
+    await context?.close();
+    await rm(profile, { recursive: true, force: true });
   }
 });
 
