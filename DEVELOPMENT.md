@@ -219,6 +219,8 @@ The person has designated one direct conversation for AI0 to report work, reques
 6. If the owner/grant ends, stop chat operations and report the need for fresh trusted approval in Copilot. Do not silently reconnect. Preserve pause/stop requests from either channel.
 7. Before intentionally issuing a final Copilot answer, follow the [finish gate](AGENTS.md#before-intentional-completion) (D23): ask once whether to finish this checkpoint or continue, then use cursor-based bounded waits for a new explicit answer. Do not treat timeout, old replies or a pre-stop notice as permission. Keep the connection open and check later instructions before finishing; the rule documents unavailable-channel/forced-host exceptions without inventing permission.
 
+If a Databag page refresh returns to chat selection instead of reopening the approved direct chat, it is not a preserved exact same-chat reload. The person must reselect the designated chat and use fresh trusted **Connect this chat** approval if access ended; then take a new owned snapshot/cursor baseline. Do not automatically select a chat, reconnect, reuse the old handle/answer anchor or treat historical reload acknowledgments as new instructions. Selected-chat persistence is a site behavior, not proof supplied by the extension.
+
 This procedure operates only while the host permits an active turn. It does not keep a finished Copilot session running or demonstrate idle wake-up; see [the host boundary](DESIGN.md#receiving-does-not-automatically-wake-an-agent). Changing agent instructions alone requires no extension reload or MCP restart. Separate acceptance tests retain their explicitly bounded scopes and do not inherit permission for unrelated side effects.
 
 ### Chat tool not invoked
