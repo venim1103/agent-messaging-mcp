@@ -5,7 +5,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
-import { autonomousFailureReasonSchema, autonomousFailureStageSchema, fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
+import { answerWaitAnchorSchema, autonomousFailureReasonSchema, autonomousFailureStageSchema, fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
   geminiFillStatusSchema, chatJobSchema, databagTargetSchema, type ChatJob, type ChatTarget, type ChatJobObservation,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
@@ -432,7 +432,7 @@ const replySchema = z.discriminatedUnion("kind", [
       z.strictObject({ operationId: z.uuid(), state: z.literal("approved"),
         expiresAt: z.number().int().safe(), approvalExpiresAt: z.number().int().safe(),
         draftFill: fixtureDraftFillStateSchema.optional() }),
-      ...fixtureDispatchStatusSchema.options
+      ...fixtureDispatchStatusSchema.options.map(schema => schema.extend({ answerWaitAnchor: answerWaitAnchorSchema.optional() }))
     ])
   }),
   z.strictObject({
@@ -758,8 +758,9 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
         request("prepare_gemini_message", { connectionId, expectedGeneration, text, idempotencyKey }),
       prepareChatMessage: (connectionId: string, text: string, idempotencyKey: string, deadlineMs = Date.now() + 30_000) =>
         request("prepare_chat_message", { connectionId, text, idempotencyKey }, deadlineMs),
-      getPreparedOperation: (operationId: string, recoveryToken?: string) =>
+      getPreparedOperation: (operationId: string, recoveryToken?: string, includeAnswerWaitAnchor = false) =>
         request("get_prepared_operation", { operationId,
+          ...(includeAnswerWaitAnchor ? { includeAnswerWaitAnchor: true as const } : {}),
           ...(recoveryToken === undefined ? {} : { recoveryToken }) }),
       checkFixturePreflight: (operationId: string) => request("check_fixture_preflight", { operationId }),
       completeFixturePreflight: (target: FixtureTarget, challengeId: string, observation: FixturePreflightResult) =>

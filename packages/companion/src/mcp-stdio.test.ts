@@ -100,7 +100,8 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), [
       "browser_chat_feasibility", "chat_request_connection", "chat_get_connection", "chat_wait_for_connection", "chat_read_messages",
-      "chat_wait_for_events", "chat_wait_for_reply", "chat_send_message", "chat_prepare_message", "chat_fill_draft", "chat_commit_message", "chat_get_operation", "chat_disconnect"
+      "chat_check_for_messages", "chat_wait_for_events", "chat_wait_for_answer", "chat_wait_for_reply", "chat_send_message",
+      "chat_prepare_message", "chat_fill_draft", "chat_commit_message", "chat_get_operation", "chat_disconnect"
     ]);
     assert.ok(tools.every((tool) => /^[a-z0-9_-]+$/.test(tool.name)));
     const fillTool = tools.find((tool) => tool.name === "chat_fill_draft");
@@ -333,6 +334,31 @@ for (const target of [
       const begin = async (overrides = {}) => (await client.request({ method: "tools/call",
         params: { name: "chat_wait_for_events", arguments: { ...args, ...overrides }, task: {} } }, CreateTaskResultSchema)).task;
       const result = (taskId: string) => client.experimental.tasks.getTaskResult(taskId, CallToolResultSchema);
+      const ordinaryZero = await client.callTool({ name: "chat_wait_for_events", arguments: { ...args, timeoutMs: 0 } });
+      const taskZero = await begin({ timeoutMs: 0 });
+      const taskZeroResult = await result(taskZero.taskId);
+      assert.deepEqual(taskZeroResult.structuredContent, ordinaryZero.structuredContent);
+      assert.equal((await client.experimental.tasks.getTask(taskZero.taskId)).status, "completed");
+      if (provider !== "gemini") assert.equal(taskZeroResult.structuredContent?.timedOut, true);
+      assert.equal(tools.find(tool => tool.name === "chat_check_for_messages")?.execution?.taskSupport ?? "forbidden", "forbidden");
+      const beforeChecks = await client.experimental.tasks.listTasks();
+      const checkArgs = { connectionId, cursor: baseline.cursor, limit: 2, view: "incoming_changes" };
+      for (let index = 0; index < 18; index++) {
+        const check = await client.callTool({ name: "chat_check_for_messages", arguments: checkArgs });
+        assert.deepEqual(check.structuredContent, ordinaryZero.structuredContent);
+      }
+      await assert.rejects(client.request({ method: "tools/call",
+        params: { name: "chat_check_for_messages", arguments: checkArgs, task: {} } }, CreateTaskResultSchema));
+      assert.deepEqual(await client.experimental.tasks.listTasks(), beforeChecks);
+      assert.equal(tools.find(tool => tool.name === "chat_wait_for_answer")?.execution?.taskSupport, "optional");
+      const answerArgs = { connectionId, operationId: "87453763-09b0-4602-9bf5-f026f512d840", timeoutMs: 0 };
+      const noQuestion = await client.callTool({ name: "chat_wait_for_answer", arguments: answerArgs });
+      assert.equal(noQuestion.isError, true);
+      assert.match(JSON.stringify(noQuestion), /PREPARATION_UNAVAILABLE/);
+      const noQuestionTask = (await client.request({ method: "tools/call",
+        params: { name: "chat_wait_for_answer", arguments: answerArgs, task: {} } }, CreateTaskResultSchema)).task;
+      assert.deepEqual((await result(noQuestionTask.taskId)).structuredContent, noQuestion.structuredContent);
+      assert.equal((await client.experimental.tasks.getTask(noQuestionTask.taskId)).status, "completed");
       const foreign = await begin({ connectionId: "d66b3997-9d43-4554-8399-267d1fe9f75c" });
       const foreignResult = await result(foreign.taskId);
       assert.equal(foreignResult.isError, true);
@@ -392,6 +418,143 @@ for (const target of [
       relay?.close();
       await client.close();
       await broker?.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  if (!target.origin.includes("gemini")) test(`${target.origin} SDK sent-question waits preserve fast replies and independent extra checks`, { timeout: 10000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-messaging-sdk-answers-"));
+    const directory = join(home, ".config/agent-messaging-mcp/broker");
+    const client = new TaskClient({ name: "Synthetic question owner", version: "0.0.1" },
+      { capabilities: { tasks: { list: {}, cancel: {} } } });
+    const peer = new TaskClient({ name: "Synthetic foreign question owner", version: "0.0.1" });
+    let broker: Awaited<ReturnType<typeof startBrokerSocket>> | undefined;
+    let database: ReturnType<typeof openPrivateOperationDatabase> | undefined;
+    let relay: Awaited<ReturnType<typeof connectBroker>> | undefined;
+    const provider = "provider" in target ? "databag" : "fixture";
+    try {
+      await mkdir(join(home, ".config/agent-messaging-mcp"), { recursive: true, mode: 0o700 });
+      database = openPrivateOperationDatabase(join(home, ".config/agent-messaging-mcp"));
+      broker = await startBrokerSocket(directory, createBrokerCredentials(), database);
+      const options = { command: process.execPath, args: [fileURLToPath(new URL("./mcp-stdio.js", import.meta.url))],
+        env: { ...process.env, HOME: home, BROWSER_CHAT_AUTO_START_BROKER: "0" } };
+      await Promise.all([client.connect(new TaskTransport(options)), peer.connect(new TaskTransport(options))]);
+      await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      relay = await connectBroker("relay", directory);
+      const roster = await relay.listChatAgents(target);
+      if (roster.kind !== "chat_agents") throw new Error("Expected question owner roster");
+      const owner = roster.payload.agents.find(agent => agent.label === "Synthetic question owner");
+      assert.ok(owner);
+      await relay.approveChatAgent(target, owner.agentId);
+      const picked = await client.callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } });
+      const connectionId = (picked.structuredContent as { connections: { connectionId: string }[] }).connections[0]!.connectionId;
+      const history: FixtureMessage[] = [{ id: "old-in", direction: "incoming", text: "Synthetic historical answer" }];
+      const publish = (rows: FixtureMessage[], challengeId?: string) => relay!.publishChatSnapshot(target, rows, challengeId);
+      const capture = async () => {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          const listed = await relay!.listChatReadChallenges(provider);
+          if (listed.kind !== "chat_read_challenges") throw new Error("Expected question read challenge");
+          const challenge = listed.payload.challenges[0];
+          if (challenge) return publish(history, challenge.challengeId);
+          await setTimeout(10);
+        }
+        throw new Error("Missing question read challenge");
+      };
+      const baselineRead = client.callTool({ name: "chat_read_messages", arguments: { connectionId } });
+      await capture();
+      const baseline = (await baselineRead).structuredContent as { cursor: { epoch: string; sequence: number } };
+      const job = async (phase: "fill" | "proof" | "submit") => {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          const listed = await relay!.listChatJobs(phase, provider);
+          if (listed.kind !== "chat_jobs") throw new Error("Expected question phase jobs");
+          if (listed.payload.jobs[0]) return listed.payload.jobs[0];
+          await setTimeout(10);
+        }
+        throw new Error(`Missing question ${phase} job`);
+      };
+      const text = "Synthetic question: continue?";
+      assert.deepEqual((await client.callTool({ name: "chat_wait_for_answer", arguments: { connectionId,
+        operationId: "87453763-09b0-4602-9bf5-f026f512d840", timeoutMs: 0 } })).structuredContent,
+        { code: "QUESTION_NOT_SENT" });
+      const sending = client.callTool({ name: "chat_send_message", arguments: { connectionId, text,
+        idempotencyKey: "a66b3997-9d43-4554-8399-267d1fe9f75c" } });
+      const fill = await job("fill");
+      const answerArgs = { connectionId, operationId: fill.operationId, timeoutMs: 0, limit: 2 };
+      await relay.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill", { ok: true, editor: "textarea" });
+      await capture();
+      const proof = await job("proof");
+      await relay.completeChatJob(proof.target, proof.operationId, proof.jobId, "proof", { ok: true, editor: "textarea",
+        draftText: text, selected: true, writable: true, submitReady: true });
+      const submit = await job("submit");
+      const outgoing: FixtureMessage = { id: "question-out", direction: "outgoing", text };
+      await publish([...history, outgoing]);
+      await relay.completeChatJob(submit.target, submit.operationId, submit.jobId, "submit",
+        { ok: true, editor: "textarea", activated: true });
+      const sent = await sending;
+      const sentStatus = sent.structuredContent as { state: string; operationId: string; recoveryToken: string; retryAllowed: boolean };
+      assert.equal(sentStatus.state, "sent");
+      assert.equal(sentStatus.operationId, fill.operationId);
+      assert.equal(sentStatus.retryAllowed, false);
+      const fast: FixtureMessage = { id: "fast-in", direction: "incoming", text: "Synthetic fast answer" };
+      await publish([...history, outgoing, fast]);
+      const begin = async (overrides = {}) => (await client.request({ method: "tools/call",
+        params: { name: "chat_wait_for_answer", arguments: { ...answerArgs, timeoutMs: 1, ...overrides }, task: {} } },
+      CreateTaskResultSchema)).task;
+      const result = (taskId: string) => client.experimental.tasks.getTaskResult(taskId, CallToolResultSchema);
+      const fastOrdinary = await client.callTool({ name: "chat_wait_for_answer", arguments: answerArgs });
+      const fastTask = await begin({ timeoutMs: 0 });
+      assert.deepEqual((await result(fastTask.taskId)).structuredContent, fastOrdinary.structuredContent);
+      type Page = { cursor: typeof baseline.cursor; timedOut: boolean;
+        events: { payload: { messages: unknown[] } }[] };
+      const page = fastOrdinary.structuredContent as Page;
+      assert.equal(page.timedOut, false);
+      assert.deepEqual(page.events.flatMap(event => event.payload.messages), [{ ...fast, change: "new" }]);
+      assert.equal(JSON.stringify(page).includes(text), false);
+      assert.equal(JSON.stringify(page).includes(history[0]!.text), false);
+      const recovered = await peer.callTool({ name: "chat_get_operation", arguments: {
+        operationId: fill.operationId, recoveryToken: sentStatus.recoveryToken } });
+      assert.equal((recovered.structuredContent as { state: string }).state, "observed_in_ui");
+      assert.deepEqual((await peer.callTool({ name: "chat_wait_for_answer", arguments: answerArgs })).structuredContent,
+        { code: "QUESTION_NOT_SENT" });
+      assert.deepEqual((await client.callTool({ name: "chat_wait_for_answer", arguments: {
+        ...answerArgs, connectionId: "d66b3997-9d43-4554-8399-267d1fe9f75c" } })).structuredContent,
+        { code: "ANSWER_ANCHOR_UNAVAILABLE" });
+      for (const cursor of [{ ...baseline.cursor, sequence: 0 }, { ...baseline.cursor, epoch: "d66b3997-9d43-4554-8399-267d1fe9f75c" }]) {
+        assert.deepEqual((await client.callTool({ name: "chat_wait_for_answer", arguments: { ...answerArgs, cursor } })).structuredContent,
+          { code: "INVALID_ANSWER_CURSOR" });
+      }
+      const pending = await begin({ cursor: page.cursor });
+      const checkArgs = { connectionId, cursor: page.cursor, limit: 2 };
+      const checked = await client.callTool({ name: "chat_check_for_messages", arguments: checkArgs });
+      assert.equal((checked.structuredContent as Page).timedOut, true);
+      const competing = await begin({ cursor: page.cursor });
+      assert.match(JSON.stringify(await result(competing.taskId)), /INCOMING_WAIT_ACTIVE/);
+      const echo: FixtureMessage = { id: "extra-out", direction: "outgoing", text: "Synthetic extra outgoing" };
+      await publish([...history, outgoing, fast, echo]);
+      await setTimeout(250);
+      assert.equal((await client.experimental.tasks.getTask(pending.taskId)).status, "working");
+      const extras: FixtureMessage[] = [{ id: "extra-one", direction: "incoming", text: "Synthetic extra one" },
+        { id: "extra-two", direction: "incoming", text: "Synthetic extra two" }];
+      await publish([...history, outgoing, fast, echo, ...extras]);
+      const arrived = (await result(pending.taskId)).structuredContent as Page;
+      assert.deepEqual(arrived.events.flatMap(event => event.payload.messages), extras.map(row => ({ ...row, change: "new" })));
+      const revised = { ...extras[1]!, text: "Synthetic revised extra" };
+      await publish([...history, outgoing, fast, echo, extras[0]!, revised]);
+      const revision = (await client.callTool({ name: "chat_check_for_messages", arguments: { ...checkArgs, cursor: arrived.cursor } })).structuredContent as Page;
+      assert.deepEqual(revision.events.flatMap(event => event.payload.messages), [{ ...revised, change: "revision" }]);
+      const cancellation = await begin({ cursor: revision.cursor });
+      assert.equal((await client.experimental.tasks.cancelTask(cancellation.taskId)).status, "cancelled");
+      const gap = await begin({ cursor: revision.cursor });
+      await relay.markChatObservationGap(target);
+      assert.deepEqual((await result(gap.taskId)).structuredContent, { code: "CURSOR_EXPIRED", resnapshot: true });
+      await client.callTool({ name: "chat_disconnect", arguments: { connectionId } });
+      assert.deepEqual((await client.callTool({ name: "chat_wait_for_answer", arguments: answerArgs })).structuredContent,
+        { code: "ANSWER_ANCHOR_UNAVAILABLE" });
+    } finally {
+      relay?.close();
+      await Promise.all([client.close(), peer.close()]);
+      await broker?.close();
+      database?.close();
       await rm(home, { recursive: true, force: true });
     }
   });
@@ -680,6 +843,9 @@ for (const target of [
       assert.equal("failureReason" in refusedStatus, false);
       assert.equal(refusedStatus.retryAllowed, false);
       assert.match(refusedStatus.recoveryToken, /^[0-9a-f]{64}$/);
+      assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_answer", arguments: {
+        connectionId: connection.connectionId, operationId: fill.operationId, timeoutMs: 0 } })).structuredContent,
+        { code: "QUESTION_NOT_SENT" });
       assert.deepEqual((await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments })).structuredContent, refusedStatus);
       assert.deepEqual((await relay.listChatJobs("fill", provider)).payload, { jobs: [] });
       assert.equal((await clients[0].callTool({ name: "chat_send_message", arguments: { ...sendArguments, text: "Synthetic changed SDK draft" } })).isError, true);

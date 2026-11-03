@@ -102,7 +102,8 @@ const requestSchema = z.discriminatedUnion("kind", [
     connectionId: z.uuid(), text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES), idempotencyKey: z.uuid()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("get_prepared_operation"), payload: z.strictObject({
-    operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional()
+    operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+    includeAnswerWaitAnchor: z.literal(true).optional()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("check_fixture_preflight"), payload: z.strictObject({
     operationId: z.uuid()
@@ -599,7 +600,7 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return operations
       ? { ...response, kind: "prepared_operation_state" as const,
         payload: request.payload.recoveryToken === undefined
-          ? operations.getOperation(owner, request.payload.operationId, now)
+          ? operations.getOperation(owner, request.payload.operationId, now, request.payload.includeAnswerWaitAnchor === true)
           : operations.recoverOperationStatus(request.payload.operationId, request.payload.recoveryToken) }
       : { ...response, kind: "error" as const, payload: { code: "PREPARATION_UNAVAILABLE" } };
   }

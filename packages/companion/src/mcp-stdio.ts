@@ -211,6 +211,49 @@ const eventWaitSchema = z.object({
   limit: z.number().int().min(1).max(2).optional(),
   view: z.enum(["snapshots", "incoming_changes"]).optional()
 }).strict();
+const answerWaitSchema = eventWaitSchema.omit({ view: true, cursor: true }).extend({
+  operationId: z.uuid(), cursor: eventWaitSchema.shape.cursor.optional()
+});
+
+async function runEventWait(args: z.infer<typeof eventWaitSchema> | z.infer<typeof answerWaitSchema>,
+  signal: AbortSignal, pending: boolean) {
+  const failure = (code: string) => "operationId" in args
+    ? { ...blocked(code), structuredContent: { code } } : blocked(code);
+  try {
+    if (signal.aborted) return failure("CANCELLED");
+    const client = await pendingBroker();
+    let eventArgs: z.infer<typeof eventWaitSchema>;
+    if ("operationId" in args) {
+      const status = await client.getPreparedOperation(args.operationId, undefined, true);
+      if (signal.aborted) return failure("CANCELLED");
+      if (status.kind === "error") return failure(status.payload.code);
+      if (status.kind !== "prepared_operation_state") return unavailable();
+      const sent = status.payload.state === "observed_in_ui"
+        || (status.payload.state === "resolved" && status.payload.resolution.outcome === "sent");
+      if (!sent) return failure("QUESTION_NOT_SENT");
+      if (!("answerWaitAnchor" in status.payload) || !status.payload.answerWaitAnchor
+        || status.payload.answerWaitAnchor.connectionId !== args.connectionId) return failure("ANSWER_ANCHOR_UNAVAILABLE");
+      const anchor = status.payload.answerWaitAnchor;
+      if (args.cursor && (args.cursor.epoch !== anchor.cursor.epoch
+        || args.cursor.sequence < anchor.cursor.sequence)) return failure("INVALID_ANSWER_CURSOR");
+      eventArgs = { ...args, cursor: args.cursor ?? anchor.cursor, view: "incoming_changes" };
+    } else eventArgs = args;
+    if (!pending || eventArgs.view !== "incoming_changes" || eventArgs.timeoutMs === 0) {
+      return waitForEvents(eventArgs, signal, client);
+    }
+    let cursor = eventArgs.cursor;
+    while (!signal.aborted) {
+      const result = await waitForEvents({ ...eventArgs, cursor }, signal, client);
+      if (result.isError || !("structuredContent" in result) || !("timedOut" in result.structuredContent)
+        || !result.structuredContent.timedOut) return result;
+      cursor = result.structuredContent.cursor;
+      await waitForPoll(200, signal);
+    }
+    return failure("CANCELLED");
+  } catch {
+    return failure(signal.aborted ? "CANCELLED" : "BROKER_UNAVAILABLE");
+  }
+}
 
 async function waitForEvents({ connectionId, cursor, timeoutMs, limit, view }: z.infer<typeof eventWaitSchema>,
   signal: AbortSignal, client?: Awaited<ReturnType<typeof connectBroker>>) {
@@ -248,62 +291,65 @@ async function waitForEvents({ connectionId, cursor, timeoutMs, limit, view }: z
   }
 }
 
-server.experimental.tasks.registerToolTask("chat_wait_for_events", {
-  description: "Ordinary calls wait up to 20 seconds for owned rendered-only chat events, defaulting to full snapshots. Explicit MCP task execution with view incoming_changes stays pending across bounded reads until an event, cancellation or loss of the original connection; only one incoming waiter per connection is allowed. Task state is memory-only, capped at 16 retained tasks with terminal results removed after five minutes. For fixture/Databag stable rows, incoming_changes returns ordered new incoming rows and marked revisions, skipping outgoing text while advancing the cursor; expired or ambiguous continuity requires explicit resnapshot. Gemini supports snapshots only. No idle-turn wake-up, reconnect, approval renewal or provider-delivery guarantee.",
-  inputSchema: eventWaitSchema,
-  execution: { taskSupport: "optional" },
+server.registerTool("chat_check_for_messages", {
+  description: "Check once for extra rendered information after an owned cursor; never wait for an answer or create a pending task. Defaults to compact incoming_changes for fixture/Databag stable rows; use snapshots explicitly for Gemini. Advance past outgoing-only frames without returning their text in compact mode. Interpret new rows and revisions; cursor gaps require a fresh snapshot. This check is independent of any pending answer wait and grants no send authority.",
+  inputSchema: eventWaitSchema.omit({ timeoutMs: true }),
   annotations: { readOnlyHint: true }
-}, {
-  async createTask(rawArguments, extra) {
-    const args = eventWaitSchema.parse(rawArguments);
-    const task = await extra.taskStore.createTask({ ttl: null, pollInterval: 1000 });
-    if (!taskStore.isAugmented(task.taskId)) {
-      const incoming = args.view === "incoming_changes";
+}, async (args, extra) => waitForEvents({ ...args, view: args.view ?? "incoming_changes", timeoutMs: 0 }, extra.signal));
+
+function registerEventWait(name: string, inputSchema: typeof eventWaitSchema | typeof answerWaitSchema, description: string) {
+  server.experimental.tasks.registerToolTask(name, {
+    description,
+    inputSchema,
+    execution: { taskSupport: "optional" },
+    annotations: { readOnlyHint: true }
+  }, {
+    async createTask(rawArguments, extra) {
+      const args = inputSchema.parse(rawArguments);
+      const incoming = "operationId" in args || args.view === "incoming_changes";
+      const task = await extra.taskStore.createTask({ ttl: null, pollInterval: 1000 });
+      if (!taskStore.isAugmented(task.taskId)) {
+        const reserved = incoming && !incomingWaiters.has(args.connectionId);
+        if (reserved) incomingWaiters.add(args.connectionId);
+        try {
+          const result = incoming && !reserved ? blocked("INCOMING_WAIT_ACTIVE") : await runEventWait(args, extra.signal, false);
+          await extra.taskStore.storeTaskResult(task.taskId, "completed", result);
+          return { task: await extra.taskStore.getTask(task.taskId) };
+        } finally {
+          if (reserved) incomingWaiters.delete(args.connectionId);
+        }
+      }
       const reserved = incoming && !incomingWaiters.has(args.connectionId);
       if (reserved) incomingWaiters.add(args.connectionId);
-      try {
-        const result = incoming && !reserved ? blocked("INCOMING_WAIT_ACTIVE") : await waitForEvents(args, extra.signal);
-        await extra.taskStore.storeTaskResult(task.taskId, "completed", result);
-        return { task: await extra.taskStore.getTask(task.taskId) };
-      } finally {
-        if (reserved) incomingWaiters.delete(args.connectionId);
-      }
-    }
-    const reserved = args.view === "incoming_changes" && !incomingWaiters.has(args.connectionId);
-    if (reserved) incomingWaiters.add(args.connectionId);
-    const run = async () => {
-      try {
-        if (args.view === "incoming_changes" && !reserved) return blocked("INCOMING_WAIT_ACTIVE");
-        const client = await pendingBroker();
-        const signal = taskStore.signal(task.taskId);
-        if (args.view !== "incoming_changes") return waitForEvents(args, signal, client);
-        let cursor = args.cursor;
-        while (!signal.aborted) {
-          const result = await waitForEvents({ ...args, cursor }, signal, client);
-          if (result.isError || !("structuredContent" in result) || !("timedOut" in result.structuredContent)
-            || !result.structuredContent.timedOut) return result;
-          cursor = result.structuredContent.cursor;
-          await waitForPoll(200, signal);
+      const run = async () => {
+        try {
+          if (incoming && !reserved) return blocked("INCOMING_WAIT_ACTIVE");
+          const signal = taskStore.signal(task.taskId);
+          return await runEventWait(args, signal, true);
+        } finally {
+          if (reserved) incomingWaiters.delete(args.connectionId);
         }
-        return blocked("CANCELLED");
-      } finally {
-        if (reserved) incomingWaiters.delete(args.connectionId);
-      }
-    };
-    void run().then(async result => {
-      if ((await taskStore.getTask(task.taskId))?.status === "working") {
-        await taskStore.storeTaskResult(task.taskId, "completed", result);
-      }
-    }).catch(async () => {
-      if ((await taskStore.getTask(task.taskId))?.status === "working") {
-        await taskStore.storeTaskResult(task.taskId, "completed", blocked("BROKER_UNAVAILABLE"));
-      }
-    });
-    return { task };
-  },
-  async getTask(_arguments, extra) { return extra.taskStore.getTask(extra.taskId); },
-  async getTaskResult(_arguments, extra) { return CallToolResultSchema.parse(await extra.taskStore.getTaskResult(extra.taskId)); }
-});
+      };
+      void run().then(async result => {
+        if ((await taskStore.getTask(task.taskId))?.status === "working") {
+          await taskStore.storeTaskResult(task.taskId, "completed", result);
+        }
+      }).catch(async () => {
+        if ((await taskStore.getTask(task.taskId))?.status === "working") {
+          await taskStore.storeTaskResult(task.taskId, "completed", blocked("BROKER_UNAVAILABLE"));
+        }
+      });
+      return { task };
+    },
+    async getTask(_arguments, extra) { return extra.taskStore.getTask(extra.taskId); },
+    async getTaskResult(_arguments, extra) { return CallToolResultSchema.parse(await extra.taskStore.getTaskResult(extra.taskId)); }
+  });
+}
+
+registerEventWait("chat_wait_for_events", eventWaitSchema,
+  "Low-level compatibility event reader; use chat_check_for_messages for extras and chat_wait_for_answer after a confirmed question send. Ordinary calls wait up to 20 seconds, defaulting to snapshots; zero timeout is nonwaiting even in task mode. Task incoming_changes stays pending across bounded reads until an event, cancellation or original-connection loss. One incoming waiter per connection; 16 retained tasks, terminal retention five minutes, memory-only state. Compact fixture/Databag reads return ordered new rows and marked revisions, skip outgoing text and advance the cursor. Gaps require explicit resnapshot; Gemini supports snapshots only. No idle-turn wake-up, reconnect, approval renewal or delivery guarantee.");
+registerEventWait("chat_wait_for_answer", answerWaitSchema,
+  "Wait for incoming candidates only after the latest actual confirmed sent operation in this owned fixture/Databag connection. operationId names the sent question, not a prepared or uncertain send. The default cursor is its retained pre-send baseline, catching fast replies before wait registration; an explicit continuation cursor must not precede it or cross epochs. Ordinary calls are bounded to 20 seconds; task calls stay pending across bounded reads. Zero timeout always checks once. Shares incoming-wait exclusivity, the 16-task cap, five-minute terminal retention and cancellation/owner/gap guards. New rows require interpretation; revisions or omission metadata are not answer/finish permission. No transcript persistence, reconnect, new send authority, model concurrency or ended-turn wake-up guarantee.");
 
 server.registerTool("chat_wait_for_reply", {
   description: "Wait up to 20 seconds for the newest rendered incoming fixture, Gemini or configured Databag reply under fresh exact-document observations. A reviewed Gemini UI signal may yield complete; otherwise two seconds of unchanged captures yield settled_heuristic. Databag uses that heuristic, not a completion signal. Positive streaming blocks settling. Neither result proves provider acceptance or delivery. An existing newest reply may qualify; an outgoing or truncated newest row cannot. Timeout returns no reply. Only a live owned connection permits reads; cancellation ends the owning broker connection.",

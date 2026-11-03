@@ -39,6 +39,8 @@ export const fixtureDispatchResultSchema = z.discriminatedUnion("ok", [
     "DRAFT_CHANGED", "SUBMIT_UNAVAILABLE", "DISPATCH_UNAVAILABLE", "DISPATCH_UNCERTAIN"]) })
 ]);
 export type FixtureDispatchResult = z.infer<typeof fixtureDispatchResultSchema>;
+export const answerWaitAnchorSchema = z.strictObject({ connectionId: z.uuid(),
+  cursor: z.strictObject({ epoch: z.uuid(), sequence: z.number().int().safe().nonnegative() }) });
 export const resolvedDispatchStatusSchema = z.strictObject({ operationId: z.uuid(), state: z.literal("resolved"),
   startedAt: z.number().int().safe(), resolution: z.strictObject({ outcome: z.enum(["sent", "not_sent"]),
     source: z.enum(["page", "person"]), resolvedAt: z.number().int().safe() }) });
@@ -267,6 +269,8 @@ export class PreparedMessageOperations {
   private readonly recoveryReceipts = new Map<string, string>();
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
   private readonly geminiDispatchBaselines = new Map<string, GeminiSnapshot>();
+  private readonly answerWaitAnchors = new Map<string, Readonly<{ owner: symbol; operationId: string;
+    startedAt: number; cursor: FixtureDispatchBaseline["cursor"] }>>();
   private readonly dispatchChecks = new Map<string, FixtureDispatchCheck>();
   private readonly geminiDispatchChecks = new Map<string, GeminiDispatchCheck>();
   private readonly dispatchInspections = new Map<string, {
@@ -344,6 +348,17 @@ export class PreparedMessageOperations {
     database.exec("UPDATE message_dispatch_attempts SET state = 'unknown' WHERE state = 'dispatching'");
   }
 
+  private retainAnswerWaitAnchor(operationId: string, startedAt: number): void {
+    const operation = this.contents.get(operationId);
+    const baseline = this.dispatchBaselines.get(operationId);
+    if (!operation || !baseline || !this.requests.getStableTarget(operation.owner, operation.connectionId)) return;
+    const previous = this.answerWaitAnchors.get(operation.connectionId);
+    if (previous && (previous.startedAt > startedAt || (previous.startedAt === startedAt
+      && previous.cursor.epoch === baseline.cursor.epoch && previous.cursor.sequence > baseline.cursor.sequence))) return;
+    this.answerWaitAnchors.set(operation.connectionId, Object.freeze({ owner: operation.owner, operationId,
+      startedAt, cursor: baseline.cursor }));
+  }
+
   private dispatchStatus(operationId: string): FixtureDispatchStatus | null {
     const record = this.database.prepare(`SELECT attempt.started_at, evidence.observed_at, evidence.message_id,
       resolution.resolved_at, resolution.outcome, resolution.source
@@ -356,10 +371,12 @@ export class PreparedMessageOperations {
       } | undefined;
     if (!record) return null;
     if (record.observed_at !== null && record.message_id !== null) {
+      this.retainAnswerWaitAnchor(operationId, record.started_at);
       return { operationId, state: "observed_in_ui", startedAt: record.started_at,
         observedAt: record.observed_at, messageId: record.message_id };
     }
     if (record.resolved_at !== null && record.outcome !== null && record.source !== null) {
+      if (record.outcome === "sent") this.retainAnswerWaitAnchor(operationId, record.started_at);
       return Object.freeze({ operationId, state: "resolved", startedAt: record.started_at,
         resolution: Object.freeze({ outcome: record.outcome, source: record.source, resolvedAt: record.resolved_at }) });
     }
@@ -478,6 +495,9 @@ export class PreparedMessageOperations {
   }
 
   private discardExpired(now: number): void {
+    for (const [connectionId, anchor] of this.answerWaitAnchors) {
+      if (!this.requests.getStableTarget(anchor.owner, connectionId, now)) this.answerWaitAnchors.delete(connectionId);
+    }
     for (const [operationId, pending] of this.dispatchJobs) {
       if (pending.expiresAt <= now) this.finishFixtureDispatch(operationId);
     }
@@ -2269,7 +2289,7 @@ export class PreparedMessageOperations {
     return this.dispatchStatus(operationId) ?? status;
   }
 
-  getOperation(owner: symbol, operationId: string, now = Date.now()) {
+  getOperation(owner: symbol, operationId: string, now = Date.now(), includeAnswerWaitAnchor = false) {
     this.discardExpired(now);
     const ownerId = this.owners.get(owner);
     if (!ownerId) return { state: "unknown" as const };
@@ -2279,7 +2299,12 @@ export class PreparedMessageOperations {
       } | undefined;
     if (!record || record.owner_id !== ownerId) return { state: "unknown" as const };
     const dispatch = this.dispatchStatus(operationId);
-    if (dispatch) return dispatch;
+    if (dispatch) {
+      const anchor = this.answerWaitAnchors.get(record.connection_id);
+      return includeAnswerWaitAnchor && anchor?.owner === owner && anchor.operationId === operationId
+        && this.requests.getStableTarget(owner, record.connection_id, now)
+        ? { ...dispatch, answerWaitAnchor: { connectionId: record.connection_id, cursor: anchor.cursor } } : dispatch;
+    }
     if (record.expires_at <= now) return { operationId, state: "expired" as const };
     if (!this.requests.getApprovedTarget(owner, record.connection_id, now)
       && !this.requests.getGeminiTarget(owner, record.connection_id, now)
@@ -2307,6 +2332,9 @@ export class PreparedMessageOperations {
 
   disconnect(owner: symbol): void {
     this.owners.delete(owner);
+    for (const [connectionId, anchor] of this.answerWaitAnchors) {
+      if (anchor.owner === owner) this.answerWaitAnchors.delete(connectionId);
+    }
     for (const [operationId, operation] of this.contents) {
       if (operation.owner === owner) this.release(operationId);
     }

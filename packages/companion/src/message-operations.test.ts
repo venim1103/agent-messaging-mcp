@@ -131,6 +131,7 @@ test("Databag full-window dispatch evidence requires unique unchanged stable-ID 
       try {
         const connection = requests.approveAgent(agent.agentId, target)!;
         const prepared = ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic bounded outgoing", randomUUID(), now + 30_000);
+        assert.equal("answerWaitAnchor" in ledger.getOperation(owner, prepared.operationId, now, true), false);
         assert.equal(await ledger.acquireComposer(owner, prepared.operationId, prepared.expiresAt), true);
         const filling = ledger.requestChatFill(owner, prepared.operationId, now + 2, prepared.expiresAt);
         assert.ok(filling && filling !== "busy");
@@ -197,6 +198,15 @@ test("Databag full-window dispatch evidence requires unique unchanged stable-ID 
         assert.equal(result.state, positive ? "observed_in_ui" : "dispatch_uncertain", context);
         assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, positive ? 1 : 0, context);
         assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()?.count, 0, context);
+        const anchored = ledger.getOperation(owner, prepared.operationId, now + 9, true);
+        const anchor = "answerWaitAnchor" in anchored ? anchored.answerWaitAnchor : undefined;
+        assert.equal(Boolean(anchor), positive, context);
+        if (positive) {
+          assert.equal(anchor?.connectionId, connection.connectionId);
+          assert.equal(anchor?.cursor.sequence, 1);
+          assert.equal("answerWaitAnchor" in ledger.getOperation(Symbol("foreign owner"), prepared.operationId, now + 9, true), false);
+          assert.deepEqual(ledger.getOperation(owner, prepared.operationId, prepared.expiresAt + 1, true), anchored);
+        }
         assert.equal(ledger.getFixtureSendAuthorization(owner, prepared.operationId, now + 9), null);
         assert.throws(() => ledger.requestFixtureDispatch(owner, prepared.operationId, inspecting.checkId, now + 9), /DISPATCH_UNCERTAIN/);
         assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
