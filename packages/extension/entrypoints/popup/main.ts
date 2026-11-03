@@ -251,7 +251,10 @@ async function inspectCompanyAIChatTab(target: InspectionTarget): Promise<Inspec
     ["Regions", `${counts.mainRegions} main; ${counts.timelines} log/feed; ${counts.articles} article; ${counts.forms} form; ${counts.lists} list`],
     ["Controls", `${counts.textareas} textarea; ${counts.contenteditables} contenteditable; ${counts.buttons} button; ${counts.links} link; ${counts.iframes} iframe`],
     ["Editors", shape.editors.map(editor => `${editor.kind}; ${editor.disabled ? "disabled" : "enabled"}; `
-      + `${editor.readOnly ? "read-only" : "writable"}`).concat(shape.editorsOmitted ? ["Additional editors omitted"] : []).join("\n") || "None visible"]
+      + `${editor.readOnly ? "read-only" : "writable"}`).concat(shape.editorsOmitted ? ["Additional editors omitted"] : []).join("\n") || "None visible"],
+    ["Structure", [`${shape.structure.length} rows; ${shape.structureOmitted ? "additional structure omitted" : "within limits"}`,
+      ...shape.structure.map((node, index) => `${index}: parent ${node.parent ?? "none"}; ${node.tag}; role ${node.role ?? "none"}`)
+    ].join("\n")]
   ], status: "Layout metadata only. Company AI Chat connection and messaging are not enabled." };
 }
 

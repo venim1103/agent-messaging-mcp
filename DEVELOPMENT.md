@@ -213,6 +213,8 @@ Hosts shaped like `https://chat.app.example.com/` are recognized for the shared 
 
 Only fixed layout counts/control states are returned; no labels, URLs, message/draft text, authentication configuration or framework state is read. Account/chat binding is unverified, so connection and messaging stay disabled. Keep real deployment details, screenshots and configuration values out of Git and diagnostic reports.
 
+The approved D30 diagnostic adds **Structure**: at most 512 visible rows with allowlisted standard tags, allowlisted roles and generated parent row numbers, not page IDs. Unknown tags are `other` and unknown roles are null. Parent links refer to the nearest reported ancestor, skipping non-rendered wrappers such as `display: contents`. The existing 4096-element/depth-64 walk remains; row or traversal clipping is explicitly marked. No iframe or shadow-root contents are inspected. Structure distinguishes layout candidates only, not native chat identity, message direction or the Send control. Installed inspection requires its own unexpired bounded scope.
+
 ### Databag work-channel operation
 
 The person has designated one direct conversation for AI0 to report work, request input and receive their delegated task instructions. Follow [the work-channel rules](AGENTS.md#databag-work-channel) and DESIGN.md D21; a display name is not an authenticated binding.

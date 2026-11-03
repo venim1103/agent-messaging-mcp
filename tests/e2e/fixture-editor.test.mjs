@@ -30,6 +30,8 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
         <input type="password" role="textbox" value="Synthetic private input">
         <div style="opacity:0"><textarea>Synthetic hidden draft</textarea></div>
         <iframe srcdoc="<main><textarea>Synthetic framed draft</textarea></main>"></iframe>
+        <synthetic-private-widget role="synthetic-private-role" style="display:block"><div role="group">Synthetic private widget</div></synthetic-private-widget>
+        <div style="display:contents"><div role="region">Synthetic private region</div></div>
       </main></body></html>` }));
     await page.goto(input.expectedUrl);
     await page.evaluate(() => {
@@ -47,22 +49,36 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
       for (const [prototype, property] of [[Node.prototype, "textContent"], [HTMLElement.prototype, "innerText"],
         [Element.prototype, "innerHTML"], [Element.prototype, "outerHTML"], [HTMLTextAreaElement.prototype, "value"],
         [HTMLInputElement.prototype, "value"], [HTMLInputElement.prototype, "files"],
+        [Element.prototype, "shadowRoot"],
         [HTMLIFrameElement.prototype, "contentDocument"], [HTMLIFrameElement.prototype, "contentWindow"]]) {
         Object.defineProperty(prototype, property, { configurable: true, get() { throw new Error("Synthetic private getter accessed"); } });
       }
       const getAttribute = Element.prototype.getAttribute;
       Element.prototype.getAttribute = function (name) {
-        if (["id", "href", "src", "title", "aria-label", "data-testid"].includes(name)) throw new Error("Synthetic private attribute accessed");
+        if (!["role", "hidden", "inert", "aria-hidden", "contenteditable", "aria-disabled", "readonly", "aria-readonly"].includes(name)) {
+          throw new Error("Synthetic private attribute accessed");
+        }
         return getAttribute.call(this, name);
       };
     });
     const shape = await page.evaluate(inspectCompanyAIChatStructure, input);
     assert.equal(shape.limited, false);
     assert.equal(shape.editorsOmitted, false);
+    assert.equal(shape.structureOmitted, false);
     assert.deepEqual(shape.counts, { mainRegions: 1, timelines: 1, articles: 1, forms: 1, lists: 0,
       textareas: 1, contenteditables: 1, buttons: 1, links: 1, iframes: 1 });
     assert.deepEqual(shape.editors, [{ kind: "textarea", disabled: false, readOnly: true },
       { kind: "contenteditable", disabled: false, readOnly: false }, { kind: "textbox", disabled: true, readOnly: false }]);
+    assert.deepEqual(shape.structure, [
+      { tag: "body", role: null, parent: null }, { tag: "main", role: null, parent: 0 },
+      { tag: "div", role: "log", parent: 1 }, { tag: "article", role: null, parent: 2 },
+      { tag: "form", role: null, parent: 1 }, { tag: "textarea", role: null, parent: 4 },
+      { tag: "button", role: null, parent: 4 }, { tag: "div", role: null, parent: 1 },
+      { tag: "div", role: "textbox", parent: 1 }, { tag: "a", role: null, parent: 1 },
+      { tag: "input", role: "textbox", parent: 1 }, { tag: "iframe", role: null, parent: 1 },
+      { tag: "other", role: null, parent: 1 }, { tag: "div", role: "group", parent: 12 },
+      { tag: "div", role: "region", parent: 1 }
+    ]);
     assert.doesNotMatch(JSON.stringify(shape), /Synthetic|https:|example|private/);
     assert.deepEqual(await page.evaluate(() => window.syntheticCompanyInspectionState()),
       { interactions: 0, mutations: 0, draftUnchanged: true, htmlUnchanged: true, storedKeys: 0 });
@@ -70,11 +86,22 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
     await page.goto(input.expectedUrl);
     await page.evaluate(() => {
       document.body.replaceChildren();
-      for (let index = 0; index < 5000; index++) document.body.append(document.createElement("button"));
+      for (let index = 0; index < 600; index++) document.body.append(document.createElement("button"));
+    });
+    const structureClipped = await page.evaluate(inspectCompanyAIChatStructure, input);
+    assert.equal(structureClipped.visitedElements, 601);
+    assert.equal(structureClipped.limited, false);
+    assert.equal(structureClipped.structure.length, 512);
+    assert.equal(structureClipped.structureOmitted, true);
+    await page.evaluate(() => {
+      for (let index = 0; index < 4400; index++) document.body.append(document.createElement("button"));
     });
     const clipped = await page.evaluate(inspectCompanyAIChatStructure, input);
     assert.equal(clipped.visitedElements, 4096);
     assert.equal(clipped.limited, true);
+    assert.equal(clipped.structure.length, 512);
+    assert.equal(clipped.structureOmitted, true);
+    assert.ok(clipped.structure.slice(1).every(node => node.parent === 0 && node.tag === "button"));
     await page.evaluate(() => {
       document.body.replaceChildren();
       let parent = document.body;
@@ -83,6 +110,8 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
     const deep = await page.evaluate(inspectCompanyAIChatStructure, input);
     assert.equal(deep.visitedElements, 65);
     assert.equal(deep.limited, true);
+    assert.equal(deep.structureOmitted, true);
+    assert.ok(deep.structure.length <= 65);
   } finally {
     await browser.close();
   }

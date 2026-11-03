@@ -149,6 +149,10 @@ test("Company AI Chat popup exposes document-bound diagnostics without host requ
     const diagnostic = await popup.locator("#messages").textContent();
     assert.ok(diagnostic.includes("1 textarea"));
     assert.ok(diagnostic.includes("1 log/feed"));
+    assert.ok(diagnostic.includes("Structure"));
+    assert.ok(diagnostic.includes("7 rows; within limits"));
+    assert.ok(diagnostic.includes("5: parent 4; textarea; role none"));
+    assert.ok(diagnostic.includes("6: parent 4; button; role none"));
     assert.doesNotMatch(diagnostic, /Synthetic|https:|example|private/);
     assert.equal(await popup.evaluate(() => globalThis.syntheticCompanyHostRequests), 0);
     const documents = await popup.evaluate(() => globalThis.syntheticCompanyDocuments);
