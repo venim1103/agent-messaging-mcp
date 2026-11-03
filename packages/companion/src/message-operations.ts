@@ -270,7 +270,7 @@ export class PreparedMessageOperations {
   private readonly dispatchBaselines = new Map<string, FixtureDispatchBaseline>();
   private readonly geminiDispatchBaselines = new Map<string, GeminiSnapshot>();
   private readonly answerWaitAnchors = new Map<string, Readonly<{ owner: symbol; operationId: string;
-    startedAt: number; cursor: FixtureDispatchBaseline["cursor"] }>>();
+    dispatchOrder: number; cursor: FixtureDispatchBaseline["cursor"] }>>();
   private readonly dispatchChecks = new Map<string, FixtureDispatchCheck>();
   private readonly geminiDispatchChecks = new Map<string, GeminiDispatchCheck>();
   private readonly dispatchInspections = new Map<string, {
@@ -348,35 +348,34 @@ export class PreparedMessageOperations {
     database.exec("UPDATE message_dispatch_attempts SET state = 'unknown' WHERE state = 'dispatching'");
   }
 
-  private retainAnswerWaitAnchor(operationId: string, startedAt: number): void {
+  private retainAnswerWaitAnchor(operationId: string, dispatchOrder: number): void {
     const operation = this.contents.get(operationId);
     const baseline = this.dispatchBaselines.get(operationId);
     if (!operation || !baseline || !this.requests.getStableTarget(operation.owner, operation.connectionId)) return;
     const previous = this.answerWaitAnchors.get(operation.connectionId);
-    if (previous && (previous.startedAt > startedAt || (previous.startedAt === startedAt
-      && previous.cursor.epoch === baseline.cursor.epoch && previous.cursor.sequence > baseline.cursor.sequence))) return;
+    if (previous && previous.dispatchOrder >= dispatchOrder) return;
     this.answerWaitAnchors.set(operation.connectionId, Object.freeze({ owner: operation.owner, operationId,
-      startedAt, cursor: baseline.cursor }));
+      dispatchOrder, cursor: baseline.cursor }));
   }
 
   private dispatchStatus(operationId: string): FixtureDispatchStatus | null {
-    const record = this.database.prepare(`SELECT attempt.started_at, evidence.observed_at, evidence.message_id,
+    const record = this.database.prepare(`SELECT attempt.rowid AS dispatch_order, attempt.started_at, evidence.observed_at, evidence.message_id,
       resolution.resolved_at, resolution.outcome, resolution.source
       FROM message_dispatch_attempts AS attempt
       LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
       LEFT JOIN message_dispatch_resolutions AS resolution ON resolution.operation_id = attempt.operation_id
       WHERE attempt.operation_id = ?`).get(operationId) as {
-        started_at: number; observed_at: number | null; message_id: string | null;
+        dispatch_order: number; started_at: number; observed_at: number | null; message_id: string | null;
         resolved_at: number | null; outcome: "sent" | "not_sent" | null; source: "page" | "person" | null
       } | undefined;
     if (!record) return null;
     if (record.observed_at !== null && record.message_id !== null) {
-      this.retainAnswerWaitAnchor(operationId, record.started_at);
+      this.retainAnswerWaitAnchor(operationId, record.dispatch_order);
       return { operationId, state: "observed_in_ui", startedAt: record.started_at,
         observedAt: record.observed_at, messageId: record.message_id };
     }
     if (record.resolved_at !== null && record.outcome !== null && record.source !== null) {
-      if (record.outcome === "sent") this.retainAnswerWaitAnchor(operationId, record.started_at);
+      if (record.outcome === "sent") this.retainAnswerWaitAnchor(operationId, record.dispatch_order);
       return Object.freeze({ operationId, state: "resolved", startedAt: record.started_at,
         resolution: Object.freeze({ outcome: record.outcome, source: record.source, resolvedAt: record.resolved_at }) });
     }

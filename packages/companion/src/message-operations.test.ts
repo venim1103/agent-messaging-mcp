@@ -110,6 +110,72 @@ test("Databag autonomous preparation and composer reservations remain exact, own
   }
 });
 
+test("sent-question anchors never regress across observation epochs with tied dispatch timestamps", async context => {
+  const now = Date.now();
+  context.mock.method(Date, "now", () => now);
+  for (const provider of ["fixture", "databag"] as const) {
+    const requests = new PendingConnectionRequests();
+    const database = new DatabaseSync(":memory:");
+    const ledger = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("Synthetic ordered question owner");
+    const agent = requests.registerAgent(owner, "Synthetic ordered question owner");
+    const target = provider === "databag"
+      ? { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`,
+        url: "https://databag.example/#/session", tabId: 3, documentId: "synthetic-document" } as const
+      : { origin: "http://127.0.0.1:8787", conversationId: "fixture-alpha", tabId: 3, documentId: "synthetic-document" } as const;
+    let messages: FixtureSnapshot["messages"] = [{ id: "history", direction: "incoming", text: "Synthetic history" }];
+    try {
+      const connection = requests.approveAgent(agent.agentId, target)!;
+      const send = async (text: string, id: string) => {
+        const prepared = ledger.prepareAutonomous(owner, connection.connectionId, text, randomUUID(), now + 30_000);
+        assert.equal(await ledger.acquireComposer(owner, prepared.operationId, prepared.expiresAt), true);
+        const filling = ledger.requestChatFill(owner, prepared.operationId, now, prepared.expiresAt);
+        assert.ok(filling && filling !== "busy");
+        const fill = ledger.listChatJobs("fill", provider, now)[0]!;
+        assert.equal(ledger.completeChatJob(fill.target, fill.operationId, fill.jobId, "fill",
+          { ok: true, editor: "textarea" }, now), true);
+        await filling.result;
+        requests.publishStableSnapshot(target, messages, now);
+        const inspecting = ledger.requestChatProof(owner, prepared.operationId, now, prepared.expiresAt);
+        assert.ok(inspecting && inspecting !== "busy");
+        const proof = ledger.listChatJobs("proof", provider, now)[0]!;
+        assert.equal(ledger.completeChatJob(proof.target, proof.operationId, proof.jobId, "proof",
+          { ok: true, editor: "textarea", draftText: text, selected: true, writable: true, submitReady: true }, now), true);
+        assert.equal(await inspecting.result, true);
+        const dispatch = ledger.requestFixtureDispatch(owner, prepared.operationId, inspecting.checkId, now);
+        const submit = ledger.listChatJobs("submit", provider, now)[0]!;
+        messages = [...messages, { id, direction: "outgoing", text }];
+        requests.publishStableSnapshot(target, messages, now);
+        assert.equal(ledger.completeChatJob(submit.target, submit.operationId, submit.jobId, "submit",
+          { ok: true, editor: "textarea", activated: true }, now), true);
+        assert.equal((await dispatch.result).state, "observed_in_ui");
+        assert.equal(ledger.releaseComposer(owner, prepared.operationId), true);
+        return prepared;
+      };
+      const first = await send("Synthetic first question", "first-out");
+      const firstStatus = ledger.getOperation(owner, first.operationId, now, true);
+      assert.ok("answerWaitAnchor" in firstStatus && firstStatus.answerWaitAnchor);
+      requests.markStableObservationGap(target, now);
+      const second = await send("Synthetic second question", "second-out");
+      const secondStatus = ledger.getOperation(owner, second.operationId, now, true);
+      assert.ok("answerWaitAnchor" in secondStatus && secondStatus.answerWaitAnchor);
+      assert.equal("startedAt" in firstStatus && "startedAt" in secondStatus
+        && firstStatus.startedAt === secondStatus.startedAt, true);
+      assert.notEqual(firstStatus.answerWaitAnchor.cursor.epoch, secondStatus.answerWaitAnchor.cursor.epoch);
+      assert.equal("answerWaitAnchor" in ledger.getOperation(owner, first.operationId, now, true), false,
+        `${provider}: reading an older sent operation must not supersede the latest question`);
+      assert.deepEqual(ledger.getOperation(owner, second.operationId, now, true), secondStatus);
+      assert.equal(ledger.recoverOperationStatus(first.operationId, first.recoveryToken).state, "observed_in_ui");
+      assert.equal("answerWaitAnchor" in ledger.getOperation(owner, first.operationId, now, true), false);
+      assert.deepEqual(ledger.getOperation(owner, second.operationId, now, true), secondStatus);
+    } finally {
+      ledger.disconnect(owner);
+      requests.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
 test("Databag full-window dispatch evidence requires unique unchanged stable-ID alignment", async () => {
   for (const omittedBaseline of [false, true]) for (const provider of ["databag", "fixture"] as const) {
     for (const mode of provider === "fixture" ? ["outgoing", "reply"] : ["outgoing", "reply", "intermediate", "omission-only", "same-text",
