@@ -23,7 +23,11 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
     const page = await browser.newPage();
     const input = { expectedUrl: "https://chat.app.example.com/chat/synthetic" };
     await page.route("**/*", route => route.fulfill({ contentType: "text/html", body: `<!doctype html><html><body>
-      <main><div role="log"><article>Synthetic private reply</article></div>
+      <main id="" data-account-id="Synthetic private account" data-user-id="Synthetic private user"
+        data-conversation-id="Synthetic private conversation" data-chat-id="Synthetic private chat"
+        data-message-id="Synthetic private message" data-testid="Synthetic private test" aria-selected="false" aria-current=""
+        data-synthetic-private="Synthetic unapproved attribute">
+        <div role="log" data-chat-id=""><article data-message-id="Synthetic private row" data-testid="Synthetic private row marker">Synthetic private reply</article></div>
         <form><textarea readonly>Synthetic human draft</textarea><button disabled>Synthetic action</button></form>
         <div contenteditable="true">Synthetic editable</div><div role="textbox" aria-disabled="true">Synthetic editor</div>
         <a href="/synthetic-private-path" aria-label="Synthetic private label">Synthetic chat</a>
@@ -49,6 +53,7 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
       for (const [prototype, property] of [[Node.prototype, "textContent"], [HTMLElement.prototype, "innerText"],
         [Element.prototype, "innerHTML"], [Element.prototype, "outerHTML"], [HTMLTextAreaElement.prototype, "value"],
         [HTMLInputElement.prototype, "value"], [HTMLInputElement.prototype, "files"],
+        [Element.prototype, "attributes"], [Element.prototype, "id"], [HTMLElement.prototype, "dataset"],
         [Element.prototype, "shadowRoot"],
         [HTMLIFrameElement.prototype, "contentDocument"], [HTMLIFrameElement.prototype, "contentWindow"]]) {
         Object.defineProperty(prototype, property, { configurable: true, get() { throw new Error("Synthetic private getter accessed"); } });
@@ -60,6 +65,14 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
         }
         return getAttribute.call(this, name);
       };
+      const hasAttribute = Element.prototype.hasAttribute;
+      Element.prototype.hasAttribute = function (name) {
+        if (!["hidden", "inert", "readonly", "id", "data-account-id", "data-user-id", "data-conversation-id",
+          "data-chat-id", "data-message-id", "data-testid", "aria-selected", "aria-current"].includes(name)) {
+          throw new Error("Synthetic unapproved attribute presence accessed");
+        }
+        return hasAttribute.call(this, name);
+      };
     });
     const shape = await page.evaluate(inspectCompanyAIChatStructure, input);
     assert.equal(shape.limited, false);
@@ -70,14 +83,17 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
     assert.deepEqual(shape.editors, [{ kind: "textarea", disabled: false, readOnly: true },
       { kind: "contenteditable", disabled: false, readOnly: false }, { kind: "textbox", disabled: true, readOnly: false }]);
     assert.deepEqual(shape.structure, [
-      { tag: "body", role: null, parent: null }, { tag: "main", role: null, parent: 0 },
-      { tag: "div", role: "log", parent: 1 }, { tag: "article", role: null, parent: 2 },
-      { tag: "form", role: null, parent: 1 }, { tag: "textarea", role: null, parent: 4 },
-      { tag: "button", role: null, parent: 4 }, { tag: "div", role: null, parent: 1 },
-      { tag: "div", role: "textbox", parent: 1 }, { tag: "a", role: null, parent: 1 },
-      { tag: "input", role: "textbox", parent: 1 }, { tag: "iframe", role: null, parent: 1 },
-      { tag: "other", role: null, parent: 1 }, { tag: "div", role: "group", parent: 12 },
-      { tag: "div", role: "region", parent: 1 }
+      { tag: "body", role: null, parent: null, attributeNames: [] },
+      { tag: "main", role: null, parent: 0, attributeNames: ["id", "data-account-id", "data-user-id", "data-conversation-id",
+        "data-chat-id", "data-message-id", "data-testid", "aria-selected", "aria-current"] },
+      { tag: "div", role: "log", parent: 1, attributeNames: ["data-chat-id"] },
+      { tag: "article", role: null, parent: 2, attributeNames: ["data-message-id", "data-testid"] },
+      { tag: "form", role: null, parent: 1, attributeNames: [] }, { tag: "textarea", role: null, parent: 4, attributeNames: [] },
+      { tag: "button", role: null, parent: 4, attributeNames: [] }, { tag: "div", role: null, parent: 1, attributeNames: [] },
+      { tag: "div", role: "textbox", parent: 1, attributeNames: [] }, { tag: "a", role: null, parent: 1, attributeNames: [] },
+      { tag: "input", role: "textbox", parent: 1, attributeNames: [] }, { tag: "iframe", role: null, parent: 1, attributeNames: [] },
+      { tag: "other", role: null, parent: 1, attributeNames: [] }, { tag: "div", role: "group", parent: 12, attributeNames: [] },
+      { tag: "div", role: "region", parent: 1, attributeNames: [] }
     ]);
     assert.doesNotMatch(JSON.stringify(shape), /Synthetic|https:|example|private/);
     assert.deepEqual(await page.evaluate(() => window.syntheticCompanyInspectionState()),
@@ -86,13 +102,20 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
     await page.goto(input.expectedUrl);
     await page.evaluate(() => {
       document.body.replaceChildren();
-      for (let index = 0; index < 600; index++) document.body.append(document.createElement("button"));
+      for (let index = 0; index < 600; index++) {
+        const button = document.createElement("button");
+        button.setAttribute("data-user-id", "Synthetic clipped private value");
+        document.body.append(button);
+      }
     });
     const structureClipped = await page.evaluate(inspectCompanyAIChatStructure, input);
     assert.equal(structureClipped.visitedElements, 601);
     assert.equal(structureClipped.limited, false);
     assert.equal(structureClipped.structure.length, 512);
     assert.equal(structureClipped.structureOmitted, true);
+    assert.ok(structureClipped.structure.slice(1).every(node => node.attributeNames.length === 1
+      && node.attributeNames[0] === "data-user-id"));
+    assert.doesNotMatch(JSON.stringify(structureClipped), /Synthetic|private/);
     await page.evaluate(() => {
       for (let index = 0; index < 4400; index++) document.body.append(document.createElement("button"));
     });

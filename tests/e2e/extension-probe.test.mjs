@@ -115,7 +115,7 @@ test("Company AI Chat popup exposes document-bound diagnostics without host requ
     const extensionId = new URL(worker.url()).hostname;
     const page = await context.newPage();
     await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
-      body: '<!doctype html><html><body><main><div role="log"><article>Synthetic private reply</article></div><form><textarea>Synthetic human draft</textarea><button disabled>Send</button></form></main></body></html>' }));
+      body: '<!doctype html><html><body><main data-account-id="Synthetic private account" data-conversation-id="Synthetic private conversation"><div role="log"><article>Synthetic private reply</article></div><form><textarea id="Synthetic private editor">Synthetic human draft</textarea><button disabled>Send</button></form></main></body></html>' }));
     await page.goto("https://chat.app.example.com/chat/synthetic");
     const popup = await context.newPage();
     await page.bringToFront();
@@ -151,8 +151,9 @@ test("Company AI Chat popup exposes document-bound diagnostics without host requ
     assert.ok(diagnostic.includes("1 log/feed"));
     assert.ok(diagnostic.includes("Structure"));
     assert.ok(diagnostic.includes("7 rows; within limits"));
-    assert.ok(diagnostic.includes("5: parent 4; textarea; role none"));
-    assert.ok(diagnostic.includes("6: parent 4; button; role none"));
+    assert.ok(diagnostic.includes("1: parent 0; main; role none; attributes data-account-id, data-conversation-id"));
+    assert.ok(diagnostic.includes("5: parent 4; textarea; role none; attributes id"));
+    assert.ok(diagnostic.includes("6: parent 4; button; role none; attributes none"));
     assert.doesNotMatch(diagnostic, /Synthetic|https:|example|private/);
     assert.equal(await popup.evaluate(() => globalThis.syntheticCompanyHostRequests), 0);
     const documents = await popup.evaluate(() => globalThis.syntheticCompanyDocuments);

@@ -14,7 +14,9 @@ export function inspectCompanyAIChatStructure(input: { expectedUrl: string }) {
   const roles = new Set(["main", "log", "feed", "article", "form", "list", "listitem", "button", "link", "textbox",
     "region", "group", "tab", "tablist", "tabpanel", "status", "alert", "navigation", "banner", "contentinfo",
     "complementary", "heading", "presentation", "none", "dialog", "menu", "menuitem", "progressbar"]);
-  const structure: { tag: string; role: string | null; parent: number | null }[] = [];
+  const identityAttributeNames = ["id", "data-account-id", "data-user-id", "data-conversation-id", "data-chat-id",
+    "data-message-id", "data-testid", "aria-selected", "aria-current"];
+  const structure: { tag: string; role: string | null; parent: number | null; attributeNames: string[] }[] = [];
   const pending: { element: Element; depth: number; parent: number | null }[] = [{ element: document.body, depth: 0, parent: null }];
   let visitedElements = 0;
   let limited = false;
@@ -38,7 +40,7 @@ export function inspectCompanyAIChatStructure(input: { expectedUrl: string }) {
       if (structure.length < 512) {
         childParent = structure.length;
         structure.push({ tag: tags.has(tag) ? tag : "other", role: role !== null && roles.has(role) ? role : null,
-          parent: entry.parent });
+          parent: entry.parent, attributeNames: identityAttributeNames.filter(name => element.hasAttribute(name)) });
       } else structureOmitted = true;
       if (tag === "main" || role === "main") counts.mainRegions++;
       if (role === "log" || role === "feed") counts.timelines++;
