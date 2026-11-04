@@ -801,6 +801,66 @@ test("only an owning facade prepares immutable fixture text without approval or 
   }
 });
 
+test("owning facade status reconciles fresh Databag evidence without restoring writes", async () => {
+  for (const mode of ["fresh", "wrong-text", "expired"] as const) {
+    const database = new DatabaseSync(":memory:");
+    const requests = new PendingConnectionRequests();
+    const operations = new PreparedMessageOperations(requests, database);
+    const owner = Symbol("Databag late evidence owner");
+    const target = { provider: "databag" as const, origin: "https://databag.example" as const,
+      url: "https://databag.example/#/session", conversationId: `databag_${"a".repeat(64)}`,
+      tabId: 3, documentId: "synthetic-late-evidence" };
+    const now = Date.now();
+    try {
+      const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target)!;
+      const prepared = operations.prepareAutonomous(owner, grant.connectionId, "Synthetic late evidence",
+        "b66b3997-9d43-4554-8399-267d1fe9f75c", now + 30_000);
+      assert.equal(await operations.acquireComposer(owner, prepared.operationId, prepared.expiresAt), true);
+      const filling = operations.requestChatFill(owner, prepared.operationId, now + 2, prepared.expiresAt);
+      assert.ok(filling && filling !== "busy");
+      const fill = operations.listChatJobs("fill", "databag", now + 2)[0]!;
+      assert.equal(operations.completeChatJob(target, prepared.operationId, fill.jobId, "fill",
+        { ok: true, editor: "textarea" }, now + 3), true);
+      await filling.result;
+      const baseline = { id: "synthetic-baseline", direction: "incoming" as const, text: "Synthetic baseline" };
+      requests.publishStableSnapshot(target, [baseline], now + 4);
+      const inspecting = operations.requestChatProof(owner, prepared.operationId, now + 5, prepared.expiresAt);
+      assert.ok(inspecting && inspecting !== "busy");
+      const proof = operations.listChatJobs("proof", "databag", now + 5)[0]!;
+      assert.equal(operations.completeChatJob(target, prepared.operationId, proof.jobId, "proof",
+        { ok: true, editor: "textarea", draftText: prepared.preview.text, selected: true, writable: true, submitReady: true }, now + 6), true);
+      assert.equal(await inspecting.result, true);
+      const dispatch = operations.requestFixtureDispatch(owner, prepared.operationId, inspecting.checkId, now + 7);
+      const submit = operations.listChatJobs("submit", "databag", now + 7)[0]!;
+      assert.equal(operations.completeChatJob(target, prepared.operationId, submit.jobId, "submit",
+        { ok: true, editor: "textarea", activated: true }, now + 8), true);
+      assert.equal((await dispatch.result).state, "dispatch_uncertain");
+      requests.publishStableSnapshot(target, [baseline, { id: "synthetic-late-outgoing", direction: "outgoing",
+        text: mode === "wrong-text" ? "Synthetic different text" : prepared.preview.text }], now + 9);
+      const checkedAt = mode === "expired" ? prepared.expiresAt + 1 : now + 10;
+      const query = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
+        connectionGeneration: 0, deadlineMs: checkedAt + 1000, kind: "get_prepared_operation",
+        payload: { operationId: prepared.operationId } };
+      const recovered = handleBrokerRequest({ ...query, payload: { ...query.payload, recoveryToken: prepared.recoveryToken } },
+        "facade", owner, requests, checkedAt, operations);
+      assert.equal("state" in recovered.payload && recovered.payload.state, "dispatch_uncertain");
+      assert.deepEqual(handleBrokerRequest(query, "facade", Symbol("foreign owner"), requests, checkedAt, operations).payload,
+        { state: "unknown" });
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 0);
+      const result = handleBrokerRequest(query, "facade", owner, requests, checkedAt, operations);
+      assert.equal(result.kind, "prepared_operation_state");
+      assert.equal("state" in result.payload && result.payload.state, mode === "fresh" ? "observed_in_ui" : "dispatch_uncertain");
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, mode === "fresh" ? 1 : 0);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
+      for (const phase of ["fill", "proof", "submit"] as const) assert.deepEqual(operations.listChatJobs(phase, "databag", checkedAt), []);
+    } finally {
+      operations.disconnect(owner);
+      requests.disconnect(owner);
+      database.close();
+    }
+  }
+});
+
 test("a facade receipt recovers only uncertain operation status after an owner restart", () => {
   const database = new DatabaseSync(":memory:");
   try {

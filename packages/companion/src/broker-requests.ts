@@ -597,6 +597,9 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
   }
   if (request.kind === "get_prepared_operation") {
+    if (operations && request.payload.recoveryToken === undefined) {
+      operations.reconcileFixtureObservation(owner, request.payload.operationId, now);
+    }
     return operations
       ? { ...response, kind: "prepared_operation_state" as const,
         payload: request.payload.recoveryToken === undefined
