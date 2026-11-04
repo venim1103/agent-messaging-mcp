@@ -729,6 +729,16 @@ test("Databag guarded fills insert once and preserve human or changed-identity d
         operationId: randomUUID(), attemptId: randomUUID(), expiresAt: Date.now() + 4000 };
     };
     let input = await reset();
+    for (const limit of [0, input.text.length - 1]) {
+      await page.locator("textarea").evaluate((editor, maxLength) => { editor.maxLength = maxLength; }, limit);
+      assert.deepEqual(await page.evaluate(inspectDatabagDraft, input), { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
+      assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
+      assert.equal(await page.locator("textarea").inputValue(), "");
+      assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 0);
+      input = await reset();
+    }
+    await page.locator("textarea").evaluate((editor, limit) => { editor.maxLength = limit; }, input.text.length);
+    assert.deepEqual(await page.evaluate(inspectDatabagDraft, input), { ok: true, editor: "textarea" });
     assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: true, editor: "textarea" });
     assert.equal(await page.locator("textarea").inputValue(), input.text);
     assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 1);
@@ -749,6 +759,13 @@ test("Databag guarded fills insert once and preserve human or changed-identity d
     await page.locator("textarea").fill("Synthetic human draft");
     assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: false, code: "DRAFT_PRESENT" });
     assert.equal(await page.locator("textarea").inputValue(), "Synthetic human draft");
+    input = await reset();
+    await page.locator("textarea").evaluate(editor => editor.addEventListener("focus", () => {
+      editor.maxLength = 0;
+    }, { once: true }));
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" });
+    assert.equal(await page.locator("textarea").inputValue(), "");
+    assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 0);
     input = await reset();
     await page.locator("textarea").evaluate(editor => editor.addEventListener("focus", () => {
       document.querySelector("[data-chat-contract]").dataset.chatChannel = "other-channel";

@@ -373,6 +373,9 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     if (!binding) return { ok: false, code: "TARGET_CHANGED" };
     const found = composer(binding, input.allowHidden);
     if (!found.ok) return found;
+    if (found.editor.maxLength >= 0 && input.text.length > found.editor.maxLength) {
+      return { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" };
+    }
     if (input.draftState === "prepared" ? found.editor.value !== input.text : found.editor.value.length > 0) {
       return { ok: false, code: "DRAFT_PRESENT" };
     }
@@ -398,6 +401,9 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     const inspectFill = () => {
       const found = composer(binding, input.allowHidden);
       if (!found.ok) return found;
+      if (found.editor.maxLength >= 0 && input.text.length > found.editor.maxLength) {
+        return { ok: false as const, code: "UNSUPPORTED_MESSAGE_TEXT" as const };
+      }
       const replacing = found.editor.value.length > 0;
       if (replacing && (!input.leftover || !ownership?.matches(input.leftover.operationId,
         input.leftover.text, input.expectedUrl, found.editor, found.root))) return { ok: false as const, code: "DRAFT_PRESENT" as const };
