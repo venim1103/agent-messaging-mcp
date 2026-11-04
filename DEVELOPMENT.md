@@ -217,6 +217,113 @@ The approved D30 diagnostic adds **Structure**: at most 512 visible rows with al
 
 The approved D33 enhancement adds `attributeNames` to each reported row and shows them as **attributes** in Structure. The fixed allowlist is `id`, `data-account-id`, `data-user-id`, `data-conversation-id`, `data-chat-id`, `data-message-id`, `data-testid`, `aria-selected`, `aria-current`. Only `hasAttribute` checks run; values, `dataset` and attribute enumeration are not read. An empty value or `aria-selected="false"` still reports the name as present, not a selected-state assertion. Rows without allowed attributes show `none`; names alone neither identify an account/chat nor approve access. Original walk/row/visibility/document bounds remain unchanged. Never return real attribute values, private selectors or copied site HTML.
 
+#### Manual framework-attachment presence (D35)
+
+This separate person-operated Console check requires explicit bounded approval; the diagnostic popup never runs it. Under that original unexpired scope, use standard Elements selection for the selected conversation element and already-visible profile/name/avatar region, once each, without activating controls. Use the same tab's top-page Console context; if a target/context is unavailable or DevTools blocks pasting, stop that part, do not disable guards or choose substitutes/ancestors. No menu, switching, logout, installation, input, draft clearing or sending.
+
+Run the following IIFE once per selected target. It enumerates own string-property names, refuses more than 64 before prefix processing, and returns a JSON string containing only fixed status and presence flags. No attachment values, getters, component/state/props traversal, DOM content, network/storage/auth inspection, SDK calls or object dumps. `false` means absent on that exact selection only, not absence throughout the application. Positive flags are not account/chat identity, provenance, readiness or continuity proof. Any value access needs a separate decision.
+
+```js
+(() => {
+   try {
+      if (typeof $0 === "undefined" || !($0 instanceof Element)) {
+         return '{"status":"unavailable"}';
+      }
+      const propertyNames = Object.getOwnPropertyNames($0);
+      if (propertyNames.length > 64) return '{"status":"over_limit"}';
+      return JSON.stringify({
+         status: "ok",
+         fiber: propertyNames.some(propertyName => propertyName.startsWith("__reactFiber$")),
+         props: propertyNames.some(propertyName => propertyName.startsWith("__reactProps$")),
+         container: propertyNames.some(propertyName => propertyName.startsWith("__reactContainer$"))
+      });
+   } catch {
+      return '{"status":"refused"}';
+   }
+})()
+```
+
+Return only the JSON string for each prescribed target, labeled `chat` and `profile`, or `unavailable`/`blocked`. Never copy property names, values, names/IDs/text, HTML, screenshots or an inspected Console object. Stop after the two targets; flags do not authorize a wider search or another inspection. Deadlines, current approval/result and synthetic preparation evidence belong in the handoff/active context, not this reusable procedure.
+
+#### Manual identity-prop shapes (D37)
+
+Only under explicit, unexpired D37 approval: select the already-selected conversation-list element in Elements, run this once in the same page's top Console context, then repeat once for the already-visible profile/name/avatar region without opening anything. This replaces the D35 snippet for this batch. Stop a missing, refused or paste-blocked target; no substitutes, ancestor search, retries, guard bypass, installation, menu, switching, logout, input, clearing or sending. The extension/MCP never runs this helper.
+
+This reads restricted framework data locally through own data descriptors only. It enumerates the selected element's own names once, processes at most 64, requires exactly one fiber attachment, and inspects at most 12 fibers through `return` and `memoizedProps`. Only the fixed fields below and one entity-object level are read. Missing/inherited properties are not followed; accessors, cycles, ambiguity, malformed links and overflow refuse without returning partial shapes. Errors never expose their text. No hooks/context/store/children/sibling/alternate/root-state traversal, application functions/SDK calls, DOM content, messages/drafts, credentials/auth/network/storage access or object dumps. Descriptor reflection cannot attest that an arbitrary object is not a Proxy; these are synthetic-tested access bounds, not a browser-isolation or identity guarantee.
+
+Output is a JSON string with fixed `status`, `direct` and `entities` fields. `direct` positions correspond to `accountId`, `userId`, `conversationId`, `chatId`, `id`, `selected`, `isSelected`, `active`, `isActive`. `entities` positions correspond to `account`, `user`, `conversation`, `chat`; each has `types` plus `ids` in the first five direct-field positions. Each array contains deduplicated fixed type flags (`string`, `number`, `boolean`, `null`, `undefined`, `object`, `other`); empty means no own field observed in the completed bounded chain. Boolean values, string contents, identifiers, lengths, property names and objects are never returned. These shapes establish neither committed-root identity/provenance/readiness nor selected-chat/timeline continuity.
+
+```js
+(() => {
+   try {
+      if (typeof $0 === "undefined" || !($0 instanceof Element)) {
+         return '{"status":"unavailable"}';
+      }
+      const propertyNames = Object.getOwnPropertyNames($0);
+      if (propertyNames.length > 64) return '{"status":"over_limit"}';
+      const attachments = propertyNames.filter(propertyName => propertyName.startsWith("__reactFiber$"));
+      if (attachments.length === 0) return '{"status":"absent"}';
+      if (attachments.length !== 1) return '{"status":"ambiguous"}';
+      const own = (target, propertyName) => {
+         const descriptor = Object.getOwnPropertyDescriptor(target, propertyName);
+         if (!descriptor) return { present: false };
+         if (!Object.hasOwn(descriptor, "value")) throw null;
+         return { present: true, value: descriptor.value };
+      };
+      const object = value => value !== null && typeof value === "object";
+      const type = value => value === null ? "null"
+         : ["string", "number", "boolean", "undefined", "object"].includes(typeof value)
+            ? typeof value : "other";
+      const fields = ["accountId", "userId", "conversationId", "chatId", "id",
+         "selected", "isSelected", "active", "isActive"];
+      const entityFields = ["account", "user", "conversation", "chat"];
+      const direct = fields.map(() => new Set());
+      const entities = entityFields.map(() => ({ types: new Set(), ids: fields.slice(0, 5).map(() => new Set()) }));
+      const attachment = own($0, attachments[0]);
+      if (!attachment.present || !object(attachment.value)) throw null;
+      let fiber = attachment.value;
+      const visited = new Set();
+      for (let depth = 0; fiber !== null; depth++) {
+         if (depth >= 12) return '{"status":"over_limit"}';
+         if (!object(fiber) || visited.has(fiber)) throw null;
+         visited.add(fiber);
+         const props = own(fiber, "memoizedProps");
+         const parent = own(fiber, "return");
+         if (!props.present || !parent.present || (props.value !== null && !object(props.value))) throw null;
+         if (parent.value !== null && !object(parent.value)) throw null;
+         if (props.value !== null) {
+            fields.forEach((field, index) => {
+               const candidate = own(props.value, field);
+               if (candidate.present) direct[index].add(type(candidate.value));
+            });
+            entityFields.forEach((field, index) => {
+               const candidate = own(props.value, field);
+               if (!candidate.present) return;
+               entities[index].types.add(type(candidate.value));
+               if (!object(candidate.value)) return;
+               fields.slice(0, 5).forEach((idField, idIndex) => {
+                  const identifier = own(candidate.value, idField);
+                  if (identifier.present) entities[index].ids[idIndex].add(type(identifier.value));
+               });
+            });
+         }
+         fiber = parent.value;
+      }
+      return JSON.stringify({
+         status: "ok",
+         direct: direct.map(types => [...types].sort()),
+         entities: entities.map(entity => ({
+            types: [...entity.types].sort(), ids: entity.ids.map(types => [...types].sort())
+         }))
+      });
+   } catch {
+      return '{"status":"refused"}';
+   }
+})()
+```
+
+Return only the final JSON string for `chat` and `profile`, or `unavailable`/`blocked`. Stop on any refusal, do not inspect raw Console objects or expand framework values. The one batch ends after those two targets, even if shapes are absent or a bound is reached. Raw values remain transient inside the IIFE; no globals, listeners, timers, storage or connector state are installed. Any wider access or operational integration requires a separate decision.
+
 ### Databag work-channel operation
 
 The person has designated one direct conversation for AI0 to report work, request input and receive their delegated task instructions. Follow [the work-channel rules](AGENTS.md#databag-work-channel) and DESIGN.md D21; a display name is not an authenticated binding.
@@ -322,6 +429,8 @@ Databag's [D25 rule](DESIGN.md#17-decisions) permits positive UI evidence in ful
 Databag browser regressions use Playwright with disposable sandboxed profiles and routed synthetic pages, including native-structure and marker variants. The long-chat public workflow exercises the extension, native relay, broker and MCP tools with omitted 32-row captures, one activation, reply handling, status-only replay and human-draft preservation. This is not a real Databag service or installed-profile delivery test. Any next deployed-site automation requires a separately agreed disposable test environment/account and bounded actions; it must not substitute the person's logged-in profile or bypass trusted popup approval. A fill refusal can leave an unsent draft; `not_sent` never means the composer is necessarily empty.
 
 Native Databag fill waits read-only for reviewed React readiness after its one insertion, inside the original browser lease. After a successful fill result, the worker's identity confirmation can also wait within that same lease; each yield retains exact root/timeline/identity/continuity, composer controls, focus, text and expiry. Ordinary identity reads do not wait or accept pending readiness. The worker still rechecks document/URL/grant before accepting completion. Pending expiry or changed focus/draft/target leaves the draft and refuses; no second insertion, lease extension or automatic submit follows. This repairs a reproduced post-fill readiness race, not every lost-result or installed failure. See [current evidence](HANDOFF.md#current-state-dashboard).
+
+Databag draft preflight and each pre-insertion fill check also refuse `UNSUPPORTED_MESSAGE_TEXT` when the proposed text's UTF-16 length exceeds the actual textarea's nonnegative `maxLength`. The default unlimited value retains existing behavior; zero refuses nonempty text and an exact fit is accepted. Rechecking after focus prevents a changed limit from causing partial insertion. This is a refusal-only guard, not a larger message limit, insertion retry, draft cleanup or proof of the cause of an installed fill failure. See the [current source evidence](HANDOFF.md#current-state-dashboard).
 
 Autonomous `DISPATCH_UNAVAILABLE` results may include optional `failureStage`: `composer`, `fill`, `read`, `proof` or `dispatch`. This fixed metadata names the last attempted phase, not a proven root cause or new authority. Existing codes, no-retry behavior and durable-status precedence remain unchanged; transport loss still yields unresolved without an invented stage. Source coverage does not establish deployment; use the coordinated restart procedure above and the [current checkpoint evidence](HANDOFF.md#t5-gated-read-deadlines-and-refusal-diagnostics-2026-10-16).
 

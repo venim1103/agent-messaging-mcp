@@ -1367,7 +1367,7 @@ test("autonomous commits share one owned deadline across neutral fill, proof, in
 });
 
 test("autonomous pre-intent refusals retain bounded failure stages without submit authority", async () => {
-  for (const provider of ["fixture", "gemini"] as const) for (const stage of ["fill", "read", "proof"] as const) {
+  for (const provider of ["fixture", "gemini", "databag"] as const) for (const stage of ["fill", "read", "proof"] as const) {
     const requests = new PendingConnectionRequests();
     const database = new DatabaseSync(":memory:");
     const ledger = new PreparedMessageOperations(requests, database);
@@ -1376,6 +1376,8 @@ test("autonomous pre-intent refusals retain bounded failure stages without submi
     const target = provider === "gemini"
       ? { origin: "https://gemini.google.com" as const, conversationId: "synthetic-refusal-stage",
         url: "https://gemini.google.com/app/synthetic-refusal-stage", tabId: 8, documentId: "refusal-stage-document" }
+      : provider === "databag" ? { provider: "databag" as const, origin: "https://databag.example" as const,
+        conversationId: `databag_${"a".repeat(64)}`, url: "https://databag.example/#/session", tabId: 8, documentId: "refusal-stage-document" }
       : { origin: "http://127.0.0.1:8787" as const, conversationId: "fixture-alpha" as const,
         tabId: 8, documentId: "refusal-stage-document" };
     try {
@@ -1404,6 +1406,9 @@ test("autonomous pre-intent refusals retain bounded failure stages without submi
           const challenge = requests.listGeminiReadChallenges()[0]!;
           requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Synthetic completed baseline", generationState: "complete" }],
             Date.now(), challenge.challengeId);
+        } else if (target.origin === "https://databag.example") {
+          const challenge = requests.listStableReadChallenges()[0]!;
+          requests.publishStableSnapshot(target, [], Date.now(), challenge.challengeId);
         } else {
           const challenge = requests.listFixtureReadChallenges()[0]!;
           requests.publishFixtureSnapshot(target, [], Date.now(), challenge.challengeId);
@@ -1415,6 +1420,7 @@ test("autonomous pre-intent refusals retain bounded failure stages without submi
           { ok: false, code: "DRAFT_CHANGED" }), false);
       }
       await rejected;
+      assert.equal(ledger.getAutonomousAuthorization(owner, prepared.operationId) !== null, stage !== "read");
       await assert.rejects(ledger.commitAutonomousMessage(owner, prepared.operationId, deadlineMs), checkFailure);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
       for (const phase of ["fill", "proof", "submit"] as const) assert.deepEqual(ledger.listChatJobs(phase, provider), []);
