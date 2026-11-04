@@ -718,10 +718,15 @@ test("Databag guarded fills insert once and preserve human or changed-identity d
   try {
     const page = await browser.newPage();
     const expectedUrl = "https://databag.example/#/session";
-    await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html", body: html }));
+    let nativeFixture = false;
+    await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html",
+      body: nativeFixture ? html.replace("<body>", '<body data-synthetic-native="true">') : html }));
     await page.goto(expectedUrl);
-    const reset = async () => {
+    const reset = async (native = false) => {
+      nativeFixture = native;
+      if (page.url() !== expectedUrl) await page.goto(expectedUrl);
       await page.reload();
+      if (native) await page.evaluate(installDatabagIdentityBridge, ["https://databag.example"]);
       await page.evaluate(installDatabagAdapter, ["https://databag.example"]);
       await page.evaluate(installDraftOwnershipTracker);
       const identity = await page.evaluate(identifyDatabagConversation);
@@ -773,6 +778,40 @@ test("Databag guarded fills insert once and preserve human or changed-identity d
     assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: false, code: "TARGET_CHANGED" });
     assert.equal(await page.locator("textarea").inputValue(), "");
     assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 0);
+    for (const native of [false, true]) for (const outcome of ["settled", "focus", "draft", "identity", "button", "disabled", "expired"]) {
+      input = await reset(native);
+      if (outcome === "expired") input = { ...input, expiresAt: Date.now() + 250 };
+      await page.locator("textarea").evaluate((editor, outcome) => {
+        editor.addEventListener("input", () => {
+          const region = editor.parentElement;
+          const height = region.getBoundingClientRect().height;
+          region.style.height = `${height}px`;
+          region.style.overflow = "hidden";
+          editor.style.height = `${height + 80}px`;
+          if (outcome !== "settled" && outcome !== "expired") setTimeout(() => {
+            if (outcome === "focus") { document.body.tabIndex = -1; document.body.focus(); }
+            if (outcome === "draft") editor.value += " edited";
+            if (outcome === "identity") location.hash = "other-channel";
+            if (outcome === "button") {
+              const button = region.querySelector("button");
+              button.replaceWith(button.cloneNode(true));
+            }
+            if (outcome === "disabled") editor.disabled = true;
+          }, 33);
+          setTimeout(() => {
+            region.style.height = "";
+            region.style.overflow = "";
+          }, 333);
+        }, { once: true });
+      }, outcome);
+      assert.deepEqual(await page.evaluate(fillDatabagDraft, input), outcome === "settled"
+        ? { ok: true, editor: "textarea" } : { ok: false, code: "FILL_UNCERTAIN" });
+      assert.equal(await page.locator("textarea").inputValue(), outcome === "draft" ? `${input.text} edited` : input.text);
+      assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 1);
+      assert.equal(await page.evaluate(() => window.syntheticActivations), 0);
+      if (outcome !== "identity") assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...input, expiresAt: Date.now() + 4000 }),
+        { ok: false, code: "FILL_UNAVAILABLE" });
+    }
     input = await reset();
     await page.locator("[data-chat-contract]").evaluate(root => { root.dataset.chatDraftSafe = "false"; });
     assert.deepEqual(await page.evaluate(fillDatabagDraft, input), { ok: false, code: "COMPOSER_UNAVAILABLE" });

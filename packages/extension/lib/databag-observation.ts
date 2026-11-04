@@ -325,7 +325,7 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     const hit = document.elementFromPoint(centerX, centerY);
     return Boolean(hit && (hit === element || element.contains(hit)));
   };
-  const composer = (binding: NonNullable<ReturnType<typeof context>>, allowHidden?: true) => {
+  const composer = (binding: NonNullable<ReturnType<typeof context>>, allowHidden?: true, waitForGeometry = false) => {
     const current = context(false);
     if (!current || current.root !== binding.root || current.timeline !== binding.timeline || current.identity !== binding.identity
       || current.continuity !== binding.continuity
@@ -351,7 +351,8 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     const editors = [...region.querySelectorAll<HTMLElement>('textarea, [contenteditable="true"], [role="textbox"]')].filter(visible);
     const editor = editors[0];
     if (editors.length !== 1 || !(editor instanceof HTMLTextAreaElement) || editor.readOnly || editor.matches(":disabled")
-      || editor.closest('[inert], [aria-disabled="true"], [aria-readonly="true"], fieldset:disabled') || !unobstructed(editor)) {
+      || editor.closest('[inert], [aria-disabled="true"], [aria-readonly="true"], fieldset:disabled')
+      || (!waitForGeometry && !unobstructed(editor))) {
       return { ok: false as const, code: "COMPOSER_UNAVAILABLE" as const };
     }
     const sends = current.native ? [...region.querySelectorAll<HTMLElement>('[class*="_send_"]')]
@@ -360,9 +361,10 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
     const buttons = current.native ? [...sends[0]!.querySelectorAll<HTMLElement>("button")].filter(visible)
       : [...region.querySelectorAll<HTMLElement>('[data-chat-send="true"]')];
     const button = buttons[0];
-    if (buttons.length !== 1 || !(button instanceof HTMLButtonElement) || !unobstructed(button)
+    if (buttons.length !== 1 || !(button instanceof HTMLButtonElement) || (!waitForGeometry && !unobstructed(button))
       || button.closest('[inert], [aria-disabled="true"]')) return { ok: false as const, code: "SUBMIT_UNAVAILABLE" as const };
-    return { ok: true as const, root, region, editor, button, ready: current.native?.ready ?? true };
+    return { ok: true as const, root, region, editor, button,
+      ready: (current.native?.ready ?? true) && (!waitForGeometry || (unobstructed(editor) && unobstructed(button))) };
   };
   const inspect = async (input: DatabagDraftInput): Promise<DatabagPreflight> => {
     if (!validDraft(input)) return { ok: false, code: "UNSUPPORTED_MESSAGE_TEXT" };
@@ -430,7 +432,7 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
       if (ready.replacing && !recorded) return { ok: false, code: "FILL_UNAVAILABLE" };
       if (!Document.prototype.execCommand.call(document, "insertText", false, input.text)) return { ok: false, code: "FILL_UNCERTAIN" };
       for (;;) {
-        const after = composer(binding, input.allowHidden);
+        const after = composer(binding, input.allowHidden, true);
         if (!after.ok || after.root !== ready.root || after.region !== ready.region || after.editor !== ready.editor
           || after.button !== ready.button || document.activeElement !== ready.editor || ready.editor.value !== input.text
           || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNCERTAIN" };
