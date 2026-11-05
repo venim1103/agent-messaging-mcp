@@ -1,10 +1,32 @@
 import { once } from "node:events";
-import { stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { cp, mkdtemp, rm, stat, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
-const extensionDirectory = fileURLToPath(new URL("../../packages/extension/.output/chrome-mv3/", import.meta.url));
+const extensionDirectory = process.env.BROWSER_CHAT_TEST_EXTENSION_DIRECTORY
+  ?? fileURLToPath(new URL("../../packages/extension/.output/chrome-mv3/", import.meta.url));
 
 const nativeRelayPath = fileURLToPath(new URL("../../packages/companion/dist/native-relay.js", import.meta.url));
+
+async function buildTestExtension(origin, signal) {
+  const sourceRoot = fileURLToPath(new URL("../../packages/extension/", import.meta.url));
+  const source = await mkdtemp(join(tmpdir(), "agent-messaging-extension-build-"));
+  try {
+    await cp(sourceRoot, source, { recursive: true, filter: entry => !relative(sourceRoot, entry).split("/")
+      .some(part => ["node_modules", ".output", ".wxt"].includes(part) || part.startsWith(".env")) });
+    await symlink(fileURLToPath(new URL("../../node_modules", import.meta.url)), join(source, "node_modules"), "dir");
+    const cli = fileURLToPath(new URL("../../node_modules/wxt/bin/wxt.mjs", import.meta.url));
+    await promisify(execFile)(process.execPath, [cli, "build"], { cwd: source, signal,
+      env: { ...process.env, BROWSER_CHAT_DATABAG_ORIGIN: origin } });
+    return { source, directory: join(source, ".output/chrome-mv3") };
+  } catch (error) {
+    await rm(source, { recursive: true, force: true });
+    throw error;
+  }
+}
 
 async function brokerSocketReady(socketPath) {
   try {
@@ -83,4 +105,4 @@ function installSyntheticGeminiProof() {
   };
 }
 
-export { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof };
+export { extensionDirectory, nativeRelayPath, buildTestExtension, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof };

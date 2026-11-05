@@ -638,8 +638,8 @@ Tests: `tests/fixtures/` holds the synthetic chat page and server. `tests/e2e/ex
 | `npm run typecheck` | Both packages |
 | `npm run test:unit` | Runs fixture and compiled companion tests; build first, reuses the gate's existing build |
 | `npm run test:unit:build` | Builds the companion, then runs all units; standalone convenience |
-| `npm run test:e2e` | Runs all E2E files through bounded parallel/serial groups; build first |
-| `npm run test:e2e:focus -- <node-test-options> <file>` | Single-worker focused E2E run against existing built artifacts |
+| `npm run test:e2e` | Builds a disposable default extension, then runs all E2E files through bounded parallel/serial groups; build companion first |
+| `npm run test:e2e:focus -- <node-test-options> <file>` | Single-worker focused E2E run against existing built artifacts or a supplied test-only output directory |
 
 The exact gate before every source commit (AGENTS.md):
 
@@ -647,7 +647,7 @@ The exact gate before every source commit (AGENTS.md):
 npm run build && npm run typecheck && npm run test:unit && npm run test:e2e
 ```
 
-Default-host verification expects only fixture/Gemini optional hosts. When ignored local configuration sets `BROWSER_CHAT_DATABAG_ORIGIN`, use `BROWSER_CHAT_DATABAG_ORIGIN=` on each verification command only; leave configuration, parent environment and assertions unchanged. This overwrites unpacked output and can hide Databag popup panels in a browser using that directory. Coordinate the build window; after all checks finish, restore configured output with `npm run build:extension && npm run verify:extension`, verify its host set, then ask the person to reload. Never automatically reload or renew approval. Test output is not installed acceptance.
+Default-host verification expects only fixture/Gemini optional hosts. The E2E runner builds that default extension in a disposable source copy, excludes ignored environment files and generated output/cache, and supplies `BROWSER_CHAT_TEST_EXTENSION_DIRECTORY` only to test workers. It clears `BROWSER_CHAT_DATABAG_ORIGIN` only for the disposable build and workers, never the parent build or configuration. Both test groups share that read-only artifact; cleanup runs after success or failure. Do not empty the origin on the root gate: that overwrites configured unpacked output and can hide Databag popup panels. No automatic installed reload or approval renewal; test output is not installed acceptance.
 
 Fast edit loop: build once after checkout, then rebuild only the package whose source changed. Run a behavior-scoped test immediately after each edit; run the full gate at meaningful source checkpoints, not after every probe. Never use stale build output. Documentation-only edits need scoped content/link/whitespace checks instead of a source gate.
 
@@ -662,7 +662,7 @@ Use `extension-dispatch.test.mjs` for public sends and private submit/loss cases
 
 `tests/e2e/run.mjs` discovers every E2E test file. Independent cases run with two isolated file workers. Six composite cases (fixture private-submit matrix, fixture crash matrix, both provider roster-race matrices, Gemini read workflow and Gemini inspector matrix) run serially through complementary name filters; their aggregate deadlines made all-parallel execution unreliable. Profiles, brokers and authority are never shared. New unmatched tests enter the parallel group; update the serial pattern when adding a composite case. A failed group stops the gate without an automatic retry. Keep the original case deadlines, polling, sandbox and assertions.
 
-Shared `extension-harness.mjs` helpers include a 32-event synthetic-only native-job trace with counts, fixed result codes and relative timing, never text/targets/receipts. The supervised Gemini fault injector captures its mode before awaiting browser execution; a fake deferred-call regression verifies later modes cannot alter an earlier invocation. Public connection tests use genuine Enter activation with visible/enabled and trusted-user-gesture assertions to avoid background-popup mouse stability waits; this is not installed-toolbar acceptance.
+Shared `extension-harness.mjs` helpers include an isolated extension builder reused by the runner and Databag popup tests, plus a 32-event synthetic-only native-job trace with counts, fixed result codes and relative timing, never text/targets/receipts. Popup tests compare configured/omitted synthetic origins, preserve the existing artifact fingerprint and require zero draft-input/send events. The supervised Gemini fault injector captures its mode before awaiting browser execution; a fake deferred-call regression verifies later modes cannot alter an earlier invocation. Public connection tests use genuine Enter activation with visible/enabled and trusted-user-gesture assertions to avoid background-popup mouse stability waits; this is not installed-toolbar acceptance.
 
 Browser-test rules: launch Chromium with `chromiumSandbox: true`, because Playwright otherwise adds `--no-sandbox`; use disposable profiles and an isolated HOME broker; wait for the current-user, owner-only socket before connecting; keep the original timeouts and assertions. Test copies of the extension may get temporary host permissions, and automated popup navigation does not grant `activeTab`, so these tests do not prove real toolbar approval. Installed-toolbar and live checks are separate, human-assisted evidence.
 

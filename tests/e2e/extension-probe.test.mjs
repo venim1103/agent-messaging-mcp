@@ -21,26 +21,21 @@ import { planNativeRegistration, registerNative } from "../../packages/companion
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 import { createNativeRequestChannel, requestNativeGrantCount } from "../../packages/extension/lib/native-channel.ts";
 import { configuredDatabagOrigins, isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
-import { extensionDirectory, nativeRelayPath, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
+import { extensionDirectory, nativeRelayPath, buildTestExtension, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
-let databagBuildSource;
-let databagTestBuild;
-after(async () => { if (databagBuildSource) await rm(databagBuildSource, { recursive: true, force: true }); });
+const databagBuildSources = [];
+const databagTestBuilds = new Map();
+after(async () => {
+  for (const source of databagBuildSources) await rm(source, { recursive: true, force: true });
+});
 
-function buildDatabagTestExtension(signal) {
-  databagTestBuild ??= (async () => {
-    const sourceRoot = fileURLToPath(new URL("../../packages/extension/", import.meta.url));
-    const source = await mkdtemp(join(tmpdir(), "agent-messaging-databag-build-"));
-    databagBuildSource = source;
-    await cp(sourceRoot, source, { recursive: true, filter: entry => !relative(sourceRoot, entry).split("/")
-      .some(part => ["node_modules", ".output", ".wxt"].includes(part) || part.startsWith(".env")) });
-    await symlink(fileURLToPath(new URL("../../node_modules", import.meta.url)), join(source, "node_modules"), "dir");
-    const cli = fileURLToPath(new URL("../../node_modules/wxt/bin/wxt.mjs", import.meta.url));
-    await promisify(execFile)(process.execPath, [cli, "build"], { cwd: source, signal,
-      env: { ...process.env, BROWSER_CHAT_DATABAG_ORIGIN: "https://databag.example" } });
-    return join(source, ".output/chrome-mv3");
-  })();
-  return databagTestBuild;
+function buildDatabagTestExtension(signal, origin = "https://databag.example") {
+  if (!databagTestBuilds.has(origin)) databagTestBuilds.set(origin, (async () => {
+    const build = await buildTestExtension(origin, signal);
+    databagBuildSources.push(build.source);
+    return build.directory;
+  })());
+  return databagTestBuilds.get(origin);
 }
 
 async function assertSharedPopupControls(popup, supervised) {
@@ -76,6 +71,54 @@ test("Databag configuration admits one exact HTTPS origin without widening host 
     " https://databag.example", "https://databag.example\n", "not a URL"]) {
     assert.equal(parseDatabagOrigin(value), null);
     assert.throws(() => configuredDatabagOrigins(value), /canonical HTTPS origin/);
+  }
+});
+
+test("Databag popup connection controls follow the compiled origin without altering the working build", { timeout: 15000 }, async testContext => {
+  const workingBuild = await verifyExtensionBuild(extensionDirectory);
+  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-databag-popup-origin-"));
+  try {
+    for (const origin of ["", "https://databag.example"]) {
+      const directory = join(profile, origin ? "configured" : "default");
+      const unpacked = join(directory, "unpacked-extension");
+      await cp(await buildDatabagTestExtension(testContext.signal, origin), unpacked, { recursive: true });
+      const manifestPath = join(unpacked, "manifest.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+      manifest.host_permissions = ["https://databag.example/*"];
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      const context = await chromium.launchPersistentContext(directory, { chromiumSandbox: true,
+        executablePath: "/usr/bin/chromium", headless: true, env: { ...process.env, HOME: directory },
+        args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
+      try {
+        const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+        const page = await context.newPage();
+        await page.route("https://databag.example/**", route => route.fulfill({ contentType: "text/html",
+          body: '<!doctype html><textarea>Synthetic retained draft</textarea><button>Send</button>' }));
+        await page.goto("https://databag.example/#/session");
+        await page.evaluate(() => {
+          globalThis.syntheticPopupInputs = 0;
+          globalThis.syntheticPopupActivations = 0;
+          document.querySelector("textarea").addEventListener("input", () => globalThis.syntheticPopupInputs++);
+          document.querySelector("button").addEventListener("click", () => globalThis.syntheticPopupActivations++);
+        });
+        const popup = await context.newPage();
+        await page.bringToFront();
+        await popup.goto(`chrome-extension://${new URL(worker.url()).hostname}/popup.html`);
+        await popup.waitForFunction(() => document.getElementById("pending-target").textContent === "Read-only target: selected chat",
+          undefined, { timeout: 4000 });
+        await assertSharedPopupControls(popup, false);
+        assert.equal(await popup.locator("#agent-panel").isVisible(), Boolean(origin));
+        assert.equal(await popup.locator("#unconfirmed-panel").isVisible(), Boolean(origin));
+        assert.equal(await page.locator("textarea").inputValue(), "Synthetic retained draft");
+        assert.deepEqual(await page.evaluate(() => ({ inputs: globalThis.syntheticPopupInputs,
+          activations: globalThis.syntheticPopupActivations })), { inputs: 0, activations: 0 });
+      } finally {
+        await context.close();
+      }
+    }
+  } finally {
+    await rm(profile, { recursive: true, force: true });
+    assert.deepEqual(await verifyExtensionBuild(extensionDirectory), workingBuild);
   }
 });
 
