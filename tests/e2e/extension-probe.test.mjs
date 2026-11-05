@@ -21,6 +21,7 @@ import { planNativeRegistration, registerNative } from "../../packages/companion
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 import { createNativeRequestChannel, requestNativeGrantCount } from "../../packages/extension/lib/native-channel.ts";
 import { configuredDatabagOrigins, isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
+import { proveCompanyAIChatIdentity } from "../../packages/extension/lib/company-ai-observation.ts";
 import { extensionDirectory, nativeRelayPath, buildTestExtension, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
 const databagBuildSources = [];
@@ -137,6 +138,140 @@ test("Company AI Chat recognition uses a hostname pattern, not browser authority
     `https://chat.app.example.com/${"a".repeat(512)}`]) {
     assert.equal(isRecognizedCompanyAIChatUrl(url), false);
   }
+});
+
+test("Company AI Chat identity primitive accepts only committed agreeing synthetic sources", () => {
+  class SyntheticElement {}
+  const fixture = () => {
+    const account = { homeAccountId: "SYNTHETIC_SECRET", localAccountId: "SYNTHETIC_SECRET", username: "SYNTHETIC_SECRET" };
+    const context = { accounts: [account], inProgress: "none" };
+    const root = { return: null, child: null, stateNode: null };
+    root.stateNode = { current: root };
+    const source = { return: root, child: null, sibling: null, memoizedProps: { conversationId: "SYNTHETIC_SECRET" },
+      dependencies: { firstContext: { memoizedValue: context, next: null } } };
+    root.child = source;
+    const attach = () => {
+      const element = new SyntheticElement();
+      const fiber = { return: source, child: null, sibling: null, stateNode: element, memoizedProps: {}, dependencies: null };
+      Object.defineProperty(element, "__reactFiber$synthetic", { value: fiber, configurable: true });
+      return { element, fiber };
+    };
+    const editor = attach(); const timeline = attach(); const profile = attach();
+    source.child = editor.fiber; editor.fiber.sibling = timeline.fiber; timeline.fiber.sibling = profile.fiber;
+    return { root, source, editor, timeline, profile, account, context };
+  };
+  const expected = { status: "ok", sameCommittedRoot: true, conversationMatched: true, profileAccountMatched: true, ready: true };
+  const inspect = (input, readProfile = () => "SYNTHETIC_SECRET", deadline = Date.now() + 10000) => {
+    const result = proveCompanyAIChatIdentity(input.editor.element, input.timeline.element,
+      input.profile.element, SyntheticElement, deadline, readProfile);
+    assert.ok(!JSON.stringify(result).includes("SYNTHETIC_SECRET"));
+    return result;
+  };
+  assert.deepEqual(inspect(fixture()), expected);
+  const refuse = mutate => { const input = fixture(); mutate(input); assert.deepEqual(inspect(input), { status: "refused" }); };
+  refuse(input => { input.root.stateNode.current = {}; });
+  refuse(input => { input.timeline.fiber.sibling = null; });
+  refuse(input => { input.editor.fiber.stateNode = {}; });
+  refuse(input => { input.source.memoizedProps = {}; });
+  refuse(input => { input.editor.fiber.memoizedProps.conversationId = undefined; });
+  refuse(input => { input.timeline.fiber.memoizedProps.conversationId = "OTHER_SYNTHETIC_SECRET"; });
+  refuse(input => { input.source.memoizedProps = {}; input.editor.fiber.memoizedProps.conversationId = "SYNTHETIC_SECRET";
+    input.timeline.fiber.memoizedProps.conversationId = "SYNTHETIC_SECRET"; });
+  refuse(input => { input.source.memoizedProps.conversationId = "x".repeat(513); });
+  refuse(input => { input.source.memoizedProps = Object.create(input.source.memoizedProps); });
+  refuse(input => { input.context.accounts.push(input.account); });
+  refuse(input => { input.context.inProgress = "pending"; });
+  refuse(input => { input.account.homeAccountId = ""; });
+  refuse(input => { input.source.dependencies.firstContext.next = {
+    memoizedValue: { accounts: [{ ...input.account }], inProgress: "none" }, next: null }; });
+  refuse(input => { input.source.dependencies.firstContext.next = input.source.dependencies.firstContext; });
+  refuse(input => { input.editor.fiber.sibling = input.editor.fiber; });
+  let reads = 0;
+  refuse(input => { Object.defineProperty(input.source.memoizedProps, "conversationId", { get() { reads++; throw new Error(); } }); });
+  refuse(input => { Object.defineProperty(input.editor.fiber, "alternate", { get() { reads++; throw new Error(); } }); });
+  assert.equal(reads, 0);
+  const alternate = fixture();
+  const oldRoot = { return: null, stateNode: alternate.root.stateNode };
+  const current = { ...alternate.editor.fiber, return: oldRoot };
+  alternate.editor.fiber.return = oldRoot; alternate.editor.fiber.alternate = current; alternate.source.child = current;
+  for (const field of ["memoizedProps", "dependencies", "child", "sibling"]) {
+    Object.defineProperty(alternate.editor.fiber, field, { get() { reads++; throw new Error(); } });
+  }
+  assert.deepEqual(inspect(alternate), expected);
+  refuse(input => { input.editor.fiber.alternate = { ...input.editor.fiber };
+    input.profile.fiber.sibling = input.editor.fiber.alternate; });
+  const changed = fixture();
+  assert.deepEqual(inspect(changed, () => { changed.root.stateNode.current = {}; return "SYNTHETIC_SECRET"; }), { status: "refused" });
+  const replaced = fixture();
+  assert.deepEqual(inspect(replaced, () => { Object.defineProperty(replaced.editor.element, "__reactFiber$synthetic", { value: {} });
+    return "SYNTHETIC_SECRET"; }), { status: "refused" });
+  assert.deepEqual(inspect(fixture(), () => "OTHER_SYNTHETIC_SECRET"), { status: "refused" });
+  assert.deepEqual(inspect(fixture(), undefined, Date.now() - 1), { status: "expired" });
+  assert.deepEqual(inspect(fixture(), undefined, NaN), { status: "refused" });
+  assert.deepEqual(inspect(fixture(), undefined, Infinity), { status: "refused" });
+  const dependencies = count => {
+    const input = fixture();
+    let next = null;
+    for (let index = 0; index < count; index++) next = { memoizedValue: input.context, next };
+    input.source.dependencies.firstContext = next;
+    return input;
+  };
+  assert.deepEqual(inspect(dependencies(32)), expected);
+  assert.deepEqual(inspect(dependencies(33)), { status: "refused" });
+  const names = fixture();
+  for (let index = 0; index < 63; index++) Object.defineProperty(names.editor.element, `extra${index}`, { value: null });
+  assert.deepEqual(inspect(names), expected);
+  Object.defineProperty(names.editor.element, "overflow", { value: null });
+  assert.deepEqual(inspect(names), { status: "refused" });
+  const ancestors = count => {
+    const input = fixture();
+    let parent = input.root;
+    for (let index = 0; index < count; index++) {
+      const wrapper = { return: parent, child: null, sibling: null, memoizedProps: {}, dependencies: null };
+      parent.child = wrapper; parent = wrapper;
+    }
+    parent.child = input.source; input.source.return = parent;
+    return input;
+  };
+  assert.deepEqual(inspect(ancestors(61)), expected);
+  assert.deepEqual(inspect(ancestors(62)), { status: "refused" });
+  const tree = count => {
+    const input = fixture();
+    let remaining = count - 5;
+    let parent = input.source;
+    while (remaining > 0) {
+      const branch = { return: input.root, child: null, sibling: null };
+      parent.sibling = branch; parent = branch; remaining--;
+      let child;
+      for (let index = 0; index < 64 && remaining > 0; index++, remaining--) {
+        const node = { return: branch, child: null, sibling: null };
+        if (child) child.sibling = node; else branch.child = node;
+        child = node;
+      }
+    }
+    return input;
+  };
+  assert.deepEqual(inspect(tree(4096)), expected);
+  assert.deepEqual(inspect(tree(4097)), { status: "refused" });
+  const siblings = count => {
+    const input = fixture();
+    let previous = input.source;
+    for (let index = 1; index < count; index++) {
+      previous.sibling = { return: input.root, child: null, sibling: null };
+      previous = previous.sibling;
+    }
+    return input;
+  };
+  assert.deepEqual(inspect(siblings(64)), expected);
+  assert.deepEqual(inspect(siblings(65)), { status: "refused" });
+  const forbidden = fixture();
+  for (const target of [forbidden.source, forbidden.context, forbidden.account, forbidden.root.stateNode]) {
+    for (const field of ["tokens", "claims", "cache", "instance", "memoizedState", "alternate", "messages", "draft"]) {
+      Object.defineProperty(target, field, { get() { reads++; throw new Error(); } });
+    }
+  }
+  assert.deepEqual(inspect(forbidden), expected);
+  assert.equal(reads, 0);
 });
 
 test("Company AI Chat popup exposes document-bound diagnostics without host requests or chat authority", { timeout: 15000 }, async testContext => {

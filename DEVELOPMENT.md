@@ -217,6 +217,14 @@ The approved D30 diagnostic adds **Structure**: at most 512 visible rows with al
 
 The approved D33 enhancement adds `attributeNames` to each reported row and shows them as **attributes** in Structure. The fixed allowlist is `id`, `data-account-id`, `data-user-id`, `data-conversation-id`, `data-chat-id`, `data-message-id`, `data-testid`, `aria-selected`, `aria-current`. Only `hasAttribute` checks run; values, `dataset` and attribute enumeration are not read. An empty value or `aria-selected="false"` still reports the name as present, not a selected-state assertion. Rows without allowed attributes show `none`; names alone neither identify an account/chat nor approve access. Original walk/row/visibility/document bounds remain unchanged. Never return real attribute values, private selectors or copied site HTML.
 
+#### Unconnected identity primitive (D47)
+
+[Company observation source](packages/extension/lib/company-ai-observation.ts) exports `proveCompanyAIChatIdentity` for approved source-only synthetic work. A future reviewed caller must supply the exact selected host objects, the element constructor, a finite deadline and a side-effect-free callback reading only the bounded visible profile text. It discovers no targets and grants no authority. The popup does not invoke it, no bridge is installed and Company connection/messaging remains disabled.
+
+The primitive requires unique current host membership, direct-host alternate candidates only, shared committed-root agreement, agreeing bounded conversation sources and the sole ready account matching the supplied profile read. Own data descriptors and 64-name/ancestry/sibling, 4,096-tree and fixed-32 dependency limits fail closed. It returns only proof booleans or refusal/expiry, never identity values. This is not account-switch, lifetime, installed or operational acceptance; further caller/wiring and live work need separate approval.
+
+Run its existing-file synthetic slice with `node --test --test-name-pattern='Company AI Chat identity primitive' tests/e2e/extension-probe.test.mjs`. This test uses invented objects, not a logged-in browser. Keep the normal full source-checkpoint gate and the existing no-authority popup tests; unchanged structure diagnostics still read no framework state.
+
 #### Manual framework-attachment presence (D35)
 
 This separate person-operated Console check requires explicit bounded approval; the diagnostic popup never runs it. Under that original unexpired scope, use standard Elements selection for the selected conversation element and already-visible profile/name/avatar region, once each, without activating controls. Use the same tab's top-page Console context; if a target/context is unavailable or DevTools blocks pasting, stop that part, do not disable guards or choose substitutes/ancestors. No menu, switching, logout, installation, input, draft clearing or sending.
