@@ -790,6 +790,7 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-extension-test-"));
   const launch = () => chromium.launchPersistentContext(profile, {
     chromiumSandbox: true, executablePath: "/usr/bin/chromium", headless: true,
+    env: { ...process.env, HOME: profile },
     args: [`--disable-extensions-except=${extensionDirectory}`, `--load-extension=${extensionDirectory}`]
   });
   let context;
@@ -799,7 +800,19 @@ test("isolated Chromium loads the extension, popup, and native host", { timeout:
     if (!worker) worker = await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
     assert.match(extensionId, /^[a-p]{32}$/);
-    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+    const isolatedRelayPath = join(profile, "isolated-native-relay.mjs");
+    await writeFile(isolatedRelayPath, `
+  import { homedir } from "node:os";
+  if (homedir() !== ${JSON.stringify(profile)}) throw new Error("Native-host test HOME is not isolated");
+  await import(${JSON.stringify(nativeRelayPath)});
+  `);
+    await assert.rejects(promisify(execFile)(process.execPath, [isolatedRelayPath],
+      { env: { ...process.env, HOME: join(profile, "other-synthetic-home") } }), error => {
+      assert.equal(error.code, 1);
+      assert.match(error.stderr, /Native-host test HOME is not isolated/);
+      return true;
+    });
+    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, isolatedRelayPath, profile));
     assert.equal(await worker.evaluate(() => typeof chrome.storage.session.get), "function");
     const manifest = await worker.evaluate(() => chrome.runtime.getManifest());
     assert.match(manifest.version_name ?? "", /^\d+(?:\.\d+){0,3}\+sha256\.[0-9a-f]{64}$/);
