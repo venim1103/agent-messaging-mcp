@@ -225,6 +225,14 @@ The primitive requires unique current host membership, direct-host alternate can
 
 Run its existing-file synthetic slice with `node --test --test-name-pattern='Company AI Chat identity primitive' tests/e2e/extension-probe.test.mjs`. This test uses invented objects, not a logged-in browser. Keep the normal full source-checkpoint gate and the existing no-authority popup tests; unchanged structure diagnostics still read no framework state.
 
+#### Unconnected document guard (D48)
+
+The same module exports `proveCompanyAIChatIdentityInDocument`, taking the exact expected URL, supplied editor/timeline/profile elements, a finite deadline and the bounded side-effect-free profile callback. Before and after D47 proof, require the same visible top-level window/document/location/element realm and document root, exact URL, and connected light-DOM targets owned by that document. Check expiry after both admission passes. Return only D47's booleans or refusal/expiry; do not discover targets or extract message/draft text.
+
+This normal module wrapper requires the D47 function in its evaluation scope; it is not a standalone serialized page entry point. There is no runtime caller, popup invocation, installed bridge or connection authority. These point-in-time checks do not prove asynchronous navigation, account switching, recycled-target continuity or connection lifetime; operational wiring and live tests need separate approval.
+
+Run both focused checks with `node --test --test-name-pattern='Company AI Chat (identity primitive|document guard)' tests/e2e/extension-probe.test.mjs`. The native-DOM check launches sandboxed Chromium with disposable HOME and invented page data, no installed extension, broker or person's profile. It verifies detached/adopted targets, callback-time detachment/URL/root replacement, unchanged stable markup and zero input/activation; VM controls cover document/realm/visibility and deadline changes. Keep the full source gate and existing no-authority popup checks.
+
 #### Manual framework-attachment presence (D35)
 
 This separate person-operated Console check requires explicit bounded approval; the diagnostic popup never runs it. Under that original unexpired scope, use standard Elements selection for the selected conversation element and already-visible profile/name/avatar region, once each, without activating controls. Use the same tab's top-page Console context; if a target/context is unavailable or DevTools blocks pasting, stop that part, do not disable guards or choose substitutes/ancestors. No menu, switching, logout, installation, input, draft clearing or sending.
