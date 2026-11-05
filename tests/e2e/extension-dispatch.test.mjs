@@ -24,6 +24,20 @@ async function describePublicSendMismatch(result, expectedState, provider, outco
       jobs: await worker.evaluate(() => globalThis.browserJobTrace) }) : undefined;
 }
 
+async function waitForQueuedWrite(ready, sending) {
+  return Promise.race([ready, sending.then(result => {
+    const status = result.structuredContent;
+    assert.fail(`Public send ended before queued write: ${JSON.stringify({ state: status?.state,
+      code: status?.code, failureStage: status?.failureStage })}`);
+  })]);
+}
+
+test("queued write observation reports early send completion without waiting for the test cap", async () => {
+  await assert.rejects(waitForQueuedWrite(new Promise(() => {}), Promise.resolve({ structuredContent: {
+    state: "not_sent", code: "DISPATCH_UNAVAILABLE", failureStage: "proof" } })), /Public send ended before queued write.*proof/);
+  assert.equal(await waitForQueuedWrite(Promise.resolve(4000), new Promise(() => {})), 4000);
+});
+
 async function exerciseChatDispatch(outcome, provider = "fixture", testContext, autonomous = false) {
   const setPhase = trackTestPhase(testContext, outcome === "hidden_structured_reply" ? `${provider} hidden structured reply`
     : outcome === "expired_read" ? `${provider} read expiry`
@@ -745,10 +759,10 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
           }, { tabId: selected.tabId, afterSubmit });
           setPhase(afterSubmit ? "starting hidden queued submit send" : "starting hidden queued fill send");
           const sending = mcpClient.callTool({ name: "chat_send_message", arguments: argumentsValue });
-          const queuedWriteRemainingMs = await worker.evaluate(async () => {
+          const queuedWriteRemainingMs = await waitForQueuedWrite(worker.evaluate(async () => {
             await globalThis.suspendedWriteReady;
             return globalThis.suspendedWriteExpiresAt - Date.now();
-          });
+          }), sending);
           const lifecycle = await context.newCDPSession(fixture);
           setPhase(afterSubmit ? "hidden page frozen before queued submit execution" : "hidden page frozen before queued fill execution");
           await lifecycle.send("Page.setWebLifecycleState", { state: "frozen" });

@@ -220,3 +220,35 @@ export function proveCompanyAIChatIdentity(editor: object, timeline: object, pro
     return { status: "ok", sameCommittedRoot: true, conversationMatched: true, profileAccountMatched: true, ready: true };
   } catch { return { status: "refused" }; }
 }
+
+export function proveCompanyAIChatIdentityInDocument(input: { expectedUrl: string; editor: Element;
+  timeline: Element; profile: Element; deadline: number; readProfile: () => unknown }):
+  ReturnType<typeof proveCompanyAIChatIdentity> {
+  try {
+    const { expectedUrl, editor, timeline, profile, deadline, readProfile } = input;
+    if (!Number.isFinite(deadline)) return { status: "refused" };
+    if (Date.now() >= deadline) return { status: "expired" };
+    if (typeof expectedUrl !== "string" || expectedUrl.length > 512) return { status: "refused" };
+    const url = new URL(expectedUrl);
+    if (url.protocol !== "https:" || url.port || url.username || url.password
+      || !/^chat\.app\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.com$/.test(url.hostname)) return { status: "refused" };
+    const expectedWindow = window;
+    const expectedDocument = document;
+    const expectedLocation = location;
+    const expectedRoot = document.documentElement;
+    const ElementType = Element;
+    const current = () => window === expectedWindow && document === expectedDocument && location === expectedLocation
+      && window.document === document && window.location === location && window.top === window
+      && document.defaultView === window && document.visibilityState === "visible"
+      && location.href === expectedUrl && document.documentElement === expectedRoot && Element === ElementType
+      && !!expectedRoot && [editor, timeline, profile].every(element => element instanceof ElementType
+        && element.ownerDocument === expectedDocument && element.isConnected && expectedRoot.contains(element));
+    const admitted = current();
+    if (Date.now() >= deadline) return { status: "expired" };
+    if (!admitted) return { status: "refused" };
+    const result = proveCompanyAIChatIdentity(editor, timeline, profile, ElementType, deadline, readProfile);
+    const stillCurrent = current();
+    if (Date.now() >= deadline) return { status: "expired" };
+    return stillCurrent ? result : { status: "refused" };
+  } catch { return { status: "refused" }; }
+}

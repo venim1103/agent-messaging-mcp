@@ -21,7 +21,7 @@ import { planNativeRegistration, registerNative } from "../../packages/companion
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 import { createNativeRequestChannel, requestNativeGrantCount } from "../../packages/extension/lib/native-channel.ts";
 import { configuredDatabagOrigins, isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
-import { proveCompanyAIChatIdentity } from "../../packages/extension/lib/company-ai-observation.ts";
+import { proveCompanyAIChatIdentity, proveCompanyAIChatIdentityInDocument } from "../../packages/extension/lib/company-ai-observation.ts";
 import { extensionDirectory, nativeRelayPath, buildTestExtension, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
 const databagBuildSources = [];
@@ -272,6 +272,158 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
   }
   assert.deepEqual(inspect(forbidden), expected);
   assert.equal(reads, 0);
+
+  const guardedFixture = () => {
+    const targets = fixture();
+    const elements = [targets.editor.element, targets.timeline.element, targets.profile.element];
+    const attached = new Set(elements);
+    const syntheticDocument = { visibilityState: "visible", documentElement: { contains: element => attached.has(element) } };
+    const syntheticLocation = { href: "https://chat.app.example.com/chat/synthetic" };
+    const syntheticWindow = { location: syntheticLocation, document: syntheticDocument };
+    syntheticWindow.top = syntheticWindow; syntheticDocument.defaultView = syntheticWindow;
+    for (const element of elements) { element.ownerDocument = syntheticDocument; element.isConnected = true; }
+    let profileReads = 0;
+    let now = Date.now();
+    const options = { expectedUrl: syntheticLocation.href, editor: elements[0], timeline: elements[1], profile: elements[2],
+      deadline: now + 10000, readProfile: () => { profileReads++; return "SYNTHETIC_SECRET"; } };
+    const sandbox = { input: options, proveCompanyAIChatIdentity, window: syntheticWindow, document: syntheticDocument,
+      location: syntheticLocation, Element: SyntheticElement, URL, Date: { now: () => now } };
+    const inspectDocument = () => {
+      const result = runInNewContext(`(${proveCompanyAIChatIdentityInDocument.toString()})(input)`, sandbox);
+      assert.ok(!JSON.stringify(result).includes("SYNTHETIC_SECRET"));
+      return JSON.parse(JSON.stringify(result));
+    };
+    return { targets, attached, options, sandbox, inspectDocument, profileReads: () => profileReads, expire: () => { now = options.deadline; } };
+  };
+  const acceptedDocument = guardedFixture();
+  assert.deepEqual(acceptedDocument.inspectDocument(), expected);
+  assert.equal(acceptedDocument.profileReads(), 1);
+  const documentChanges = [
+    input => { input.options.editor.isConnected = false; },
+    input => { input.options.timeline.ownerDocument = {}; },
+    input => { input.attached.delete(input.options.profile); },
+    input => { input.sandbox.document = { ...input.sandbox.document }; },
+    input => { input.sandbox.document.documentElement = { contains: () => true }; },
+    input => { input.sandbox.document.visibilityState = "hidden"; },
+    input => { input.sandbox.document.defaultView = {}; },
+    input => { input.sandbox.window = { ...input.sandbox.window }; },
+    input => { input.sandbox.window.top = {}; },
+    input => { input.sandbox.location = { ...input.sandbox.location }; },
+    input => { input.sandbox.location.href += "?changed"; },
+    input => { input.sandbox.Element = class OtherSyntheticElement {}; }
+  ];
+  for (const change of documentChanges) {
+    const after = guardedFixture();
+    after.options.readProfile = () => { change(after); return "SYNTHETIC_SECRET"; };
+    assert.deepEqual(after.inspectDocument(), { status: "refused" });
+  }
+  for (const change of documentChanges.toSpliced(4, 1)) {
+    const before = guardedFixture(); change(before);
+    assert.deepEqual(before.inspectDocument(), { status: "refused" });
+    assert.equal(before.profileReads(), 0);
+  }
+  for (const expectedUrl of ["not a URL", "http://chat.app.example.com/", "https://other.example.com/",
+    "https://user@chat.app.example.com/", "https://chat.app.example.com:8443/", "x".repeat(513), null]) {
+    const invalid = guardedFixture(); invalid.options.expectedUrl = expectedUrl;
+    assert.deepEqual(invalid.inspectDocument(), { status: "refused" });
+    assert.equal(invalid.profileReads(), 0);
+  }
+  for (const deadline of [NaN, Infinity]) {
+    const invalid = guardedFixture(); invalid.options.deadline = deadline;
+    assert.deepEqual(invalid.inspectDocument(), { status: "refused" });
+    assert.equal(invalid.profileReads(), 0);
+  }
+  const expiredDocument = guardedFixture(); expiredDocument.expire();
+  assert.deepEqual(expiredDocument.inspectDocument(), { status: "expired" });
+  assert.equal(expiredDocument.profileReads(), 0);
+  const expiringDocument = guardedFixture();
+  expiringDocument.options.readProfile = () => { expiringDocument.expire(); return "SYNTHETIC_SECRET"; };
+  assert.deepEqual(expiringDocument.inspectDocument(), { status: "expired" });
+  for (const expireAt of [3, 6]) {
+    const expiringCheck = guardedFixture();
+    let checks = 0;
+    expiringCheck.sandbox.document.documentElement.contains = element => {
+      if (++checks === expireAt) expiringCheck.expire();
+      return expiringCheck.attached.has(element);
+    };
+    assert.deepEqual(expiringCheck.inspectDocument(), { status: "expired" });
+    assert.equal(expiringCheck.profileReads(), expireAt === 3 ? 0 : 1);
+  }
+});
+
+test("Company AI Chat document guard checks native DOM without connection or input", { timeout: 15000 }, async () => {
+  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-company-document-"));
+  let browser;
+  try {
+    browser = await chromium.launch({ chromiumSandbox: true, executablePath: "/usr/bin/chromium", headless: true,
+      env: { ...process.env, HOME: profile } });
+    const page = await browser.newPage();
+    await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
+      body: '<!doctype html><main><textarea>Synthetic retained draft</textarea><div role="log">Synthetic private message</div><span>synthetic@example.test</span><button>Send</button></main>' }));
+    await page.goto("https://chat.app.example.com/chat/synthetic");
+    await page.addScriptTag({ content: `const proveCompanyAIChatIdentity = ${proveCompanyAIChatIdentity.toString()};
+      const proveCompanyAIChatIdentityInDocument = ${proveCompanyAIChatIdentityInDocument.toString()};` });
+    const results = await page.evaluate(() => {
+      const editor = document.querySelector("textarea");
+      const timeline = document.querySelector('[role="log"]');
+      const profile = document.querySelector("span");
+      let inputs = 0; let activations = 0; let profileReads = 0;
+      editor.addEventListener("input", () => inputs++);
+      document.querySelector("button").addEventListener("click", () => activations++);
+      const root = { return: null, child: null, stateNode: null };
+      root.stateNode = { current: root };
+      const source = { return: root, child: null, sibling: null, memoizedProps: { conversationId: "synthetic-chat" },
+        dependencies: { firstContext: { memoizedValue: { accounts: [{ homeAccountId: "synthetic-home",
+          localAccountId: "synthetic-local", username: "synthetic@example.test" }], inProgress: "none" }, next: null } } };
+      root.child = source;
+      let previous;
+      for (const element of [editor, timeline, profile]) {
+        const fiber = { return: source, child: null, sibling: null, stateNode: element, memoizedProps: {}, dependencies: null };
+        Object.defineProperty(element, "__reactFiber$synthetic", { value: fiber });
+        if (previous) previous.sibling = fiber; else source.child = fiber;
+        previous = fiber;
+      }
+      const readProfile = () => { profileReads++; return profile.textContent; };
+      const options = { expectedUrl: location.href, editor, timeline, profile, deadline: Date.now() + 10000, readProfile };
+      const before = document.documentElement.outerHTML;
+      const accepted = proveCompanyAIChatIdentityInDocument(options);
+      const unchanged = document.documentElement.outerHTML === before;
+      editor.remove();
+      const unguardedDetached = proveCompanyAIChatIdentity(editor, timeline, profile, Element, options.deadline, readProfile);
+      profileReads = 0;
+      const detached = proveCompanyAIChatIdentityInDocument(options);
+      const detachedReads = profileReads;
+      document.querySelector("main").append(editor);
+      const otherDocument = document.implementation.createHTMLDocument("Synthetic other document");
+      otherDocument.adoptNode(profile);
+      const adopted = proveCompanyAIChatIdentityInDocument(options);
+      const adoptedReads = profileReads;
+      document.querySelector("main").append(profile);
+      const detachedDuringProof = proveCompanyAIChatIdentityInDocument({ ...options,
+        readProfile: () => { editor.remove(); return profile.textContent; } });
+      document.querySelector("main").append(editor);
+      const changedUrl = proveCompanyAIChatIdentityInDocument({ ...options,
+        readProfile: () => { history.replaceState(null, "", "?synthetic-change"); return profile.textContent; } });
+      history.replaceState(null, "", options.expectedUrl);
+      const replacedRoot = proveCompanyAIChatIdentityInDocument({ ...options,
+        readProfile: () => { document.documentElement.replaceWith(document.documentElement.cloneNode(true)); return profile.textContent; } });
+      return { accepted, unchanged, unguardedDetached, detached, detachedReads, adopted, adoptedReads,
+        detachedDuringProof, changedUrl, replacedRoot, inputs, activations };
+    });
+    assert.equal(results.accepted.status, "ok");
+    assert.equal(results.unguardedDetached.status, "ok");
+    for (const key of ["detached", "adopted", "detachedDuringProof", "changedUrl", "replacedRoot"]) {
+      assert.deepEqual(results[key], { status: "refused" });
+    }
+    assert.equal(results.unchanged, true);
+    assert.equal(results.detachedReads, 0);
+    assert.equal(results.adoptedReads, 0);
+    assert.equal(results.inputs, 0);
+    assert.equal(results.activations, 0);
+  } finally {
+    await browser?.close();
+    await rm(profile, { recursive: true, force: true });
+  }
 });
 
 test("Company AI Chat popup exposes document-bound diagnostics without host requests or chat authority", { timeout: 15000 }, async testContext => {
