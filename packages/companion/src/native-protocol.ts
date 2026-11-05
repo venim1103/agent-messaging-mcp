@@ -1,7 +1,7 @@
 import * as z from "zod/v4";
 import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureFillResultSchema,
   fixturePreflightResultSchema, geminiFillResultSchema, geminiDispatchCheckResultSchema,
-  chatTargetSchema, chatJobSchema, chatJobCompletionSchema, databagTargetSchema } from "./message-operations.js";
+  chatTargetSchema, chatJobSchema, chatJobCompletionSchema, companyAIChatTargetSchema, databagTargetSchema } from "./message-operations.js";
 import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
   MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES, isGeminiTarget } from "./pending-connections.js";
 
@@ -248,7 +248,8 @@ function isValidGeminiTarget(target: z.infer<typeof geminiTargetSchema>): boolea
   }
 }
 
-const chatAgentTargetSchema = z.union([fixtureTargetSchema, geminiTargetSchema.refine(isValidGeminiTarget), databagTargetSchema]);
+const chatAgentTargetSchema = z.union([fixtureTargetSchema, geminiTargetSchema.refine(isValidGeminiTarget),
+  databagTargetSchema, companyAIChatTargetSchema]);
 const chatJobTargetSchema = chatTargetSchema.refine(target => target.provider !== "gemini"
   || (isValidGeminiTarget(target) && new URL(target.url).pathname === `/app/${target.conversationId}`));
 const chatJobRequestSchema = z.discriminatedUnion("kind", [

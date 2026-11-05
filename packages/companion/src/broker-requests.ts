@@ -2,7 +2,7 @@ import * as z from "zod/v4";
 import type { BrokerRole } from "./broker-roles.js";
 import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureFillResultSchema,
   fixturePreflightResultSchema, geminiFillResultSchema, geminiDispatchCheckResultSchema, MAX_PREPARED_MESSAGE_BYTES,
-  chatJobSchema, chatJobCompletionSchema, databagTargetSchema, PreparedMessageOperations } from "./message-operations.js";
+  chatJobSchema, chatJobCompletionSchema, companyAIChatTargetSchema, databagTargetSchema, PreparedMessageOperations } from "./message-operations.js";
 import { chatGapPayloadSchema, chatReadListPayloadSchema, chatSnapshotPayloadSchema, PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
   isGeminiTarget, PendingConnectionRequests, type ApprovedTarget, type FixtureMessage, type GeminiRenderedMessage }
@@ -24,7 +24,7 @@ const geminiTarget = z.strictObject({
   url: z.string().min(1).max(512),
   tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
 });
-const approvedTarget = z.union([fixtureTarget, geminiTarget, databagTargetSchema]);
+const approvedTarget = z.union([fixtureTarget, geminiTarget, databagTargetSchema, companyAIChatTargetSchema]);
 const fixtureMessage = z.strictObject({
   id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
   direction: z.enum(["incoming", "outgoing"]), text: z.string().max(16_000),
@@ -302,7 +302,8 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   if (request.kind === "mark_chat_observation_gap") {
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
     const target: ApprovedTarget = request.payload.target;
-    const count = isGeminiTarget(target) ? requests.markGeminiObservationGap(target, now) : requests.markStableObservationGap(target, now);
+    const count = target.provider === "company_ai" ? requests.disconnectChat(target, now)
+      : isGeminiTarget(target) ? requests.markGeminiObservationGap(target, now) : requests.markStableObservationGap(target, now);
     return { ...response, kind: "chat_gap_marked" as const, payload: { count } };
   }
   if (request.kind === "list_fixture_read_challenges") {

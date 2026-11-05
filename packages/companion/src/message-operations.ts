@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
-import { isDatabagOrigin, isGeminiTarget, targetProvider, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget, type StableDomTarget,
+import { isCompanyAIChatOrigin, isCompanyAIChatTargetUrl, isDatabagOrigin, isGeminiTarget, isStableDomTarget, targetProvider, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget, type StableDomTarget,
   type FixtureSnapshot, type GeminiSnapshot } from "./pending-connections.js";
 
 export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
@@ -76,6 +76,11 @@ export const databagTargetSchema = z.strictObject({ provider: z.literal("databag
   url: z.string().min(1).max(512), tabId: z.number().int().safe().positive(),
   documentId: z.string().regex(/^[!-~]{1,128}$/)
 }).refine(target => target.url === `${target.origin}/#/session`);
+export const companyAIChatTargetSchema = z.strictObject({ provider: z.literal("company_ai"),
+  origin: z.custom<`https://${string}`>(isCompanyAIChatOrigin), conversationId: z.string().regex(/^company_ai_[a-f0-9]{64}$/),
+  url: z.string().min(1).max(512), tabId: z.number().int().safe().positive(),
+  documentId: z.string().regex(/^[!-~]{1,128}$/)
+}).refine(target => isCompanyAIChatTargetUrl(target.url, target.origin));
 export const chatTargetSchema = z.discriminatedUnion("provider", [
   z.strictObject({ provider: z.literal("fixture"), origin: z.literal("http://127.0.0.1:8787"),
     conversationId: z.literal("fixture-alpha"), tabId: z.number().int().safe().positive(),
@@ -662,6 +667,7 @@ export class PreparedMessageOperations {
     expectedGeneration: number, target: ApprovedTarget, label: TargetLabel, text: string,
     idempotencyKey: string, now: number, autonomousExpiresAt?: number): PreparedMessage<TargetLabel> {
     if (expectedGeneration !== 1) throw new Error("GENERATION_MISMATCH");
+    if (!isGeminiTarget(target) && !isStableDomTarget(target)) throw new Error("CONNECTION_NOT_FOUND");
     if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > MAX_PREPARED_MESSAGE_BYTES || !text.trim()) {
       throw new Error("INVALID_MESSAGE_TEXT");
     }
@@ -2123,6 +2129,7 @@ export class PreparedMessageOperations {
       const parsed = geminiDispatchResultSchema.safeParse(observation);
       return parsed.success && this.completeGeminiDispatch(target, operationId, jobId, parsed.data, now);
     }
+    if (!isStableDomTarget(target)) return false;
     const parsed = fixtureDispatchResultSchema.safeParse(observation);
     return parsed.success && this.completeFixtureDispatch(target, operationId, jobId, parsed.data, now);
   }

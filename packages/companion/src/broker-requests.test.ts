@@ -58,17 +58,20 @@ for (const provider of ["fixture", "databag", "gemini"] as const) {
   });
 }
 
-test("Databag neutral approval is relay-only and refuses broadened targets", () => {
+for (const provider of ["databag", "company_ai"] as const) test(`${provider} neutral approval is relay-only and refuses broadened targets`, () => {
   const requests = new PendingConnectionRequests();
-  const owner = Symbol("Databag owner");
+  const owner = Symbol("approved owner");
   const agent = requests.registerAgent(owner);
   const envelope = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
     connectionGeneration: 0, deadlineMs: 6000 };
-  const target = { provider: "databag", origin: "https://databag.example", url: "https://databag.example/#/session",
-    conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
+  const target: ApprovedTarget = provider === "databag"
+    ? { provider, origin: "https://databag.example", url: "https://databag.example/#/session",
+      conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" }
+    : { provider, origin: "https://chat.app.example.com", url: "https://chat.app.example.com/chat/synthetic",
+      conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
   const message = { ...envelope, kind: "approve_chat_agent", payload: { target, agentId: agent.agentId } };
   assert.deepEqual(handleBrokerRequest(message, "facade", owner, requests, 1000).payload, { code: "PERMISSION_DENIED" });
-  for (const changes of [{ url: `${target.url}?other` }, { origin: "https://*.example" },
+  for (const changes of [{ url: `${target.url}${provider === "databag" ? "?other" : "?code=synthetic"}` }, { origin: "https://*.example" },
     { origin: "http://databag.example" }, { conversationId: "fixture-alpha" }, { selector: "textarea" }]) {
     assert.throws(() => handleBrokerRequest({ ...message, payload: { ...message.payload, target: { ...target, ...changes } } },
       "relay", Symbol("relay"), requests, 1000));
@@ -77,6 +80,14 @@ test("Databag neutral approval is relay-only and refuses broadened targets", () 
   const roster = handleBrokerRequest({ ...envelope, kind: "list_chat_agents", payload: { target } }, "relay", Symbol("relay"), requests, 1000);
   assert.equal(roster.kind, "chat_agents");
   assert.deepEqual(roster.payload, { agents: [{ ...agent, connectionCount: 1, autonomous: true }] });
+  if (provider === "company_ai") {
+    const grant = requests.approveAgent(agent.agentId, target, 1000)!;
+    const gap = { ...envelope, kind: "mark_chat_observation_gap", payload: { target } };
+    assert.deepEqual(handleBrokerRequest(gap, "facade", owner, requests, 1001).payload, { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(gap, "relay", Symbol("relay"), requests, 1001).payload, { count: 1 });
+    assert.deepEqual(requests.listChatAgents(target, 1001), [{ ...agent, connectionCount: 0 }]);
+    assert.equal(requests.get(owner, grant.requestId, 1001)?.state, "stale");
+  }
   requests.disconnect(owner);
 });
 

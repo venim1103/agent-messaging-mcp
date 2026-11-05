@@ -74,6 +74,45 @@ test("Gemini explicit UI completion is fresh, incoming and untruncated without a
   assert.equal(observation.observe(snapshot(6000), 6000)?.generationState, "complete");
 });
 
+test("Company autonomous admission pins an explicit target without entering legacy grant paths", () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("Company owner");
+  const stranger = Symbol("other owner");
+  const agent = requests.registerAgent(owner);
+  const selected = { provider: "company_ai", origin: "https://chat.app.example.com",
+    url: "https://chat.app.example.com/chat/synthetic", conversationId: `company_ai_${"a".repeat(64)}`,
+    tabId: 3, documentId: "synthetic-document" };
+  const target = selected as unknown as ApprovedTarget;
+  const grant = requests.approveAgent(agent.agentId, target, 1000);
+  assert.ok(grant);
+  assert.deepEqual(grant.capabilities, ["read", "send"]);
+  assert.deepEqual(requests.getAutonomousTarget(owner, grant.connectionId, 1000), target);
+  assert.equal(requests.getAutonomousTarget(stranger, grant.connectionId, 1000), null);
+  assert.equal(requests.getApprovedTarget(owner, grant.connectionId, 1000), null);
+  assert.equal(requests.getGeminiTarget(owner, grant.connectionId, 1000), null);
+  assert.equal(requests.getStableTarget(owner, grant.connectionId, 1000), null);
+  assert.equal(requests.requestFreshStableRead(owner, grant.connectionId, 1000), null);
+  for (const changes of [
+    { provider: "gemini" }, { provider: "databag" }, { provider: undefined },
+    { origin: "http://chat.app.example.com" }, { origin: "https://chat.app.example.com/" },
+    { origin: "https://other.example" }, { origin: "https://user@chat.app.example.com" },
+    { url: "https://other.example/chat/synthetic" }, { url: `${selected.url}?code=synthetic` },
+    { url: `${selected.url}#access_token=synthetic` }, { url: `${selected.url}?STATE=synthetic` },
+    { conversationId: `company_ai_${"A".repeat(64)}` }, { documentId: "" }, { tabId: 0 }
+  ]) {
+    assert.equal(requests.approveAgent(agent.agentId, { ...selected, ...changes } as unknown as ApprovedTarget, 1000), null);
+  }
+  const pending = requests.create(owner, 1000);
+  assert.equal(requests.approve(pending.requestId, target as Parameters<PendingConnectionRequests["approve"]>[1], 1000), null);
+  assert.equal(requests.approveGemini(pending.requestId, target as Parameters<PendingConnectionRequests["approveGemini"]>[1], 1000), null);
+  assert.equal(requests.disconnectChat({ ...target, documentId: "wrong-document" }, 1000), 0);
+  assert.equal(requests.beginChatReload(target, 1001), 1);
+  assert.equal(requests.getAutonomousTarget(owner, grant.connectionId, 1001), null);
+  assert.equal(requests.rebindChat(target, { ...target, documentId: "new-document" }, 1002), 0);
+  assert.equal(requests.disconnectChat(target, 1002), 0);
+  requests.disconnect(owner);
+});
+
 test("Databag autonomous admission pins exact HTTPS session identity and rejects legacy grants", () => {
   const requests = new PendingConnectionRequests();
   const owner = Symbol("Databag owner");

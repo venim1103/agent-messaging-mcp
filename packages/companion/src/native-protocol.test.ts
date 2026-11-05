@@ -138,7 +138,9 @@ test("native agent roster and removal accept only bounded exact-target envelopes
     { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
       documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat?hl=en" },
     { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 3,
-      documentId: "synthetic-document", url: "https://databag.example/#/session" }
+      documentId: "synthetic-document", url: "https://databag.example/#/session" },
+    { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3,
+      documentId: "synthetic-document", url: "https://chat.app.example.com/chat/synthetic" }
   ]) {
     for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat", "approve_chat_agent", "begin_chat_reload", "rebind_chat",
       "list_unconfirmed_dispatches", "resolve_unconfirmed_dispatch"]) {
@@ -147,6 +149,14 @@ test("native agent roster and removal accept only bounded exact-target envelopes
         ...(kind === "rebind_chat" ? { previous: target } : {}) };
       const message = { ...request, kind, payload };
       assert.deepEqual(parseNativeChatAgentRequest(message, now), message);
+      if (target.provider === "company_ai") {
+        for (const suffix of ["?code=synthetic", "#access_token=synthetic", "?STATE=synthetic"]) {
+          assert.throws(() => parseNativeChatAgentRequest({ ...message, payload: { ...payload,
+            target: { ...target, url: `${target.url}${suffix}` } } }, now), /Invalid native chat agent request/);
+        }
+        assert.throws(() => parseNativeChatAgentRequest({ ...message, payload: { ...payload,
+          target: { ...target, approved: true } } }, now), /Invalid native chat agent request/);
+      }
       for (const invalid of [
         { ...message, deadlineMs: now }, { ...message, deadlineMs: now + 30_001 },
         { ...message, connectionGeneration: 1 },

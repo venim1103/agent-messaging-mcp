@@ -16,6 +16,33 @@ import { AutonomousCommitFailure, MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MES
   from "./message-operations.js";
 import { isGeminiTarget, PendingConnectionRequests, type FixtureSnapshot, type FixtureTarget, type GeminiTarget } from "./pending-connections.js";
 
+test("Company admission does not enable legacy message operations or allocate durable intent", () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  const ledger = new PreparedMessageOperations(requests, database);
+  const owner = Symbol("Company prepared owner");
+  const target = { provider: "company_ai", origin: "https://chat.app.example.com",
+    conversationId: `company_ai_${"a".repeat(64)}`, url: "https://chat.app.example.com/chat/synthetic",
+    tabId: 3, documentId: "synthetic-document" } as const;
+  try {
+    const connection = requests.approveAgent(requests.registerAgent(owner).agentId, target)!;
+    assert.ok(connection);
+    assert.throws(() => ledger.prepareAutonomous(owner, connection.connectionId,
+      "Synthetic Company draft", randomUUID(), Date.now() + 4000), /CONNECTION_NOT_FOUND/);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM prepared_message_operations").get()!.count, 0);
+    assert.equal(ledger.completeChatSubmitJob(target, randomUUID(), randomUUID(),
+      { ok: true, editor: "textarea", activated: true }), false);
+    for (const provider of ["fixture", "gemini", "databag"] as const) {
+      for (const phase of ["fill", "proof", "submit", "settle"] as const) {
+        assert.deepEqual(ledger.listChatJobs(phase, provider), []);
+      }
+    }
+  } finally {
+    requests.disconnect(owner);
+    database.close();
+  }
+});
+
 test("Databag autonomous preparation and composer reservations remain exact, owned and shared", async () => {
   const requests = new PendingConnectionRequests();
   const database = new DatabaseSync(":memory:");

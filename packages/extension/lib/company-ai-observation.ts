@@ -294,8 +294,8 @@ export function proveCompanyAIChatIdentityInDocument(input: CompanyDocumentInput
   return readCompanyAIChatIdentityInDocument(input).proof;
 }
 
-export function createCompanyAIChatIdentityCheck(input: CompanyDocumentInput):
-  { status: "ok"; check: () => CompanyIdentityProof; dispose: () => void } | { status: "refused" | "expired" } {
+function captureCompanyAIChatIdentity(input: CompanyDocumentInput):
+  { status: "ok"; check: (deadline?: number) => CompanyIdentityProof; dispose: () => void } | { status: "refused" | "expired" } {
   try {
     let request: CompanyDocumentInput | undefined = { ...input };
     let captured: CompanyDocumentRead["snapshot"];
@@ -329,11 +329,11 @@ export function createCompanyAIChatIdentityCheck(input: CompanyDocumentInput):
     } catch { return end(); }
     if (terminal || !request) return end();
     if (Date.now() >= request.deadline) return end({ status: "expired" });
-    return { status: "ok", dispose: () => { end(); }, check: () => {
+    return { status: "ok", dispose: () => { end(); }, check: (deadline?: number) => {
       if (terminal) return terminal;
       if (checking || !request) return end();
       checking = true;
-      const fresh = readCompanyAIChatIdentityInDocument(request);
+      const fresh = readCompanyAIChatIdentityInDocument(deadline === undefined ? request : { ...request, deadline });
       checking = false;
       if (terminal) return terminal;
       const current = fresh.snapshot;
@@ -349,4 +349,39 @@ export function createCompanyAIChatIdentityCheck(input: CompanyDocumentInput):
       return fresh.proof;
     } };
   } catch { return { status: "refused" }; }
+}
+
+export function createCompanyAIChatIdentityCheck(input: CompanyDocumentInput):
+  { status: "ok"; check: () => CompanyIdentityProof; dispose: () => void } | { status: "refused" | "expired" } {
+  const captured = captureCompanyAIChatIdentity(input);
+  return captured.status === "ok" ? { status: "ok", check: () => captured.check(), dispose: captured.dispose } : captured;
+}
+
+export function createCompanyAIChatIdentityBinding(input: CompanyDocumentInput):
+  { status: "ok"; conversationId: string; check: (deadline: number) => CompanyIdentityProof; dispose: () => void }
+  | { status: "refused" | "expired" } {
+  let captured: ReturnType<typeof captureCompanyAIChatIdentity> | undefined;
+  try {
+    const request = { ...input };
+    const now = Date.now();
+    if (!Number.isFinite(request.deadline) || request.deadline > now + 4000) return { status: "refused" };
+    if (request.deadline <= now) return { status: "expired" };
+    const url = new URL(request.expectedUrl);
+    if ([...url.searchParams.keys(), ...new URLSearchParams(url.hash.slice(1)).keys()]
+      .some(name => /^(code|access_token|id_token|client_info|state|session_state)$/i.test(name))) return { status: "refused" };
+    const binding = captureCompanyAIChatIdentity(request);
+    captured = binding;
+    if (binding.status !== "ok") return binding;
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    const proof = binding.check();
+    if (proof.status !== "ok") { binding.dispose(); return proof; }
+    const conversationId = `company_ai_${Array.from(bytes, value => value.toString(16).padStart(2, "0")).join("")}`;
+    return { status: "ok", conversationId, dispose: binding.dispose, check: (deadline: number) => {
+      const now = Date.now();
+      return binding.check(!Number.isFinite(deadline) || deadline > now + 4000 ? NaN : deadline);
+    } };
+  } catch {
+    if (captured?.status === "ok") captured.dispose();
+    return { status: "refused" };
+  }
 }

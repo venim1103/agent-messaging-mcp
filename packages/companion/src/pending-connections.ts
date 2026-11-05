@@ -50,15 +50,27 @@ export type DatabagTarget = Readonly<{
   tabId: number;
   documentId: string;
 }>;
-export type ApprovedTarget = FixtureTarget | GeminiTarget | DatabagTarget;
+export type CompanyAIChatTarget = Readonly<{
+  provider: "company_ai";
+  origin: `https://${string}`;
+  conversationId: string;
+  url: string;
+  tabId: number;
+  documentId: string;
+}>;
+export type ApprovedTarget = FixtureTarget | GeminiTarget | DatabagTarget | CompanyAIChatTarget;
 export type StableDomTarget = FixtureTarget | DatabagTarget;
 
-export function targetProvider(target: ApprovedTarget): "fixture" | "gemini" | "databag" {
+export function targetProvider(target: ApprovedTarget): "fixture" | "gemini" | "databag" | "company_ai" {
   return target.provider ?? (target.origin === "http://127.0.0.1:8787" ? "fixture" : "gemini");
 }
 
 export function isGeminiTarget(target: ApprovedTarget): target is GeminiTarget {
   return targetProvider(target) === "gemini" && target.origin === "https://gemini.google.com";
+}
+
+export function isStableDomTarget(target: ApprovedTarget): target is StableDomTarget {
+  return targetProvider(target) === "fixture" || target.provider === "databag";
 }
 
 export function isDatabagOrigin(value: unknown): value is `https://${string}` {
@@ -68,6 +80,26 @@ export function isDatabagOrigin(value: unknown): value is `https://${string}` {
     return origin.protocol === "https:" && origin.origin === value && origin.href === `${value}/`
       && !origin.username && !origin.password && !origin.hostname.includes("*")
       && origin.origin !== "https://gemini.google.com";
+  } catch { return false; }
+}
+
+export function isCompanyAIChatOrigin(value: unknown): value is `https://${string}` {
+  if (typeof value !== "string" || value.length > 256) return false;
+  try {
+    const origin = new URL(value);
+    return origin.protocol === "https:" && origin.origin === value && !origin.port
+      && !origin.username && !origin.password
+      && /^chat\.app\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.com$/.test(origin.hostname);
+  } catch { return false; }
+}
+
+export function isCompanyAIChatTargetUrl(value: unknown, origin: unknown): value is string {
+  if (!isCompanyAIChatOrigin(origin) || typeof value !== "string" || value.length > 512) return false;
+  try {
+    const url = new URL(value);
+    return url.origin === origin && url.href === value && !url.username && !url.password
+      && ![...url.searchParams.keys(), ...new URLSearchParams(url.hash.slice(1)).keys()]
+        .some(name => /^(code|access_token|id_token|client_info|state|session_state)$/i.test(name));
   } catch { return false; }
 }
 
@@ -303,6 +335,7 @@ export class PendingConnectionRequests {
 
   beginChatReload(target: ApprovedTarget, now = Date.now()): number {
     if (!this.validTarget(target)) return 0;
+    if (target.provider === "company_ai") return this.disconnectChat(target, now);
     let preserved = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
@@ -328,6 +361,7 @@ export class PendingConnectionRequests {
   }
 
   rebindChat(previous: ApprovedTarget, target: ApprovedTarget, now = Date.now()): number {
+    if (previous.provider === "company_ai" || target.provider === "company_ai") return 0;
     if (!this.validTarget(previous) || !this.validTarget(target) || previous.documentId === target.documentId
       || !this.matchesTarget(previous, { ...target, documentId: previous.documentId })) return 0;
     let rebound = 0;
@@ -433,7 +467,7 @@ export class PendingConnectionRequests {
 
   getStableTarget(owner: symbol, connectionId: string, now = Date.now()): StableDomTarget | null {
     const target = this.liveGrant(owner, connectionId, now)?.target;
-    return target && !isGeminiTarget(target) ? target : null;
+    return target && isStableDomTarget(target) ? target : null;
   }
 
   getGeminiTarget(owner: symbol, connectionId: string, now = Date.now()): GeminiTarget | null {
@@ -616,7 +650,7 @@ export class PendingConnectionRequests {
 
   requestFreshStableRead(owner: symbol, connectionId: string, now = Date.now(), deadlineMs = now + FIXTURE_READ_TIMEOUT_MS) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant || isGeminiTarget(grant.target) || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
+    if (!grant || !isStableDomTarget(grant.target) || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     if (this.fixtureReads.size >= MAX_PENDING_FIXTURE_READS) return "busy" as const;
     const challengeId = randomUUID();
     const expiresAt = Math.min(now + FIXTURE_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt ?? Infinity);
@@ -797,6 +831,10 @@ export class PendingConnectionRequests {
   }
 
   private validTarget(target: ApprovedTarget): boolean {
+    if (target.provider === "company_ai") {
+      return isCompanyAIChatTargetUrl(target.url, target.origin) && /^company_ai_[a-f0-9]{64}$/.test(target.conversationId)
+        && Number.isSafeInteger(target.tabId) && target.tabId > 0 && /^[!-~]{1,128}$/.test(target.documentId);
+    }
     if (target.provider === "databag") {
       return isDatabagOrigin(target.origin) && /^databag_[a-f0-9]{64}$/.test(target.conversationId)
         && Number.isSafeInteger(target.tabId) && target.tabId > 0
