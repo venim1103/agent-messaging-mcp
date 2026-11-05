@@ -695,6 +695,9 @@ The review raised D1-D9. The user's target experience (section 2) and answers on
 
 The system's value should be **controlled, inspectable chat operations with explicit limitations**, rather than a claim that every website can be automated identically.
 
+- **D53 Company connection implementation: decided, requested (2026-11-05).** The person clarifies that connection means implementing Company Chat AI's actual connection system, not creating another Databag connection. Company currently exposes Inspect only. Wire the existing trusted popup/native/broker/MCP connection pipeline to reviewed Company identity and supported operations, reusing D47-D51 proof fields/bounds and D1/D2/D5 authority; do not create a copied provider command family or a misleading connected state without a verified adapter.
+    Stop Databag reconnection requests/waits. Source implementation is requested; fresh live inspection/test approval, exact-page readiness and trusted Company popup approval remain separate. Explicit Company-origin configuration must not grant browser access automatically; authentication callbacks are not connection targets. No provider APIs, credentials, site patch, security relaxation or assumed live approval. D52 remains unapproved until a genuinely new explicit answer; source checkpoints still require focused checks and the exact full gate.
+
 ## Sources
 
 Primary documentation reviewed for this proposal; facts about a live site's compatibility still require the planned experiments.

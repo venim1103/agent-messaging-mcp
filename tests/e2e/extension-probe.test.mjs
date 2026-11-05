@@ -21,7 +21,8 @@ import { connectBroker } from "../../packages/companion/dist/broker-client.js";
 import { planNativeRegistration, registerNative } from "../../packages/companion/dist/native-registration.js";
 import { reserveBrowserSubmitAttempt, reserveFixtureSubmitAttempt } from "../../packages/extension/lib/fixture-observation.ts";
 import { createNativeRequestChannel, requestNativeGrantCount } from "../../packages/extension/lib/native-channel.ts";
-import { configuredDatabagOrigins, isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
+import { configuredCompanyAIChatOrigins, configuredDatabagOrigins, isEligibleCompanyAIChatUrl,
+  isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
 import { proveCompanyAIChatIdentity, proveCompanyAIChatIdentityInDocument } from "../../packages/extension/lib/company-ai-observation.ts";
 import { extensionDirectory, nativeRelayPath, buildTestExtension, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
@@ -128,6 +129,18 @@ test("Databag popup connection controls follow the compiled origin without alter
 });
 
 test("Company AI Chat recognition uses a hostname pattern, not browser authority", () => {
+  assert.deepEqual(configuredCompanyAIChatOrigins(undefined), []);
+  assert.deepEqual(configuredCompanyAIChatOrigins(""), []);
+  assert.deepEqual(configuredCompanyAIChatOrigins("https://chat.app.example.com"), ["https://chat.app.example.com"]);
+  assert.equal(isEligibleCompanyAIChatUrl("https://chat.app.example.com/"), false);
+  assert.equal(isEligibleCompanyAIChatUrl("https://chat.app.example.com/", ["https://chat.app.example.com"]), true);
+  for (const value of ["https://chat.app.example.com/", "https://other.example", "https://chat.app.example.com/path"]) {
+    assert.throws(() => configuredCompanyAIChatOrigins(value), /canonical HTTPS origin/);
+  }
+  for (const suffix of ["#code=synthetic", "?access_token=synthetic", "#id_token=synthetic",
+    "#client_info=synthetic&state=synthetic", "?session_state=synthetic"]) {
+    assert.equal(isEligibleCompanyAIChatUrl(`https://chat.app.example.com/${suffix}`, ["https://chat.app.example.com"]), false);
+  }
   for (const url of ["https://chat.app.example.com", "https://chat.app.example.com/",
     "https://chat.app.example.com/chat/synthetic", "https://chat.app.example-team.com/#/chat/synthetic"]) {
     assert.equal(isRecognizedCompanyAIChatUrl(url), true);

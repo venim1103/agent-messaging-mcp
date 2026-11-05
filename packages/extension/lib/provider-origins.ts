@@ -38,3 +38,23 @@ export function isRecognizedCompanyAIChatUrl(value: unknown): value is string {
     return false;
   }
 }
+
+export function configuredCompanyAIChatOrigins(value: string | undefined): readonly string[] {
+  if (value === undefined || value === "") return Object.freeze([]);
+  if (!isRecognizedCompanyAIChatUrl(value) || new URL(value).origin !== value) {
+    throw new Error("Company AI Chat requires one canonical HTTPS origin without a path or credentials");
+  }
+  return Object.freeze([value]);
+}
+
+declare const __COMPANY_AI_ORIGINS__: readonly string[];
+export const companyAIChatOrigins: readonly string[] = Object.freeze(
+  typeof __COMPANY_AI_ORIGINS__ === "undefined" ? [] : [...__COMPANY_AI_ORIGINS__]);
+
+export function isEligibleCompanyAIChatUrl(value: unknown, origins = companyAIChatOrigins): value is string {
+  if (!isRecognizedCompanyAIChatUrl(value) || origins.length !== 1 || new URL(value).origin !== origins[0]) return false;
+  const url = new URL(value);
+  const authenticationFields = /^(code|access_token|id_token|client_info|state|session_state)$/i;
+  return ![...url.searchParams.keys(), ...new URLSearchParams(url.hash.slice(1)).keys()]
+    .some(name => authenticationFields.test(name));
+}
