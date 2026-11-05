@@ -3187,6 +3187,8 @@ for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup c
       });
     await assertSharedPopupControls(popup, false);
     assert.equal(await popup.locator("#unconfirmed-panel").isHidden(), true);
+    assert.equal(await popup.locator("#connection-consent").textContent(),
+      "Approval lets that agent read this chat until the connection ends. Sending is unavailable. Experimental: site changes may interrupt access.");
     assert.equal(await page.evaluate(() => globalThis.syntheticCompanyMessageReads), 0);
     await popup.evaluate(() => {
       const request = chrome.permissions.request.bind(chrome.permissions);

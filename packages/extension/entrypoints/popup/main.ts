@@ -40,6 +40,7 @@ const fixtureOrigin = "http://127.0.0.1:8787";
 const geminiOrigin = "https://gemini.google.com";
 const inspectButton = document.querySelector<HTMLButtonElement>("#inspect");
 const agentPanel = document.querySelector<HTMLElement>("#agent-panel");
+const connectionConsent = document.querySelector<HTMLElement>("#connection-consent");
 const agentCount = document.querySelector<HTMLElement>("#agent-count");
 const agentList = document.querySelector<HTMLOListElement>("#agent-list");
 const refreshAgentsButton = document.querySelector<HTMLButtonElement>("#refresh-agents");
@@ -387,7 +388,8 @@ async function refreshChatAgents(): Promise<void> {
       identity.className = "agent-instance";
       identity.textContent = agent.agentId;
       const state = document.createElement("p");
-      state.textContent = agent.autonomous ? "Autonomous access" : agent.connectionCount ? "Supervised connection" : "Not connected";
+      state.textContent = agent.autonomous ? selected.adapter.provider === "company_ai" ? "Read-only access" : "Autonomous access"
+        : agent.connectionCount ? "Supervised connection" : "Not connected";
       row.append(label, identity, state);
       if (!agent.autonomous) {
         const connect = document.createElement("button");
@@ -517,6 +519,9 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   sendReviewButton.hidden = !supervised;
   pendingTarget.textContent = "Read-only target: selected chat";
   agentPanel.hidden = !selectedChat?.canConnect;
+  if (connectionConsent && selectedChat?.adapter.provider === "company_ai") {
+    connectionConsent.textContent = "Approval lets that agent read this chat until the connection ends. Sending is unavailable. Experimental: site changes may interrupt access.";
+  }
   unconfirmedPanel.hidden = agentPanel.hidden || selectedChat?.adapter.provider === "company_ai";
   if (!unconfirmedPanel.hidden) unconfirmedStatus.textContent = "Not checked";
   if (!agentPanel.hidden) void refreshChatAgents();
