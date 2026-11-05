@@ -2,11 +2,13 @@
 
 Connect an AI assistant to a browser chat you explicitly select and approve, using your existing browser login.
 
-You choose the conversation and approve each assistant once. That assistant can then read and send in that chat until its connection ends. Your login stays in your browser: no provider API keys or exported credentials are needed.
+You choose the conversation and approve each assistant once. That assistant can then use the supported read or send operations until its connection ends. Your login stays in your browser: no provider API keys or exported credentials are needed.
 
 Reply waiting uses page completion indicators where available and quiet-period estimates otherwise.
 
 Gemini is supported. Stock Databag is not currently supported; see [DEVELOPMENT.md](DEVELOPMENT.md#databag-compatibility). Integrations must work without modifying or redeploying the website.
+
+Company AI Chat has an experimental read-only integration. It requires exact-site configuration and popup approval; sender direction and reply completion remain unknown. See [setup and limits](DEVELOPMENT.md#read-only-connection-d53).
 
 > **Experimental prototype.** Not ready for everyday use or personal conversations. Browser and site support is limited; background-tab reliability on real sites is unverified. Messages observed on the page are not proof of delivery.
 

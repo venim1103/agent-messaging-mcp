@@ -11,7 +11,7 @@ const extensionDirectory = process.env.BROWSER_CHAT_TEST_EXTENSION_DIRECTORY
 
 const nativeRelayPath = fileURLToPath(new URL("../../packages/companion/dist/native-relay.js", import.meta.url));
 
-async function buildTestExtension(origin, signal) {
+async function buildTestExtension(origin, signal, companyAIOrigin = "") {
   const sourceRoot = fileURLToPath(new URL("../../packages/extension/", import.meta.url));
   const source = await mkdtemp(join(tmpdir(), "agent-messaging-extension-build-"));
   try {
@@ -20,7 +20,7 @@ async function buildTestExtension(origin, signal) {
     await symlink(fileURLToPath(new URL("../../node_modules", import.meta.url)), join(source, "node_modules"), "dir");
     const cli = fileURLToPath(new URL("../../node_modules/wxt/bin/wxt.mjs", import.meta.url));
     await promisify(execFile)(process.execPath, [cli, "build"], { cwd: source, signal,
-      env: { ...process.env, BROWSER_CHAT_DATABAG_ORIGIN: origin } });
+      env: { ...process.env, BROWSER_CHAT_DATABAG_ORIGIN: origin, BROWSER_CHAT_COMPANY_AI_ORIGIN: companyAIOrigin } });
     return { source, directory: join(source, ".output/chrome-mv3") };
   } catch (error) {
     await rm(source, { recursive: true, force: true });

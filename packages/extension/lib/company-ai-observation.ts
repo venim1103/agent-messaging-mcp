@@ -72,6 +72,72 @@ export function inspectCompanyAIChatStructure(input: { expectedUrl: string }) {
     structure, structureOmitted: structureOmitted || limited || pending.length > 0 };
 }
 
+export function locateCompanyAIChatReadTargets(input: { expectedUrl: string; deadline: number }) {
+  try {
+    const { expectedUrl, deadline } = input;
+    const now = Date.now();
+    if (!Number.isFinite(deadline) || deadline <= now || deadline > now + 4000
+      || typeof expectedUrl !== "string" || expectedUrl.length > 512
+      || window.top !== window || document.visibilityState !== "visible" || location.href !== expectedUrl) return null;
+    const url = new URL(expectedUrl);
+    if (url.protocol !== "https:" || url.port || url.username || url.password
+      || !/^chat\.app\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.com$/.test(url.hostname)
+      || [...url.searchParams.keys(), ...new URLSearchParams(url.hash.slice(1)).keys()]
+        .some(name => /^(code|access_token|id_token|client_info|state|session_state)$/i.test(name))) return null;
+    if (!document.body) return null;
+    const visible: Element[] = [];
+    const pending: { element: Element; depth: number }[] = [{ element: document.body, depth: 0 }];
+    let visited = 0;
+    while (pending.length) {
+      if (Date.now() >= deadline || ++visited > 4096) return null;
+      const { element, depth } = pending.pop()!;
+      if (depth && element.nextElementSibling) pending.push({ element: element.nextElementSibling, depth });
+      if (["script", "style", "template", "noscript", "iframe"].includes(element.localName)) continue;
+      const style = getComputedStyle(element);
+      if (element.hasAttribute("hidden") || element.hasAttribute("inert") || element.getAttribute("aria-hidden") === "true"
+        || style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0) continue;
+      if (element.getClientRects().length) visible.push(element);
+      if (element.firstElementChild) {
+        if (depth >= 64) return null;
+        pending.push({ element: element.firstElementChild, depth: depth + 1 });
+      }
+    }
+    const editors = visible.filter(element => element.localName === "textarea");
+    if (editors.length !== 1 || !(editors[0] instanceof HTMLTextAreaElement)
+      || editors[0].disabled || editors[0].readOnly) return null;
+    const editor = editors[0];
+    const profileSpans = visible.filter(element => element.localName === "span" && element.closest("nav")
+      && !element.closest("a,button,[role=button]"));
+    const profiles = profileSpans.filter(element => !profileSpans.some(child => child !== element && element.contains(child))
+      && element.childNodes.length <= 32 && [...element.childNodes].some(child => child.nodeType === Node.TEXT_NODE));
+    if (profiles.length !== 1) return null;
+    const profile = profiles[0]!;
+    const textContainers = visible.filter(element => ["p", "pre", "blockquote", "table", "ol", "ul"].includes(element.localName));
+    const groups = new Map<Element, Element[]>();
+    for (const element of visible) {
+      if (Date.now() >= deadline) return null;
+      const parent = element.parentElement;
+      if (element.localName !== "div" || !element.hasAttribute("data-testid") || !parent
+        || element.closest("nav") || element.contains(editor) || element.contains(profile)
+        || !textContainers.some(text => element.contains(text))) continue;
+      const rows = groups.get(parent) ?? [];
+      rows.push(element);
+      groups.set(parent, rows);
+    }
+    for (let ancestor = editor.parentElement; ancestor && ancestor !== document.body; ancestor = ancestor.parentElement) {
+      if (Date.now() >= deadline) return null;
+      const candidates = [...groups].filter(([timeline, rows]) => ancestor.contains(timeline)
+        && !timeline.contains(editor) && !timeline.contains(profile) && rows.length <= 32);
+      if (candidates.length > 1) return null;
+      if (candidates.length === 1) {
+        const [timeline, rows] = candidates[0]!;
+        return { editor, timeline, profile, rows };
+      }
+    }
+    return null;
+  } catch { return null; }
+}
+
 type CompanyIdentityProof = { status: "ok"; sameCommittedRoot: true; conversationMatched: true;
   profileAccountMatched: true; ready: true } | { status: "refused" | "expired" };
 type CompanyIdentitySnapshot = { rootState: object; account: object; conversationId: string;
@@ -384,4 +450,116 @@ export function createCompanyAIChatIdentityBinding(input: CompanyDocumentInput):
     if (captured?.status === "ok") captured.dispose();
     return { status: "refused" };
   }
+}
+
+export type CompanyRenderedSnapshot = { messages: { direction: "unknown"; text: string; truncated?: true }[]; omittedBefore: true };
+
+export function createCompanyAIChatReadBinding(input: { expectedUrl: string; deadline: number }):
+  { status: "ok"; conversationId: string; check: (deadline: number) => boolean;
+    capture: (deadline: number) => CompanyRenderedSnapshot | null; dispose: () => void } | { status: "refused" | "expired" } {
+  let disposeOnError: (() => void) | undefined;
+  try {
+    const expectedUrl = input.expectedUrl;
+    let targets = locateCompanyAIChatReadTargets(input) ?? undefined;
+    if (!targets) return { status: input.deadline <= Date.now() ? "expired" : "refused" };
+    const readProfile = () => {
+      if (!targets || targets.profile.childNodes.length > 32) return null;
+      let text = "";
+      for (const node of targets.profile.childNodes) {
+        if (node.nodeType !== Node.TEXT_NODE) continue;
+        const value = node.nodeValue;
+        if (typeof value !== "string" || value.length > 256 - text.length) return null;
+        text += value;
+      }
+      return text;
+    };
+    const identity = createCompanyAIChatIdentityBinding({ ...input, editor: targets.editor,
+      timeline: targets.timeline, profile: targets.profile, readProfile });
+    if (identity.status !== "ok") return identity;
+    let listenerWindow: Window | undefined = window;
+    let listenerDocument: Document | undefined = document;
+    const dispose = () => {
+      identity.dispose(); targets = undefined;
+      try { listenerWindow?.removeEventListener("pagehide", dispose); } catch {}
+      try { listenerDocument?.removeEventListener("visibilitychange", visibilityChanged); } catch {}
+      listenerWindow = undefined; listenerDocument = undefined;
+    };
+    const visibilityChanged = () => {
+      try { if (listenerDocument?.visibilityState !== "visible") dispose(); } catch { dispose(); }
+    };
+    disposeOnError = dispose;
+    listenerWindow.addEventListener("pagehide", dispose);
+    listenerDocument.addEventListener("visibilitychange", visibilityChanged);
+    const check = (deadline: number) => {
+      const current = targets && locateCompanyAIChatReadTargets({ expectedUrl, deadline });
+      if (!current || !targets || current.editor !== targets.editor || current.timeline !== targets.timeline
+        || current.profile !== targets.profile || identity.check(deadline).status !== "ok") {
+        dispose(); return false;
+      }
+      return true;
+    };
+    return { status: "ok", conversationId: identity.conversationId, check, dispose, capture: (deadline: number) => {
+      try {
+        if (!check(deadline) || !targets) return null;
+        const current = locateCompanyAIChatReadTargets({ expectedUrl, deadline });
+        if (!current) return null;
+        const messages: CompanyRenderedSnapshot["messages"] = [];
+        const encoder = new TextEncoder();
+        let bytesLeft = 96 * 1024 - encoder.encode(JSON.stringify({ messages: [], omittedBefore: true })).length;
+        let visited = 0;
+        for (const row of [...current.rows].reverse()) {
+          if (!bytesLeft) break;
+          let text = "";
+          let truncated = false;
+          const pending: { node: Node; depth: number }[] = [{ node: row, depth: 0 }];
+          while (pending.length) {
+            if (Date.now() >= deadline || ++visited > 4096) return null;
+            const { node, depth } = pending.pop()!;
+            if (depth && node.nextSibling) pending.push({ node: node.nextSibling, depth });
+            if (node.nodeType === Node.TEXT_NODE) {
+              const value = node.nodeValue;
+              if (typeof value !== "string") return null;
+              if (value.length > 16000 - text.length) truncated = true;
+              text += value.slice(0, 16000 - text.length);
+              if (truncated) break;
+            } else if (node instanceof Element) {
+              if (["button", "input", "textarea", "select", "script", "style", "template", "noscript", "iframe", "svg", "img"].includes(node.localName)
+                || node.getAttribute("role") === "button" || node.hasAttribute("hidden") || node.hasAttribute("inert")
+                || node.getAttribute("aria-hidden") === "true") continue;
+              const style = getComputedStyle(node);
+              if (style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0) continue;
+              if (["p", "pre", "blockquote", "div", "li", "tr", "br", "h1", "h2", "h3", "h4", "h5", "h6"].includes(node.localName)
+                && text && !text.endsWith("\n")) {
+                if (text.length >= 16000) { truncated = true; break; }
+                text += "\n";
+              }
+              if (node.firstChild) {
+                if (depth >= 64) return null;
+                pending.push({ node: node.firstChild, depth: depth + 1 });
+              }
+            }
+          }
+          text = text.trim();
+          const cost = (value: string) => encoder.encode(JSON.stringify({ direction: "unknown", text: value,
+            ...(truncated ? { truncated: true } : {}) })).length + (messages.length ? 1 : 0);
+          if (cost(text) > bytesLeft) {
+            truncated = true;
+            let lower = 0;
+            let upper = text.length;
+            while (lower < upper) {
+              const middle = Math.ceil((lower + upper) / 2);
+              if (cost(text.slice(0, middle)) <= bytesLeft) lower = middle;
+              else upper = middle - 1;
+            }
+            text = text.slice(0, lower);
+            truncated = true;
+          }
+          if (!text) continue;
+          bytesLeft -= cost(text);
+          messages.unshift({ direction: "unknown", text, ...(truncated ? { truncated: true as const } : {}) });
+        }
+        return check(deadline) && messages.length ? { messages, omittedBefore: true } : null;
+      } catch { return null; }
+    } };
+  } catch { disposeOnError?.(); return { status: "refused" }; }
 }

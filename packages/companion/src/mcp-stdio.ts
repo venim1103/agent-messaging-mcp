@@ -190,7 +190,7 @@ server.registerTool("chat_wait_for_connection", {
 });
 
 server.registerTool("chat_read_messages", {
-  description: "Read a fresh rendered-only snapshot from an owned, toolbar-approved fixture, Gemini or configured Databag chat after an exact-document browser challenge. Results contain the selected chat's supported visible message text, not complete history. Databag requires its reviewed DOM contract and supports plain text only.",
+  description: "Read a fresh rendered-only snapshot from an owned, toolbar-approved fixture, Gemini, configured Databag or Company AI chat after an exact-document browser challenge. Results contain the selected chat's supported visible message text, not complete history. Company AI is read-only with unknown sender direction and completion. Databag supports plain text only.",
   inputSchema: z.object({ connectionId: z.uuid(), limit: z.number().int().min(1).max(32).optional() }).strict(),
   annotations: { readOnlyHint: true }
 }, async ({ connectionId, limit }) => {

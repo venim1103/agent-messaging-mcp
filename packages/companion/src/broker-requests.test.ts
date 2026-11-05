@@ -5,10 +5,10 @@ import { handleBrokerRequest } from "./broker-requests.js";
 import { FIXTURE_REVIEW_APPROVAL_TTL_MS, PreparedMessageOperations } from "./message-operations.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
 import { GEMINI_READ_TIMEOUT_MS, MAX_PENDING_REQUESTS, PendingConnectionRequests, PENDING_REQUEST_TTL_MS,
-  isGeminiTarget, type ApprovedTarget }
+  isGeminiTarget, isRenderedChatTarget, type ApprovedTarget }
   from "./pending-connections.js";
 
-for (const provider of ["fixture", "databag", "gemini"] as const) {
+for (const provider of ["fixture", "databag", "gemini", "company_ai"] as const) {
   test(`${provider} compact event view is owned, role-restricted and explicitly supported`, () => {
     const requests = new PendingConnectionRequests();
     const owner = Symbol("compact owner");
@@ -19,15 +19,19 @@ for (const provider of ["fixture", "databag", "gemini"] as const) {
       : provider === "gemini"
       ? { origin: "https://gemini.google.com", url: "https://gemini.google.com/app/synthetic-chat",
         conversationId: "synthetic-chat", tabId: 3, documentId: "synthetic-document" }
-      : { provider: "databag", origin: "https://databag.example", url: "https://databag.example/#/session",
-        conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
+      : provider === "databag"
+      ? { provider, origin: "https://databag.example", url: "https://databag.example/#/session",
+        conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" }
+      : { provider, origin: "https://chat.app.example.com", url: "https://chat.app.example.com/chat/synthetic",
+        conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
     const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target, 1000)!;
     const before = [{ id: "old", direction: "incoming" as const, text: "Historical instruction" }];
-    const publish = (rows: typeof before) => isGeminiTarget(target)
-      ? requests.publishGeminiSnapshot(target, rows.map(({ direction, text }) => ({ direction, text })), 1001)
+    const publish = (rows: typeof before) => isRenderedChatTarget(target)
+      ? requests.publishGeminiSnapshot(target, rows.map(({ direction, text }) => ({
+        direction: provider === "company_ai" ? "unknown" : direction, text })), 1001)
       : requests.publishStableSnapshot(target, rows, 1001);
     publish(before);
-    const baseline = isGeminiTarget(target) ? requests.getGeminiSnapshot(owner, grant.connectionId, 1001)
+    const baseline = isRenderedChatTarget(target) ? requests.getGeminiSnapshot(owner, grant.connectionId, 1001)
       : requests.getStableSnapshot(owner, grant.connectionId, 1001);
     assert.ok(baseline && baseline !== "not_ready");
     publish([...before, { id: "new", direction: "incoming", text: "New instruction" }]);
@@ -35,7 +39,7 @@ for (const provider of ["fixture", "databag", "gemini"] as const) {
       connectionId: grant.connectionId, cursor: baseline.cursor, limit: 1, view: "incoming_changes"
     } };
     const compact = handleBrokerRequest(message, "facade", owner, requests, 1001);
-    if (provider === "gemini") assert.deepEqual(compact.payload, { code: "VIEW_UNSUPPORTED" });
+    if (provider === "gemini" || provider === "company_ai") assert.deepEqual(compact.payload, { code: "VIEW_UNSUPPORTED" });
     else {
       assert.equal(compact.kind, "fixture_events");
       assert.equal(JSON.stringify(compact.payload).includes("Historical instruction"), false);
@@ -50,9 +54,12 @@ for (const provider of ["fixture", "databag", "gemini"] as const) {
       const { view: ignored, ...payload } = message.payload;
       const ordinary = handleBrokerRequest({ ...message, payload: { ...payload, ...(view ? { view } : {}) } },
         "facade", owner, requests, 1001);
-      assert.equal(ordinary.kind, provider === "gemini" ? "gemini_events" : "fixture_events");
+      assert.equal(ordinary.kind, isRenderedChatTarget(target) ? "gemini_events" : "fixture_events");
       assert.equal(JSON.stringify(ordinary.payload).includes("Historical instruction"), true);
     }
+    const reading = { ...envelope, kind: "read_approved_snapshot", payload: { connectionId: grant.connectionId } };
+    assert.equal(handleBrokerRequest(reading, "facade", owner, requests, 1001).kind,
+      isRenderedChatTarget(target) ? "gemini_read_authorized" : "fixture_read_authorized");
     requests.disconnect(owner);
     assert.deepEqual(handleBrokerRequest(message, "facade", owner, requests, 1001).payload, { code: "CONNECTION_NOT_FOUND" });
   });
@@ -91,24 +98,31 @@ for (const provider of ["databag", "company_ai"] as const) test(`${provider} neu
   requests.disconnect(owner);
 });
 
-test("Databag neutral observations preserve read ownership, challenges and legacy refusal", async () => {
+for (const provider of ["databag", "company_ai"] as const) test(`${provider} neutral observations preserve read ownership, challenges and legacy refusal`, async () => {
   const requests = new PendingConnectionRequests();
-  const owner = Symbol("Databag reader");
-  const target = { provider: "databag", origin: "https://databag.example", url: "https://databag.example/#/session",
-    conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" } as const;
+  const owner = Symbol("neutral reader");
+  const target = provider === "databag"
+    ? { provider, origin: "https://databag.example", url: "https://databag.example/#/session",
+      conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" } as const
+    : { provider, origin: "https://chat.app.example.com", url: "https://chat.app.example.com/chat/synthetic",
+      conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" } as const;
   const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target, 1000)!;
   const envelope = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
     connectionGeneration: 0, deadlineMs: 6000 };
   const reading = { ...envelope, kind: "read_approved_snapshot", payload: { connectionId: grant.connectionId } };
-  assert.equal(handleBrokerRequest(reading, "facade", owner, requests, 1000).kind, "fixture_read_authorized");
+  assert.equal(handleBrokerRequest(reading, "facade", owner, requests, 1000).kind,
+    provider === "databag" ? "fixture_read_authorized" : "gemini_read_authorized");
   assert.deepEqual(handleBrokerRequest(reading, "facade", Symbol("other owner"), requests, 1000).payload, { code: "CONNECTION_NOT_FOUND" });
   assert.deepEqual(handleBrokerRequest({ ...reading, kind: "read_fixture_snapshot" }, "facade", owner, requests, 1000).payload,
     { code: "CONNECTION_NOT_FOUND" });
-  const read = requests.requestFreshStableRead(owner, grant.connectionId, 1000, 1050);
+  const read = provider === "databag" ? requests.requestFreshStableRead(owner, grant.connectionId, 1000, 1050)
+    : requests.requestFreshGeminiRead(owner, grant.connectionId, 1000, 1050);
   assert.ok(read && read !== "busy");
-  const list = { ...envelope, kind: "list_chat_read_challenges", payload: { provider: "databag" } };
+  const list = { ...envelope, kind: "list_chat_read_challenges", payload: { provider } };
+  const messages = provider === "databag" ? [{ id: "synthetic-row", direction: "incoming", text: "Synthetic reply" }]
+    : [{ direction: "unknown", text: "Synthetic reply" }];
   const publish = { ...envelope, kind: "publish_chat_snapshot", payload: { target,
-    messages: [{ id: "synthetic-row", direction: "incoming", text: "Synthetic reply" }], challengeId: read.challengeId } };
+    messages, challengeId: read.challengeId } };
   const gap = { ...envelope, kind: "mark_chat_observation_gap", payload: { target } };
   for (const message of [list, publish, gap]) {
     assert.deepEqual(handleBrokerRequest(message, "facade", owner, requests, 1001).payload, { code: "PERMISSION_DENIED" });
@@ -122,11 +136,13 @@ test("Databag neutral observations preserve read ownership, challenges and legac
   assert.deepEqual(handleBrokerRequest(publish, "relay", Symbol("relay"), requests, 1001).payload, { count: 1 });
   const snapshot = await read.result;
   assert.ok(snapshot && snapshot !== "not_ready");
-  assert.deepEqual(snapshot.messages, publish.payload.messages);
+  assert.deepEqual(snapshot.messages, provider === "databag" ? messages
+    : messages.map(message => ({ ...message, identityQuality: "uncertain", generationState: "unknown" })));
   const events = { ...envelope, kind: "read_approved_events", payload: { connectionId: grant.connectionId, cursor: snapshot.cursor } };
-  assert.equal(handleBrokerRequest(events, "facade", owner, requests, 1001).kind, "fixture_events");
+  assert.equal(handleBrokerRequest(events, "facade", owner, requests, 1001).kind,
+    provider === "databag" ? "fixture_events" : "gemini_events");
   assert.deepEqual(handleBrokerRequest(gap, "relay", Symbol("relay"), requests, 1002).payload, { count: 1 });
-  assert.equal(requests.getStableSnapshot(owner, grant.connectionId, 1002), "not_ready");
+  assert.equal(requests.getStableSnapshot(owner, grant.connectionId, 1002), provider === "databag" ? "not_ready" : null);
   requests.disconnect(owner);
 });
 

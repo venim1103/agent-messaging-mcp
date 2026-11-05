@@ -85,7 +85,7 @@ test("Company autonomous admission pins an explicit target without entering lega
   const target = selected as unknown as ApprovedTarget;
   const grant = requests.approveAgent(agent.agentId, target, 1000);
   assert.ok(grant);
-  assert.deepEqual(grant.capabilities, ["read", "send"]);
+  assert.deepEqual(grant.capabilities, ["read"]);
   assert.deepEqual(requests.getAutonomousTarget(owner, grant.connectionId, 1000), target);
   assert.equal(requests.getAutonomousTarget(stranger, grant.connectionId, 1000), null);
   assert.equal(requests.getApprovedTarget(owner, grant.connectionId, 1000), null);
@@ -111,6 +111,51 @@ test("Company autonomous admission pins an explicit target without entering lega
   assert.equal(requests.rebindChat(target, { ...target, documentId: "new-document" }, 1002), 0);
   assert.equal(requests.disconnectChat(target, 1002), 0);
   requests.disconnect(owner);
+});
+
+test("Company rendered reads are owner-bound and never enter stable-row getters", async () => {
+  const requests = new PendingConnectionRequests();
+  const owner = Symbol("Company read owner");
+  const stranger = Symbol("foreign read owner");
+  const now = Date.now();
+  const target = { provider: "company_ai", origin: "https://chat.app.example.com",
+    url: "https://chat.app.example.com/chat/synthetic", conversationId: `company_ai_${"b".repeat(64)}`,
+    tabId: 4, documentId: "synthetic-read-document" } as const;
+  try {
+    const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target, now);
+    assert.ok(grant);
+    assert.equal(requests.getStableSnapshot(owner, grant.connectionId, now), null);
+    assert.equal(requests.readStableEvents(owner, grant.connectionId, { epoch: "synthetic", sequence: 0 }, 1, now), null);
+    assert.equal(requests.readStableIncomingChanges(owner, grant.connectionId, { epoch: "synthetic", sequence: 0 }, 1, now), null);
+    assert.equal(requests.getGeminiTarget(owner, grant.connectionId, now), null);
+    assert.equal(requests.requestFreshGeminiRead(stranger, grant.connectionId, now), null);
+    const challenge = requests.requestFreshGeminiRead(owner, grant.connectionId, now);
+    assert.ok(challenge && challenge !== "busy");
+    assert.deepEqual(requests.listGeminiReadChallenges(now), []);
+    assert.deepEqual(requests.listChatReadChallenges("company_ai", now), [{ challengeId: challenge.challengeId,
+      target, expiresAt: now + GEMINI_READ_TIMEOUT_MS }]);
+    const messages = [{ direction: "unknown" as const, text: "Synthetic Company reply" }];
+    assert.throws(() => requests.publishGeminiSnapshot(target, [{ ...messages[0]!, direction: "incoming" }], now));
+    assert.throws(() => requests.publishGeminiSnapshot(target, [{ ...messages[0]!, generationState: "complete" }], now));
+    assert.equal(requests.publishGeminiSnapshot({ ...target, documentId: "foreign-document" }, messages,
+      now + 1, challenge.challengeId), 0);
+    assert.equal(requests.publishGeminiSnapshot(target, messages, now + 1, challenge.challengeId), 1);
+    const snapshot = await challenge.result;
+    assert.ok(snapshot && snapshot !== "not_ready");
+    assert.equal(snapshot.coverage, "rendered_only");
+    assert.deepEqual(snapshot.messages, [{ ...messages[0], identityQuality: "uncertain", generationState: "unknown" }]);
+    assert.equal(new ReplyObservation().observe(snapshot, now + 1), null);
+    assert.equal(requests.getGeminiSnapshot(stranger, grant.connectionId, now + 1), null);
+    assert.equal(requests.getGeminiSnapshot(owner, grant.connectionId, now + MAX_GEMINI_SNAPSHOT_AGE_MS + 2), "not_ready");
+    assert.deepEqual(requests.listChatReadChallenges("company_ai", now + 1), []);
+    const pending = requests.requestFreshGeminiRead(owner, grant.connectionId, now + 2);
+    assert.ok(pending && pending !== "busy");
+    requests.disconnectChat(target, now + 3);
+    assert.equal(await pending.result, null);
+    assert.deepEqual(requests.listChatReadChallenges("company_ai", now + 3), []);
+  } finally {
+    requests.disconnect(owner);
+  }
 });
 
 test("Databag autonomous admission pins exact HTTPS session identity and rejects legacy grants", () => {

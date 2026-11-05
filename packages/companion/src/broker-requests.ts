@@ -5,7 +5,7 @@ import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureF
   chatJobSchema, chatJobCompletionSchema, companyAIChatTargetSchema, databagTargetSchema, PreparedMessageOperations } from "./message-operations.js";
 import { chatGapPayloadSchema, chatReadListPayloadSchema, chatSnapshotPayloadSchema, PROTOCOL_VERSION } from "./native-protocol.js";
 import { MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES,
-  isGeminiTarget, PendingConnectionRequests, type ApprovedTarget, type FixtureMessage, type GeminiRenderedMessage }
+  isGeminiTarget, isRenderedChatTarget, PendingConnectionRequests, type ApprovedTarget, type FixtureMessage, type GeminiRenderedMessage }
   from "./pending-connections.js";
 
 const envelope = {
@@ -294,7 +294,7 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
     const { messages, challengeId, omittedBefore } = request.payload;
     const target: ApprovedTarget = request.payload.target;
-    const count = isGeminiTarget(target)
+    const count = isRenderedChatTarget(target)
       ? requests.publishGeminiSnapshot(target, messages as ReadonlyArray<GeminiRenderedMessage>, now, challengeId, omittedBefore)
       : requests.publishStableSnapshot(target, messages as ReadonlyArray<FixtureMessage>, now, challengeId, omittedBefore);
     return { ...response, kind: "chat_snapshot_published" as const, payload: { count } };
@@ -737,7 +737,7 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       ?? requests.getGeminiTarget(owner, request.payload.connectionId, now)
       ?? requests.getAutonomousTarget(owner, request.payload.connectionId, now);
     return target
-      ? { ...response, kind: isGeminiTarget(target) ? "gemini_read_authorized" as const : "fixture_read_authorized" as const,
+      ? { ...response, kind: isRenderedChatTarget(target) ? "gemini_read_authorized" as const : "fixture_read_authorized" as const,
         payload: { connectionId: request.payload.connectionId, limit: request.payload.limit ?? 32 } }
       : { ...response, kind: "error" as const, payload: { code: "CONNECTION_NOT_FOUND" } };
   }
@@ -753,16 +753,16 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     const target = requests.getApprovedTarget(owner, request.payload.connectionId, now)
       ?? requests.getGeminiTarget(owner, request.payload.connectionId, now)
       ?? requests.getAutonomousTarget(owner, request.payload.connectionId, now);
-    if (target && isGeminiTarget(target) && request.payload.view === "incoming_changes") {
+    if (target && isRenderedChatTarget(target) && request.payload.view === "incoming_changes") {
       return { ...response, kind: "error" as const, payload: { code: "VIEW_UNSUPPORTED" } };
     }
-    const events = !target ? null : isGeminiTarget(target)
+    const events = !target ? null : isRenderedChatTarget(target)
       ? requests.readGeminiEvents(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now)
       : request.payload.view === "incoming_changes"
       ? requests.readStableIncomingChanges(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now)
       : requests.readStableEvents(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now);
     return events && events !== "not_ready"
-      ? { ...response, kind: target && isGeminiTarget(target) ? "gemini_events" as const : "fixture_events" as const, payload: events }
+      ? { ...response, kind: target && isRenderedChatTarget(target) ? "gemini_events" as const : "fixture_events" as const, payload: events }
       : { ...response, kind: "error" as const,
         payload: { code: events === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } };
   }

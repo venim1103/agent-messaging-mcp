@@ -49,11 +49,14 @@ test("native neutral observations validate provider, exact target, row model and
     { origin: "https://gemini.google.com", conversationId: "synthetic-chat", tabId: 3,
       documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" },
     { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 3,
-      documentId: "synthetic-document", url: "https://databag.example/#/session" }
+      documentId: "synthetic-document", url: "https://databag.example/#/session" },
+    { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3,
+      documentId: "synthetic-document", url: "https://chat.app.example.com/chat/synthetic" }
   ];
-  for (const [index, provider] of ["fixture", "gemini", "databag"].entries()) {
+  for (const [index, provider] of ["fixture", "gemini", "databag", "company_ai"].entries()) {
     const target = targets[index]!;
-    const messages = provider === "gemini" ? [{ direction: "incoming", text: "Synthetic reply" }]
+    const rendered = provider === "gemini" || provider === "company_ai";
+    const messages = rendered ? [{ direction: provider === "company_ai" ? "unknown" : "incoming", text: "Synthetic reply" }]
       : [{ id: "synthetic-row", direction: "incoming", text: "Synthetic reply" }];
     const publication = { ...request, kind: "publish_chat_snapshot", payload: { target, messages } };
     const gap = { ...request, kind: "mark_chat_observation_gap", payload: { target } };
@@ -68,13 +71,26 @@ test("native neutral observations validate provider, exact target, row model and
       messages: Array.from({ length: 33 }, () => messages[0]) } }, now));
     assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
       messages: [{ ...messages[0], text: "x".repeat(16_001) }] } }, now));
-    if (provider !== "gemini") assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+    if (!rendered) assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
       messages: [messages[0], messages[0]] } }, now));
-    if (provider === "databag") {
+    if (provider === "databag" || provider === "company_ai") {
       assert.throws(() => parseNativeFixtureSnapshot({ ...publication, kind: "publish_fixture_snapshot" }, now));
       assert.throws(() => parseNativeGeminiSnapshot({ ...publication, kind: "publish_gemini_snapshot" }, now));
       assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
-        target: { ...target, url: `${target.url}?other` } } }, now));
+        target: { ...target, url: `${target.url}${provider === "databag" ? "?other" : "?code=synthetic"}` } } }, now));
+    }
+    if (provider === "company_ai") {
+      for (const direction of ["incoming", "outgoing"]) assert.throws(() => parseNativeChatObservationRequest({ ...publication,
+        payload: { ...publication.payload, messages: [{ ...messages[0], direction }] } }, now));
+      assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+        messages: [{ ...messages[0], generationState: "complete" }] } }, now));
+      assert.deepEqual(parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+        messages: [messages[0], messages[0]] } }, now).payload, { target, messages: [messages[0], messages[0]] });
+      assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+        messages: [{ ...messages[0], id: "invented-stable-id" }] } }, now));
+    } else {
+      assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+        messages: [{ ...messages[0], direction: "unknown" }] } }, now));
     }
   }
 });

@@ -2,7 +2,7 @@ import { browser } from "wxt/browser";
 import { captureGeminiSnapshot, inspectGeminiMathLayout, inspectGeminiPromptControls, inspectGeminiSubmitControls, isEligibleGeminiUrl } from "../../lib/gemini-observation";
 import { inspectDatabagStructure } from "../../lib/databag-observation";
 import { inspectCompanyAIChatStructure } from "../../lib/company-ai-observation";
-import { isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl } from "../../lib/provider-origins";
+import { isEligibleCompanyAIChatUrl, isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl } from "../../lib/provider-origins";
 
 type FixturePreview = {
   conversationId: string;
@@ -517,7 +517,7 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   sendReviewButton.hidden = !supervised;
   pendingTarget.textContent = "Read-only target: selected chat";
   agentPanel.hidden = !selectedChat?.canConnect;
-  unconfirmedPanel.hidden = agentPanel.hidden;
+  unconfirmedPanel.hidden = agentPanel.hidden || selectedChat?.adapter.provider === "company_ai";
   if (!unconfirmedPanel.hidden) unconfirmedStatus.textContent = "Not checked";
   if (!agentPanel.hidden) void refreshChatAgents();
 });
@@ -552,7 +552,7 @@ const chatAdapters = [
       approve: "approve_gemini", reviews: geminiReviewCommands } },
   { provider: "databag", matches: isEligibleDatabagUrl, canConnect: isEligibleDatabagUrl,
     inspect: inspectDatabagTab, inspectionAccess: "optionalHost", supervised: null },
-  { provider: "company_ai", matches: isRecognizedCompanyAIChatUrl, canConnect: () => false,
+  { provider: "company_ai", matches: isRecognizedCompanyAIChatUrl, canConnect: isEligibleCompanyAIChatUrl,
     inspect: inspectCompanyAIChatTab, inspectionAccess: "activeTab", supervised: null }
 ] as const;
 

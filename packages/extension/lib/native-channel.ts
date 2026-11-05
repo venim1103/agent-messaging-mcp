@@ -20,7 +20,7 @@ export type GrantCountRequest = { kind: "revoke_fixture"; payload: {
   } } } | { kind: "mark_gemini_observation_gap"; payload: { target: {
     origin: "https://gemini.google.com"; conversationId: string; url: string; tabId: number; documentId: string
   } } } | { kind: "mark_chat_observation_gap"; payload: { target: {
-    provider: "databag"; origin: string; conversationId: string; url: string; tabId: number; documentId: string
+    provider: "databag" | "company_ai"; origin: string; conversationId: string; url: string; tabId: number; documentId: string
   } } };
 
 export async function requestNativeGrantCount(request: ReturnType<typeof createNativeRequestChannel>,

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import * as z from "zod/v4";
 import { MAX_BROKER_PENDING_REQUESTS, type BrokerRole } from "./broker-roles.js";
 import { answerWaitAnchorSchema, autonomousFailureReasonSchema, autonomousFailureStageSchema, fixtureDispatchStatusSchema, resolvedDispatchStatusSchema, fixtureDraftFillStateSchema, fixtureFillStatusSchema, fixturePreflightStatusSchema,
-  geminiFillStatusSchema, chatJobSchema, databagTargetSchema, type ChatJob, type ChatTarget, type ChatJobObservation,
+  geminiFillStatusSchema, chatJobSchema, companyAIChatTargetSchema, databagTargetSchema, type ChatJob, type ChatTarget, type ChatJobObservation,
   MAX_PENDING_FIXTURE_FILLS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
   MAX_PENDING_FIXTURE_DISPATCHES,
   MAX_PREPARED_MESSAGE_BYTES, MAX_PREPARED_REVIEWS, type FixtureDispatchCheckResult,
@@ -15,7 +15,7 @@ import { answerWaitAnchorSchema, autonomousFailureReasonSchema, autonomousFailur
 import type { ApprovedTarget, FixtureMessage, FixtureTarget, GeminiRenderedMessage, GeminiTarget } from "./pending-connections.js";
 import { encodeNativeFrame, NativeFrameDecoder } from "./native-framing.js";
 import { PROTOCOL_VERSION } from "./native-protocol.js";
-import { isDatabagOrigin, MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_EVENTS_PER_READ,
+import { isCompanyAIChatOrigin, isDatabagOrigin, MAX_FIXTURE_EVENTS_PER_READ, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_EVENTS_PER_READ,
   MAX_GEMINI_SNAPSHOT_MESSAGES,
   MAX_AUTONOMOUS_CONNECTIONS, MAX_CONNECTION_WAIT_MS, MAX_CONNECTED_AGENTS,
   MAX_PENDING_FIXTURE_READS, MAX_PENDING_GEMINI_READS, MAX_PENDING_REQUESTS }
@@ -44,7 +44,7 @@ const geminiTarget = z.strictObject({
   tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/)
 });
 const geminiMessage = z.strictObject({
-  direction: z.enum(["incoming", "outgoing"]), text: z.string().min(1).max(16_000),
+  direction: z.enum(["incoming", "outgoing", "unknown"]), text: z.string().min(1).max(16_000),
   truncated: z.literal(true).optional(),
   identityQuality: z.literal("uncertain"), generationState: z.enum(["unknown", "streaming", "complete"])
 }).refine(message => message.direction === "incoming" || message.generationState === "unknown");
@@ -60,9 +60,13 @@ const autonomousConnection = z.strictObject({ requestId: z.uuid(), state: z.lite
   generation: z.literal(1), origin: z.union([z.enum(["http://127.0.0.1:8787", "https://gemini.google.com"]),
     z.custom<`https://${string}`>(isDatabagOrigin)]),
   conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), expiresAt: z.null(),
-  capabilities: z.tuple([z.literal("read"), z.literal("send")])
-}).refine(connection => connection.origin === "http://127.0.0.1:8787" ? connection.conversationId === "fixture-alpha"
-  : connection.origin === "https://gemini.google.com" || /^databag_[a-f0-9]{64}$/.test(connection.conversationId));
+  capabilities: z.union([z.tuple([z.literal("read")]), z.tuple([z.literal("read"), z.literal("send")])])
+}).refine(connection => connection.origin === "http://127.0.0.1:8787"
+  ? connection.conversationId === "fixture-alpha" && connection.capabilities.length === 2
+  : connection.origin === "https://gemini.google.com" ? connection.capabilities.length === 2
+    : /^company_ai_[a-f0-9]{64}$/.test(connection.conversationId)
+      ? isCompanyAIChatOrigin(connection.origin) && connection.capabilities.length === 1
+      : /^databag_[a-f0-9]{64}$/.test(connection.conversationId) && connection.capabilities.length === 2);
 
 const replySchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("chat_reload_started"), protocolVersion: z.literal(PROTOCOL_VERSION),
@@ -171,7 +175,7 @@ const replySchema = z.discriminatedUnion("kind", [
     kind: z.literal("chat_read_challenges"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ challenges: z.array(z.strictObject({
-      challengeId: z.uuid(), target: z.union([fixtureTarget, geminiTarget, databagTargetSchema]), expiresAt: z.number().int().safe()
+      challengeId: z.uuid(), target: z.union([fixtureTarget, geminiTarget, databagTargetSchema, companyAIChatTargetSchema]), expiresAt: z.number().int().safe()
     })).max(Math.max(MAX_PENDING_FIXTURE_READS, MAX_PENDING_GEMINI_READS)),
     activeTabIds: z.array(z.number().int().safe().positive()).max(MAX_AUTONOMOUS_CONNECTIONS + MAX_PENDING_REQUESTS) })
   }),
@@ -791,7 +795,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       completeFixtureFill: (target: FixtureTarget, attemptId: string, observation: FixtureFillResult) =>
         request("complete_fixture_fill", { target, attemptId, observation }),
       listPending: () => request("list_pending", {}),
-      listChatReadChallenges: (provider: "fixture" | "gemini" | "databag") => request("list_chat_read_challenges", { provider }),
+      listChatReadChallenges: (provider: "fixture" | "gemini" | "databag" | "company_ai") => request("list_chat_read_challenges", { provider }),
       publishChatSnapshot: (target: ApprovedTarget, messages: ReadonlyArray<FixtureMessage | GeminiRenderedMessage>,
         challengeId?: string, omittedBefore = false) => request("publish_chat_snapshot", { target, messages, omittedBefore,
         ...(challengeId === undefined ? {} : { challengeId }) }),

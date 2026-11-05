@@ -60,6 +60,7 @@ export type CompanyAIChatTarget = Readonly<{
 }>;
 export type ApprovedTarget = FixtureTarget | GeminiTarget | DatabagTarget | CompanyAIChatTarget;
 export type StableDomTarget = FixtureTarget | DatabagTarget;
+export type RenderedChatTarget = GeminiTarget | CompanyAIChatTarget;
 
 export function targetProvider(target: ApprovedTarget): "fixture" | "gemini" | "databag" | "company_ai" {
   return target.provider ?? (target.origin === "http://127.0.0.1:8787" ? "fixture" : "gemini");
@@ -71,6 +72,10 @@ export function isGeminiTarget(target: ApprovedTarget): target is GeminiTarget {
 
 export function isStableDomTarget(target: ApprovedTarget): target is StableDomTarget {
   return targetProvider(target) === "fixture" || target.provider === "databag";
+}
+
+export function isRenderedChatTarget(target: ApprovedTarget): target is RenderedChatTarget {
+  return isGeminiTarget(target) || target.provider === "company_ai";
 }
 
 export function isDatabagOrigin(value: unknown): value is `https://${string}` {
@@ -120,7 +125,7 @@ export type ReadonlyConnectionState = ReadonlyConnection & Readonly<{
 }>;
 export type AutonomousConnection = Readonly<Omit<ReadonlyConnection, "state" | "expiresAt"> & {
   state: "ready";
-  capabilities: readonly ["read", "send"];
+  capabilities: readonly ["read"] | readonly ["read", "send"];
   expiresAt: null;
 }>;
 export type ApprovedConnection = ReadonlyConnection | AutonomousConnection;
@@ -136,7 +141,7 @@ export type FixtureSnapshot = Readonly<{
   omittedBefore: boolean;
   messages: ReadonlyArray<FixtureMessage>;
 }>;
-export type GeminiRenderedMessage = Readonly<{ direction: "incoming" | "outgoing"; text: string; truncated?: true;
+export type GeminiRenderedMessage = Readonly<{ direction: "incoming" | "outgoing" | "unknown"; text: string; truncated?: true;
   generationState?: "streaming" | "complete" }>;
 export type GeminiSnapshot = Readonly<{
   coverage: "rendered_only";
@@ -211,7 +216,7 @@ type PendingFixtureRead = {
 type PendingGeminiRead = {
   owner: symbol;
   connectionId: string;
-  target: GeminiTarget;
+  target: RenderedChatTarget;
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
   resolve: (snapshot: GeminiSnapshot | "not_ready" | null) => void;
@@ -487,7 +492,7 @@ export class PendingConnectionRequests {
 
   getGeminiSnapshot(owner: symbol, connectionId: string, now = Date.now()): GeminiSnapshot | "not_ready" | null {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant || !isGeminiTarget(grant.target)) return null;
+    if (!grant || !isRenderedChatTarget(grant.target)) return null;
     return grant.geminiSnapshot && now - grant.geminiSnapshot.capturedAt <= MAX_GEMINI_SNAPSHOT_AGE_MS
       ? grant.geminiSnapshot : "not_ready";
   }
@@ -495,13 +500,13 @@ export class PendingConnectionRequests {
   readGeminiEvents(owner: symbol, connectionId: string,
     cursor: { epoch: string; sequence: number }, limit = MAX_GEMINI_EVENTS_PER_READ, now = Date.now()) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant || !isGeminiTarget(grant.target)) return null;
+    if (!grant || !isRenderedChatTarget(grant.target)) return null;
     return grant.geminiObservations?.read(cursor, limit) ?? "not_ready";
   }
 
   requestFreshGeminiRead(owner: symbol, connectionId: string, now = Date.now(), deadlineMs = now + GEMINI_READ_TIMEOUT_MS) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant || !isGeminiTarget(grant.target) || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
+    if (!grant || !isRenderedChatTarget(grant.target) || !Number.isSafeInteger(deadlineMs) || deadlineMs <= now) return null;
     if (this.geminiReads.size >= MAX_PENDING_GEMINI_READS) return "busy" as const;
     const challengeId = randomUUID();
     const expiresAt = Math.min(now + GEMINI_READ_TIMEOUT_MS, deadlineMs, grant.connection.expiresAt ?? Infinity);
@@ -512,11 +517,11 @@ export class PendingConnectionRequests {
     return { challengeId, result };
   }
 
-  listGeminiReadChallenges(now = Date.now()) {
+  listGeminiReadChallenges(now = Date.now(), provider: "gemini" | "company_ai" = "gemini") {
     for (const [challengeId, pending] of this.geminiReads) {
       if (pending.expiresAt <= now) this.finishGeminiRead(challengeId, "not_ready");
     }
-    return [...this.geminiReads].map(([challengeId, pending]) => ({
+    return [...this.geminiReads].filter(([, pending]) => targetProvider(pending.target) === provider).map(([challengeId, pending]) => ({
       challengeId, target: pending.target, expiresAt: pending.expiresAt
     }));
   }
@@ -531,7 +536,7 @@ export class PendingConnectionRequests {
     return [...tabs].sort((first, second) => first - second);
   }
 
-  publishGeminiSnapshot(target: GeminiTarget, messages: ReadonlyArray<GeminiRenderedMessage>,
+  publishGeminiSnapshot(target: RenderedChatTarget, messages: ReadonlyArray<GeminiRenderedMessage>,
     now = Date.now(), challengeId?: string, omittedBefore = false): number {
     if (!messages.length || messages.length > MAX_GEMINI_SNAPSHOT_MESSAGES
       || typeof omittedBefore !== "boolean"
@@ -539,7 +544,8 @@ export class PendingConnectionRequests {
         || Object.keys(message).some((key) => !["direction", "text", "truncated", "generationState"].includes(key))
         || ("truncated" in message && message.truncated !== true)
         || ("generationState" in message && (!["streaming", "complete"].includes(message.generationState ?? "") || message.direction !== "incoming"))
-        || (message.direction !== "incoming" && message.direction !== "outgoing")
+        || (target.provider === "company_ai" ? message.direction !== "unknown" || "generationState" in message
+          : message.direction !== "incoming" && message.direction !== "outgoing")
         || typeof message.text !== "string" || !message.text || message.text.length > 16_000)
       || Buffer.byteLength(JSON.stringify({ messages, omittedBefore }), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
       throw new Error("Invalid Gemini snapshot");
@@ -578,7 +584,7 @@ export class PendingConnectionRequests {
 
   getStableSnapshot(owner: symbol, connectionId: string, now = Date.now()): FixtureSnapshot | "not_ready" | null {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant || isGeminiTarget(grant.target)) return null;
+    if (!grant || !isStableDomTarget(grant.target)) return null;
     return grant.snapshot && now - grant.snapshot.capturedAt <= MAX_FIXTURE_SNAPSHOT_AGE_MS
       ? grant.snapshot : "not_ready";
   }
@@ -590,14 +596,14 @@ export class PendingConnectionRequests {
   readStableEvents(owner: symbol, connectionId: string,
     cursor: { epoch: string; sequence: number }, limit = MAX_FIXTURE_EVENTS_PER_READ, now = Date.now()) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant || isGeminiTarget(grant.target)) return null;
+    if (!grant || !isStableDomTarget(grant.target)) return null;
     return grant.observations?.read(cursor, limit) ?? "not_ready";
   }
 
   readStableIncomingChanges(owner: symbol, connectionId: string,
     cursor: { epoch: string; sequence: number }, limit = MAX_FIXTURE_EVENTS_PER_READ, now = Date.now()) {
     const grant = this.liveGrant(owner, connectionId, now);
-    if (!grant || isGeminiTarget(grant.target)) return null;
+    if (!grant || !isStableDomTarget(grant.target)) return null;
     const result = grant.observations?.readWithBaseline(cursor, limit);
     if (!result) return "not_ready" as const;
     if (result.state === "expired") return result;
@@ -679,12 +685,12 @@ export class PendingConnectionRequests {
       ? [{ ...challenge, target: challenge.target }] : []);
   }
 
-  listChatReadChallenges(provider: "fixture" | "gemini" | "databag", now = Date.now()) {
-    return provider === "gemini" ? this.listGeminiReadChallenges(now)
+  listChatReadChallenges(provider: "fixture" | "gemini" | "databag" | "company_ai", now = Date.now()) {
+    return provider === "gemini" || provider === "company_ai" ? this.listGeminiReadChallenges(now, provider)
       : this.listStableReadChallenges(now).filter(challenge => targetProvider(challenge.target) === provider);
   }
 
-  listActiveChatTabIds(provider: "fixture" | "gemini" | "databag", now = Date.now()): number[] {
+  listActiveChatTabIds(provider: "fixture" | "gemini" | "databag" | "company_ai", now = Date.now()): number[] {
     const tabs = new Set<number>();
     for (const request of this.requests.values()) {
       const grant = request.grant;
@@ -824,7 +830,8 @@ export class PendingConnectionRequests {
     const pending = this.create(owner, now);
     const connection: AutonomousConnection = Object.freeze({ requestId: pending.requestId, state: "ready",
       connectionId: randomUUID(), generation: 1, origin: target.origin, conversationId: target.conversationId,
-      capabilities: Object.freeze(["read", "send"] as const), expiresAt: null });
+      capabilities: target.provider === "company_ai" ? Object.freeze(["read"] as const)
+        : Object.freeze(["read", "send"] as const), expiresAt: null });
     this.requests.get(pending.requestId)!.grant = { connection, target: Object.freeze({ ...target }), stale: false };
     this.finishConnectionWait(owner, { connections: this.ownedAutonomousConnections(owner, now), timedOut: false }, now);
     return connection;

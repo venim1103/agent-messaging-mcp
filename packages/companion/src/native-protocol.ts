@@ -3,7 +3,7 @@ import { fixtureDispatchCheckResultSchema, fixtureDispatchResultSchema, fixtureF
   fixturePreflightResultSchema, geminiFillResultSchema, geminiDispatchCheckResultSchema,
   chatTargetSchema, chatJobSchema, chatJobCompletionSchema, companyAIChatTargetSchema, databagTargetSchema } from "./message-operations.js";
 import { MAX_FIXTURE_SNAPSHOT_BYTES, MAX_FIXTURE_SNAPSHOT_MESSAGES,
-  MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES, isGeminiTarget } from "./pending-connections.js";
+  MAX_GEMINI_SNAPSHOT_BYTES, MAX_GEMINI_SNAPSHOT_MESSAGES, isGeminiTarget, isRenderedChatTarget } from "./pending-connections.js";
 
 export const NATIVE_HOST_NAME = "com.agent_messaging_mcp.bridge";
 export const PROTOCOL_VERSION = 1;
@@ -494,15 +494,18 @@ const fixtureSnapshotSchema = z.strictObject({
   })
 });
 
-export const chatReadProviderSchema = z.enum(["fixture", "gemini", "databag"]);
+export const chatReadProviderSchema = z.enum(["fixture", "gemini", "databag", "company_ai"]);
 export const chatReadListPayloadSchema = z.strictObject({ provider: chatReadProviderSchema });
 export const chatSnapshotPayloadSchema = z.union([
   fixtureSnapshotSchema.shape.payload,
   geminiSnapshotSchema.shape.payload.refine(payload => isValidGeminiTarget(payload.target)),
-  fixtureSnapshotSchema.shape.payload.extend({ target: databagTargetSchema })
+  fixtureSnapshotSchema.shape.payload.extend({ target: databagTargetSchema }),
+  geminiSnapshotSchema.shape.payload.extend({ target: companyAIChatTargetSchema,
+    messages: z.array(z.strictObject({ direction: z.literal("unknown"), text: z.string().min(1).max(16_000),
+      truncated: z.literal(true).optional() })).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES) })
 ]).refine(payload => Buffer.byteLength(JSON.stringify({ messages: payload.messages,
   omittedBefore: payload.omittedBefore ?? false }), "utf8") <= MAX_FIXTURE_SNAPSHOT_BYTES
-  && (isGeminiTarget(payload.target)
+  && (isRenderedChatTarget(payload.target)
     || new Set(payload.messages.map(message => "id" in message ? message.id : null)).size === payload.messages.length));
 export const chatGapPayloadSchema = z.strictObject({ target: chatAgentTargetSchema });
 const chatObservationRequestSchema = z.discriminatedUnion("kind", [

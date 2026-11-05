@@ -24,6 +24,7 @@ import { createNativeRequestChannel, requestNativeGrantCount } from "../../packa
 import { configuredCompanyAIChatOrigins, configuredDatabagOrigins, isEligibleCompanyAIChatUrl,
   isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
 import { proveCompanyAIChatIdentity, proveCompanyAIChatIdentityInDocument } from "../../packages/extension/lib/company-ai-observation.ts";
+import { invokeCompanyAIChatReader } from "../../packages/extension/lib/company-ai-reader.ts";
 import { extensionDirectory, nativeRelayPath, buildTestExtension, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
 const companyProofScript = transpileModule(await readFile(new URL("../../packages/extension/lib/company-ai-observation.ts",
@@ -417,7 +418,8 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
   assert.equal(duringProfileBinding.check().status, "refused");
   assert.equal(duringProfile.listenerCount(), 0);
   const bound = guardedFixture();
-  assert.deepEqual(Object.keys(bound.sandbox.exports).sort(), ["createCompanyAIChatIdentityBinding", "createCompanyAIChatIdentityCheck",
+  assert.deepEqual(Object.keys(bound.sandbox.exports).sort(), ["createCompanyAIChatIdentityBinding", "createCompanyAIChatIdentityCheck", "createCompanyAIChatReadBinding",
+    "locateCompanyAIChatReadTargets",
     "inspectCompanyAIChatStructure", "proveCompanyAIChatIdentity", "proveCompanyAIChatIdentityInDocument"].sort());
   const binding = bound.sandbox.exports.createCompanyAIChatIdentityCheck(bound.options);
   assert.equal(binding.status, "ok");
@@ -572,6 +574,219 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
     };
     assert.deepEqual(expiringCheck.inspectDocument(), { status: "expired" });
     assert.equal(expiringCheck.profileReads(), expireAt === 3 ? 0 : 1);
+  }
+});
+
+test("Company AI Chat read targets are bounded, structural and text-free", { timeout: 15000 }, async () => {
+  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-company-locators-"));
+  let browser;
+  try {
+    browser = await chromium.launch({ chromiumSandbox: true, executablePath: "/usr/bin/chromium", headless: true,
+      env: { ...process.env, HOME: profile } });
+    const page = await browser.newPage();
+    await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
+      body: '<!doctype html><nav><a><span>Invented brand</span></a><span id="profile">Synthetic private account</span></nav><section><div id="timeline"><div data-testid="synthetic-first"><p>Synthetic private text</p></div><div data-testid="synthetic-second"><p>Synthetic private text</p></div></div><div><button>Attach</button><textarea id="editor">Synthetic retained draft</textarea><button>Send</button></div></section>' }));
+    await page.goto("https://chat.app.example.com/chat/synthetic");
+    await page.addScriptTag({ content: `(() => { const exports = {}; ${companyProofScript}
+      globalThis.syntheticCompanyProof = exports; })();` });
+    const result = await page.evaluate(() => {
+      let privateReads = 0;
+      Object.defineProperty(Node.prototype, "textContent", { get: () => { privateReads++; throw new Error("Private text read"); } });
+      Object.defineProperty(HTMLTextAreaElement.prototype, "value", { get: () => { privateReads++; throw new Error("Draft read"); } });
+      Object.defineProperty(HTMLElement.prototype, "innerText", { get: () => { privateReads++; throw new Error("Private text read"); } });
+      Object.defineProperty(Element.prototype, "innerHTML", { get: () => { privateReads++; throw new Error("Private markup read"); } });
+      let mutations = 0;
+      let inputs = 0;
+      let activations = 0;
+      document.addEventListener("input", () => inputs++, true);
+      document.addEventListener("click", () => activations++, true);
+      const observer = new MutationObserver(() => {});
+      observer.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+      const locate = () => {
+        observer.takeRecords();
+        const located = globalThis.syntheticCompanyProof.locateCompanyAIChatReadTargets({ expectedUrl: location.href,
+          deadline: Date.now() + 4000 });
+        mutations += observer.takeRecords().length;
+        return located;
+      };
+      const targets = locate();
+      const accepted = targets?.editor === document.getElementById("editor") && targets.timeline === document.getElementById("timeline")
+        && targets.profile === document.getElementById("profile") && targets.rows.length === 2;
+      const nestedProfile = document.createElement("span");
+      nestedProfile.append(document.createTextNode("Invented nested profile"));
+      document.getElementById("profile").append(nestedProfile);
+      const nestedProfileResolved = locate()?.profile === nestedProfile;
+      nestedProfile.remove();
+      const iconOnlyProfile = document.createElement("span");
+      iconOnlyProfile.append(document.createElement("img"));
+      document.querySelector("nav").append(iconOnlyProfile);
+      const iconOnlyProfileIgnored = locate() !== null;
+      iconOnlyProfile.remove();
+      const duplicateProfile = document.createElement("span");
+      duplicateProfile.append(document.createTextNode("Invented second profile"));
+      document.querySelector("nav").append(duplicateProfile);
+      const ambiguousProfile = locate() === null;
+      duplicateProfile.hidden = true;
+      const hiddenProfileIgnored = locate() !== null;
+      duplicateProfile.remove();
+      const secondTimeline = document.getElementById("timeline").cloneNode(true);
+      document.querySelector("section").prepend(secondTimeline);
+      const ambiguousTimeline = locate() === null;
+      secondTimeline.remove();
+      const secondEditor = document.createElement("textarea");
+      document.querySelector("section").append(secondEditor);
+      const ambiguousEditor = locate() === null;
+      secondEditor.remove();
+      const expired = globalThis.syntheticCompanyProof.locateCompanyAIChatReadTargets({ expectedUrl: location.href, deadline: Date.now() }) === null;
+      const oversized = globalThis.syntheticCompanyProof.locateCompanyAIChatReadTargets({ expectedUrl: location.href, deadline: Infinity }) === null;
+      observer.disconnect();
+      return { accepted, nestedProfileResolved, iconOnlyProfileIgnored, ambiguousProfile, hiddenProfileIgnored, ambiguousTimeline,
+        ambiguousEditor, expired, oversized,
+        privateReads, mutations, inputs, activations };
+    });
+    assert.deepEqual(result, { accepted: true, nestedProfileResolved: true, iconOnlyProfileIgnored: true, ambiguousProfile: true,
+      hiddenProfileIgnored: true, ambiguousTimeline: true,
+      ambiguousEditor: true, expired: true, oversized: true, privateReads: 0, mutations: 0, inputs: 0, activations: 0 });
+  } finally {
+    await browser?.close();
+    await rm(profile, { recursive: true, force: true });
+  }
+});
+
+test("Company AI Chat read binding separates identity from bounded unknown-sender capture", { timeout: 15000 }, async testContext => {
+  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-company-read-binding-"));
+  let browser;
+  try {
+    browser = await chromium.launch({ chromiumSandbox: true, executablePath: "/usr/bin/chromium", headless: true,
+      env: { ...process.env, HOME: profile } });
+    const page = await browser.newPage();
+    await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
+      body: '<!doctype html><nav><span>synthetic@example.test</span></nav><main><div role="log"><div data-testid="invented-first"><p>Synthetic first row</p><button>Excluded control</button></div><div data-testid="invented-second"><p>Synthetic second row</p></div></div><textarea>Synthetic retained draft</textarea><button>Send</button></main>' }));
+    await page.goto("https://chat.app.example.com/chat/synthetic");
+    const build = await buildTestExtension("", testContext.signal, "https://chat.app.example.com");
+    databagBuildSources.push(build.source);
+    const companyReaderScript = await readFile(join(build.directory, "company-ai-main.js"), "utf8");
+    await page.addScriptTag({ content: companyReaderScript });
+    await page.addScriptTag({ content: `(() => { const exports = {}; ${companyProofScript}
+      globalThis.syntheticCompanyProof = exports; })();` });
+    const result = await page.evaluate(() => {
+      const editor = document.querySelector("textarea");
+      const timeline = document.querySelector('[role="log"]');
+      const profile = document.querySelector("nav span");
+      const root = { return: null, child: null, stateNode: null };
+      root.stateNode = { current: root };
+      const source = { return: root, child: null, sibling: null, memoizedProps: { conversationId: "synthetic-chat" },
+        dependencies: { firstContext: { memoizedValue: { accounts: [{ homeAccountId: "synthetic-home",
+          localAccountId: "synthetic-local", username: "synthetic@example.test" }], inProgress: "none" }, next: null } } };
+      root.child = source;
+      globalThis.syntheticCompanySource = source;
+      let previous;
+      for (const element of [editor, timeline, profile]) {
+        const fiber = { return: source, child: null, sibling: null, stateNode: element, memoizedProps: {}, dependencies: null };
+        Object.defineProperty(element, "__reactFiber$synthetic", { value: fiber });
+        if (previous) previous.sibling = fiber; else source.child = fiber;
+        previous = fiber;
+      }
+      let messageReads = 0;
+      let draftReads = 0;
+      let inputs = 0;
+      let activations = 0;
+      const nativeNodeValue = Object.getOwnPropertyDescriptor(Node.prototype, "nodeValue").get;
+      Object.defineProperty(Node.prototype, "nodeValue", { get() {
+        if (timeline.contains(this)) messageReads++;
+        return nativeNodeValue.call(this);
+      } });
+      Object.defineProperty(HTMLTextAreaElement.prototype, "value", { get() { draftReads++; throw new Error("Draft read"); } });
+      document.addEventListener("input", () => inputs++, true);
+      document.addEventListener("click", () => activations++, true);
+      const deadline = Date.now() + 4000;
+      const binding = globalThis.syntheticCompanyProof.createCompanyAIChatReadBinding({ expectedUrl: location.href, deadline });
+      const identityReadFree = messageReads === 0 && draftReads === 0;
+      const initialCheck = binding.check(deadline);
+      const checkReadFree = messageReads === 0 && draftReads === 0;
+      const snapshot = binding.capture(deadline);
+      const privateOutput = !JSON.stringify({ binding, snapshot }).includes("synthetic@example.test")
+        && !JSON.stringify({ binding, snapshot }).includes("synthetic-chat");
+      source.memoizedProps.conversationId = "synthetic-other";
+      const terminal = !binding.check(deadline);
+      const reads = messageReads;
+      const refusedCapture = binding.capture(deadline) === null && messageReads === reads;
+      binding.dispose();
+      return { status: binding.status, identityReadFree, initialCheck, checkReadFree, snapshot, privateOutput,
+        terminal, refusedCapture, draftReads, inputs, activations };
+    });
+    assert.deepEqual(result, { status: "ok", identityReadFree: true, initialCheck: true, checkReadFree: true,
+      snapshot: { messages: [{ direction: "unknown", text: "Synthetic first row" }, { direction: "unknown", text: "Synthetic second row" }],
+        omittedBefore: true }, privateOutput: true, terminal: true, refusedCapture: true, draftReads: 0, inputs: 0, activations: 0 });
+      await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-chat"; });
+      const request = { action: "bind", url: page.url(), deadline: Date.now() + 4000 };
+      const bound = await page.evaluate(invokeCompanyAIChatReader, request);
+      assert.ok(bound && /^company_ai_[a-f0-9]{64}$/.test(bound.conversationId));
+      assert.equal(bound.snapshot, undefined);
+      const checking = { ...request, action: "check", conversationId: bound.conversationId };
+      assert.deepEqual(await page.evaluate(invokeCompanyAIChatReader, checking), bound);
+      const captured = await page.evaluate(invokeCompanyAIChatReader, { ...checking, action: "capture" });
+      assert.deepEqual(captured.snapshot, result.snapshot);
+      const bounds = await page.evaluate(() => {
+        const timeline = document.querySelector('[role="log"]');
+        const original = [...timeline.children];
+        const createRow = text => {
+          const row = document.createElement("div"); row.setAttribute("data-testid", "invented-bounded");
+          const paragraph = document.createElement("p"); paragraph.append(document.createTextNode(text)); row.append(paragraph);
+          return row;
+        };
+        const create = () => globalThis.syntheticCompanyProof.createCompanyAIChatReadBinding({ expectedUrl: location.href,
+          deadline: Date.now() + 4000 });
+        try {
+          timeline.replaceChildren(createRow("x".repeat(16000)));
+          const extra = document.createElement("p"); extra.append(document.createTextNode("Overflow")); timeline.firstChild.append(extra);
+          const characterBinding = create();
+          const characters = characterBinding.capture(Date.now() + 4000);
+          characterBinding.dispose();
+          timeline.replaceChildren(...Array.from({ length: 8 }, () => createRow('"'.repeat(16000))));
+          const byteBinding = create();
+          const bytes = byteBinding.capture(Date.now() + 4000);
+          byteBinding.dispose();
+          timeline.replaceChildren(createRow(""));
+          const paragraph = timeline.querySelector("p");
+          for (let index = 0; index < 4097; index++) paragraph.append(document.createTextNode("x"));
+          const nodeBinding = create();
+          const nodesRefused = nodeBinding.capture(Date.now() + 4000) === null;
+          nodeBinding.dispose();
+          timeline.replaceChildren(...original);
+          const ended = create();
+          window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+          const terminal = !ended.check(Date.now() + 4000) && ended.capture(Date.now() + 4000) === null;
+          return { charactersBounded: characters.messages[0].text.length === 16000 && characters.messages[0].truncated === true,
+            bytesBounded: new TextEncoder().encode(JSON.stringify(bytes)).length <= 96 * 1024,
+            bytesTruncated: bytes.messages.some(message => message.truncated === true), nodesRefused, terminal };
+        } finally { timeline.replaceChildren(...original); }
+      });
+      assert.deepEqual(bounds, { charactersBounded: true, bytesBounded: true, bytesTruncated: true, nodesRefused: true, terminal: true });
+      assert.equal(await page.evaluate(invokeCompanyAIChatReader, { ...checking, conversationId: `company_ai_${"f".repeat(64)}` }), null);
+      await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-other"; });
+      assert.equal(await page.evaluate(invokeCompanyAIChatReader, checking), null);
+      assert.equal(await page.evaluate(invokeCompanyAIChatReader, { ...checking, action: "capture" }), null);
+      for (const property of ["version", "origin", "request"]) {
+        const poisonedPage = await browser.newPage();
+        try {
+          await poisonedPage.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
+            body: "<!doctype html><main>Invented marker fixture</main>" }));
+          await poisonedPage.goto("https://chat.app.example.com/chat/synthetic-marker");
+          await poisonedPage.evaluate(property => {
+            globalThis.syntheticMarkerReads = 0;
+            const marker = { version: 1, origin: location.origin, request: () => null };
+            const value = marker[property];
+            Object.defineProperty(marker, property, { get() { globalThis.syntheticMarkerReads++; return value; } });
+            Object.defineProperty(globalThis, "agentCompanyAIChatReader", { value: marker });
+          }, property);
+          await poisonedPage.addScriptTag({ content: companyReaderScript });
+          assert.equal(await poisonedPage.evaluate(() => globalThis.syntheticMarkerReads), 0);
+        } finally { await poisonedPage.close(); }
+      }
+  } finally {
+    await browser?.close();
+    await rm(profile, { recursive: true, force: true });
   }
 });
 
@@ -2851,6 +3066,218 @@ for (const provider of ["fixture", "gemini"]) {
     }
   });
 }
+
+for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup connection reads through native MCP and revokes exact owners without sending (${scenario})`, { timeout: 20000 }, async testContext => {
+  const setPhase = trackTestPhase(testContext, "Company connected read");
+  const profile = await mkdtemp(join(tmpdir(), "agent-messaging-company-connected-read-"));
+  const clients = [new Client({ name: "Company one", version: "0.0.1" }), new Client({ name: "Company two", version: "0.0.1" })];
+  let context;
+  let broker;
+  let brokerExit;
+  try {
+    const build = await buildTestExtension("", testContext.signal, "https://chat.app.example.com");
+    databagBuildSources.push(build.source);
+    const unpacked = join(profile, "unpacked-extension");
+    await cp(build.directory, unpacked, { recursive: true });
+    const manifestPath = join(unpacked, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    assert.deepEqual(manifest.optional_host_permissions,
+      ["http://127.0.0.1:8787/*", "https://gemini.google.com/*", "https://chat.app.example.com/*"]);
+    manifest.host_permissions = ["https://chat.app.example.com/*"];
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true, executablePath: "/usr/bin/chromium",
+      headless: true, env: { ...process.env, HOME: profile },
+      args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
+    const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
+    const extensionId = new URL(worker.url()).hostname;
+    await worker.evaluate(() => {
+      globalThis.syntheticCompanyCalls = [];
+      globalThis.syntheticCompanyReadGap = false;
+      globalThis.syntheticCompanyCorruptions = 0;
+      const connect = chrome.runtime.connectNative.bind(chrome.runtime);
+      chrome.runtime.connectNative = (...args) => {
+        const port = connect(...args);
+        const listen = port.onMessage.addListener.bind(port.onMessage);
+        port.onMessage.addListener = listener => listen(reply => {
+          if (reply.kind === "chat_read_challenges" && globalThis.syntheticCompanyReadGap) {
+            globalThis.syntheticCompanyReadGap = false;
+            globalThis.syntheticCompanyCorruptions++;
+            return listener({ ...reply, payload: { ...reply.payload, unsupported: true } });
+          }
+          listener(reply);
+        });
+        return port;
+      };
+      const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+      chrome.scripting.executeScript = async options => {
+        try {
+          const result = await execute(options);
+          globalThis.syntheticCompanyCalls.push({ phase: options.files ? "install" : options.args?.[0]?.action ?? "other",
+            topFrame: result[0]?.frameId === 0, returned: result[0]?.result != null });
+          return result;
+        } catch (error) {
+          globalThis.syntheticCompanyCalls.push({ phase: options.files ? "install" : options.args?.[0]?.action ?? "other", threw: true });
+          throw error;
+        } finally { if (globalThis.syntheticCompanyCalls.length > 32) globalThis.syntheticCompanyCalls.shift(); }
+      };
+    });
+    await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
+    const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
+    const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
+    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+    brokerExit = once(broker, "exit");
+    let ready = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      testContext.signal.throwIfAborted();
+      ready = await brokerSocketReady(join(profile, ".config/agent-messaging-mcp/broker/broker.sock"));
+      if (ready) break;
+      await setTimeout(25);
+    }
+    assert.equal(ready, true);
+    const environment = { ...process.env, HOME: profile, BROWSER_CHAT_AUTO_START_BROKER: "0" };
+    delete environment.BROWSER_CHAT_AGENT_LABEL;
+    await Promise.all(clients.map(client => client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [mcpEntry], env: environment }))));
+    for (const client of clients) assert.deepEqual((await client.callTool({ name: "chat_wait_for_connection",
+      arguments: { timeoutMs: 0 } })).structuredContent, { connections: [], timedOut: true });
+    const page = await context.newPage();
+    const url = "https://chat.app.example.com/chat/synthetic";
+    await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
+      body: '<!doctype html><nav><span>synthetic@example.test</span></nav><main><div role="log"><div data-testid="invented-first"><p>Synthetic first row</p><button>Excluded control</button></div><div data-testid="invented-second"><p>Synthetic second row</p></div></div><textarea>Synthetic retained draft</textarea><button>Send</button></main>' }));
+    await page.goto(url);
+    await page.evaluate(() => {
+      const editor = document.querySelector("textarea");
+      const timeline = document.querySelector('[role="log"]');
+      const profile = document.querySelector("nav span");
+      const root = { return: null, child: null, stateNode: null };
+      root.stateNode = { current: root };
+      const source = { return: root, child: null, sibling: null, memoizedProps: { conversationId: "synthetic-chat" },
+        dependencies: { firstContext: { memoizedValue: { accounts: [{ homeAccountId: "synthetic-home",
+          localAccountId: "synthetic-local", username: "synthetic@example.test" }], inProgress: "none" }, next: null } } };
+      root.child = source;
+      let previous;
+      for (const element of [editor, timeline, profile]) {
+        const fiber = { return: source, child: null, sibling: null, stateNode: element, memoizedProps: {}, dependencies: null };
+        Object.defineProperty(element, "__reactFiber$synthetic", { value: fiber });
+        if (previous) previous.sibling = fiber; else source.child = fiber;
+        previous = fiber;
+      }
+      globalThis.syntheticCompanySource = source;
+      globalThis.syntheticCompanyInputs = 0;
+      globalThis.syntheticCompanyActivations = 0;
+      globalThis.syntheticCompanyMessageReads = 0;
+      const nativeNodeValue = Object.getOwnPropertyDescriptor(Node.prototype, "nodeValue").get;
+      Object.defineProperty(Node.prototype, "nodeValue", { get() {
+        if (timeline.contains(this)) globalThis.syntheticCompanyMessageReads++;
+        return nativeNodeValue.call(this);
+      } });
+      Object.defineProperty(HTMLTextAreaElement.prototype, "value", { get() { throw new Error("Unexpected draft read"); } });
+      document.addEventListener("input", () => globalThis.syntheticCompanyInputs++, true);
+      document.addEventListener("click", () => globalThis.syntheticCompanyActivations++, true);
+    });
+    const popup = await context.newPage();
+    await page.bringToFront();
+    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+    await popup.waitForFunction(() => document.querySelector("#agent-count")?.textContent === "0 connected / 2 available",
+      undefined, { timeout: 4000 }).catch(async error => {
+        testContext.diagnostic(JSON.stringify({ count: await popup.locator("#agent-count").textContent(),
+          calls: await worker.evaluate(() => globalThis.syntheticCompanyCalls),
+          visible: await page.evaluate(() => document.visibilityState === "visible") }));
+        throw error;
+      });
+    await assertSharedPopupControls(popup, false);
+    assert.equal(await popup.locator("#unconfirmed-panel").isHidden(), true);
+    assert.equal(await page.evaluate(() => globalThis.syntheticCompanyMessageReads), 0);
+    await popup.evaluate(() => {
+      const request = chrome.permissions.request.bind(chrome.permissions);
+      globalThis.syntheticCompanyPermissionRequests = [];
+      globalThis.syntheticCompanyDenyFirst = true;
+      chrome.permissions.request = options => {
+        globalThis.syntheticCompanyPermissionRequests.push({ origins: options.origins, gesture: navigator.userActivation.isActive });
+        if (globalThis.syntheticCompanyDenyFirst) { globalThis.syntheticCompanyDenyFirst = false; return Promise.resolve(false); }
+        return request(options);
+      };
+    });
+    const row = label => popup.locator("#agent-list li").filter({ hasText: label });
+    const activate = async control => {
+      await popup.waitForFunction(() => document.querySelector("#refresh-agents")?.disabled === false
+        && [...document.querySelectorAll("#agent-list button")].every(button => !button.disabled), undefined, { timeout: 4000 });
+      assert.equal(await control.isVisible(), true);
+      assert.equal(await control.isEnabled(), true);
+      await control.press("Enter");
+    };
+    const count = value => popup.waitForFunction(value => document.querySelector("#agent-count")?.textContent
+      === `${value} connected / 2 available`, value, { timeout: 4000 });
+    await activate(row("Company one").getByRole("button", { name: "Connect this chat" }));
+    await popup.getByText("Site access denied; no connection created.", { exact: true }).waitFor({ timeout: 4000 });
+    assert.deepEqual((await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+      { connections: [], timedOut: true });
+    assert.equal(await page.evaluate(() => globalThis.syntheticCompanyMessageReads), 0);
+    setPhase("trusted approval and public read");
+    await activate(row("Company one").getByRole("button", { name: "Connect this chat" }));
+    await count(1);
+    const pickup = (await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent;
+    assert.equal(pickup.connections.length, 1);
+    const connection = pickup.connections[0];
+    assert.deepEqual(connection.capabilities, ["read"]);
+    assert.equal(connection.expiresAt, null);
+    assert.equal(connection.origin, "https://chat.app.example.com");
+    const state = await clients[0].callTool({ name: "chat_get_connection", arguments: { requestId: connection.requestId } });
+    assert.equal(state.isError, undefined);
+    assert.deepEqual(state.structuredContent.capabilities, ["read"]);
+    const snapshot = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
+    assert.equal(snapshot.isError, undefined);
+    assert.equal(snapshot.structuredContent.coverage, "rendered_only");
+    assert.equal(snapshot.structuredContent.omittedBefore, true);
+    assert.deepEqual(snapshot.structuredContent.messages, ["Synthetic first row", "Synthetic second row"].map(text =>
+      ({ direction: "unknown", text, identityQuality: "uncertain", generationState: "unknown" })));
+    const sending = await clients[0].callTool({ name: "chat_send_message", arguments: { connectionId: connection.connectionId,
+      text: "Synthetic unsupported send", idempotencyKey: crypto.randomUUID() } });
+    assert.equal(sending.structuredContent.state, "not_sent");
+    assert.equal(sending.structuredContent.retryAllowed, false);
+    assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } })).isError, true);
+    const unsupported = await clients[0].callTool({ name: "chat_wait_for_events", arguments: {
+      connectionId: connection.connectionId, cursor: snapshot.structuredContent.cursor, timeoutMs: 0, view: "incoming_changes" } });
+    assert.deepEqual(unsupported.structuredContent, { code: "VIEW_UNSUPPORTED" });
+    const permissions = await popup.evaluate(() => globalThis.syntheticCompanyPermissionRequests);
+    assert.equal(permissions.length, 2);
+    assert.ok(permissions.every(request => request.gesture === true && JSON.stringify(request.origins)
+      === JSON.stringify(["https://chat.app.example.com/*"])));
+    setPhase("multiple owners and identity revocation");
+    await activate(row("Company two").getByRole("button", { name: "Connect this chat" }));
+    await count(2);
+    const second = (await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent.connections[0];
+    await activate(row("Company one").getByRole("button", { name: "Remove access" }));
+    await count(1);
+    assert.equal((await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } })).isError, true);
+    assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).isError, undefined);
+    assert.deepEqual(await page.evaluate(() => ({ inputs: globalThis.syntheticCompanyInputs, activations: globalThis.syntheticCompanyActivations })),
+      { inputs: 0, activations: 0 });
+    if (scenario === "identity") await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-other"; });
+    else if (scenario === "reload") await page.reload();
+    else await worker.evaluate(() => { globalThis.syntheticCompanyReadGap = true; });
+    let revoked = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      testContext.signal.throwIfAborted();
+      revoked = await worker.evaluate(async () => Object.keys(await chrome.storage.session.get(null))
+        .every(key => !key.startsWith("company_ai-grant-")));
+      if (revoked) break;
+      await setTimeout(25);
+    }
+    assert.equal(revoked, true, `Company ${scenario} must remove the stored grant`);
+    if (scenario === "read-gap") assert.equal(await worker.evaluate(() => globalThis.syntheticCompanyCorruptions), 1);
+    assert.deepEqual((await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
+      { connections: [], timedOut: true });
+    assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).isError, true);
+  } finally {
+    setPhase("cleanup");
+    await Promise.all(clients.map(client => client.close().catch(() => {})));
+    await context?.close();
+    broker?.kill("SIGTERM");
+    if (brokerExit) await brokerExit;
+    await rm(profile, { recursive: true, force: true });
+  }
+});
 
 for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].flatMap(provider =>
   ["failure", "lifetime", "reload", "reload-failure", ...(provider === "databag"

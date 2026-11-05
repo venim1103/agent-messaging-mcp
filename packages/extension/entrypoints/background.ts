@@ -9,7 +9,8 @@ import { installDraftOwnershipTracker } from "../lib/draft-ownership";
 import { installDatabagIdentityBridge } from "../lib/databag-identity";
 import { captureDatabagSnapshot, fillDatabagDraft, identifyDatabagConversation, inspectDatabagDraft, installDatabagAdapter,
   observeDatabagMessages, stopDatabagObservation, submitDatabagDraft } from "../lib/databag-observation";
-import { databagOrigins, isEligibleDatabagUrl } from "../lib/provider-origins";
+import { invokeCompanyAIChatReader } from "../lib/company-ai-reader";
+import { databagOrigins, isEligibleCompanyAIChatUrl, isEligibleDatabagUrl } from "../lib/provider-origins";
 
 const nativeHostName = "com.agent_messaging_mcp.bridge";
 const protocolVersion = 1;
@@ -27,8 +28,9 @@ type ChatAgentsResult = { ok: true; agents: ChatAgent[]; countsKnown: boolean } 
   | { ok: false; error: string };
 type ChatTarget = { provider?: "fixture"; origin: "http://127.0.0.1:8787"; conversationId: "fixture-alpha"; tabId: number; documentId: string }
   | { provider?: "gemini"; origin: "https://gemini.google.com"; conversationId: string; url: string; tabId: number; documentId: string }
-  | { provider: "databag"; origin: `https://${string}`; conversationId: string; url: string; tabId: number; documentId: string };
-type SavedProvider = "gemini" | "databag";
+  | { provider: "databag"; origin: `https://${string}`; conversationId: string; url: string; tabId: number; documentId: string }
+  | { provider: "company_ai"; origin: `https://${string}`; conversationId: string; url: string; tabId: number; documentId: string };
+type SavedProvider = "gemini" | "databag" | "company_ai";
 type FixtureApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
 type FixtureReviewsResult = { ok: true; reviews: { operationId: string; expiresAt: number;
@@ -65,6 +67,8 @@ const fixtureResetKey = "fixture-reset-done";
 const fixtureGrantKey = (tabId: number) => `fixture-grant-${tabId}`;
 const geminiGrantKey = (tabId: number) => `gemini-grant-${tabId}`;
 const databagGrantKey = (tabId: number) => `databag-grant-${tabId}`;
+const companyGrantKey = (tabId: number) => `company_ai-grant-${tabId}`;
+const savedGrantKey = (provider: SavedProvider, tabId: number) => `${provider}-grant-${tabId}`;
 const geminiStatusKey = (tabId: number) => `gemini-grant-status-${tabId}`;
 type StoredFixtureGrant = { documentId: string; expiresAt: number | null; url?: string; conversationId?: string;
   revision?: string; reloadPending?: true };
@@ -74,6 +78,7 @@ let fixtureResetPromise: Promise<boolean> | undefined;
 const fixtureSnapshotJobs = new Map<number, Promise<boolean>>();
 const geminiSnapshotJobs = new Map<number, Promise<boolean>>();
 const databagSnapshotJobs = new Map<number, Promise<boolean>>();
+const companySnapshotJobs = new Map<number, Promise<boolean>>();
 const grantStorageMutations = new Map<string, Promise<void>>();
 const chatTabUpdates = new Map<number, Promise<void>>();
 let fixtureReadWatch: ReturnType<typeof browser.runtime.connectNative> | undefined;
@@ -82,18 +87,29 @@ type ReadWatchRestart = { timer?: ReturnType<typeof setTimeout>; delayMs: number
 const fixtureWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
 const geminiWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
 const databagWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
+const companyWatchRestart: ReadWatchRestart = { delayMs: 1_000 };
+
+function isEligibleSavedChatUrl(provider: SavedProvider, url: unknown): url is string {
+  return provider === "gemini" ? typeof url === "string" && isEligibleGeminiUrl(url)
+    : provider === "databag" ? isEligibleDatabagUrl(url) : isEligibleCompanyAIChatUrl(url);
+}
 
 function isLiveStoredExpiry(expiresAt: unknown): boolean {
   return expiresAt === null || (typeof expiresAt === "number" && Number.isSafeInteger(expiresAt) && expiresAt > Date.now());
 }
 
 function chatGrantKey(target: ChatTarget): string {
-  return target.provider === "databag" ? databagGrantKey(target.tabId)
+  return target.provider === "company_ai" ? companyGrantKey(target.tabId) : target.provider === "databag" ? databagGrantKey(target.tabId)
     : target.origin === geminiOrigin ? geminiGrantKey(target.tabId) : fixtureGrantKey(target.tabId);
 }
 
 function storedChatTarget(key: string, tabId: number, grant: StoredFixtureGrant): ChatTarget | null {
   const documentId = grant.documentId;
+  if (key === companyGrantKey(tabId)) {
+    return isEligibleCompanyAIChatUrl(grant.url) && typeof grant.conversationId === "string" && /^company_ai_[a-f0-9]{64}$/.test(grant.conversationId)
+      ? { provider: "company_ai", origin: new URL(grant.url).origin as `https://${string}`, conversationId: grant.conversationId,
+        url: grant.url, tabId, documentId } : null;
+  }
   if (key === databagGrantKey(tabId)) {
     return isEligibleDatabagUrl(grant.url) && typeof grant.conversationId === "string" && /^databag_[a-f0-9]{64}$/.test(grant.conversationId)
       ? { provider: "databag", origin: new URL(grant.url).origin as `https://${string}`, conversationId: grant.conversationId,
@@ -147,6 +163,13 @@ async function stopDatabagTargetObservation(tabId: number, documentId: string): 
     func: stopDatabagObservation }).catch(() => {});
 }
 
+async function stopCompanyTargetObservation(target: ChatTarget): Promise<void> {
+  if (target.provider !== "company_ai") return;
+  await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] }, world: "MAIN",
+    func: invokeCompanyAIChatReader, args: [{ action: "dispose", url: target.url,
+      conversationId: target.conversationId, deadline: Date.now() + 4000 }] }).catch(() => {});
+}
+
 async function revokeChangedChatGrant(key: string, tabId: number, documentId: string): Promise<void> {
   const grant = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
   if (grant?.documentId !== documentId || grant.reloadPending || chatTabUpdates.has(tabId)) return;
@@ -162,6 +185,7 @@ async function revokeChangedChatGrant(key: string, tabId: number, documentId: st
     if (latest?.documentId !== grant.documentId || latest.revision !== grant.revision) return;
     await browser.storage.session.remove(key);
     if (target.provider === "databag" && reply.payload.remainingAgents === 0) await stopDatabagTargetObservation(tabId, documentId);
+    if (target.provider === "company_ai" && reply.payload.remainingAgents === 0) await stopCompanyTargetObservation(target);
     if (target.origin === geminiOrigin) await recordGeminiGrantStatus(tabId, "target_changed").catch(() => {});
   });
 }
@@ -198,7 +222,7 @@ async function classifyFixturePublicationFailure(tabId: number, documentId: stri
 }
 
 async function revokeTrackedFixture(tabId: number, geminiReason?: GeminiGrantStatus["code"]): Promise<void> {
-  const keys = [fixtureGrantKey(tabId), geminiGrantKey(tabId), databagGrantKey(tabId)];
+  const keys = [fixtureGrantKey(tabId), geminiGrantKey(tabId), databagGrantKey(tabId), companyGrantKey(tabId)];
   const stored = await browser.storage.session.get(keys);
   const active: string[] = [];
   for (const key of keys) {
@@ -217,6 +241,9 @@ async function revokeTrackedFixture(tabId: number, geminiReason?: GeminiGrantSta
     await browser.storage.session.remove(active);
     const databag = stored[databagGrantKey(tabId)] as StoredGeminiGrant | undefined;
     if (active.includes(databagGrantKey(tabId)) && databag) await stopDatabagTargetObservation(tabId, databag.documentId);
+    const company = stored[companyGrantKey(tabId)] as StoredGeminiGrant | undefined;
+    const target = company && storedChatTarget(companyGrantKey(tabId), tabId, company);
+    if (target && active.includes(companyGrantKey(tabId))) await stopCompanyTargetObservation(target);
   }
 }
 
@@ -337,12 +364,12 @@ function queueFixtureSnapshot(tabId: number, documentId: string, challengeId?: s
 async function publishSavedChatSnapshot(provider: SavedProvider, tabId: number, expectedUrl: string,
   documentId: string, challengeId?: string, expiresAt = Infinity): Promise<boolean> {
   try {
-    if (expiresAt <= Date.now() || !(provider === "gemini" ? isEligibleGeminiUrl(expectedUrl) : isEligibleDatabagUrl(expectedUrl))
+    if (expiresAt <= Date.now() || !isEligibleSavedChatUrl(provider, expectedUrl)
       || (challengeId !== undefined
         && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(challengeId))) {
       return false;
     }
-    const key = provider === "gemini" ? geminiGrantKey(tabId) : databagGrantKey(tabId);
+    const key = savedGrantKey(provider, tabId);
     const stored = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
     if (stored?.documentId !== documentId || stored.url !== expectedUrl || stored.reloadPending || chatTabUpdates.has(tabId)
       || !isLiveStoredExpiry(stored.expiresAt)) return false;
@@ -350,23 +377,32 @@ async function publishSavedChatSnapshot(provider: SavedProvider, tabId: number, 
     if (!target || target.origin === "http://127.0.0.1:8787") return false;
     const [captured] = provider === "gemini"
       ? await browser.scripting.executeScript({ target: { tabId, documentIds: [documentId] }, func: captureGeminiSnapshot, args: [expectedUrl] })
-      : await browser.scripting.executeScript({ target: { tabId, documentIds: [documentId] }, func: captureDatabagSnapshot, args: [target.conversationId] });
+      : provider === "databag"
+      ? await browser.scripting.executeScript({ target: { tabId, documentIds: [documentId] }, func: captureDatabagSnapshot, args: [target.conversationId] })
+      : await browser.scripting.executeScript({ target: { tabId, documentIds: [documentId] }, world: "MAIN", func: invokeCompanyAIChatReader,
+        args: [{ action: "capture", url: expectedUrl, conversationId: target.conversationId, deadline: Math.min(Date.now() + 4000, expiresAt) }] });
     const tab = await browser.tabs.get(tabId);
     if (captured?.frameId !== 0 || captured.documentId !== documentId || !captured.result
       || tab.url !== expectedUrl || expiresAt <= Date.now()) return false;
-    const messages = captured.result.messages;
+    const snapshot = "snapshot" in captured.result ? captured.result.snapshot : "messages" in captured.result ? captured.result : null;
+    if (!snapshot || (provider === "company_ai" && (!("conversationId" in captured.result)
+      || captured.result.conversationId !== target.conversationId || !("url" in captured.result) || captured.result.url !== expectedUrl))) return false;
+    const messages = snapshot.messages;
     const conversationId = target.conversationId;
 
     const deadlineMs = Math.min(Date.now() + 10_000, expiresAt);
     const reply = await sendNativeRequest(provider === "gemini" ? "publish_gemini_snapshot" : "publish_chat_snapshot", {
-      target, messages, omittedBefore: captured.result.omittedBefore,
+      target, messages, omittedBefore: snapshot.omittedBefore,
     ...(challengeId === undefined ? {} : { challengeId }) }, deadlineMs);
     const payload = reply.payload;
     if (reply.kind !== (provider === "gemini" ? "gemini_snapshot_published" : "chat_snapshot_published") || Object.keys(payload).length !== 1
       || typeof payload.count !== "number" || !Number.isSafeInteger(payload.count) || payload.count <= 0) return false;
     const [current] = provider === "gemini"
       ? await browser.scripting.executeScript({ target: { tabId, documentIds: [documentId] }, func: identifyGeminiConversation })
-      : await browser.scripting.executeScript({ target: { tabId, documentIds: [documentId] }, func: identifyDatabagConversation });
+      : provider === "databag"
+      ? await browser.scripting.executeScript({ target: { tabId, documentIds: [documentId] }, func: identifyDatabagConversation })
+      : await browser.scripting.executeScript({ target: { tabId, documentIds: [documentId] }, world: "MAIN", func: invokeCompanyAIChatReader,
+        args: [{ action: "check", url: expectedUrl, conversationId, deadline: Math.min(Date.now() + 4000, expiresAt) }] });
     const currentTab = await browser.tabs.get(tabId);
     return current?.frameId === 0 && current.documentId === documentId
       && current.result?.url === expectedUrl && current.result.conversationId === conversationId
@@ -378,7 +414,7 @@ async function publishSavedChatSnapshot(provider: SavedProvider, tabId: number, 
 
 function queueSavedChatSnapshot(provider: SavedProvider, tabId: number, expectedUrl: string, documentId: string,
   challengeId?: string, expiresAt?: number) {
-  const jobs = provider === "gemini" ? geminiSnapshotJobs : databagSnapshotJobs;
+  const jobs = provider === "gemini" ? geminiSnapshotJobs : provider === "databag" ? databagSnapshotJobs : companySnapshotJobs;
   const previous = jobs.get(tabId) ?? Promise.resolve(true);
   const job = previous.then(() => publishSavedChatSnapshot(provider, tabId, expectedUrl, documentId, challengeId, expiresAt),
     () => publishSavedChatSnapshot(provider, tabId, expectedUrl, documentId, challengeId, expiresAt));
@@ -413,8 +449,8 @@ async function hasTrackedSavedGrant(provider: SavedProvider): Promise<boolean> {
     if (!new RegExp(`^${provider}-grant-[1-9]\\d*$`).test(key) || typeof value !== "object" || value === null) return false;
     const grant = value as Partial<StoredGeminiGrant>;
     return typeof grant.documentId === "string" && /^[!-~]{1,128}$/.test(grant.documentId)
-      && typeof grant.url === "string" && (provider === "gemini" ? isEligibleGeminiUrl(grant.url)
-        : isEligibleDatabagUrl(grant.url) && typeof grant.conversationId === "string" && /^databag_[a-f0-9]{64}$/.test(grant.conversationId))
+      && isEligibleSavedChatUrl(provider, grant.url) && (provider === "gemini" || typeof grant.conversationId === "string"
+        && (provider === "databag" ? /^databag_[a-f0-9]{64}$/ : /^company_ai_[a-f0-9]{64}$/).test(grant.conversationId))
       && isLiveStoredExpiry(grant.expiresAt);
   });
 }
@@ -451,6 +487,11 @@ async function releaseDisconnectedGrants(provider: "fixture" | SavedProvider, ac
       const latest = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
       if (latest?.documentId !== grant.documentId || latest.expiresAt !== grant.expiresAt || latest.revision !== grant.revision) return;
       await browser.storage.session.remove(key);
+      if (provider === "company_ai") {
+        const target = storedChatTarget(key, tabId, grant);
+        if (target) await stopCompanyTargetObservation(target);
+        return;
+      }
       await browser.scripting.executeScript({ target: { tabId, documentIds: [grant.documentId] },
         func: provider === "fixture" ? stopFixtureObservation : provider === "gemini" ? stopGeminiObservation : stopDatabagObservation }).catch(() => {});
     });
@@ -488,8 +529,12 @@ async function markTrackedSavedGaps(provider: SavedProvider): Promise<boolean> {
       || !isLiveStoredExpiry(grant.expiresAt)) continue;
     const target = storedChatTarget(key, tabId, grant);
     if (!target || target.origin === "http://127.0.0.1:8787") continue;
-    if (target.provider === "databag") {
+    if (target.provider === "databag" || target.provider === "company_ai") {
       if (!await sendGrantCountRequest({ kind: "mark_chat_observation_gap", payload: { target } })) return false;
+      if (target.provider === "company_ai") {
+        await browser.storage.session.remove(key);
+        await stopCompanyTargetObservation(target);
+      }
     } else if (!await sendGrantCountRequest({ kind: "mark_gemini_observation_gap", payload: { target } })) return false;
   }
   return true;
@@ -985,7 +1030,7 @@ function parseFixtureDispatchAttempts(value: unknown, requestId: string, deadlin
   });
 }
 
-function parseChatJobs(value: unknown, requestId: string, deadlineMs: number, provider: "fixture" | SavedProvider,
+function parseChatJobs(value: unknown, requestId: string, deadlineMs: number, provider: "fixture" | "gemini" | "databag",
   phase: ChatBrowserJob["phase"] = "submit") {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
   const reply = value as Record<string, unknown>;
@@ -1093,8 +1138,8 @@ function parseGeminiReadChallenges(value: unknown, requestId: string, deadlineMs
       || typeof target.conversationId !== "string" || typeof target.url !== "string"
       || (provider === "gemini" ? target.origin !== geminiOrigin || !/^[A-Za-z0-9_-]{1,128}$/.test(target.conversationId)
         || !isEligibleGeminiUrl(target.url) || new URL(target.url).pathname.split("/").filter(Boolean)[1] !== target.conversationId
-        : target.provider !== "databag" || !isEligibleDatabagUrl(target.url) || new URL(target.url).origin !== target.origin
-          || !/^databag_[a-f0-9]{64}$/.test(target.conversationId))
+        : target.provider !== provider || !isEligibleSavedChatUrl(provider, target.url) || new URL(target.url).origin !== target.origin
+          || !(provider === "databag" ? /^databag_[a-f0-9]{64}$/ : /^company_ai_[a-f0-9]{64}$/).test(target.conversationId))
       || typeof target.tabId !== "number" || !Number.isSafeInteger(target.tabId) || target.tabId < 1
       || typeof target.documentId !== "string" || !/^[!-~]{1,128}$/.test(target.documentId)) throw new Error();
     return { challengeId: challenge.challengeId, expiresAt: challenge.expiresAt,
@@ -1261,7 +1306,7 @@ function startGeminiReadWatch(): boolean {
 
 function startSavedChatReadWatch(provider: SavedProvider): boolean {
   if (savedReadWatches.has(provider)) return true;
-  const restart = provider === "gemini" ? geminiWatchRestart : databagWatchRestart;
+  const restart = provider === "gemini" ? geminiWatchRestart : provider === "databag" ? databagWatchRestart : companyWatchRestart;
   const hasGrant = () => hasTrackedSavedGrant(provider);
   const start = () => startSavedChatReadWatch(provider);
   clearTimeout(restart.timer);
@@ -1289,7 +1334,10 @@ function startSavedChatReadWatch(provider: SavedProvider): boolean {
     clearTimeout(responseTimer);
     clearTimeout(pollTimer);
     port.disconnect();
-    scheduleReadWatchRestart(restart, hasGrant, start);
+    if (provider === "company_ai") {
+      void markTrackedSavedGaps(provider).then(ended => { if (!ended) scheduleReadWatchRestart(restart, hasGrant,
+        () => { void markTrackedSavedGaps(provider); return false; }); }).catch(() => {});
+    } else scheduleReadWatchRestart(restart, hasGrant, start);
   }
 
   async function poll() {
@@ -1306,7 +1354,7 @@ function startSavedChatReadWatch(provider: SavedProvider): boolean {
         : phase === "fill" ? "list_gemini_fill_challenges"
           : provider === "gemini" ? "list_gemini_read_challenges" : "list_chat_read_challenges", protocolVersion,
         requestId, connectionGeneration: 0, deadlineMs,
-        payload: chatPhase ? { phase: chatPhase, provider } : provider === "databag" ? { provider } : {} });
+        payload: chatPhase ? { phase: chatPhase, provider } : provider !== "gemini" ? { provider } : {} });
     } catch {
       stop();
     }
@@ -1317,6 +1365,7 @@ function startSavedChatReadWatch(provider: SavedProvider): boolean {
     if (!requestId) return stop();
     clearTimeout(responseTimer);
     if (phase !== "read") {
+      if (provider === "company_ai") return stop();
       if (provider === "databag" && (phase === "fill" || phase === "proof")) return stop();
       const checks = (() => {
         try { return phase === "submit" || phase === "chat_fill" || phase === "chat_proof" || phase === "chat_settle"
@@ -1350,22 +1399,34 @@ function startSavedChatReadWatch(provider: SavedProvider): boolean {
     restart.delayMs = 1_000;
     void (async () => {
       await releaseDisconnectedGrants(provider, listing.activeTabIds, listedGrants);
+      if (provider === "company_ai") for (const [key, value] of Object.entries(listedGrants)) {
+        if (!/^company_ai-grant-[1-9]\d*$/.test(key)) continue;
+        const tabId = Number(key.slice("company_ai-grant-".length));
+        const grant = value as StoredGeminiGrant;
+        const target = storedChatTarget(key, tabId, grant);
+        if (!target || target.provider !== "company_ai" || grant.reloadPending || chatTabUpdates.has(tabId)) continue;
+        const [checked] = await browser.scripting.executeScript({ target: { tabId, documentIds: [grant.documentId] }, world: "MAIN",
+          func: invokeCompanyAIChatReader, args: [{ action: "check", url: target.url,
+            conversationId: target.conversationId, deadline: Date.now() + 4000 }] }).catch(() => []);
+        if (checked?.frameId !== 0 || checked.documentId !== grant.documentId || checked.result?.url !== target.url
+          || checked.result.conversationId !== target.conversationId) await revokeChangedChatGrant(key, tabId, grant.documentId);
+      }
       for (const challenge of listing.challenges) {
         if (challenge.expiresAt <= Date.now()) continue;
-        const key = provider === "gemini" ? geminiGrantKey(challenge.tabId) : databagGrantKey(challenge.tabId);
+        const key = savedGrantKey(provider, challenge.tabId);
         const grant = (await browser.storage.session.get(key))[key] as StoredGeminiGrant | undefined;
         if (!grant || grant.documentId !== challenge.documentId || grant.url !== challenge.url
-          || (provider === "databag" && grant.conversationId !== challenge.conversationId)
+          || (provider !== "gemini" && grant.conversationId !== challenge.conversationId)
           || grant.reloadPending || chatTabUpdates.has(challenge.tabId) || !isLiveStoredExpiry(grant.expiresAt)) continue;
         if (!await queueSavedChatSnapshot(provider, challenge.tabId, challenge.url,
           challenge.documentId, challenge.challengeId, challenge.expiresAt)) {
-          if (await classifyGeminiPublicationFailure(challenge.tabId, challenge.url, challenge.documentId) === "target_changed") {
+          if (provider === "company_ai" || await classifyGeminiPublicationFailure(challenge.tabId, challenge.url, challenge.documentId) === "target_changed") {
             await revokeChangedChatGrant(key, challenge.tabId, challenge.documentId);
           }
         }
       }
-      phase = provider === "gemini" ? "fill" : "chat_fill";
-      if (isCurrent()) pollTimer = setTimeout(() => { void poll(); }, 0);
+      phase = provider === "company_ai" ? "read" : provider === "gemini" ? "fill" : "chat_fill";
+      if (isCurrent()) pollTimer = setTimeout(() => { void poll(); }, provider === "company_ai" ? 250 : 0);
     })().catch(stop);
   });
   port.onDisconnect.addListener(() => { void browser.runtime.lastError; stop(); });
@@ -1618,7 +1679,7 @@ async function approveGemini(tabId: number, expectedUrl: string, pendingRequestI
 }
 
 async function selectedChatTab(tabId: number, expectedUrl: string): Promise<boolean> {
-  if (!isEligibleGeminiUrl(expectedUrl) && !isEligibleDatabagUrl(expectedUrl)
+  if (!isEligibleGeminiUrl(expectedUrl) && !isEligibleDatabagUrl(expectedUrl) && !isEligibleCompanyAIChatUrl(expectedUrl)
     && new URL(expectedUrl).origin !== "http://127.0.0.1:8787") return false;
   const [active] = await browser.tabs.query({ active: true, currentWindow: true });
   return active?.id === tabId && active.url === expectedUrl;
@@ -1634,7 +1695,16 @@ async function chatDocumentTarget(tabId: number, expectedUrl: string, documentId
   if ((await browser.tabs.get(tabId)).url !== expectedUrl) return null;
   const scriptTarget = { tabId, ...(documentId ? { documentIds: [documentId] } : {}) };
   let target: ChatTarget;
-  if (isEligibleGeminiUrl(expectedUrl)) {
+  if (isEligibleCompanyAIChatUrl(expectedUrl)) {
+    const [installed] = await browser.scripting.executeScript({ target: scriptTarget, world: "MAIN", files: ["/company-ai-main.js"] });
+    if (installed?.frameId !== 0 || (documentId && installed.documentId !== documentId)) return null;
+    const [identity] = await browser.scripting.executeScript({ target: { tabId, documentIds: [installed.documentId] }, world: "MAIN",
+      func: invokeCompanyAIChatReader, args: [{ action: "bind", url: expectedUrl, deadline: Date.now() + 4000 }] });
+    if (identity?.frameId !== 0 || identity.documentId !== installed.documentId || identity.result?.url !== expectedUrl
+      || !/^company_ai_[a-f0-9]{64}$/.test(identity.result.conversationId)) return null;
+    target = { provider: "company_ai", origin: new URL(expectedUrl).origin as `https://${string}`,
+      conversationId: identity.result.conversationId, url: expectedUrl, tabId, documentId: identity.documentId };
+  } else if (isEligibleGeminiUrl(expectedUrl)) {
     const [identity] = await browser.scripting.executeScript({ target: scriptTarget, func: identifyGeminiConversation });
     if (identity?.frameId !== 0 || identity.result?.url !== expectedUrl) return null;
     target = { origin: "https://gemini.google.com", conversationId: identity.result.conversationId,
@@ -1709,6 +1779,13 @@ async function manageSelectedUnconfirmedDispatches(tabId: number, expectedUrl: s
 
 async function observeApprovedChatTarget(target: ChatTarget): Promise<void> {
   const scriptTarget = { tabId: target.tabId, documentIds: [target.documentId] };
+  if (target.provider === "company_ai") {
+    const [identity] = await browser.scripting.executeScript({ target: scriptTarget, world: "MAIN", func: invokeCompanyAIChatReader,
+      args: [{ action: "check", url: target.url, conversationId: target.conversationId, deadline: Date.now() + 4000 }] });
+    if (identity?.frameId !== 0 || identity.documentId !== target.documentId || identity.result?.conversationId !== target.conversationId
+      || identity.result.url !== target.url || !startSavedChatReadWatch("company_ai")) throw new Error();
+    return;
+  }
   if (target.provider === "databag") {
     const [observed] = await browser.scripting.executeScript({ target: scriptTarget, func: observeDatabagMessages, args: [target.conversationId] });
     if (observed?.frameId !== 0 || observed.documentId !== target.documentId || observed.result !== true
@@ -1769,6 +1846,7 @@ async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agen
             && latest.url === expectedUrl) {
             await browser.storage.session.remove(grantKey);
             if (target.provider === "databag") await stopDatabagTargetObservation(tabId, target.documentId);
+            if (target.provider === "company_ai") await stopCompanyTargetObservation(target);
           }
         });
       }
@@ -1780,7 +1858,7 @@ async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agen
       await mutateStoredGrant(grantKey, async () => {
         if (Date.now() >= deadlineMs) throw new Error();
         await browser.storage.session.set({ [grantKey]: { documentId: target.documentId, url: expectedUrl,
-          ...(target.provider === "databag" ? { conversationId: target.conversationId } : {}),
+          ...(target.provider === "databag" || target.provider === "company_ai" ? { conversationId: target.conversationId } : {}),
           expiresAt: null, revision: crypto.randomUUID() } satisfies StoredGeminiGrant });
       });
       await observeApprovedChatTarget(target);
@@ -1799,6 +1877,7 @@ async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agen
         if (latest?.documentId === stored.documentId && latest.expiresAt === stored.expiresAt && latest.revision === stored.revision) {
           await browser.storage.session.remove(grantKey);
           if (target?.provider === "databag") await stopDatabagTargetObservation(tabId, target.documentId);
+          if (target?.provider === "company_ai") await stopCompanyTargetObservation(target);
         }
       });
     }
@@ -1812,10 +1891,14 @@ async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agen
 }
 
 async function handleChatTabUpdate(tabId: number, change: { status?: string; url?: string }): Promise<void> {
-  for (const key of [fixtureGrantKey(tabId), geminiGrantKey(tabId), databagGrantKey(tabId)]) {
+  for (const key of [fixtureGrantKey(tabId), geminiGrantKey(tabId), databagGrantKey(tabId), companyGrantKey(tabId)]) {
     await mutateStoredGrant(key, async () => {
       const stored = (await browser.storage.session.get(key))[key] as StoredFixtureGrant | StoredGeminiGrant | undefined;
       if (!stored) return;
+      if (key === companyGrantKey(tabId)) {
+        if (change.status === "loading" || change.url !== undefined) await revokeTrackedFixture(tabId, "target_changed");
+        return;
+      }
       if (stored.expiresAt !== null || !stored.url
         || (change.url !== undefined && change.url !== stored.url) || (await browser.tabs.get(tabId)).url !== stored.url) {
         if (change.status === "loading" || change.url || stored.reloadPending) await revokeTrackedFixture(tabId, "target_changed");
@@ -2212,6 +2295,7 @@ export default defineBackground(() => {
     if (ready && await hasTrackedFixtureGrant() && await markTrackedFixtureGaps()) startFixtureReadWatch();
     if (ready && await hasTrackedGeminiGrant() && await markTrackedGeminiGaps()) startGeminiReadWatch();
     if (ready && await hasTrackedSavedGrant("databag") && await markTrackedSavedGaps("databag")) startSavedChatReadWatch("databag");
+    if (ready && await hasTrackedSavedGrant("company_ai")) await markTrackedSavedGaps("company_ai");
   }).catch(() => {});
   browser.tabs.onRemoved.addListener((tabId) => { void revokeTrackedFixture(tabId).catch(() => {}); });
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
