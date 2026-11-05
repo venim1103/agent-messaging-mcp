@@ -281,9 +281,17 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
     const targets = fixture();
     const elements = [targets.editor.element, targets.timeline.element, targets.profile.element];
     const attached = new Set(elements);
-    const syntheticDocument = { visibilityState: "visible", documentElement: { contains: element => attached.has(element) } };
+    const listeners = new Set();
+    const eventTarget = data => {
+      const target = Object.assign(new EventTarget(), data);
+      const add = target.addEventListener.bind(target), remove = target.removeEventListener.bind(target);
+      target.addEventListener = (type, listener) => { add(type, listener); listeners.add(listener); };
+      target.removeEventListener = (type, listener) => { remove(type, listener); listeners.delete(listener); };
+      return target;
+    };
+    const syntheticDocument = eventTarget({ visibilityState: "visible", documentElement: { contains: element => attached.has(element) } });
     const syntheticLocation = { href: "https://chat.app.example.com/chat/synthetic" };
-    const syntheticWindow = { location: syntheticLocation, document: syntheticDocument };
+    const syntheticWindow = eventTarget({ location: syntheticLocation, document: syntheticDocument });
     syntheticWindow.top = syntheticWindow; syntheticDocument.defaultView = syntheticWindow;
     for (const element of elements) { element.ownerDocument = syntheticDocument; element.isConnected = true; }
     let profileReads = 0;
@@ -298,11 +306,59 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
       assert.ok(!JSON.stringify(result).includes("SYNTHETIC_SECRET"));
       return JSON.parse(JSON.stringify(result));
     };
-    return { targets, attached, options, sandbox, inspectDocument, profileReads: () => profileReads, expire: () => { now = options.deadline; } };
+    return { targets, attached, options, sandbox, inspectDocument, profileReads: () => profileReads,
+      listenerCount: () => listeners.size, expire: () => { now = options.deadline; } };
   };
   const acceptedDocument = guardedFixture();
   assert.deepEqual(acceptedDocument.inspectDocument(), expected);
   assert.equal(acceptedDocument.profileReads(), 1);
+  for (const end of [
+    (input, captured) => { assert.equal(captured.dispose(), undefined); captured.dispose(); },
+    input => { input.sandbox.window.dispatchEvent(new Event("pagehide")); },
+    input => { input.sandbox.document.visibilityState = "hidden";
+      input.sandbox.document.dispatchEvent(new Event("visibilitychange"));
+      input.sandbox.document.visibilityState = "visible"; },
+    input => { Object.defineProperty(input.sandbox.document, "visibilityState", { get() { throw new Error("SYNTHETIC_SECRET"); } });
+      input.sandbox.document.dispatchEvent(new Event("visibilitychange")); },
+    input => { input.expire(); }
+  ]) {
+    const lifecycle = guardedFixture();
+    const captured = lifecycle.sandbox.exports.createCompanyAIChatIdentityCheck(lifecycle.options);
+    assert.equal(captured.status, "ok");
+    assert.equal(lifecycle.listenerCount(), 2);
+    end(lifecycle, captured);
+    const beforeTerminal = lifecycle.profileReads();
+    assert.ok(["refused", "expired"].includes(captured.check().status));
+    assert.equal(lifecycle.profileReads(), beforeTerminal);
+    assert.equal(lifecycle.listenerCount(), 0);
+    captured.dispose();
+    assert.equal(lifecycle.listenerCount(), 0);
+  }
+  const visibleEvent = guardedFixture();
+  const visibleBinding = visibleEvent.sandbox.exports.createCompanyAIChatIdentityCheck(visibleEvent.options);
+  visibleEvent.sandbox.document.dispatchEvent(new Event("visibilitychange"));
+  assert.equal(visibleBinding.check().status, "ok");
+  visibleBinding.dispose();
+  const failedRegistration = guardedFixture();
+  failedRegistration.sandbox.document.addEventListener = () => { throw new Error("SYNTHETIC_SECRET"); };
+  assert.equal(JSON.stringify(failedRegistration.sandbox.exports.createCompanyAIChatIdentityCheck(failedRegistration.options)),
+    '{"status":"refused"}');
+  assert.equal(failedRegistration.listenerCount(), 0);
+  const expiredRegistration = guardedFixture();
+  const addBeforeExpiry = expiredRegistration.sandbox.document.addEventListener;
+  expiredRegistration.sandbox.document.addEventListener = (...args) => { addBeforeExpiry(...args); expiredRegistration.expire(); };
+  assert.equal(JSON.stringify(expiredRegistration.sandbox.exports.createCompanyAIChatIdentityCheck(expiredRegistration.options)),
+    '{"status":"expired"}');
+  assert.equal(expiredRegistration.listenerCount(), 0);
+  const duringProfile = guardedFixture();
+  let duringProfileBinding;
+  duringProfile.options.readProfile = () => {
+    if (duringProfileBinding) duringProfile.sandbox.window.dispatchEvent(new Event("pagehide"));
+    return "SYNTHETIC_SECRET";
+  };
+  duringProfileBinding = duringProfile.sandbox.exports.createCompanyAIChatIdentityCheck(duringProfile.options);
+  assert.equal(duringProfileBinding.check().status, "refused");
+  assert.equal(duringProfile.listenerCount(), 0);
   const bound = guardedFixture();
   assert.deepEqual(Object.keys(bound.sandbox.exports).sort(), ["createCompanyAIChatIdentityCheck",
     "inspectCompanyAIChatStructure", "proveCompanyAIChatIdentity", "proveCompanyAIChatIdentityInDocument"].sort());
@@ -341,6 +397,7 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
     const readsAfterRefusal = changedBinding.profileReads();
     assert.equal(captured.check().status, "refused");
     assert.equal(changedBinding.profileReads(), readsAfterRefusal);
+    assert.equal(changedBinding.listenerCount(), 0);
     assert.ok(!JSON.stringify(captured).includes("SYNTHETIC_SECRET"));
   }
   const newCommit = guardedFixture();
@@ -509,6 +566,36 @@ test("Company AI Chat document guard checks native DOM without connection or inp
       const readsAfterIdentityChange = profileReads;
       const terminalCaptured = binding.check();
       const terminalReadFree = profileReads === readsAfterIdentityChange;
+      const lifecycle = [];
+      const listeners = new Set();
+      const originals = [window, document].map(target => {
+        const add = target.addEventListener, remove = target.removeEventListener;
+        target.addEventListener = (type, listener) => { add.call(target, type, listener); listeners.add(listener); };
+        target.removeEventListener = (type, listener) => { remove.call(target, type, listener); listeners.delete(listener); };
+        return { target, add, remove };
+      });
+      try {
+        for (const end of [
+          captured => { captured.dispose(); captured.dispose(); },
+          () => { window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })); },
+          () => { Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+            document.dispatchEvent(new Event("visibilitychange")); delete document.visibilityState; }
+        ]) {
+          const captured = createCompanyAIChatIdentityCheck(options);
+          const initialStatus = captured.status;
+          const registered = listeners.size;
+          end(captured);
+          const reads = profileReads;
+          lifecycle.push({ initialStatus, registered, terminal: captured.check(), later: captured.check(),
+            readFree: reads === profileReads, listenerCount: listeners.size });
+        }
+      } finally {
+        for (const { target, add, remove } of originals) {
+          target.addEventListener = add; target.removeEventListener = remove;
+        }
+        delete document.visibilityState;
+      }
+      const lifecycleUnchanged = document.documentElement.outerHTML === before;
       editor.remove();
       const unguardedDetached = proveCompanyAIChatIdentity(editor, timeline, profile, Element, options.deadline, readProfile);
       profileReads = 0;
@@ -529,7 +616,7 @@ test("Company AI Chat document guard checks native DOM without connection or inp
       const replacedRoot = proveCompanyAIChatIdentityInDocument({ ...options,
         readProfile: () => { document.documentElement.replaceWith(document.documentElement.cloneNode(true)); return profile.textContent; } });
       return { accepted, unchanged, capturedAccepted, independentChangedIdentity, capturedChangedIdentity,
-        terminalCaptured, terminalReadFree, unguardedDetached, detached, detachedReads, adopted, adoptedReads,
+        terminalCaptured, terminalReadFree, lifecycle, lifecycleUnchanged, unguardedDetached, detached, detachedReads, adopted, adoptedReads,
         detachedDuringProof, changedUrl, replacedRoot, inputs, activations };
     });
     assert.equal(results.accepted.status, "ok");
@@ -539,6 +626,12 @@ test("Company AI Chat document guard checks native DOM without connection or inp
     assert.deepEqual(results.capturedChangedIdentity, { status: "refused" });
     assert.deepEqual(results.terminalCaptured, { status: "refused" });
     assert.equal(results.terminalReadFree, true);
+    assert.equal(results.lifecycle.length, 3);
+    for (const lifecycle of results.lifecycle) {
+      assert.deepEqual(lifecycle, { initialStatus: "ok", registered: 2, terminal: { status: "refused" },
+        later: { status: "refused" }, readFree: true, listenerCount: 0 });
+    }
+    assert.equal(results.lifecycleUnchanged, true);
     for (const key of ["detached", "adopted", "detachedDuringProof", "changedUrl", "replacedRoot"]) {
       assert.deepEqual(results[key], { status: "refused" });
     }

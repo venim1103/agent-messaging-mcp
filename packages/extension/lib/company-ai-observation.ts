@@ -295,9 +295,9 @@ export function proveCompanyAIChatIdentityInDocument(input: CompanyDocumentInput
 }
 
 export function createCompanyAIChatIdentityCheck(input: CompanyDocumentInput):
-  { status: "ok"; check: () => CompanyIdentityProof } | { status: "refused" | "expired" } {
+  { status: "ok"; check: () => CompanyIdentityProof; dispose: () => void } | { status: "refused" | "expired" } {
   try {
-    const request = { ...input };
+    let request: CompanyDocumentInput | undefined = { ...input };
     let captured: CompanyDocumentRead["snapshot"];
     {
       const initial = readCompanyAIChatIdentityInDocument(request);
@@ -305,17 +305,37 @@ export function createCompanyAIChatIdentityCheck(input: CompanyDocumentInput):
       captured = initial.snapshot;
       if (!captured) return { status: "refused" };
     }
-    let terminal: CompanyIdentityProof | undefined;
+    let terminal: { status: "refused" | "expired" } | undefined;
+    let listenerWindow: Window | undefined = captured.window;
+    let listenerDocument: Document | undefined = captured.document;
     let checking = false;
-    return { status: "ok", check: () => {
+    const end = (proof: { status: "refused" | "expired" } = { status: "refused" }) => {
+      terminal ??= proof;
+      captured = undefined;
+      request = undefined;
+      try { listenerWindow?.removeEventListener("pagehide", pageHidden); } catch {}
+      try { listenerDocument?.removeEventListener("visibilitychange", visibilityChanged); } catch {}
+      listenerWindow = undefined;
+      listenerDocument = undefined;
+      return terminal;
+    };
+    const pageHidden = () => { end(); };
+    const visibilityChanged = () => {
+      try { if (listenerDocument?.visibilityState !== "visible") end(); } catch { end(); }
+    };
+    try {
+      listenerWindow.addEventListener("pagehide", pageHidden);
+      listenerDocument.addEventListener("visibilitychange", visibilityChanged);
+    } catch { return end(); }
+    if (terminal || !request) return end();
+    if (Date.now() >= request.deadline) return end({ status: "expired" });
+    return { status: "ok", dispose: () => { end(); }, check: () => {
       if (terminal) return terminal;
-      if (checking) {
-        captured = undefined;
-        return terminal = { status: "refused" };
-      }
+      if (checking || !request) return end();
       checking = true;
       const fresh = readCompanyAIChatIdentityInDocument(request);
       checking = false;
+      if (terminal) return terminal;
       const current = fresh.snapshot;
       if (fresh.proof.status !== "ok" || !current || !captured
         || current.rootState !== captured.rootState || current.account !== captured.account
@@ -324,9 +344,7 @@ export function createCompanyAIChatIdentityCheck(input: CompanyDocumentInput):
         || current.document !== captured.document || current.documentRoot !== captured.documentRoot
         || current.window !== captured.window || current.location !== captured.location
         || current.ElementType !== captured.ElementType) {
-        terminal = fresh.proof.status === "ok" ? { status: "refused" } : fresh.proof;
-        captured = undefined;
-        return terminal;
+        return end(fresh.proof.status === "ok" ? { status: "refused" } : fresh.proof);
       }
       return fresh.proof;
     } };
