@@ -72,17 +72,32 @@ export function inspectCompanyAIChatStructure(input: { expectedUrl: string }) {
     structure, structureOmitted: structureOmitted || limited || pending.length > 0 };
 }
 
-export function proveCompanyAIChatIdentity(editor: object, timeline: object, profile: object,
-  ElementType: new () => object, deadline: number, readProfile: () => unknown):
-  { status: "ok"; sameCommittedRoot: true; conversationMatched: true; profileAccountMatched: true; ready: true }
-  | { status: "refused" | "expired" } {
+type CompanyIdentityProof = { status: "ok"; sameCommittedRoot: true; conversationMatched: true;
+  profileAccountMatched: true; ready: true } | { status: "refused" | "expired" };
+type CompanyIdentitySnapshot = { rootState: object; account: object; conversationId: string;
+  homeAccountId: string; localAccountId: string; username: string };
+type CompanyIdentityRead = { proof: CompanyIdentityProof; snapshot?: CompanyIdentitySnapshot };
+type CompanyDocumentInput = { expectedUrl: string; editor: Element; timeline: Element; profile: Element;
+  deadline: number; readProfile: () => unknown };
+type CompanyDocumentRead = { proof: CompanyIdentityProof;
+  snapshot?: CompanyIdentitySnapshot & { document: Document; documentRoot: Element;
+    window: Window; location: Location; ElementType: typeof Element } };
+
+function readCompanyAIChatIdentity(editor: object, timeline: object, profile: object,
+  ElementType: new () => object, deadline: number, readProfile: () => unknown): CompanyIdentityRead {
   try {
-    if (!Number.isFinite(deadline)) return { status: "refused" };
-    if (Date.now() >= deadline) return { status: "expired" };
+    if (!Number.isFinite(deadline)) return { proof: { status: "refused" } };
+    if (Date.now() >= deadline) return { proof: { status: "expired" } };
     if (typeof readProfile !== "function" || new Set([editor, timeline, profile]).size !== 3) throw null;
     const object = (value: unknown): value is object => value !== null && typeof value === "object";
-    const own = (target: object, name: string, optional = false): unknown => {
+    const readings: { target: object; name: string; descriptor: PropertyDescriptor | undefined }[] = [];
+    const descriptorOf = (target: object, name: string) => {
       const descriptor = Object.getOwnPropertyDescriptor(target, name);
+      readings.push({ target, name, descriptor });
+      return descriptor;
+    };
+    const own = (target: object, name: string, optional = false): unknown => {
+      const descriptor = descriptorOf(target, name);
       if (!descriptor && optional) return undefined;
       if (!descriptor || !Object.hasOwn(descriptor, "value")) throw null;
       return descriptor.value;
@@ -152,8 +167,12 @@ export function proveCompanyAIChatIdentity(editor: object, timeline: object, pro
         }
         return chain;
       });
-      const current = () => own(rootState!, "current") === root && attachments.every(attachment =>
-        own(attachment.element, attachment.name) === attachment.attached);
+      const current = () => own(rootState!, "current") === root && attachments.every(attachment => {
+        const names = Object.getOwnPropertyNames(attachment.element);
+        const matching = names.filter(name => name.startsWith("__reactFiber$"));
+        return names.length <= 64 && matching.length === 1 && matching[0] === attachment.name
+          && own(attachment.element, attachment.name) === attachment.attached;
+      });
       if (!current()) throw null;
       return { root, rootState, chains, current };
     };
@@ -182,7 +201,7 @@ export function proveCompanyAIChatIdentity(editor: object, timeline: object, pro
         if (Date.now() >= deadline) throw null;
         const inspect = (value: unknown) => {
           if (!object(value)) return;
-          const descriptor = Object.getOwnPropertyDescriptor(value, "conversationId");
+          const descriptor = descriptorOf(value, "conversationId");
           if (!descriptor) return;
           if (!Object.hasOwn(descriptor, "value")) throw null;
           const candidate: unknown = descriptor.value;
@@ -211,27 +230,42 @@ export function proveCompanyAIChatIdentity(editor: object, timeline: object, pro
         account = candidate;
       });
     }
-    if (!account || !bounded(own(account, "homeAccountId"), 512) || !bounded(own(account, "localAccountId"), 512)) throw null;
+    if (!account) throw null;
+    const homeAccountId = own(account, "homeAccountId");
+    const localAccountId = own(account, "localAccountId");
+    if (!bounded(homeAccountId, 512) || !bounded(localAccountId, 512)) throw null;
     const username = own(account, "username");
     if (!bounded(username, 256)) throw null;
     const displayed = readProfile();
     if (typeof displayed !== "string" || displayed.length > 256 || displayed.trim() !== username
       || Date.now() >= deadline || !conversation.current() || !accountProof.current()) throw null;
-    return { status: "ok", sameCommittedRoot: true, conversationMatched: true, profileAccountMatched: true, ready: true };
-  } catch { return { status: "refused" }; }
+    for (const reading of readings) {
+      if (Date.now() >= deadline) throw null;
+      const current = Object.getOwnPropertyDescriptor(reading.target, reading.name);
+      if (reading.descriptor ? !current || !Object.hasOwn(current, "value")
+        || current.value !== reading.descriptor.value : current !== undefined) throw null;
+    }
+    if (Date.now() >= deadline) throw null;
+    return { proof: { status: "ok", sameCommittedRoot: true, conversationMatched: true, profileAccountMatched: true, ready: true },
+      snapshot: { rootState: conversation.rootState, account, conversationId: editorProof.identity,
+        homeAccountId, localAccountId, username } };
+  } catch { return { proof: { status: "refused" } }; }
 }
 
-export function proveCompanyAIChatIdentityInDocument(input: { expectedUrl: string; editor: Element;
-  timeline: Element; profile: Element; deadline: number; readProfile: () => unknown }):
-  ReturnType<typeof proveCompanyAIChatIdentity> {
+export function proveCompanyAIChatIdentity(editor: object, timeline: object, profile: object,
+  ElementType: new () => object, deadline: number, readProfile: () => unknown): CompanyIdentityProof {
+  return readCompanyAIChatIdentity(editor, timeline, profile, ElementType, deadline, readProfile).proof;
+}
+
+function readCompanyAIChatIdentityInDocument(input: CompanyDocumentInput): CompanyDocumentRead {
   try {
     const { expectedUrl, editor, timeline, profile, deadline, readProfile } = input;
-    if (!Number.isFinite(deadline)) return { status: "refused" };
-    if (Date.now() >= deadline) return { status: "expired" };
-    if (typeof expectedUrl !== "string" || expectedUrl.length > 512) return { status: "refused" };
+    if (!Number.isFinite(deadline)) return { proof: { status: "refused" } };
+    if (Date.now() >= deadline) return { proof: { status: "expired" } };
+    if (typeof expectedUrl !== "string" || expectedUrl.length > 512) return { proof: { status: "refused" } };
     const url = new URL(expectedUrl);
     if (url.protocol !== "https:" || url.port || url.username || url.password
-      || !/^chat\.app\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.com$/.test(url.hostname)) return { status: "refused" };
+      || !/^chat\.app\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.com$/.test(url.hostname)) return { proof: { status: "refused" } };
     const expectedWindow = window;
     const expectedDocument = document;
     const expectedLocation = location;
@@ -244,11 +278,57 @@ export function proveCompanyAIChatIdentityInDocument(input: { expectedUrl: strin
       && !!expectedRoot && [editor, timeline, profile].every(element => element instanceof ElementType
         && element.ownerDocument === expectedDocument && element.isConnected && expectedRoot.contains(element));
     const admitted = current();
-    if (Date.now() >= deadline) return { status: "expired" };
-    if (!admitted) return { status: "refused" };
-    const result = proveCompanyAIChatIdentity(editor, timeline, profile, ElementType, deadline, readProfile);
+    if (Date.now() >= deadline) return { proof: { status: "expired" } };
+    if (!admitted) return { proof: { status: "refused" } };
+    const result = readCompanyAIChatIdentity(editor, timeline, profile, ElementType, deadline, readProfile);
     const stillCurrent = current();
-    if (Date.now() >= deadline) return { status: "expired" };
-    return stillCurrent ? result : { status: "refused" };
+    if (Date.now() >= deadline) return { proof: { status: "expired" } };
+    if (!stillCurrent) return { proof: { status: "refused" } };
+    return { proof: result.proof, ...(result.snapshot ? { snapshot: { ...result.snapshot,
+      document: expectedDocument, documentRoot: expectedRoot, window: expectedWindow,
+      location: expectedLocation, ElementType } } : {}) };
+  } catch { return { proof: { status: "refused" } }; }
+}
+
+export function proveCompanyAIChatIdentityInDocument(input: CompanyDocumentInput): CompanyIdentityProof {
+  return readCompanyAIChatIdentityInDocument(input).proof;
+}
+
+export function createCompanyAIChatIdentityCheck(input: CompanyDocumentInput):
+  { status: "ok"; check: () => CompanyIdentityProof } | { status: "refused" | "expired" } {
+  try {
+    const request = { ...input };
+    let captured: CompanyDocumentRead["snapshot"];
+    {
+      const initial = readCompanyAIChatIdentityInDocument(request);
+      if (initial.proof.status !== "ok") return initial.proof;
+      captured = initial.snapshot;
+      if (!captured) return { status: "refused" };
+    }
+    let terminal: CompanyIdentityProof | undefined;
+    let checking = false;
+    return { status: "ok", check: () => {
+      if (terminal) return terminal;
+      if (checking) {
+        captured = undefined;
+        return terminal = { status: "refused" };
+      }
+      checking = true;
+      const fresh = readCompanyAIChatIdentityInDocument(request);
+      checking = false;
+      const current = fresh.snapshot;
+      if (fresh.proof.status !== "ok" || !current || !captured
+        || current.rootState !== captured.rootState || current.account !== captured.account
+        || current.conversationId !== captured.conversationId || current.homeAccountId !== captured.homeAccountId
+        || current.localAccountId !== captured.localAccountId || current.username !== captured.username
+        || current.document !== captured.document || current.documentRoot !== captured.documentRoot
+        || current.window !== captured.window || current.location !== captured.location
+        || current.ElementType !== captured.ElementType) {
+        terminal = fresh.proof.status === "ok" ? { status: "refused" } : fresh.proof;
+        captured = undefined;
+        return terminal;
+      }
+      return fresh.proof;
+    } };
   } catch { return { status: "refused" }; }
 }

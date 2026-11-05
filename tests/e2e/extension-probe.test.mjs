@@ -11,6 +11,7 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { runInNewContext } from "node:vm";
+import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { unzipSync } from "fflate";
@@ -23,6 +24,9 @@ import { createNativeRequestChannel, requestNativeGrantCount } from "../../packa
 import { configuredDatabagOrigins, isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
 import { proveCompanyAIChatIdentity, proveCompanyAIChatIdentityInDocument } from "../../packages/extension/lib/company-ai-observation.ts";
 import { extensionDirectory, nativeRelayPath, buildTestExtension, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
+
+const companyProofScript = transpileModule(await readFile(new URL("../../packages/extension/lib/company-ai-observation.ts",
+  import.meta.url), "utf8"), { compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2022 } }).outputText;
 
 const databagBuildSources = [];
 const databagTestBuilds = new Map();
@@ -286,10 +290,11 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
     let now = Date.now();
     const options = { expectedUrl: syntheticLocation.href, editor: elements[0], timeline: elements[1], profile: elements[2],
       deadline: now + 10000, readProfile: () => { profileReads++; return "SYNTHETIC_SECRET"; } };
-    const sandbox = { input: options, proveCompanyAIChatIdentity, window: syntheticWindow, document: syntheticDocument,
+    const sandbox = { exports: {}, input: options, window: syntheticWindow, document: syntheticDocument,
       location: syntheticLocation, Element: SyntheticElement, URL, Date: { now: () => now } };
+    runInNewContext(companyProofScript, sandbox);
     const inspectDocument = () => {
-      const result = runInNewContext(`(${proveCompanyAIChatIdentityInDocument.toString()})(input)`, sandbox);
+      const result = sandbox.exports.proveCompanyAIChatIdentityInDocument(options);
       assert.ok(!JSON.stringify(result).includes("SYNTHETIC_SECRET"));
       return JSON.parse(JSON.stringify(result));
     };
@@ -298,6 +303,111 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
   const acceptedDocument = guardedFixture();
   assert.deepEqual(acceptedDocument.inspectDocument(), expected);
   assert.equal(acceptedDocument.profileReads(), 1);
+  const bound = guardedFixture();
+  assert.deepEqual(Object.keys(bound.sandbox.exports).sort(), ["createCompanyAIChatIdentityCheck",
+    "inspectCompanyAIChatStructure", "proveCompanyAIChatIdentity", "proveCompanyAIChatIdentityInDocument"].sort());
+  const binding = bound.sandbox.exports.createCompanyAIChatIdentityCheck(bound.options);
+  assert.equal(binding.status, "ok");
+  assert.equal(JSON.stringify(binding), '{"status":"ok"}');
+  assert.equal(binding.check().status, "ok");
+  bound.targets.source.memoizedProps.conversationId = "OTHER_SYNTHETIC_SECRET";
+  assert.equal(bound.inspectDocument().status, "ok");
+  assert.equal(binding.check().status, "refused");
+  bound.targets.source.memoizedProps.conversationId = "SYNTHETIC_SECRET";
+  const afterRefusalReads = bound.profileReads();
+  assert.equal(binding.check().status, "refused");
+  assert.equal(bound.profileReads(), afterRefusalReads);
+  const changedAccount = guardedFixture();
+  const accountBinding = changedAccount.sandbox.exports.createCompanyAIChatIdentityCheck(changedAccount.options);
+  changedAccount.targets.account.homeAccountId = "OTHER_SYNTHETIC_SECRET";
+  assert.equal(changedAccount.inspectDocument().status, "ok");
+  assert.equal(accountBinding.check().status, "refused");
+  for (const change of [
+    input => { input.targets.account.localAccountId = "OTHER_SYNTHETIC_SECRET"; },
+    input => { input.targets.context.accounts = [{ ...input.targets.account }]; },
+    input => { input.targets.context.inProgress = "pending"; },
+    input => { input.targets.root.stateNode = { current: input.targets.root }; },
+    input => { input.options.editor.isConnected = false; },
+    input => { input.sandbox.document.visibilityState = "hidden"; },
+    input => { const next = { ...input.sandbox.window }; next.top = next;
+      input.sandbox.window = next; input.sandbox.document.defaultView = next; },
+    input => { const next = { ...input.sandbox.location }; input.sandbox.location = next;
+      input.sandbox.window.location = next; }
+  ]) {
+    const changedBinding = guardedFixture();
+    const captured = changedBinding.sandbox.exports.createCompanyAIChatIdentityCheck(changedBinding.options);
+    assert.equal(captured.status, "ok"); change(changedBinding);
+    assert.equal(captured.check().status, "refused");
+    const readsAfterRefusal = changedBinding.profileReads();
+    assert.equal(captured.check().status, "refused");
+    assert.equal(changedBinding.profileReads(), readsAfterRefusal);
+    assert.ok(!JSON.stringify(captured).includes("SYNTHETIC_SECRET"));
+  }
+  const newCommit = guardedFixture();
+  const committedBinding = newCommit.sandbox.exports.createCompanyAIChatIdentityCheck(newCommit.options);
+  const nextRoot = { ...newCommit.targets.root };
+  nextRoot.stateNode.current = nextRoot; newCommit.targets.source.return = nextRoot;
+  assert.equal(committedBinding.check().status, "ok");
+  const nonRenewable = guardedFixture();
+  const expiringBinding = nonRenewable.sandbox.exports.createCompanyAIChatIdentityCheck(nonRenewable.options);
+  nonRenewable.expire(); nonRenewable.options.deadline += 10000;
+  assert.equal(expiringBinding.check().status, "expired");
+  assert.equal(nonRenewable.profileReads(), 1);
+  assert.equal(expiringBinding.check().status, "expired");
+  assert.equal(nonRenewable.profileReads(), 1);
+  const recycled = guardedFixture();
+  const recycledBinding = recycled.sandbox.exports.createCompanyAIChatIdentityCheck(recycled.options);
+  const replacementHost = { ...recycled.targets.editor.fiber,
+    memoizedProps: { conversationId: "OTHER_SYNTHETIC_SECRET" } };
+  recycled.targets.source.memoizedProps.conversationId = "OTHER_SYNTHETIC_SECRET";
+  Object.defineProperty(recycled.options.editor, "__reactFiber$synthetic", { value: replacementHost });
+  recycled.targets.source.child = replacementHost;
+  assert.equal(recycled.inspectDocument().status, "ok");
+  assert.equal(recycledBinding.check().status, "refused");
+  for (const change of [
+    input => { input.targets.source.memoizedProps.conversationId = "OTHER_SYNTHETIC_SECRET"; },
+    input => { input.targets.account.homeAccountId = "OTHER_SYNTHETIC_SECRET"; },
+    input => { input.targets.context.inProgress = "pending"; },
+    input => { Object.defineProperty(input.options.editor, "__reactFiber$another", { value: {} }); }
+  ]) {
+    const changedDuringProfile = guardedFixture();
+    changedDuringProfile.options.readProfile = () => { change(changedDuringProfile); return "SYNTHETIC_SECRET"; };
+    assert.equal(changedDuringProfile.inspectDocument().status, "refused");
+  }
+  const accessorBinding = guardedFixture();
+  const capturedAccessor = accessorBinding.sandbox.exports.createCompanyAIChatIdentityCheck(accessorBinding.options);
+  let forbiddenReads = 0;
+  Object.defineProperty(accessorBinding.targets.account, "homeAccountId", { get() { forbiddenReads++; throw new Error(); } });
+  assert.equal(capturedAccessor.check().status, "refused");
+  assert.equal(forbiddenReads, 0);
+  const reentrant = guardedFixture();
+  let reentrantBinding;
+  let callbackCalls = 0;
+  reentrant.options.readProfile = () => {
+    callbackCalls++;
+    if (reentrantBinding) assert.equal(reentrantBinding.check().status, "refused");
+    return "SYNTHETIC_SECRET";
+  };
+  reentrantBinding = reentrant.sandbox.exports.createCompanyAIChatIdentityCheck(reentrant.options);
+  assert.equal(reentrantBinding.status, "ok");
+  assert.equal(reentrantBinding.check().status, "refused");
+  assert.equal(callbackCalls, 2);
+  assert.equal(reentrantBinding.check().status, "refused");
+  assert.equal(callbackCalls, 2);
+  for (const change of [
+    input => { input.options.deadline = NaN; },
+    input => { input.options.expectedUrl = "https://other.example.test/"; },
+    input => { input.options.editor.isConnected = false; },
+    input => { input.targets.context.inProgress = "pending"; },
+    input => { input.options.readProfile = () => { throw new Error("SYNTHETIC_SECRET"); }; }
+  ]) {
+    const invalidBinding = guardedFixture(); change(invalidBinding);
+    const result = invalidBinding.sandbox.exports.createCompanyAIChatIdentityCheck(invalidBinding.options);
+    assert.equal(JSON.stringify(result), '{"status":"refused"}');
+  }
+  const expiredCapture = guardedFixture(); expiredCapture.expire();
+  assert.equal(JSON.stringify(expiredCapture.sandbox.exports.createCompanyAIChatIdentityCheck(expiredCapture.options)),
+    '{"status":"expired"}');
   const documentChanges = [
     input => { input.options.editor.isConnected = false; },
     input => { input.options.timeline.ownerDocument = {}; },
@@ -361,9 +471,11 @@ test("Company AI Chat document guard checks native DOM without connection or inp
     await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
       body: '<!doctype html><main><textarea>Synthetic retained draft</textarea><div role="log">Synthetic private message</div><span>synthetic@example.test</span><button>Send</button></main>' }));
     await page.goto("https://chat.app.example.com/chat/synthetic");
-    await page.addScriptTag({ content: `const proveCompanyAIChatIdentity = ${proveCompanyAIChatIdentity.toString()};
-      const proveCompanyAIChatIdentityInDocument = ${proveCompanyAIChatIdentityInDocument.toString()};` });
+    await page.addScriptTag({ content: `(() => { const exports = {}; ${companyProofScript}
+      globalThis.syntheticCompanyProof = exports; })();` });
     const results = await page.evaluate(() => {
+      const { proveCompanyAIChatIdentity, proveCompanyAIChatIdentityInDocument,
+        createCompanyAIChatIdentityCheck } = globalThis.syntheticCompanyProof;
       const editor = document.querySelector("textarea");
       const timeline = document.querySelector('[role="log"]');
       const profile = document.querySelector("span");
@@ -388,6 +500,15 @@ test("Company AI Chat document guard checks native DOM without connection or inp
       const before = document.documentElement.outerHTML;
       const accepted = proveCompanyAIChatIdentityInDocument(options);
       const unchanged = document.documentElement.outerHTML === before;
+      const binding = createCompanyAIChatIdentityCheck(options);
+      const capturedAccepted = binding.check();
+      source.memoizedProps.conversationId = "synthetic-other-chat";
+      const independentChangedIdentity = proveCompanyAIChatIdentityInDocument(options);
+      const capturedChangedIdentity = binding.check();
+      source.memoizedProps.conversationId = "synthetic-chat";
+      const readsAfterIdentityChange = profileReads;
+      const terminalCaptured = binding.check();
+      const terminalReadFree = profileReads === readsAfterIdentityChange;
       editor.remove();
       const unguardedDetached = proveCompanyAIChatIdentity(editor, timeline, profile, Element, options.deadline, readProfile);
       profileReads = 0;
@@ -407,11 +528,17 @@ test("Company AI Chat document guard checks native DOM without connection or inp
       history.replaceState(null, "", options.expectedUrl);
       const replacedRoot = proveCompanyAIChatIdentityInDocument({ ...options,
         readProfile: () => { document.documentElement.replaceWith(document.documentElement.cloneNode(true)); return profile.textContent; } });
-      return { accepted, unchanged, unguardedDetached, detached, detachedReads, adopted, adoptedReads,
+      return { accepted, unchanged, capturedAccepted, independentChangedIdentity, capturedChangedIdentity,
+        terminalCaptured, terminalReadFree, unguardedDetached, detached, detachedReads, adopted, adoptedReads,
         detachedDuringProof, changedUrl, replacedRoot, inputs, activations };
     });
     assert.equal(results.accepted.status, "ok");
     assert.equal(results.unguardedDetached.status, "ok");
+    assert.equal(results.capturedAccepted.status, "ok");
+    assert.equal(results.independentChangedIdentity.status, "ok");
+    assert.deepEqual(results.capturedChangedIdentity, { status: "refused" });
+    assert.deepEqual(results.terminalCaptured, { status: "refused" });
+    assert.equal(results.terminalReadFree, true);
     for (const key of ["detached", "adopted", "detachedDuringProof", "changedUrl", "replacedRoot"]) {
       assert.deepEqual(results[key], { status: "refused" });
     }
