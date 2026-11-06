@@ -105,8 +105,7 @@ export function locateCompanyAIChatReadTargets(input: { expectedUrl: string; dea
       }
     }
     const editors = visible.filter(element => element.localName === "textarea");
-    if (editors.length !== 1 || !(editors[0] instanceof HTMLTextAreaElement)
-      || editors[0].disabled || editors[0].readOnly) return null;
+    if (editors.length !== 1 || !(editors[0] instanceof HTMLTextAreaElement)) return null;
     const editor = editors[0];
     const profileSpans = visible.filter(element => element.localName === "span" && element.closest("nav")
       && !element.closest("a,button,[role=button]"));
@@ -143,7 +142,7 @@ export function locateCompanyAIChatReadTargets(input: { expectedUrl: string; dea
 export function locateCompanyAIChatComposer(input: { expectedUrl: string; deadline: number }) {
   try {
     const targets = locateCompanyAIChatReadTargets(input);
-    if (!targets) return null;
+    if (!targets || targets.editor.disabled || targets.editor.readOnly) return null;
     let composer: Element | null = targets.editor.form ?? targets.editor.parentElement;
     for (let depth = 0; composer && depth < 8; depth++, composer = composer.parentElement) {
       if (composer === document.body || composer.contains(targets.timeline) || composer.contains(targets.profile)) return null;

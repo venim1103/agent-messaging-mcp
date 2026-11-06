@@ -839,6 +839,17 @@ test("Company AI Chat read binding separates identity from bounded sender captur
       assert.deepEqual(await page.evaluate(invokeCompanyAIChatReader, checking), bound);
       const captured = await page.evaluate(invokeCompanyAIChatReader, { ...checking, action: "capture" });
       assert.deepEqual(captured.snapshot, result.snapshot);
+      for (const property of ["disabled", "readOnly"]) {
+        await page.evaluate(property => { document.querySelector("textarea")[property] = true; }, property);
+        try {
+          assert.deepEqual(await page.evaluate(invokeCompanyAIChatReader, { ...checking, deadline: Date.now() + 4000 }), bound);
+          const lockedCapture = await page.evaluate(invokeCompanyAIChatReader,
+            { ...checking, action: "capture", deadline: Date.now() + 4000 });
+          assert.deepEqual(lockedCapture.snapshot, result.snapshot);
+        } finally {
+          await page.evaluate(property => { document.querySelector("textarea")[property] = false; }, property);
+        }
+      }
       const bounds = await page.evaluate(() => {
         const timeline = document.querySelector('[role="log"]');
         const original = [...timeline.children];
@@ -968,6 +979,20 @@ test("Company isolated writer preserves guarded native input and one-shot submis
       text: "Invented Company writer check", deadline: Date.now() + 4000 });
     const fillInput = () => { const input = draft(); return { ...input, operationId: crypto.randomUUID(),
       attemptId: crypto.randomUUID(), expiresAt: input.deadline }; };
+    assert.deepEqual(await invoke(inspectCompanyAIChatDraft, draft()), { ok: true, editor: "textarea" });
+    for (const property of ["disabled", "readOnly"]) {
+      await page.evaluate(property => { document.querySelector("textarea")[property] = true; }, property);
+      try {
+        assert.deepEqual(await invoke(inspectCompanyAIChatDraft, draft()), { ok: false, code: "TARGET_CHANGED" });
+        const rejected = fillInput();
+        assert.deepEqual(await invoke(fillCompanyAIChatDraft, rejected), { ok: false, code: "TARGET_CHANGED" });
+        assert.deepEqual(await invoke(submitCompanyAIChatDraft, { ...rejected, attemptId: rejected.operationId }),
+          { ok: false, code: "TARGET_CHANGED" });
+        assert.deepEqual(await page.evaluate(() => [globalThis.syntheticInputs, globalThis.syntheticActivations]), [0, 0]);
+      } finally {
+        await page.evaluate(property => { document.querySelector("textarea")[property] = false; }, property);
+      }
+    }
     assert.deepEqual(await invoke(inspectCompanyAIChatDraft, draft()), { ok: true, editor: "textarea" });
     const input = fillInput();
     assert.deepEqual(await invoke(fillCompanyAIChatDraft, input), { ok: true, editor: "textarea" });
