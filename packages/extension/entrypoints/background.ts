@@ -1782,11 +1782,15 @@ async function manageSelectedUnconfirmedDispatches(tabId: number, expectedUrl: s
         || !attempts.every((item: unknown) => {
           if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
           const attempt = item as Record<string, unknown>;
-          return Object.keys(attempt).length === 2 && typeof attempt.operationId === "string" && uuid.test(attempt.operationId)
+          return Object.keys(attempt).length === 3 && typeof attempt.operationId === "string" && uuid.test(attempt.operationId)
             && typeof attempt.startedAt === "number" && Number.isSafeInteger(attempt.startedAt)
-            && attempt.startedAt >= 0 && attempt.startedAt <= Date.now();
+            && attempt.startedAt >= 0 && attempt.startedAt <= Date.now()
+            && (attempt.messageText === null || (typeof attempt.messageText === "string"
+              && attempt.messageText.length > 0 && attempt.messageText.length <= 4000
+              && new TextEncoder().encode(attempt.messageText).byteLength <= 4000));
         }) || new Set(attempts.map(item => item.operationId)).size !== attempts.length) throw new Error();
-      return { ok: true as const, attempts: attempts as { operationId: string; startedAt: number }[], hasMore: payload.hasMore };
+      return { ok: true as const, attempts: attempts as { operationId: string; startedAt: number; messageText: string | null }[],
+        hasMore: payload.hasMore };
     }
     const resolution = payload.resolution;
     if (reply.kind !== "dispatch_resolved" || Object.keys(payload).length !== 4 || payload.operationId !== operationId

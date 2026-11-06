@@ -1314,7 +1314,8 @@ test("resolved dispatch status IPC preserves owner and receipt boundaries withou
     }
     const listed = await relay.listUnconfirmedDispatches(target);
     assert.equal(listed.kind, "unconfirmed_dispatches");
-    assert.deepEqual(listed.payload, { attempts: [{ operationId, startedAt }], hasMore: false });
+    assert.deepEqual(listed.payload, { attempts: [{ operationId, startedAt,
+      messageText: "Synthetic resolved IPC operation" }], hasMore: false });
     assert.equal(JSON.stringify(listed.payload).includes(target.documentId), false);
     const foreign = { origin: "https://gemini.google.com" as const, conversationId: "fixture-alpha",
       url: "https://gemini.google.com/app/fixture-alpha", tabId: 4, documentId: "synthetic-foreign-document" };

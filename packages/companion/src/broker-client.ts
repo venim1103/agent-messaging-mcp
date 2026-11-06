@@ -245,7 +245,10 @@ const replySchema = z.discriminatedUnion("kind", [
     kind: z.literal("unconfirmed_dispatches"), protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: z.uuid(), connectionGeneration: z.literal(0), deadlineMs: z.number().int().safe(),
     payload: z.strictObject({ attempts: z.array(z.strictObject({ operationId: z.uuid(),
-      startedAt: z.number().int().safe().nonnegative() })).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
+      startedAt: z.number().int().safe().nonnegative(),
+      messageText: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES)
+        .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES).nullable()
+    })).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
   }),
   z.strictObject({
     kind: z.literal("dispatch_resolved"), protocolVersion: z.literal(PROTOCOL_VERSION),

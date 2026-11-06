@@ -265,6 +265,9 @@ export class PreparedMessageOperations {
   private readonly geminiContents = new Map<string, Readonly<{
     owner: symbol; connectionId: string; target: RenderedChatTarget; text: string; expiresAt: number; autonomous?: true
   }>>();
+  private readonly unconfirmedMessages = new Map<string, Readonly<{
+    owner: symbol; target: Pick<ApprovedTarget, "origin" | "conversationId">; text: string
+  }>>();
   private readonly reviewTokens = new Map<string, string>();
   private readonly approvals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
   private readonly fillReviewTokens = new Map<string, Readonly<{ reviewId: string; expiresAt: number }>>();
@@ -377,11 +380,13 @@ export class PreparedMessageOperations {
       } | undefined;
     if (!record) return null;
     if (record.observed_at !== null && record.message_id !== null) {
+      this.unconfirmedMessages.delete(operationId);
       this.retainAnswerWaitAnchor(operationId, record.dispatch_order);
       return { operationId, state: "observed_in_ui", startedAt: record.started_at,
         observedAt: record.observed_at, messageId: record.message_id };
     }
     if (record.resolved_at !== null && record.outcome !== null && record.source !== null) {
+      this.unconfirmedMessages.delete(operationId);
       if (record.outcome === "sent") this.retainAnswerWaitAnchor(operationId, record.dispatch_order);
       return Object.freeze({ operationId, state: "resolved", startedAt: record.started_at,
         resolution: Object.freeze({ outcome: record.outcome, source: record.source, resolvedAt: record.resolved_at }) });
@@ -429,7 +434,11 @@ export class PreparedMessageOperations {
         || typeof row.started_at !== "number" || !Number.isSafeInteger(row.started_at)) {
         throw new Error("DISPATCH_RESOLUTION_UNAVAILABLE");
       }
-      return Object.freeze({ operationId: row.operation_id, startedAt: row.started_at });
+      const operation = this.unconfirmedMessages.get(row.operation_id)
+        ?? this.contents.get(row.operation_id) ?? this.geminiContents.get(row.operation_id);
+      const messageText = operation && this.conversationKey(operation.target) === this.conversationKey(target)
+        ? operation.text : null;
+      return Object.freeze({ operationId: row.operation_id, startedAt: row.started_at, messageText });
     });
     return Object.freeze({ attempts: Object.freeze(attempts), hasMore: rows.length > MAX_PREPARED_REVIEWS });
   }
@@ -1621,6 +1630,16 @@ export class PreparedMessageOperations {
       this.database.exec("ROLLBACK");
       throw error;
     }
+    const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
+    if (operation) {
+      while (this.unconfirmedMessages.size >= MAX_ACTIVE_PREPARED_MESSAGES) {
+        const oldest = this.unconfirmedMessages.keys().next().value;
+        if (oldest === undefined) break;
+        this.unconfirmedMessages.delete(oldest);
+      }
+      this.unconfirmedMessages.set(operationId, Object.freeze({ owner: operation.owner,
+        target: Object.freeze({ origin: target.origin, conversationId: target.conversationId }), text: operation.text }));
+    }
   }
 
   recordFixtureDispatchStart(owner: symbol, operationId: string, now = Date.now(), checkId?: string) {
@@ -2352,6 +2371,9 @@ export class PreparedMessageOperations {
 
   disconnect(owner: symbol): void {
     this.owners.delete(owner);
+    for (const [operationId, operation] of this.unconfirmedMessages) {
+      if (operation.owner === owner) this.unconfirmedMessages.delete(operationId);
+    }
     for (const [connectionId, anchor] of this.answerWaitAnchors) {
       if (anchor.owner === owner) this.answerWaitAnchors.delete(connectionId);
     }

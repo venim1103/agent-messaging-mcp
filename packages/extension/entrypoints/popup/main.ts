@@ -26,7 +26,7 @@ type ChatAgent = { agentId: string; label: string; connectionCount: number; auto
 type ChatAgentsResult = { ok: true; agents: ChatAgent[]; countsKnown: boolean } | { ok: false; error: string };
 type ChatAgentApprovalResult = { ok: true; agentId: string; expiresAt: null } | { ok: false; error: string };
 type ChatAgentRemovalResult = { ok: true; revoked: number; remainingAgents: number } | { ok: false; error: string };
-type UnconfirmedDispatchesResult = { ok: true; attempts: { operationId: string; startedAt: number }[]; hasMore: boolean }
+type UnconfirmedDispatchesResult = { ok: true; attempts: { operationId: string; startedAt: number; messageText: string | null }[]; hasMore: boolean }
   | { ok: false; error: string };
 type ChatApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
@@ -319,7 +319,11 @@ async function refreshUnconfirmedDispatches(): Promise<void> {
       const timestamp = document.createElement("time");
       timestamp.dateTime = new Date(attempt.startedAt).toISOString();
       timestamp.textContent = new Date(attempt.startedAt).toLocaleString();
-      row.append(timestamp, identity);
+      const message = document.createElement("pre");
+      message.textContent = attempt.messageText ?? "Message text unavailable";
+      const actions = document.createElement("div");
+      actions.className = "unconfirmed-actions";
+      row.append(message, timestamp, identity, actions);
       const buttons: HTMLButtonElement[] = [];
       for (const outcome of ["sent", "not_sent"] as const) {
         const button = document.createElement("button");
@@ -340,7 +344,7 @@ async function refreshUnconfirmedDispatches(): Promise<void> {
           }
         });
         buttons.push(button);
-        row.append(button);
+        actions.append(button);
       }
       unconfirmedList.append(row);
     }

@@ -99,7 +99,7 @@
         overflow-wrap: anywhere;
       }
 
-      #reviews pre {
+      #reviews pre, #unconfirmed-list pre {
         max-height: 160px;
         margin: 8px 0 0;
         overflow: auto;
@@ -145,9 +145,20 @@
         max-height: 280px;
       }
 
+      #unconfirmed-list time {
+        display: block;
+        color: #52645d;
+        font-size: 12px;
+      }
+
       #unconfirmed-list button {
         margin-top: 8px;
-        margin-right: 8px;
+      }
+
+      .unconfirmed-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
       }
     </style>
   </head>

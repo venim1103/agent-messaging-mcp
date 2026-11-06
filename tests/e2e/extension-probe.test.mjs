@@ -2881,8 +2881,13 @@ for (const provider of ["fixture", "gemini"]) {
             if (reply.kind === "unconfirmed_dispatches" && globalThis.holdResolutionListing) {
               globalThis.holdResolutionListing = false;
               globalThis.releaseResolutionListing = () => listener(reply);
-            } else listener(reply.kind === "unconfirmed_dispatches" && globalThis.malformedResolutionListing
-              ? { ...reply, payload: { ...reply.payload, retryAllowed: true } } : reply);
+            } else {
+              const payload = reply.kind === "unconfirmed_dispatches" && globalThis.syntheticResolutionPreview !== undefined
+                ? { ...reply.payload, attempts: reply.payload.attempts.map((attempt, index) => index === 0
+                  ? { ...attempt, messageText: globalThis.syntheticResolutionPreview } : attempt) } : reply.payload;
+              listener({ ...reply, payload: reply.kind === "unconfirmed_dispatches" && globalThis.malformedResolutionListing
+                ? { ...payload, retryAllowed: true } : payload });
+            }
           });
           return port;
         };
@@ -2954,10 +2959,25 @@ for (const provider of ["fixture", "gemini"]) {
       await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
       await popup.waitForFunction(() => document.querySelectorAll("#unconfirmed-list li[data-operation-id]").length === 2,
         undefined, { timeout: 4000 });
+      assert.deepEqual(await popup.locator("#unconfirmed-list pre").allTextContents(),
+        ["Message text unavailable", "Message text unavailable"]);
+      for (const malformed of [37, "", "x".repeat(4001), "\u{1f600}".repeat(1001)]) {
+        await worker.evaluate(value => { globalThis.syntheticResolutionPreview = value; }, malformed);
+        await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
+        await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Unavailable",
+          undefined, { timeout: 4000 });
+        assert.equal(await popup.locator("#unconfirmed-list li").count(), 0);
+      }
+      const preview = `Synthetic multiline preview\n<strong>not markup</strong>\n${"longword".repeat(80)}`;
+      await worker.evaluate(value => { globalThis.syntheticResolutionPreview = value; }, preview);
+      await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
+      await popup.waitForFunction(value => document.querySelector("#unconfirmed-list pre")?.textContent === value,
+        preview, { timeout: 4000 });
+      assert.equal(await popup.locator("#unconfirmed-list pre *").count(), 0);
       const storageBefore = await worker.evaluate(() => chrome.storage.session.get(null));
       assert.deepEqual(new Set(await popup.locator("#unconfirmed-list li").evaluateAll(rows => rows.map(row => row.dataset.operationId))),
         new Set(operationIds.slice(0, 2)));
-      assert.equal(await popup.locator("#unconfirmed-list").evaluate(list => [...list.querySelectorAll("p, time, button")]
+      assert.equal(await popup.locator("#unconfirmed-list").evaluate(list => [...list.querySelectorAll("p, pre, time, button")]
         .every(element => element.scrollWidth <= element.clientWidth)), true);
       await popup.locator("main").screenshot({ path: join(tmpdir(), `agent-messaging-${provider}-resolutions.png`) });
       for (const kind of ["list_unconfirmed_dispatches", "resolve_unconfirmed_dispatch"]) {
@@ -3476,6 +3496,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
       await popup.locator("#refresh-unconfirmed").press("Enter");
       const uncertain = popup.locator(`#unconfirmed-list li[data-operation-id="${submitted.operationId}"]`);
       await uncertain.waitFor({ timeout: 4000 });
+      assert.equal(await uncertain.locator("pre").textContent(), argumentsValue.text);
       await uncertain.getByRole("button", { name: "Sent", exact: true }).press("Enter");
       await popup.getByText("Outcome recorded. Nothing was resent.", { exact: true }).waitFor({ timeout: 4000 });
       const resolved = (await clients[0].callTool({ name: "chat_send_message", arguments: argumentsValue })).structuredContent;
