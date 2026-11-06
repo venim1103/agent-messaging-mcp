@@ -23,7 +23,7 @@ for (const provider of ["fixture", "databag", "gemini", "company_ai"] as const) 
       ? { provider, origin: "https://databag.example", url: "https://databag.example/#/session",
         conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" }
       : { provider, origin: "https://chat.app.example.com", url: "https://chat.app.example.com/chat/synthetic",
-        conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
+        conversationId: `company_ai_v2_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
     const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target, 1000)!;
     const before = [{ id: "old", direction: "incoming" as const, text: "Historical instruction" }];
     const publish = (rows: typeof before) => isRenderedChatTarget(target)
@@ -75,7 +75,7 @@ for (const provider of ["databag", "company_ai"] as const) test(`${provider} neu
     ? { provider, origin: "https://databag.example", url: "https://databag.example/#/session",
       conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" }
     : { provider, origin: "https://chat.app.example.com", url: "https://chat.app.example.com/chat/synthetic",
-      conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
+      conversationId: `company_ai_v2_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" };
   const message = { ...envelope, kind: "approve_chat_agent", payload: { target, agentId: agent.agentId } };
   assert.deepEqual(handleBrokerRequest(message, "facade", owner, requests, 1000).payload, { code: "PERMISSION_DENIED" });
   for (const changes of [{ url: `${target.url}${provider === "databag" ? "?other" : "?code=synthetic"}` }, { origin: "https://*.example" },
@@ -115,7 +115,7 @@ for (const provider of ["databag", "company_ai"] as const) test(`${provider} neu
     ? { provider, origin: "https://databag.example", url: "https://databag.example/#/session",
       conversationId: `databag_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" } as const
     : { provider, origin: "https://chat.app.example.com", url: "https://chat.app.example.com/chat/synthetic",
-      conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" } as const;
+      conversationId: `company_ai_v2_${"a".repeat(64)}`, tabId: 3, documentId: "synthetic-document" } as const;
   const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target, 1000)!;
   const envelope = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
     connectionGeneration: 0, deadlineMs: 6000 };

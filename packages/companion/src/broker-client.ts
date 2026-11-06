@@ -64,7 +64,7 @@ const autonomousConnection = z.strictObject({ requestId: z.uuid(), state: z.lite
 }).refine(connection => connection.origin === "http://127.0.0.1:8787"
   ? connection.conversationId === "fixture-alpha" && connection.capabilities.length === 2
   : connection.origin === "https://gemini.google.com" ? connection.capabilities.length === 2
-    : /^company_ai_[a-f0-9]{64}$/.test(connection.conversationId)
+    : /^company_ai_v2_[a-f0-9]{64}$/.test(connection.conversationId)
       ? isCompanyAIChatOrigin(connection.origin)
       : /^databag_[a-f0-9]{64}$/.test(connection.conversationId) && connection.capabilities.length === 2);
 
@@ -247,7 +247,8 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ attempts: z.array(z.strictObject({ operationId: z.uuid(),
       startedAt: z.number().int().safe().nonnegative(),
       messageText: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES)
-        .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES).nullable()
+        .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES).nullable(),
+      scope: z.enum(["chat", "unlinked"])
     })).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
   }),
   z.strictObject({

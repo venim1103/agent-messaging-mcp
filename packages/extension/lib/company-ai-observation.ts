@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha2.js";
+
 export function inspectCompanyAIChatStructure(input: { expectedUrl: string }) {
   if (!input || typeof input.expectedUrl !== "string" || input.expectedUrl.length > 512
     || window.top !== window || document.visibilityState !== "visible" || location.href !== input.expectedUrl) return null;
@@ -419,7 +421,8 @@ export function proveCompanyAIChatIdentityInDocument(input: CompanyDocumentInput
 }
 
 function captureCompanyAIChatIdentity(input: CompanyDocumentInput):
-  { status: "ok"; check: (deadline?: number) => CompanyIdentityProof; dispose: () => void } | { status: "refused" | "expired" } {
+  { status: "ok"; check: (deadline?: number) => CompanyIdentityProof; dispose: () => void;
+    correlation: () => string | undefined } | { status: "refused" | "expired" } {
   try {
     let request: CompanyDocumentInput | undefined = { ...input };
     let captured: CompanyDocumentRead["snapshot"];
@@ -453,7 +456,13 @@ function captureCompanyAIChatIdentity(input: CompanyDocumentInput):
     } catch { return end(); }
     if (terminal || !request) return end();
     if (Date.now() >= request.deadline) return end({ status: "expired" });
-    return { status: "ok", dispose: () => { end(); }, check: (deadline?: number) => {
+    return { status: "ok", dispose: () => { end(); }, correlation: () => {
+      if (terminal || !captured || !request) return undefined;
+      const encoded = new TextEncoder().encode(JSON.stringify(["company-ai-v2", new URL(request.expectedUrl).origin,
+        captured.homeAccountId, captured.localAccountId, captured.conversationId]));
+      try { return Array.from(sha256(encoded), value => value.toString(16).padStart(2, "0")).join(""); }
+      finally { encoded.fill(0); }
+    }, check: (deadline?: number) => {
       if (terminal) return terminal;
       if (checking || !request) return end();
       checking = true;
@@ -496,10 +505,11 @@ export function createCompanyAIChatIdentityBinding(input: CompanyDocumentInput):
     const binding = captureCompanyAIChatIdentity(request);
     captured = binding;
     if (binding.status !== "ok") return binding;
-    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    const digest = binding.correlation();
     const proof = binding.check();
     if (proof.status !== "ok") { binding.dispose(); return proof; }
-    const conversationId = `company_ai_${Array.from(bytes, value => value.toString(16).padStart(2, "0")).join("")}`;
+    if (digest === undefined) { binding.dispose(); return { status: "refused" }; }
+    const conversationId = `company_ai_v2_${digest}`;
     return { status: "ok", conversationId, dispose: binding.dispose, check: (deadline: number) => {
       const now = Date.now();
       return binding.check(!Number.isFinite(deadline) || deadline > now + 4000 ? NaN : deadline);

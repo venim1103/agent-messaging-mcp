@@ -79,7 +79,7 @@ export const databagTargetSchema = z.strictObject({ provider: z.literal("databag
   documentId: z.string().regex(/^[!-~]{1,128}$/)
 }).refine(target => target.url === `${target.origin}/#/session`);
 export const companyAIChatTargetSchema = z.strictObject({ provider: z.literal("company_ai"),
-  origin: z.custom<`https://${string}`>(isCompanyAIChatOrigin), conversationId: z.string().regex(/^company_ai_[a-f0-9]{64}$/),
+  origin: z.custom<`https://${string}`>(isCompanyAIChatOrigin), conversationId: z.string().regex(/^company_ai_v2_[a-f0-9]{64}$/),
   url: z.string().min(1).max(512), tabId: z.number().int().safe().positive(),
   documentId: z.string().regex(/^[!-~]{1,128}$/)
 }).refine(target => isCompanyAIChatTargetUrl(target.url, target.origin));
@@ -336,11 +336,16 @@ export class PreparedMessageOperations {
       operation_id TEXT PRIMARY KEY REFERENCES prepared_message_operations(operation_id) ON DELETE RESTRICT,
       started_at INTEGER NOT NULL,
       conversation_key TEXT CHECK (length(conversation_key) = 64),
+      correlation_version INTEGER CHECK (correlation_version = 1),
       state TEXT NOT NULL CHECK (state IN ('dispatching', 'unknown'))
     )`);
     if (!database.prepare("PRAGMA table_info(message_dispatch_attempts)").all()
       .some(column => column.name === "conversation_key")) {
       database.exec("ALTER TABLE message_dispatch_attempts ADD COLUMN conversation_key TEXT CHECK (length(conversation_key) = 64)");
+    }
+    if (!database.prepare("PRAGMA table_info(message_dispatch_attempts)").all()
+      .some(column => column.name === "correlation_version")) {
+      database.exec("ALTER TABLE message_dispatch_attempts ADD COLUMN correlation_version INTEGER CHECK (correlation_version = 1)");
     }
     database.exec(`CREATE INDEX IF NOT EXISTS message_dispatch_conversation_started
       ON message_dispatch_attempts (conversation_key, started_at)`);
@@ -408,24 +413,25 @@ export class PreparedMessageOperations {
       LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
       LEFT JOIN message_dispatch_resolutions AS resolution ON resolution.operation_id = attempt.operation_id
       WHERE evidence.operation_id IS NULL AND resolution.operation_id IS NULL
-      AND (attempt.conversation_key IS NULL OR attempt.conversation_key = ?) LIMIT 1`)
+      AND (attempt.correlation_version IS NULL OR attempt.conversation_key IS NULL OR attempt.conversation_key = ?) LIMIT 1`)
       .get(this.conversationKey(target)));
   }
 
   private isSendRateLimited(target: Pick<ApprovedTarget, "origin" | "conversationId">, now: number): boolean {
     const count = this.database.prepare(`SELECT count(*) AS count FROM message_dispatch_attempts
-      WHERE conversation_key = ? AND started_at > ?`)
+      WHERE (correlation_version IS NULL OR conversation_key IS NULL OR conversation_key = ?) AND started_at > ?`)
       .get(this.conversationKey(target), now - SEND_RATE_WINDOW_MS)?.count;
     return typeof count !== "number" || count >= this.maxSendsPerHour;
   }
 
   listUnconfirmedDispatches(target: ApprovedTarget, now = Date.now()) {
     if (!Number.isSafeInteger(now) || now < 0) throw new Error("DISPATCH_RESOLUTION_UNAVAILABLE");
-    const rows = this.database.prepare(`SELECT attempt.operation_id, attempt.started_at
+    const rows = this.database.prepare(`SELECT attempt.operation_id, attempt.started_at, attempt.correlation_version, attempt.conversation_key
       FROM message_dispatch_attempts AS attempt
       LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
       LEFT JOIN message_dispatch_resolutions AS resolution ON resolution.operation_id = attempt.operation_id
-      WHERE attempt.conversation_key = ? AND attempt.started_at >= 0 AND attempt.started_at <= ?
+      WHERE (attempt.correlation_version IS NULL OR attempt.conversation_key IS NULL OR attempt.conversation_key = ?)
+      AND attempt.started_at >= 0 AND attempt.started_at <= ?
       AND evidence.operation_id IS NULL AND resolution.operation_id IS NULL
       ORDER BY attempt.started_at, attempt.operation_id LIMIT ?`)
       .all(this.conversationKey(target), now - FIXTURE_DISPATCH_CHECK_TIMEOUT_MS, MAX_PREPARED_REVIEWS + 1);
@@ -436,9 +442,10 @@ export class PreparedMessageOperations {
       }
       const operation = this.unconfirmedMessages.get(row.operation_id)
         ?? this.contents.get(row.operation_id) ?? this.geminiContents.get(row.operation_id);
-      const messageText = operation && this.conversationKey(operation.target) === this.conversationKey(target)
+      const scope = row.correlation_version === null || row.conversation_key === null ? "unlinked" : "chat";
+      const messageText = scope === "chat" && operation && this.conversationKey(operation.target) === this.conversationKey(target)
         ? operation.text : null;
-      return Object.freeze({ operationId: row.operation_id, startedAt: row.started_at, messageText });
+      return Object.freeze({ operationId: row.operation_id, startedAt: row.started_at, messageText, scope });
     });
     return Object.freeze({ attempts: Object.freeze(attempts), hasMore: rows.length > MAX_PREPARED_REVIEWS });
   }
@@ -453,7 +460,8 @@ export class PreparedMessageOperations {
         resolution.outcome AS outcome FROM message_dispatch_attempts AS attempt
         LEFT JOIN message_dispatch_evidence AS evidence ON evidence.operation_id = attempt.operation_id
         LEFT JOIN message_dispatch_resolutions AS resolution ON resolution.operation_id = attempt.operation_id
-        WHERE attempt.operation_id = ? AND attempt.conversation_key = ?`)
+        WHERE attempt.operation_id = ? AND (attempt.correlation_version IS NULL
+          OR attempt.conversation_key IS NULL OR attempt.conversation_key = ?)`)
         .get(operationId, this.conversationKey(target));
       if (!record || typeof record.started_at !== "number" || !Number.isSafeInteger(record.started_at)
         || record.started_at < 0 || now - record.started_at < FIXTURE_DISPATCH_CHECK_TIMEOUT_MS
@@ -1623,8 +1631,8 @@ export class PreparedMessageOperations {
     try {
       if (this.hasUnresolvedDispatch(target)) throw new Error("DISPATCH_UNCERTAIN");
       if (this.isSendRateLimited(target, now)) throw new Error("SEND_RATE_LIMITED");
-      this.database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
-        VALUES (?, ?, ?, 'dispatching')`).run(operationId, now, this.conversationKey(target));
+      this.database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, correlation_version, state)
+        VALUES (?, ?, ?, 1, 'dispatching')`).run(operationId, now, this.conversationKey(target));
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");

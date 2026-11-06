@@ -26,7 +26,8 @@ type ChatAgent = { agentId: string; label: string; connectionCount: number; auto
 type ChatAgentsResult = { ok: true; agents: ChatAgent[]; countsKnown: boolean } | { ok: false; error: string };
 type ChatAgentApprovalResult = { ok: true; agentId: string; expiresAt: null } | { ok: false; error: string };
 type ChatAgentRemovalResult = { ok: true; revoked: number; remainingAgents: number } | { ok: false; error: string };
-type UnconfirmedDispatchesResult = { ok: true; attempts: { operationId: string; startedAt: number; messageText: string | null }[]; hasMore: boolean }
+type UnconfirmedDispatchesResult = { ok: true; attempts: { operationId: string; startedAt: number; messageText: string | null;
+  scope: "chat" | "unlinked" }[]; hasMore: boolean }
   | { ok: false; error: string };
 type ChatApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
@@ -313,6 +314,10 @@ async function refreshUnconfirmedDispatches(): Promise<void> {
     for (const attempt of response.attempts) {
       const row = document.createElement("li");
       row.dataset.operationId = attempt.operationId;
+      row.dataset.scope = attempt.scope;
+      const scope = document.createElement("p");
+      scope.className = "agent-instance";
+      scope.textContent = attempt.scope === "unlinked" ? "Unlinked older attempt" : "This chat";
       const identity = document.createElement("p");
       identity.className = "agent-instance";
       identity.textContent = attempt.operationId;
@@ -323,7 +328,7 @@ async function refreshUnconfirmedDispatches(): Promise<void> {
       message.textContent = attempt.messageText ?? "Message text unavailable";
       const actions = document.createElement("div");
       actions.className = "unconfirmed-actions";
-      row.append(message, timestamp, identity, actions);
+      row.append(scope, message, timestamp, identity, actions);
       const buttons: HTMLButtonElement[] = [];
       for (const outcome of ["sent", "not_sent"] as const) {
         const button = document.createElement("button");

@@ -108,7 +108,7 @@ function chatGrantKey(target: ChatTarget): string {
 function storedChatTarget(key: string, tabId: number, grant: StoredFixtureGrant): ChatTarget | null {
   const documentId = grant.documentId;
   if (key === companyGrantKey(tabId)) {
-    return isEligibleCompanyAIChatUrl(grant.url) && typeof grant.conversationId === "string" && /^company_ai_[a-f0-9]{64}$/.test(grant.conversationId)
+    return isEligibleCompanyAIChatUrl(grant.url) && typeof grant.conversationId === "string" && /^company_ai_v2_[a-f0-9]{64}$/.test(grant.conversationId)
       ? { provider: "company_ai", origin: new URL(grant.url).origin as `https://${string}`, conversationId: grant.conversationId,
         url: grant.url, tabId, documentId } : null;
   }
@@ -452,7 +452,7 @@ async function hasTrackedSavedGrant(provider: SavedProvider): Promise<boolean> {
     const grant = value as Partial<StoredGeminiGrant>;
     return typeof grant.documentId === "string" && /^[!-~]{1,128}$/.test(grant.documentId)
       && isEligibleSavedChatUrl(provider, grant.url) && (provider === "gemini" || typeof grant.conversationId === "string"
-        && (provider === "databag" ? /^databag_[a-f0-9]{64}$/ : /^company_ai_[a-f0-9]{64}$/).test(grant.conversationId))
+        && (provider === "databag" ? /^databag_[a-f0-9]{64}$/ : /^company_ai_v2_[a-f0-9]{64}$/).test(grant.conversationId))
       && isLiveStoredExpiry(grant.expiresAt);
   });
 }
@@ -1087,7 +1087,7 @@ function parseChatJobs(value: unknown, requestId: string, deadlineMs: number, pr
         : provider === "databag" ? !isEligibleDatabagUrl(target.url) || new URL(target.url).origin !== target.origin
           || typeof target.conversationId !== "string" || !/^databag_[a-f0-9]{64}$/.test(target.conversationId)
         : provider === "company_ai" ? !isEligibleCompanyAIChatUrl(target.url) || new URL(target.url).origin !== target.origin
-          || typeof target.conversationId !== "string" || !/^company_ai_[a-f0-9]{64}$/.test(target.conversationId)
+          || typeof target.conversationId !== "string" || !/^company_ai_v2_[a-f0-9]{64}$/.test(target.conversationId)
         : target.origin !== "http://127.0.0.1:8787" || target.conversationId !== "fixture-alpha")) throw new Error();
     return entry as ChatBrowserJob;
   });
@@ -1162,7 +1162,7 @@ function parseGeminiReadChallenges(value: unknown, requestId: string, deadlineMs
       || (provider === "gemini" ? target.origin !== geminiOrigin || !/^[A-Za-z0-9_-]{1,128}$/.test(target.conversationId)
         || !isEligibleGeminiUrl(target.url) || new URL(target.url).pathname.split("/").filter(Boolean)[1] !== target.conversationId
         : target.provider !== provider || !isEligibleSavedChatUrl(provider, target.url) || new URL(target.url).origin !== target.origin
-          || !(provider === "databag" ? /^databag_[a-f0-9]{64}$/ : /^company_ai_[a-f0-9]{64}$/).test(target.conversationId))
+          || !(provider === "databag" ? /^databag_[a-f0-9]{64}$/ : /^company_ai_v2_[a-f0-9]{64}$/).test(target.conversationId))
       || typeof target.tabId !== "number" || !Number.isSafeInteger(target.tabId) || target.tabId < 1
       || typeof target.documentId !== "string" || !/^[!-~]{1,128}$/.test(target.documentId)) throw new Error();
     return { challengeId: challenge.challengeId, expiresAt: challenge.expiresAt,
@@ -1723,7 +1723,7 @@ async function chatDocumentTarget(tabId: number, expectedUrl: string, documentId
     const [identity] = await browser.scripting.executeScript({ target: { tabId, documentIds: [installed.documentId] }, world: "MAIN",
       func: invokeCompanyAIChatReader, args: [{ action: "bind", url: expectedUrl, deadline: Date.now() + 4000 }] });
     if (identity?.frameId !== 0 || identity.documentId !== installed.documentId || identity.result?.url !== expectedUrl
-      || !/^company_ai_[a-f0-9]{64}$/.test(identity.result.conversationId)) return null;
+      || !/^company_ai_v2_[a-f0-9]{64}$/.test(identity.result.conversationId)) return null;
     target = { provider: "company_ai", origin: new URL(expectedUrl).origin as `https://${string}`,
       conversationId: identity.result.conversationId, url: expectedUrl, tabId, documentId: identity.documentId };
     const [writer] = await browser.scripting.executeScript({ target: { tabId, documentIds: [target.documentId] },
@@ -1782,14 +1782,16 @@ async function manageSelectedUnconfirmedDispatches(tabId: number, expectedUrl: s
         || !attempts.every((item: unknown) => {
           if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
           const attempt = item as Record<string, unknown>;
-          return Object.keys(attempt).length === 3 && typeof attempt.operationId === "string" && uuid.test(attempt.operationId)
+          return Object.keys(attempt).length === 4 && typeof attempt.operationId === "string" && uuid.test(attempt.operationId)
             && typeof attempt.startedAt === "number" && Number.isSafeInteger(attempt.startedAt)
             && attempt.startedAt >= 0 && attempt.startedAt <= Date.now()
+            && (attempt.scope === "chat" || attempt.scope === "unlinked")
             && (attempt.messageText === null || (typeof attempt.messageText === "string"
               && attempt.messageText.length > 0 && attempt.messageText.length <= 4000
               && new TextEncoder().encode(attempt.messageText).byteLength <= 4000));
         }) || new Set(attempts.map(item => item.operationId)).size !== attempts.length) throw new Error();
-      return { ok: true as const, attempts: attempts as { operationId: string; startedAt: number; messageText: string | null }[],
+      return { ok: true as const, attempts: attempts as { operationId: string; startedAt: number; messageText: string | null;
+        scope: "chat" | "unlinked" }[],
         hasMore: payload.hasMore };
     }
     const resolution = payload.resolution;

@@ -22,7 +22,7 @@ test("Company admission does not enable legacy message operations or allocate du
   const ledger = new PreparedMessageOperations(requests, database);
   const owner = Symbol("Company prepared owner");
   const target = { provider: "company_ai", origin: "https://chat.app.example.com",
-    conversationId: `company_ai_${"a".repeat(64)}`, url: "https://chat.app.example.com/chat/synthetic",
+    conversationId: `company_ai_v2_${"a".repeat(64)}`, url: "https://chat.app.example.com/chat/synthetic",
     tabId: 3, documentId: "synthetic-document" } as const;
   try {
     const connection = requests.approveAgent(requests.registerAgent(owner).agentId, target)!;
@@ -48,7 +48,7 @@ test("Company send capability reuses rendered jobs without widening read-only gr
   const database = new DatabaseSync(":memory:");
   const ledger = new PreparedMessageOperations(requests, database);
   const owner = Symbol("Company writer owner"), other = Symbol("Company foreign owner");
-  const target = { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_${"a".repeat(64)}`,
+  const target = { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_v2_${"a".repeat(64)}`,
     url: "https://chat.app.example.com/chat/synthetic", tabId: 3, documentId: "synthetic-document" } as const;
   try {
     const agent = requests.registerAgent(owner);
@@ -2244,6 +2244,92 @@ test("composer coordination is provider-neutral and respects uncertainty, indepe
   }
 });
 
+test("unlinked older dispatches remain quarantined until trusted status-only resolution", async (context) => {
+  const requests = new PendingConnectionRequests();
+  const directory = await mkdtemp(join(tmpdir(), "agent-messaging-company-correlation-"));
+  const path = join(directory, "operations.sqlite");
+  let database = new DatabaseSync(path);
+  let ledger = new PreparedMessageOperations(requests, database, 2);
+  const owner = Symbol("synthetic quarantine owner");
+  const restartedOwner = Symbol("synthetic correlation owner after restart");
+  const target = { provider: "company_ai", origin: "https://chat.app.example.com",
+    conversationId: `company_ai_v2_${"b".repeat(64)}`, url: "https://chat.app.example.com/chat/synthetic",
+    tabId: 3, documentId: "synthetic-quarantine-document" } as const;
+  const operationId = randomUUID(), now = Date.now();
+  context.mock.method(Date, "now", () => now);
+  try {
+    const key = database.prepare("SELECT key FROM message_conversation_key WHERE singleton = 1").get()!.key as Uint8Array;
+    const oldKey = createHmac("sha256", key).update(JSON.stringify([target.origin, `company_ai_${"a".repeat(64)}`])).digest("hex");
+    database.prepare(`INSERT INTO prepared_message_operations
+      (operation_id, owner_id, connection_id, idempotency_key, content_digest, target_digest, expires_at, state)
+      VALUES (?, 'synthetic-old-owner', 'synthetic-old-connection', ?, ?, ?, 1000, 'awaiting_approval')`)
+      .run(operationId, randomUUID(), "0".repeat(64), "1".repeat(64));
+    database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
+      VALUES (?, ?, ?, 'unknown')`).run(operationId, now - 10000, oldKey);
+    database.exec("ALTER TABLE message_dispatch_attempts DROP COLUMN correlation_version");
+    database.close();
+    database = new DatabaseSync(path);
+    ledger = new PreparedMessageOperations(requests, database, 2);
+    assert.equal(database.prepare("SELECT correlation_version FROM message_dispatch_attempts").get()!.correlation_version, null);
+    const connection = requests.approveAgent(requests.registerAgent(owner).agentId, target, now, true)!;
+    const prepared = ledger.prepareAutonomous(owner, connection.connectionId, "Synthetic quarantined operation", randomUUID(), now + 4000, now);
+    assert.equal(await ledger.acquireComposer(owner, prepared.operationId, now + 4000), false);
+    assert.deepEqual(ledger.listUnconfirmedDispatches(target, now), { attempts: [{ operationId,
+      startedAt: now - 10000, messageText: null, scope: "unlinked" }], hasMore: false });
+    const resolved = ledger.resolveUnconfirmedDispatch(target, operationId, "sent", now);
+    assert.ok(resolved.state === "resolved");
+    assert.equal(resolved.resolution.outcome, "sent");
+    assert.equal(database.prepare("SELECT conversation_key FROM message_dispatch_attempts WHERE operation_id = ?")
+      .get(operationId)!.conversation_key, oldKey);
+    assert.deepEqual(ledger.getOperation(owner, operationId, now), { state: "unknown" });
+    assert.deepEqual(ledger.listUnconfirmedDispatches(target, now), { attempts: [], hasMore: false });
+    assert.throws(() => ledger.resolveUnconfirmedDispatch(target, operationId, "not_sent", now), /DISPATCH_RESOLUTION_UNAVAILABLE/);
+    assert.equal(await ledger.acquireComposer(owner, prepared.operationId, now + 4000), true);
+    const currentKey = createHmac("sha256", key).update(JSON.stringify([target.origin, target.conversationId])).digest("hex");
+    database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, correlation_version, state)
+      VALUES (?, ?, ?, 1, 'dispatching')`).run(prepared.operationId, now - 5000, currentKey);
+    ledger.disconnect(owner);
+    requests.disconnect(owner);
+    database.close();
+    database = new DatabaseSync(path);
+    ledger = new PreparedMessageOperations(requests, database, 2);
+    const recreated = { ...target, tabId: 4, documentId: "synthetic-recreated-correlation-document" };
+    assert.deepEqual(ledger.listUnconfirmedDispatches(recreated, now), { attempts: [{ operationId: prepared.operationId,
+      startedAt: now - 5000, messageText: null, scope: "chat" }], hasMore: false });
+    assert.deepEqual(ledger.getOperation(restartedOwner, prepared.operationId, now), { state: "unknown" });
+    const foreign = { ...recreated, conversationId: `company_ai_v2_${"c".repeat(64)}` };
+    assert.deepEqual(ledger.listUnconfirmedDispatches(foreign, now), { attempts: [], hasMore: false });
+    assert.throws(() => ledger.resolveUnconfirmedDispatch(foreign, prepared.operationId, "sent", now), /DISPATCH_RESOLUTION_UNAVAILABLE/);
+    const fresh = requests.approveAgent(requests.registerAgent(restartedOwner).agentId, recreated, now, true)!;
+    const next = ledger.prepareAutonomous(restartedOwner, fresh.connectionId, "Synthetic fresh correlated operation", randomUUID(), now + 4000, now);
+    assert.equal(await ledger.acquireComposer(restartedOwner, next.operationId, now + 4000), false);
+    assert.ok(ledger.resolveUnconfirmedDispatch(recreated, prepared.operationId, "sent", now).state === "resolved");
+    assert.equal(await ledger.acquireComposer(restartedOwner, next.operationId, now + 4000), true);
+    assert.equal(ledger.consumeGeminiFillApproval(restartedOwner, next.operationId, now), null);
+    assert.ok(ledger.getGeminiFillAuthorization(restartedOwner, next.operationId, now));
+    const different = requests.approveAgent(requests.registerAgent(owner).agentId, foreign, now, true)!;
+    const unrelated = ledger.prepareAutonomous(owner, different.connectionId, "Synthetic unrelated correlated operation", randomUUID(), now + 4000, now);
+    assert.equal(await ledger.acquireComposer(owner, unrelated.operationId, now + 4000), true);
+    assert.ok(ledger.consumeGeminiFillApproval(owner, unrelated.operationId, now));
+    ledger.disconnect(restartedOwner);
+    const later = now + 3600000;
+    context.mock.method(Date, "now", () => later);
+    const afterWindow = ledger.prepareAutonomous(restartedOwner, fresh.connectionId, "Synthetic operation after rate window", randomUUID(), later + 4000, later);
+    assert.equal(await ledger.acquireComposer(restartedOwner, afterWindow.operationId, later + 4000), true);
+    assert.ok(ledger.consumeGeminiFillApproval(restartedOwner, afterWindow.operationId, later));
+    const stored = JSON.stringify(database.prepare("SELECT * FROM message_dispatch_attempts").all());
+    assert.equal(stored.includes(target.origin) || stored.includes(target.conversationId)
+      || stored.includes("Synthetic quarantined operation"), false);
+  } finally {
+    ledger.disconnect(owner);
+    ledger.disconnect(restartedOwner);
+    requests.disconnect(owner);
+    requests.disconnect(restartedOwner);
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("unconfirmed dispatch listing is bounded read-only metadata and filters unavailable attempts", () => {
   const database = new DatabaseSync(":memory:");
   const ledger = new PreparedMessageOperations(new PendingConnectionRequests(), database);
@@ -2258,13 +2344,13 @@ test("unconfirmed dispatch listing is bounded read-only metadata and filters una
       VALUES (?, 'synthetic-owner', 'synthetic-connection', ?, ?, ?, 1000, 'awaiting_approval')`);
     const insert = (operationId: string, conversationKey: string | null, startedAt = 1000) => {
       prepare.run(operationId, randomUUID(), "0".repeat(64), "1".repeat(64));
-      database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
-        VALUES (?, ?, ?, 'unknown')`).run(operationId, startedAt, conversationKey);
+      database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, correlation_version, state)
+        VALUES (?, ?, ?, 1, 'unknown')`).run(operationId, startedAt, conversationKey);
     };
     const operationIds = Array.from({ length: MAX_PREPARED_REVIEWS + 1 }, () => randomUUID()).sort();
     for (const operationId of [...operationIds].reverse()) insert(operationId, digest(target.conversationId));
     insert(randomUUID(), digest("fixture-beta"));
-    insert(randomUUID(), null);
+    insert("ffffffff-ffff-4fff-bfff-ffffffffffff", null);
     insert(randomUUID(), digest(target.conversationId), 2001);
     const evidencedId = randomUUID();
     insert(evidencedId, digest(target.conversationId));
@@ -2277,7 +2363,7 @@ test("unconfirmed dispatch listing is bounded read-only metadata and filters una
     const changesBefore = database.prepare("SELECT total_changes() AS count").get()?.count;
     const listed = ledger.listUnconfirmedDispatches(target, 6000);
     assert.deepEqual(listed, { attempts: operationIds.slice(0, MAX_PREPARED_REVIEWS)
-      .map(operationId => ({ operationId, startedAt: 1000, messageText: null })), hasMore: true });
+      .map(operationId => ({ operationId, startedAt: 1000, messageText: null, scope: "chat" })), hasMore: true });
     assert.ok(Object.isFrozen(listed) && Object.isFrozen(listed.attempts) && listed.attempts.every(Object.isFrozen));
     assert.deepEqual(ledger.listUnconfirmedDispatches(target, 6000), listed);
     assert.equal(database.prepare("SELECT total_changes() AS count").get()?.count, changesBefore);
@@ -2313,12 +2399,12 @@ test("unconfirmed message previews outlive draft authority but not owner or brok
     assert.equal(ledger.getGeminiSendAuthorization(owner, prepared.operationId, prepared.expiresAt + 1), null);
     const changes = database.prepare("SELECT total_changes() AS count").get()?.count;
     assert.deepEqual(ledger.listUnconfirmedDispatches(target, prepared.expiresAt + 1), {
-      attempts: [{ operationId: prepared.operationId, startedAt: 2006, messageText: prepared.preview.text }], hasMore: false
+      attempts: [{ operationId: prepared.operationId, startedAt: 2006, messageText: prepared.preview.text, scope: "chat" }], hasMore: false
     });
     assert.equal(database.prepare("SELECT total_changes() AS count").get()?.count, changes);
     assert.equal(JSON.stringify(database.prepare("SELECT * FROM prepared_message_operations").all()).includes(prepared.preview.text), false);
     assert.equal(JSON.stringify(database.prepare("SELECT * FROM message_dispatch_attempts").all()).includes(prepared.preview.text), false);
-    const unavailable = { attempts: [{ operationId: prepared.operationId, startedAt: 2006, messageText: null }], hasMore: false };
+    const unavailable = { attempts: [{ operationId: prepared.operationId, startedAt: 2006, messageText: null, scope: "chat" }], hasMore: false };
     assert.deepEqual(new PreparedMessageOperations(requests, database).listUnconfirmedDispatches(target, prepared.expiresAt + 1), unavailable);
     ledger.disconnect(owner);
     assert.deepEqual(ledger.listUnconfirmedDispatches(target, prepared.expiresAt + 1), unavailable);
@@ -2350,7 +2436,7 @@ test("conversation-scoped person resolution is immutable status only and unblock
       ledger.recordGeminiDispatchStart(owner, prepared.operationId, 2006, checkId);
       assert.deepEqual(ledger.listUnconfirmedDispatches(target, 6005), { attempts: [], hasMore: false });
       assert.deepEqual(ledger.listUnconfirmedDispatches(target, 6006), {
-        attempts: [{ operationId: prepared.operationId, startedAt: 2006, messageText: prepared.preview.text }], hasMore: false
+        attempts: [{ operationId: prepared.operationId, startedAt: 2006, messageText: prepared.preview.text, scope: "chat" }], hasMore: false
       });
       assert.deepEqual(ledger.listUnconfirmedDispatches({ ...target, conversationId: "synthetic-foreign" }, 6006),
         { attempts: [], hasMore: false });
@@ -2373,7 +2459,7 @@ test("conversation-scoped person resolution is immutable status only and unblock
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()?.count, 0);
       assert.equal(database.prepare("SELECT state FROM message_dispatch_attempts").get()?.state, "dispatching");
       assert.deepEqual(new PreparedMessageOperations(requests, database).listUnconfirmedDispatches(target, 6006), {
-        attempts: [{ operationId: prepared.operationId, startedAt: 2006, messageText: null }], hasMore: false
+        attempts: [{ operationId: prepared.operationId, startedAt: 2006, messageText: null, scope: "chat" }], hasMore: false
       });
       const resolved = ledger.resolveUnconfirmedDispatch(target, prepared.operationId, outcome, 6006);
       assert.deepEqual(ledger.listUnconfirmedDispatches(target, 6006), { attempts: [], hasMore: false });
@@ -2506,14 +2592,17 @@ test("conversation-scoped journal migration leaves legacy unresolved attempts gl
     const legacy = ledger.prepareGemini(owner, grant.connectionId, 1, "Synthetic legacy journal operation",
       "a66b3997-9d43-4554-8399-267d1fe9f75c", 2001);
     database.exec(`DROP INDEX message_dispatch_conversation_started;
-      ALTER TABLE message_dispatch_attempts DROP COLUMN conversation_key; DROP TABLE message_conversation_key`);
+      ALTER TABLE message_dispatch_attempts DROP COLUMN conversation_key;
+      ALTER TABLE message_dispatch_attempts DROP COLUMN correlation_version; DROP TABLE message_conversation_key`);
     database.prepare("INSERT INTO message_dispatch_attempts (operation_id, started_at, state) VALUES (?, ?, 'dispatching')")
       .run(legacy.operationId, 2002);
     migrated = new PreparedMessageOperations(requests, database);
     assert.equal(database.prepare("SELECT conversation_key FROM message_dispatch_attempts").get()?.conversation_key, null);
     assert.equal(database.prepare("SELECT state FROM message_dispatch_attempts").get()?.state, "unknown");
-    assert.throws(() => migrated!.resolveUnconfirmedDispatch(target, legacy.operationId, "not_sent", 6002),
+    assert.throws(() => migrated!.resolveUnconfirmedDispatch(target, legacy.operationId, "not_sent", 2007),
       /DISPATCH_RESOLUTION_UNAVAILABLE/);
+    assert.deepEqual(migrated.listUnconfirmedDispatches(target, 6002), { attempts: [{ operationId: legacy.operationId,
+      startedAt: 2002, messageText: null, scope: "unlinked" }], hasMore: false });
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()?.count, 0);
     const keys = database.prepare("SELECT key FROM message_conversation_key").all();
     assert.equal(keys.length, 1);
@@ -4043,7 +4132,7 @@ test("private dispatch intent persists before any submit and restart refuses reu
     assert.ok(typeof conversationKey === "string");
     assert.match(conversationKey, /^[a-f0-9]{64}$/);
     assert.deepEqual(database.prepare("SELECT * FROM message_dispatch_attempts").all().map((row) => ({ ...row })), [
-      { operation_id: prepared.operationId, started_at: 2004, conversation_key: conversationKey, state: "dispatching" }
+      { operation_id: prepared.operationId, started_at: 2004, conversation_key: conversationKey, correlation_version: 1, state: "dispatching" }
     ]);
     assert.deepEqual(ledger.getOperation(owner, prepared.operationId, 2005), {
       operationId: prepared.operationId, state: "dispatch_uncertain", startedAt: 2004
@@ -4071,7 +4160,7 @@ test("private dispatch intent persists before any submit and restart refuses reu
     });
     assert.deepEqual(restarted.recoverOperationStatus(prepared.operationId, "invalid"), { state: "unknown" });
     assert.deepEqual(database.prepare("SELECT * FROM message_dispatch_attempts").all().map((row) => ({ ...row })), [
-      { operation_id: prepared.operationId, started_at: 2004, conversation_key: conversationKey, state: "unknown" }
+      { operation_id: prepared.operationId, started_at: 2004, conversation_key: conversationKey, correlation_version: 1, state: "unknown" }
     ]);
     assert.equal(database.prepare("PRAGMA foreign_keys").get()?.foreign_keys, 1);
     const nextOwner = Symbol("new broker owner");

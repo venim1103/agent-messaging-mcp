@@ -851,7 +851,7 @@ export class PendingConnectionRequests {
 
   private validTarget(target: ApprovedTarget): boolean {
     if (target.provider === "company_ai") {
-      return isCompanyAIChatTargetUrl(target.url, target.origin) && /^company_ai_[a-f0-9]{64}$/.test(target.conversationId)
+      return isCompanyAIChatTargetUrl(target.url, target.origin) && /^company_ai_v2_[a-f0-9]{64}$/.test(target.conversationId)
         && Number.isSafeInteger(target.tabId) && target.tabId > 0 && /^[!-~]{1,128}$/.test(target.documentId);
     }
     if (target.provider === "databag") {

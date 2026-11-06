@@ -57,7 +57,7 @@ export function installCompanyAIChatReader(origins: readonly string[]): boolean 
       if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length !== 3) return;
       const { nonce, conversationId, deadline } = input as { nonce?: unknown; conversationId?: unknown; deadline?: unknown };
       if (typeof nonce !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(nonce)
-        || typeof conversationId !== "string" || !/^company_ai_[a-f0-9]{64}$/.test(conversationId)
+        || typeof conversationId !== "string" || !/^company_ai_v2_[a-f0-9]{64}$/.test(conversationId)
         || typeof deadline !== "number" || !Number.isFinite(deadline) || deadline <= Date.now() || deadline > Date.now() + 4000) return;
       const valid = boundUrl === location.href && binding?.conversationId === conversationId
         && binding.checkEditor(event.target, deadline) === true;
@@ -72,7 +72,7 @@ export function installCompanyAIChatReader(origins: readonly string[]): boolean 
 
 export function checkCompanyAIChatIdentity(editor: HTMLTextAreaElement, conversationId: string, deadline: number): boolean {
   if (!(editor instanceof HTMLTextAreaElement) || editor.ownerDocument !== document || !editor.isConnected
-    || !/^company_ai_[a-f0-9]{64}$/.test(conversationId) || !Number.isFinite(deadline)
+    || !/^company_ai_v2_[a-f0-9]{64}$/.test(conversationId) || !Number.isFinite(deadline)
     || deadline <= Date.now() || deadline > Date.now() + 4000) return false;
   const nonce = crypto.randomUUID();
   let valid = false;

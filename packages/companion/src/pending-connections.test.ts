@@ -86,7 +86,7 @@ test("Company autonomous admission pins an explicit target without entering lega
   const stranger = Symbol("other owner");
   const agent = requests.registerAgent(owner);
   const selected = { provider: "company_ai", origin: "https://chat.app.example.com",
-    url: "https://chat.app.example.com/chat/synthetic", conversationId: `company_ai_${"a".repeat(64)}`,
+    url: "https://chat.app.example.com/chat/synthetic", conversationId: `company_ai_v2_${"a".repeat(64)}`,
     tabId: 3, documentId: "synthetic-document" };
   const target = selected as unknown as ApprovedTarget;
   const grant = requests.approveAgent(agent.agentId, target, 1000);
@@ -104,7 +104,7 @@ test("Company autonomous admission pins an explicit target without entering lega
     { origin: "https://other.example" }, { origin: "https://user@chat.app.example.com" },
     { url: "https://other.example/chat/synthetic" }, { url: `${selected.url}?code=synthetic` },
     { url: `${selected.url}#access_token=synthetic` }, { url: `${selected.url}?STATE=synthetic` },
-    { conversationId: `company_ai_${"A".repeat(64)}` }, { documentId: "" }, { tabId: 0 }
+    { conversationId: `company_ai_v2_${"A".repeat(64)}` }, { documentId: "" }, { tabId: 0 }
   ]) {
     assert.equal(requests.approveAgent(agent.agentId, { ...selected, ...changes } as unknown as ApprovedTarget, 1000), null);
   }
@@ -125,7 +125,7 @@ test("Company rendered reads are owner-bound and never enter stable-row getters"
   const stranger = Symbol("foreign read owner");
   const now = Date.now();
   const target = { provider: "company_ai", origin: "https://chat.app.example.com",
-    url: "https://chat.app.example.com/chat/synthetic", conversationId: `company_ai_${"b".repeat(64)}`,
+    url: "https://chat.app.example.com/chat/synthetic", conversationId: `company_ai_v2_${"b".repeat(64)}`,
     tabId: 4, documentId: "synthetic-read-document" } as const;
   try {
     const grant = requests.approveAgent(requests.registerAgent(owner).agentId, target, now);

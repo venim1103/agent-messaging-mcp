@@ -11,6 +11,7 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { runInNewContext } from "node:vm";
+import { build as bundle } from "rolldown";
 import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -28,8 +29,11 @@ import { fillCompanyAIChatDraft, inspectCompanyAIChatDraft, invokeCompanyAIChatR
   submitCompanyAIChatDraft } from "../../packages/extension/lib/company-ai-reader.ts";
 import { extensionDirectory, nativeRelayPath, buildTestExtension, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
-const companyProofScript = transpileModule(await readFile(new URL("../../packages/extension/lib/company-ai-observation.ts",
-  import.meta.url), "utf8"), { compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2022 } }).outputText;
+const companyProofBundle = await bundle({
+  input: fileURLToPath(new URL("../../packages/extension/lib/company-ai-observation.ts", import.meta.url)),
+  platform: "browser", write: false, output: { format: "iife", name: "syntheticCompanyProof" }
+});
+const companyProofScript = `${companyProofBundle.output[0].code}\nObject.assign(exports, syntheticCompanyProof);`;
 
 const databagBuildSources = [];
 const databagTestBuilds = new Map();
@@ -314,7 +318,8 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
     const options = { expectedUrl: syntheticLocation.href, editor: elements[0], timeline: elements[1], profile: elements[2],
       deadline: now + budget, readProfile: () => { profileReads++; return "SYNTHETIC_SECRET"; } };
     const sandbox = { exports: {}, input: options, window: syntheticWindow, document: syntheticDocument,
-      location: syntheticLocation, Element: SyntheticElement, URL, URLSearchParams, crypto: globalThis.crypto, Date: { now: () => now } };
+      location: syntheticLocation, Element: SyntheticElement, URL, URLSearchParams, TextEncoder,
+      crypto: globalThis.crypto, Date: { now: () => now } };
     runInNewContext(companyProofScript, sandbox);
     const inspectDocument = () => {
       const result = sandbox.exports.proveCompanyAIChatIdentityInDocument(options);
@@ -330,9 +335,28 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
   const runtime = guardedFixture(4000);
   const runtimeBinding = runtime.sandbox.exports.createCompanyAIChatIdentityBinding(runtime.options);
   assert.equal(runtimeBinding.status, "ok");
-  assert.match(runtimeBinding.conversationId, /^company_ai_[a-f0-9]{64}$/);
+  assert.match(runtimeBinding.conversationId, /^company_ai_v2_[a-f0-9]{64}$/);
   assert.ok(!JSON.stringify(runtimeBinding).includes("SYNTHETIC_SECRET"));
   assert.deepEqual(Object.keys(runtimeBinding).sort(), ["check", "conversationId", "dispose", "status"]);
+  const recreated = guardedFixture(4000);
+  const recreatedBinding = recreated.sandbox.exports.createCompanyAIChatIdentityBinding(recreated.options);
+  assert.equal(recreatedBinding.status, "ok");
+  assert.equal(recreatedBinding.conversationId, runtimeBinding.conversationId);
+  recreatedBinding.dispose();
+  for (const change of [
+    input => { input.targets.account.homeAccountId = "different-synthetic-account"; },
+    input => { input.targets.account.localAccountId = "different-synthetic-local-account"; },
+    input => { input.targets.source.memoizedProps.conversationId = "different-synthetic-chat"; },
+    input => { input.options.expectedUrl = "https://chat.app.other.com/chat/synthetic";
+      input.sandbox.location.href = input.options.expectedUrl; }
+  ]) {
+    const isolated = guardedFixture(4000);
+    change(isolated);
+    const isolatedBinding = isolated.sandbox.exports.createCompanyAIChatIdentityBinding(isolated.options);
+    assert.equal(isolatedBinding.status, "ok");
+    assert.notEqual(isolatedBinding.conversationId, runtimeBinding.conversationId);
+    isolatedBinding.dispose();
+  }
   runtime.expire();
   assert.equal(runtimeBinding.check(runtime.options.deadline + 4000).status, "ok");
   runtime.targets.source.memoizedProps.conversationId = "OTHER_SYNTHETIC_SECRET";
@@ -365,12 +389,12 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
     assert.equal(current.profileReads(), reads);
     assert.equal(current.listenerCount(), 0);
   }
-  const duringEntropy = guardedFixture(4000);
-  duringEntropy.sandbox.crypto = { getRandomValues: bytes => {
-    duringEntropy.sandbox.window.dispatchEvent(new Event("pagehide")); return bytes;
-  } };
-  assert.equal(duringEntropy.sandbox.exports.createCompanyAIChatIdentityBinding(duringEntropy.options).status, "refused");
-  assert.equal(duringEntropy.listenerCount(), 0);
+  const duringCorrelation = guardedFixture(4000);
+  duringCorrelation.sandbox.TextEncoder = class extends TextEncoder {
+    encode(text) { duringCorrelation.sandbox.window.dispatchEvent(new Event("pagehide")); return super.encode(text); }
+  };
+  assert.equal(duringCorrelation.sandbox.exports.createCompanyAIChatIdentityBinding(duringCorrelation.options).status, "refused");
+  assert.equal(duringCorrelation.listenerCount(), 0);
   for (const end of [
     (input, captured) => { assert.equal(captured.dispose(), undefined); captured.dispose(); },
     input => { input.sandbox.window.dispatchEvent(new Event("pagehide")); },
@@ -785,7 +809,7 @@ test("Company AI Chat read binding separates identity from bounded sender captur
       await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-chat"; });
       const request = { action: "bind", url: page.url(), deadline: Date.now() + 4000 };
       const bound = await page.evaluate(invokeCompanyAIChatReader, request);
-      assert.ok(bound && /^company_ai_[a-f0-9]{64}$/.test(bound.conversationId));
+      assert.ok(bound && /^company_ai_v2_[a-f0-9]{64}$/.test(bound.conversationId));
       assert.equal(bound.snapshot, undefined);
       const bridge = await page.evaluate(({ conversationId }) => {
         const editor = document.querySelector("textarea");
@@ -802,7 +826,7 @@ test("Company AI Chat read binding separates identity from bounded sender captur
           return received === 1 && valid;
         };
         const matched = check(editor, conversationId, Date.now() + 4000);
-        const foreignRefused = !check(editor, `company_ai_${"f".repeat(64)}`, Date.now() + 4000);
+        const foreignRefused = !check(editor, `company_ai_v2_${"f".repeat(64)}`, Date.now() + 4000);
         const expiredRefused = !check(editor, conversationId, Date.now());
         const clone = editor.cloneNode(true); document.querySelector("main").append(clone);
         const otherEditorRefused = !check(clone, conversationId, Date.now() + 4000);
@@ -850,7 +874,7 @@ test("Company AI Chat read binding separates identity from bounded sender captur
         } finally { timeline.replaceChildren(...original); }
       });
       assert.deepEqual(bounds, { charactersBounded: true, bytesBounded: true, bytesTruncated: true, nodesRefused: true, terminal: true });
-      assert.equal(await page.evaluate(invokeCompanyAIChatReader, { ...checking, conversationId: `company_ai_${"f".repeat(64)}` }), null);
+      assert.equal(await page.evaluate(invokeCompanyAIChatReader, { ...checking, conversationId: `company_ai_v2_${"f".repeat(64)}` }), null);
       await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-other"; });
       assert.equal(await page.evaluate(invokeCompanyAIChatReader, checking), null);
       assert.equal(await page.evaluate(invokeCompanyAIChatReader, { ...checking, action: "capture" }), null);
@@ -1014,7 +1038,7 @@ test("Company AI Chat document guard checks native DOM without connection or inp
       const capturedAccepted = binding.check();
       const runtimeBinding = createCompanyAIChatIdentityBinding({ ...options, deadline: Date.now() + 4000 });
       const runtimeAccepted = runtimeBinding.check(Date.now() + 4000);
-      const runtimeIdBounded = /^company_ai_[a-f0-9]{64}$/.test(runtimeBinding.conversationId);
+      const runtimeIdBounded = /^company_ai_v2_[a-f0-9]{64}$/.test(runtimeBinding.conversationId);
       const runtimePrivate = !JSON.stringify(runtimeBinding).includes("synthetic@example.test")
         && !JSON.stringify(runtimeBinding).includes("synthetic-chat");
       source.memoizedProps.conversationId = "synthetic-other-chat";
@@ -2917,8 +2941,8 @@ for (const provider of ["fixture", "gemini"]) {
       const prepare = journal.prepare(`INSERT INTO prepared_message_operations
         (operation_id, owner_id, connection_id, idempotency_key, content_digest, target_digest, expires_at, state)
         VALUES (?, 'synthetic-owner', 'synthetic-connection', ?, ?, ?, ?, 'awaiting_approval')`);
-      const insert = journal.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
-        VALUES (?, ?, ?, 'unknown')`);
+      const insert = journal.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, correlation_version, state)
+        VALUES (?, ?, ?, 1, 'unknown')`);
       operationIds.forEach((operationId, index) => {
         prepare.run(operationId, crypto.randomUUID(), "0".repeat(64), "1".repeat(64), startedAt);
         insert.run(operationId, index === 3 ? Date.now() + 60000 : startedAt,
@@ -2990,7 +3014,17 @@ for (const provider of ["fixture", "gemini"]) {
       }
       assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_resolutions").get().count, 0);
       setPhase("person resolution controls");
-      for (const [index, label, outcome] of [[0, "Not sent", "not_sent"], [1, "Sent", "sent"]]) {
+      const legacyId = crypto.randomUUID(), legacyKey = digest(`${conversationId}-older-binding`);
+      operationIds.push(legacyId);
+      prepare.run(legacyId, crypto.randomUUID(), "0".repeat(64), "1".repeat(64), startedAt);
+      journal.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
+        VALUES (?, ?, ?, 'unknown')`).run(legacyId, startedAt, legacyKey);
+      await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
+      const legacy = popup.locator(`[data-operation-id="${legacyId}"]`);
+      await legacy.waitFor({ timeout: 4000 });
+      assert.equal(await legacy.getAttribute("data-scope"), "unlinked");
+      assert.equal(await legacy.locator("p").first().textContent(), "Unlinked older attempt");
+      for (const [index, label, outcome] of [[0, "Not sent", "not_sent"], [1, "Sent", "sent"], [4, "Sent", "sent"]]) {
         await activateControl(popup.locator(`[data-operation-id="${operationIds[index]}"]`).getByRole("button", { name: label, exact: true }));
         await popup.waitForFunction(operationId => !document.querySelector(`[data-operation-id="${operationId}"]`),
           operationIds[index], { timeout: 4000 });
@@ -3010,8 +3044,10 @@ for (const provider of ["fixture", "gemini"]) {
       const foreign = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
         ...selected, kind: "resolve_unconfirmed_dispatch", operationId: operationIds[2], outcome: "not_sent" });
       assert.equal(foreign.ok, false);
-      assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_resolutions").get().count, 2);
-      assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_attempts").get().count, 4);
+      assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_resolutions").get().count, 3);
+      assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_attempts").get().count, 5);
+      assert.equal(journal.prepare("SELECT conversation_key FROM message_dispatch_attempts WHERE operation_id = ?")
+        .get(legacyId).conversation_key, legacyKey);
       assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), storageBefore);
       assert.equal(await editor.evaluate(element => element.value ?? element.textContent), "A person's synthetic unsent draft");
       assert.deepEqual(await page.evaluate(() => globalThis.resolutionEvents), { input: 0, click: 0, submit: 0 });

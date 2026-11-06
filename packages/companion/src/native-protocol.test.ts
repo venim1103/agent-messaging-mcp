@@ -50,7 +50,7 @@ test("native neutral observations validate provider, exact target, row model and
       documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat" },
     { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 3,
       documentId: "synthetic-document", url: "https://databag.example/#/session" },
-    { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3,
+    { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_v2_${"a".repeat(64)}`, tabId: 3,
       documentId: "synthetic-document", url: "https://chat.app.example.com/chat/synthetic" }
   ];
   for (const [index, provider] of ["fixture", "gemini", "databag", "company_ai"].entries()) {
@@ -109,7 +109,7 @@ test("native neutral jobs validate phase, provider, exact target and phase-speci
       documentId: "synthetic-neutral", url: "https://gemini.google.com/app/synthetic-neutral?hl=en" },
     { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 5,
       documentId: "synthetic-neutral", url: "https://databag.example/#/session" },
-    { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_${"a".repeat(64)}`, tabId: 6,
+    { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_v2_${"a".repeat(64)}`, tabId: 6,
       documentId: "synthetic-neutral", url: "https://chat.app.example.com/chat/synthetic" }
   ]) {
     for (const phase of ["fill", "proof", "submit", "settle"]) {
@@ -164,7 +164,7 @@ test("native agent roster and removal accept only bounded exact-target envelopes
       documentId: "synthetic-document", url: "https://gemini.google.com/app/synthetic-chat?hl=en" },
     { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 3,
       documentId: "synthetic-document", url: "https://databag.example/#/session" },
-    { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_${"a".repeat(64)}`, tabId: 3,
+    { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_v2_${"a".repeat(64)}`, tabId: 3,
       documentId: "synthetic-document", url: "https://chat.app.example.com/chat/synthetic" }
   ]) {
     for (const kind of ["list_chat_agents", "remove_chat_agent", "disconnect_chat", "approve_chat_agent", "begin_chat_reload", "rebind_chat",

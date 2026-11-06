@@ -1297,8 +1297,8 @@ test("resolved dispatch status IPC preserves owner and receipt boundaries withou
     const key = database.prepare("SELECT key FROM message_conversation_key WHERE singleton = 1").get()?.key;
     assert.ok(key instanceof Uint8Array);
     const digest = createHmac("sha256", key).update(JSON.stringify([target.origin, target.conversationId])).digest("hex");
-    database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, state)
-      VALUES (?, ?, ?, 'unknown')`).run(operationId, startedAt, digest);
+    database.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, correlation_version, state)
+      VALUES (?, ?, ?, 1, 'unknown')`).run(operationId, startedAt, digest);
     assert.throws(() => facade.listUnconfirmedDispatches(target), /Broker role cannot perform/);
     assert.throws(() => facade.resolveUnconfirmedDispatch(target, operationId, "not_sent"), /Broker role cannot perform/);
     rawFacade = connect(join(directory, "broker.sock"));
@@ -1315,7 +1315,7 @@ test("resolved dispatch status IPC preserves owner and receipt boundaries withou
     const listed = await relay.listUnconfirmedDispatches(target);
     assert.equal(listed.kind, "unconfirmed_dispatches");
     assert.deepEqual(listed.payload, { attempts: [{ operationId, startedAt,
-      messageText: "Synthetic resolved IPC operation" }], hasMore: false });
+      messageText: "Synthetic resolved IPC operation", scope: "chat" }], hasMore: false });
     assert.equal(JSON.stringify(listed.payload).includes(target.documentId), false);
     const foreign = { origin: "https://gemini.google.com" as const, conversationId: "fixture-alpha",
       url: "https://gemini.google.com/app/fixture-alpha", tabId: 4, documentId: "synthetic-foreign-document" };
