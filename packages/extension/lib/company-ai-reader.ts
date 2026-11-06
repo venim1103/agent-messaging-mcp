@@ -130,7 +130,7 @@ export function installCompanyAIChatWriter(origins: readonly string[]): boolean 
   const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   const fillAttempts = new Set<string>();
   const submitAttempts = new Set<string>();
-  const inspectTargets = (input: CompanyDraftInput) => {
+  const inspectTargets = (input: CompanyDraftInput, allowDisabledSend = false) => {
     if (!input || input.expectedUrl !== location.href || !isEligibleCompanyAIChatUrl(input.expectedUrl, origins)
       || !Number.isFinite(input.deadline) || input.deadline <= Date.now() || input.deadline > Date.now() + 4000) {
       return { ok: false as const, code: "TARGET_CHANGED" as const };
@@ -148,6 +148,7 @@ export function installCompanyAIChatWriter(origins: readonly string[]): boolean 
       if (rect.width <= 0 || rect.height <= 0 || rect.left < 0 || rect.top < 0 || rect.right > innerWidth || rect.bottom > innerHeight) {
         return { ok: false as const, code };
       }
+      if (element === targets.send && allowDisabledSend && element.matches(":disabled")) continue;
       const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
       if (!hit || (hit !== element && !element.contains(hit))) return { ok: false as const, code };
     }
@@ -158,7 +159,7 @@ export function installCompanyAIChatWriter(origins: readonly string[]): boolean 
   };
   const inspect = (input: CompanyDraftInput): CompanyDraftResult => {
     try {
-      const found = inspectTargets(input);
+      const found = inspectTargets(input, input?.draftState !== "prepared");
       if (!found.ok) return found;
       if (input.draftState !== undefined && input.draftState !== "empty" && input.draftState !== "prepared") {
         return { ok: false, code: "COMPOSER_UNAVAILABLE" };
@@ -179,12 +180,12 @@ export function installCompanyAIChatWriter(origins: readonly string[]): boolean 
     fillAttempts.add(input.attemptId);
     let inserted = false;
     try {
-      const before = inspectTargets(input);
+      const before = inspectTargets(input, true);
       if (!before.ok) return before;
       if (before.editor.value.length) return { ok: false, code: "DRAFT_PRESENT" };
       HTMLElement.prototype.focus.call(before.editor, { preventScroll: true });
       HTMLTextAreaElement.prototype.setSelectionRange.call(before.editor, 0, 0);
-      const ready = inspectTargets(input);
+      const ready = inspectTargets(input, true);
       if (!ready.ok) return ready;
       if (ready.editor !== before.editor || ready.composer !== before.composer || ready.send !== before.send
         || document.activeElement !== ready.editor || ready.editor.value.length || Date.now() >= input.expiresAt) {
@@ -197,7 +198,7 @@ export function installCompanyAIChatWriter(origins: readonly string[]): boolean 
       if (!checkCompanyAIChatIdentity(ready.editor, input.conversationId, input.deadline)) return { ok: false, code: "TARGET_CHANGED" };
       inserted = true;
       if (!Document.prototype.execCommand.call(document, "insertText", false, input.text)) return { ok: false, code: "FILL_UNCERTAIN" };
-      const after = inspectTargets(input);
+      const after = inspectTargets(input, true);
       if (!after.ok || after.editor !== ready.editor || after.composer !== ready.composer || after.send !== ready.send
         || document.activeElement !== ready.editor || ready.editor.value !== input.text || !ownership.confirm(input.operationId)
         || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNCERTAIN" };

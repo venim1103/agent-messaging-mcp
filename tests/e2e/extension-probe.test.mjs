@@ -885,7 +885,7 @@ test("Company isolated writer preserves guarded native input and one-shot submis
       env: { ...process.env, HOME: home } });
     const page = await browser.newPage();
     await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
-      body: '<!doctype html><nav><span>synthetic@example.test</span></nav><main><div role="log"><div data-testid="invented-row"><p>Invented previous row</p></div></div><section><textarea></textarea><button type="button" disabled><span>Send</span></button></section></main>' }));
+      body: '<!doctype html><style>button:disabled { pointer-events: none; }</style><nav><span>synthetic@example.test</span></nav><main><div role="log"><div data-testid="invented-row"><p>Invented previous row</p></div></div><section><textarea></textarea><button type="button" disabled><span>Send</span></button></section></main>' }));
     await page.goto("https://chat.app.example.com/chat/synthetic-writer");
     await page.evaluate(() => {
       const editor = document.querySelector("textarea"), timeline = document.querySelector('[role="log"]');
@@ -934,6 +934,22 @@ test("Company isolated writer preserves guarded native input and one-shot submis
     const input = fillInput();
     assert.deepEqual(await invoke(fillCompanyAIChatDraft, input), { ok: true, editor: "textarea" });
     assert.deepEqual(await invoke(fillCompanyAIChatDraft, input), { ok: false, code: "FILL_UNAVAILABLE" });
+    await page.evaluate(() => { document.querySelector("button").disabled = true; });
+    assert.deepEqual(await invoke(inspectCompanyAIChatDraft, { ...draft(), draftState: "prepared" }),
+      { ok: false, code: "SUBMIT_UNAVAILABLE" });
+    const disabled = fillInput();
+    assert.deepEqual(await invoke(submitCompanyAIChatDraft, { ...disabled, attemptId: disabled.operationId }),
+      { ok: false, code: "SUBMIT_UNAVAILABLE" });
+    assert.deepEqual(await page.evaluate(() => [globalThis.syntheticInputs, globalThis.syntheticActivations]), [1, 0]);
+    await page.evaluate(() => { document.querySelector("button").disabled = false; });
+    await page.evaluate(() => { document.querySelector("button").style.pointerEvents = "none"; });
+    assert.deepEqual(await invoke(inspectCompanyAIChatDraft, { ...draft(), draftState: "prepared" }),
+      { ok: false, code: "SUBMIT_UNAVAILABLE" });
+    const blocked = fillInput();
+    assert.deepEqual(await invoke(submitCompanyAIChatDraft, { ...blocked, attemptId: blocked.operationId }),
+      { ok: false, code: "SUBMIT_UNAVAILABLE" });
+    assert.deepEqual(await page.evaluate(() => [globalThis.syntheticInputs, globalThis.syntheticActivations]), [1, 0]);
+    await page.evaluate(() => { document.querySelector("button").style.pointerEvents = ""; });
     assert.deepEqual(await invoke(inspectCompanyAIChatDraft, { ...draft(), draftState: "prepared" }), { ok: true, editor: "textarea" });
     const submit = { ...input, attemptId: input.operationId, deadline: Date.now() + 4000 };
     submit.expiresAt = submit.deadline;
@@ -3316,7 +3332,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
     const page = await context.newPage();
     const url = "https://chat.app.example.com/chat/synthetic";
     await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
-      body: '<!doctype html><nav><span>synthetic@example.test</span></nav><main><div role="log"><div data-testid="invented-first"><p>Synthetic first row</p><button>Excluded control</button></div><div data-testid="invented-second"><p>Synthetic second row</p></div></div><section><textarea>Synthetic retained draft</textarea><button>Send</button></section></main>' }));
+      body: '<!doctype html><style>button:disabled { pointer-events: none; }</style><nav><span>synthetic@example.test</span></nav><main><div role="log"><div data-testid="invented-first"><p>Synthetic first row</p><button>Excluded control</button></div><div data-testid="invented-second"><p>Synthetic second row</p></div></div><section><textarea>Synthetic retained draft</textarea><button>Send</button></section></main>' }));
     await page.goto(url);
     await page.evaluate(() => {
       const editor = document.querySelector("textarea");
