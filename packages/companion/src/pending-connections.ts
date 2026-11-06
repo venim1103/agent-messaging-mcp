@@ -480,9 +480,21 @@ export class PendingConnectionRequests {
     return target && isGeminiTarget(target) ? target : null;
   }
 
+  getRenderedTarget(owner: symbol, connectionId: string, now = Date.now()): GeminiTarget | CompanyAIChatTarget | null {
+    const target = this.liveGrant(owner, connectionId, now)?.target;
+    return target && isGeminiTarget(target) ? this.getGeminiTarget(owner, connectionId, now)
+      : target?.provider === "company_ai" ? target : null;
+  }
+
   getAutonomousTarget(owner: symbol, connectionId: string, now = Date.now()): ApprovedTarget | null {
     const grant = this.liveGrant(owner, connectionId, now);
     return grant?.connection.state === "ready" ? grant.target : null;
+  }
+
+  getAutonomousWriteTarget(owner: symbol, connectionId: string, now = Date.now()): ApprovedTarget | null {
+    const grant = this.liveGrant(owner, connectionId, now);
+    return grant?.connection.state === "ready" && "capabilities" in grant.connection
+      && grant.connection.capabilities.some(capability => capability === "send") ? grant.target : null;
   }
 
   getConnectionExpiresAt(owner: symbol, connectionId: string, now = Date.now()): number | null {
@@ -815,7 +827,7 @@ export class PendingConnectionRequests {
     return this.createGrant(requestId, target, now);
   }
 
-  approveAgent(agentId: string, target: ApprovedTarget, now = Date.now()): AutonomousConnection | null {
+  approveAgent(agentId: string, target: ApprovedTarget, now = Date.now(), send = false): AutonomousConnection | null {
     const entry = [...this.agents].find(([, agent]) => agent.agentId === agentId);
     if (!entry || !Number.isSafeInteger(now) || now < 0 || !this.validTarget(target)) return null;
     const owner = entry[0];
@@ -830,7 +842,7 @@ export class PendingConnectionRequests {
     const pending = this.create(owner, now);
     const connection: AutonomousConnection = Object.freeze({ requestId: pending.requestId, state: "ready",
       connectionId: randomUUID(), generation: 1, origin: target.origin, conversationId: target.conversationId,
-      capabilities: target.provider === "company_ai" ? Object.freeze(["read"] as const)
+      capabilities: target.provider === "company_ai" && !send ? Object.freeze(["read"] as const)
         : Object.freeze(["read", "send"] as const), expiresAt: null });
     this.requests.get(pending.requestId)!.grant = { connection, target: Object.freeze({ ...target }), stale: false };
     this.finishConnectionWait(owner, { connections: this.ownedAutonomousConnections(owner, now), timedOut: false }, now);

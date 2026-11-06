@@ -190,7 +190,7 @@ server.registerTool("chat_wait_for_connection", {
 });
 
 server.registerTool("chat_read_messages", {
-  description: "Read a fresh rendered-only snapshot from an owned, toolbar-approved fixture, Gemini, configured Databag or Company AI chat after an exact-document browser challenge. Results contain the selected chat's supported visible message text, not complete history. Company AI is read-only with unknown sender direction and completion. Databag supports plain text only.",
+  description: "Read a fresh rendered-only snapshot from an owned, toolbar-approved fixture, Gemini, configured Databag or Company AI chat after an exact-document browser challenge. Results contain the selected chat's supported visible message text, not complete history. Company AI has uncertain row identity, conservative sender hints and unknown completion. Databag supports plain text only.",
   inputSchema: z.object({ connectionId: z.uuid(), limit: z.number().int().min(1).max(32).optional() }).strict(),
   annotations: { readOnlyHint: true }
 }, async ({ connectionId, limit }) => {
@@ -416,7 +416,7 @@ server.registerTool("chat_wait_for_reply", {
 });
 
 server.registerTool("chat_send_message", {
-  description: "Send once in an owned autonomous fixture, Gemini or configured Databag chat approved for this agent through Connect this chat. Databag requires its reviewed DOM contract and a plain-text, attachment-free composer. One original deadline spans preparation, fill, fresh proof, durable intent, one activation and bounded evidence. Returns sent, not_sent or unresolved, always retryAllowed false; sent is a page or person assessment, not provider acceptance or delivery. The same key and arguments return existing status without another submission. Never automatically resend an unresolved result or clear a person's draft. Recovery tokens permit status only."
+  description: "Send once in an owned autonomous fixture, Gemini, configured Databag or Company AI chat with explicit read/send approval for this agent through Connect this chat. Databag requires its reviewed DOM contract and a plain-text, attachment-free composer. Company AI requires a visible, empty native textarea and unambiguous Send control; submission remains unresolved until trusted person outcome review. One original deadline spans preparation, fill, fresh proof, durable intent, one activation and bounded evidence. Returns sent, not_sent or unresolved, always retryAllowed false; sent is a page or person assessment, not provider acceptance or delivery. The same key and arguments return existing status without another submission. Never automatically resend an unresolved result or clear a person's draft. Recovery tokens permit status only."
     + " A composer refusal with failureReason unconfirmed_send requires the person to review Unconfirmed Sends in the trusted popup and record the actual outcome; never retry the blocked operation.",
   inputSchema: z.object({ connectionId: z.uuid(), text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES),
     idempotencyKey: z.uuid() }).strict(),
@@ -521,7 +521,7 @@ server.registerTool("chat_commit_message", {
 });
 
 server.registerTool("chat_get_operation", {
-  description: "Read owned fixture, Gemini or configured Databag operation status, including durable dispatch uncertainty and immutable page/person resolutions. A recoveryToken recovers dispatch status after restart, never fill state, browser access, approval or resend permission. Filled describes past exact readback, not the current draft. Page or person evidence is not service acceptance or delivery; no status query performs a submit.",
+  description: "Read owned fixture, Gemini, configured Databag or Company AI operation status, including durable dispatch uncertainty and immutable page/person resolutions. A recoveryToken recovers dispatch status after restart, never fill state, browser access, approval or resend permission. Filled describes past exact readback, not the current draft. Page or person evidence is not service acceptance or delivery; no status query performs a submit.",
   inputSchema: z.object({ operationId: z.uuid(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   annotations: { readOnlyHint: true }
 }, async ({ operationId, recoveryToken }) => {

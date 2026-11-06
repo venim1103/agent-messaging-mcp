@@ -257,7 +257,7 @@ async function inspectCompanyAIChatTab(target: InspectionTarget): Promise<Inspec
       ...shape.structure.map((node, index) => `${index}: parent ${node.parent ?? "none"}; ${node.tag}; role ${node.role ?? "none"}; `
         + `attributes ${node.attributeNames.join(", ") || "none"}`)
     ].join("\n")]
-  ], status: "Layout metadata only. Company AI Chat connection and messaging are not enabled." };
+  ], status: "Layout metadata only. No connection or messaging action performed." };
 }
 
 if (!inspectButton || !agentPanel || !agentCount || !agentList || !refreshAgentsButton || !disconnectChatButton
@@ -388,7 +388,7 @@ async function refreshChatAgents(): Promise<void> {
       identity.className = "agent-instance";
       identity.textContent = agent.agentId;
       const state = document.createElement("p");
-      state.textContent = agent.autonomous ? selected.adapter.provider === "company_ai" ? "Read-only access" : "Autonomous access"
+      state.textContent = agent.autonomous ? selected.adapter.provider === "company_ai" ? "Connected access" : "Autonomous access"
         : agent.connectionCount ? "Supervised connection" : "Not connected";
       row.append(label, identity, state);
       if (!agent.autonomous) {
@@ -520,9 +520,9 @@ void browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
   pendingTarget.textContent = "Read-only target: selected chat";
   agentPanel.hidden = !selectedChat?.canConnect;
   if (connectionConsent && selectedChat?.adapter.provider === "company_ai") {
-    connectionConsent.textContent = "Approval lets that agent read this chat until the connection ends. Sending is unavailable. Experimental: site changes may interrupt access.";
+    connectionConsent.textContent = "Approval lets that agent read and send in this chat until the connection ends. Experimental: site changes may interrupt access; submitted messages may need outcome review.";
   }
-  unconfirmedPanel.hidden = agentPanel.hidden || selectedChat?.adapter.provider === "company_ai";
+  unconfirmedPanel.hidden = agentPanel.hidden;
   if (!unconfirmedPanel.hidden) unconfirmedStatus.textContent = "Not checked";
   if (!agentPanel.hidden) void refreshChatAgents();
 });

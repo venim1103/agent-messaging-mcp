@@ -5,7 +5,9 @@ import { DatabaseSync } from "node:sqlite";
 import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
 import { isCompanyAIChatOrigin, isCompanyAIChatTargetUrl, isDatabagOrigin, isGeminiTarget, isStableDomTarget, targetProvider, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget, type StableDomTarget,
-  type FixtureSnapshot, type GeminiSnapshot } from "./pending-connections.js";
+  type CompanyAIChatTarget, type FixtureSnapshot, type GeminiSnapshot } from "./pending-connections.js";
+
+type RenderedChatTarget = GeminiTarget | CompanyAIChatTarget;
 
 export const PREPARED_MESSAGE_TTL_MS = 3 * 60_000;
 export const FIXTURE_REVIEW_APPROVAL_TTL_MS = 2 * 60_000;
@@ -88,7 +90,7 @@ export const chatTargetSchema = z.discriminatedUnion("provider", [
   z.strictObject({ provider: z.literal("gemini"), origin: z.literal("https://gemini.google.com"),
     conversationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), url: z.string().min(1).max(512),
     tabId: z.number().int().safe().positive(), documentId: z.string().regex(/^[!-~]{1,128}$/) }),
-  databagTargetSchema
+  databagTargetSchema, companyAIChatTargetSchema
 ]);
 export type ChatTarget = z.infer<typeof chatTargetSchema>;
 export const chatSubmitResultSchema = z.union([fixtureDispatchResultSchema, geminiDispatchResultSchema]);
@@ -135,7 +137,7 @@ export const chatJobCompletionSchema = z.discriminatedUnion("phase", [
   z.strictObject({ ...chatCompletionIdentity, phase: z.literal("submit"), observation: chatSubmitResultSchema })
 ]).refine(payload => (payload.phase !== "submit" || payload.operationId === payload.jobId)
   && (!payload.observation.ok || (payload.target.provider === "gemini"
-    ? payload.observation.editor === "contenteditable" : payload.target.provider === "databag"
+    ? payload.observation.editor === "contenteditable" : payload.target.provider === "databag" || payload.target.provider === "company_ai"
       ? payload.observation.editor === "textarea" : payload.observation.editor !== "contenteditable")));
 export type ChatJobObservation = z.infer<typeof chatJobCompletionSchema>["observation"];
 export const geminiFillStatusSchema = z.discriminatedUnion("ok", [
@@ -189,7 +191,7 @@ export function openPrivateOperationDatabase(directory: string): DatabaseSync {
   return new DatabaseSync(filePath);
 }
 
-type PreparedMessage<TargetLabel extends "fixture-alpha" | "gemini" | "databag" = "fixture-alpha"> = Readonly<{
+type PreparedMessage<TargetLabel extends "fixture-alpha" | "gemini" | "databag" | "company_ai" = "fixture-alpha"> = Readonly<{
   operationId: string;
   connectionId: string;
   state: "awaiting_approval";
@@ -214,7 +216,7 @@ type FixtureDispatchAuthorization = Readonly<{
   owner: symbol; operationId: string; target: StableDomTarget; text: string; startedAt: number; expiresAt: number
 }>;
 type GeminiDispatchCheck = Readonly<{
-  checkId: string; owner: symbol; target: GeminiTarget; text: string; createdAt: number; expiresAt: number;
+  checkId: string; owner: symbol; target: RenderedChatTarget; text: string; createdAt: number; expiresAt: number;
   baseline: GeminiSnapshot; checkedAt: number | null; issued: boolean
 }>;
 type FixtureDispatchStatus = Readonly<z.infer<typeof fixtureDispatchStatusSchema>>;
@@ -231,8 +233,8 @@ type PendingFixtureFill = {
 };
 type GeminiFillStatus = z.infer<typeof geminiFillStatusSchema>;
 type PendingGeminiFill = {
-  owner: symbol; operationId: string; target: GeminiTarget; text: string; expiresAt: number; issued: boolean;
-  timer: ReturnType<typeof setTimeout>; resolve: (status: GeminiFillStatus | null) => void
+  owner: symbol; operationId: string; target: RenderedChatTarget; text: string; expiresAt: number; issued: boolean;
+  timer: ReturnType<typeof setTimeout>; resolve: (status: GeminiFillStatus | FixtureFillStatus | null) => void
 };
 type PendingFixtureDispatch = {
   owner: symbol; operationId: string; target: StableDomTarget; text: string; expiresAt: number; startedAt: number;
@@ -240,7 +242,7 @@ type PendingFixtureDispatch = {
 };
 type GeminiDispatchStatus = FixtureDispatchStatus;
 type PendingGeminiDispatch = {
-  owner: symbol; operationId: string; target: GeminiTarget; text: string; expiresAt: number; startedAt: number;
+  owner: symbol; operationId: string; target: RenderedChatTarget; text: string; expiresAt: number; startedAt: number;
   baseline: GeminiSnapshot; issued: boolean; timer: ReturnType<typeof setTimeout>; resolve: (status: GeminiDispatchStatus) => void
 };
 type PendingComposerWait = {
@@ -261,7 +263,7 @@ export class PreparedMessageOperations {
     owner: symbol; connectionId: string; target: StableDomTarget; text: string; expiresAt: number; autonomous?: true
   }>>();
   private readonly geminiContents = new Map<string, Readonly<{
-    owner: symbol; connectionId: string; target: GeminiTarget; text: string; expiresAt: number; autonomous?: true
+    owner: symbol; connectionId: string; target: RenderedChatTarget; text: string; expiresAt: number; autonomous?: true
   }>>();
   private readonly reviewTokens = new Map<string, string>();
   private readonly approvals = new Map<string, Readonly<{ approvedAt: number; expiresAt: number }>>();
@@ -554,13 +556,14 @@ export class PreparedMessageOperations {
   prepareAutonomous(owner: symbol, connectionId: string, text: string, idempotencyKey: string,
     deadlineMs: number, now = Date.now()) {
     this.discardExpired(now);
-    const target = this.requests.getAutonomousTarget(owner, connectionId, now);
+    const target = this.requests.getAutonomousWriteTarget(owner, connectionId, now);
     if (!target) throw new Error("CONNECTION_NOT_FOUND");
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= now || deadlineMs > now + 30_000) {
       throw new Error("INVALID_REQUEST_DEADLINE");
     }
     const prepared = this.prepareBound(owner, connectionId, 1, target,
-      target.provider === "databag" ? "databag" : isGeminiTarget(target) ? "gemini" : "fixture-alpha", text, idempotencyKey, now, deadlineMs);
+      target.provider === "company_ai" ? "company_ai" : target.provider === "databag" ? "databag"
+        : isGeminiTarget(target) ? "gemini" : "fixture-alpha", text, idempotencyKey, now, deadlineMs);
     const receipt = this.createRecoveryReceiptRecord(prepared.operationId);
     return Object.freeze({ ...prepared, state: "prepared" as const, recoveryToken: receipt.recoveryToken });
   }
@@ -588,7 +591,7 @@ export class PreparedMessageOperations {
   getAutonomousAuthorization(owner: symbol, operationId: string, now = Date.now()) {
     this.discardExpired(now);
     const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
-    const live = operation && this.requests.getAutonomousTarget(owner, operation.connectionId, now);
+    const live = operation && this.requests.getAutonomousWriteTarget(owner, operation.connectionId, now);
     if (!operation?.autonomous || operation.owner !== owner || !this.owners.has(owner) || !live
       || !this.sameComposerTarget(operation.target, live)) return null;
     return Object.freeze({ operationId, target: operation.target, text: operation.text, expiresAt: operation.expiresAt });
@@ -663,11 +666,12 @@ export class PreparedMessageOperations {
     return true;
   }
 
-  private prepareBound<TargetLabel extends "fixture-alpha" | "gemini" | "databag">(owner: symbol, connectionId: string,
+  private prepareBound<TargetLabel extends "fixture-alpha" | "gemini" | "databag" | "company_ai">(owner: symbol, connectionId: string,
     expectedGeneration: number, target: ApprovedTarget, label: TargetLabel, text: string,
     idempotencyKey: string, now: number, autonomousExpiresAt?: number): PreparedMessage<TargetLabel> {
     if (expectedGeneration !== 1) throw new Error("GENERATION_MISMATCH");
-    if (!isGeminiTarget(target) && !isStableDomTarget(target)) throw new Error("CONNECTION_NOT_FOUND");
+    if (!isGeminiTarget(target) && !isStableDomTarget(target)
+      && !(target.provider === "company_ai" && autonomousExpiresAt !== undefined)) throw new Error("CONNECTION_NOT_FOUND");
     if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > MAX_PREPARED_MESSAGE_BYTES || !text.trim()) {
       throw new Error("INVALID_MESSAGE_TEXT");
     }
@@ -716,7 +720,7 @@ export class PreparedMessageOperations {
       VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_approval')`)
       .run(operationId, ownerId, connectionId, idempotencyKey, contentDigest, targetDigest, expiresAt);
     const mode = autonomousExpiresAt === undefined ? {} : { autonomous: true as const };
-    if (isGeminiTarget(target)) {
+    if (isGeminiTarget(target) || target.provider === "company_ai") {
       this.geminiContents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt, ...mode }));
     } else {
       this.contents.set(operationId, Object.freeze({ owner, connectionId, target, text, expiresAt, ...mode }));
@@ -725,7 +729,7 @@ export class PreparedMessageOperations {
       preview: Object.freeze({ target: label, text }) });
   }
 
-  private sameGeminiTarget(left: GeminiTarget, right: GeminiTarget): boolean {
+  private sameGeminiTarget(left: RenderedChatTarget, right: RenderedChatTarget): boolean {
     return left.origin === right.origin && left.conversationId === right.conversationId && left.url === right.url
       && left.tabId === right.tabId && left.documentId === right.documentId;
   }
@@ -864,7 +868,8 @@ export class PreparedMessageOperations {
     const operation = this.geminiContents.get(operationId);
     if (operation?.autonomous) {
       const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
-      return authority && isGeminiTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
+      return authority && (isGeminiTarget(authority.target) || authority.target.provider === "company_ai")
+        ? Object.freeze({ ...authority, target: authority.target }) : null;
     }
     const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
     const grantExpiresAt = operation && this.requests.getConnectionExpiresAt(owner, operation.connectionId, now);
@@ -882,7 +887,8 @@ export class PreparedMessageOperations {
     const operation = this.geminiContents.get(operationId);
     if (operation?.autonomous) {
       const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "fill", now);
-      return authority && isGeminiTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
+      return authority && (isGeminiTarget(authority.target) || authority.target.provider === "company_ai")
+        ? Object.freeze({ ...authority, target: authority.target }) : null;
     }
     const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
     const consent = this.fillApprovals.get(operationId);
@@ -903,7 +909,7 @@ export class PreparedMessageOperations {
     return authorization;
   }
 
-  private finishGeminiFillCheck(attemptId: string, status: GeminiFillStatus | null, now = Date.now()): void {
+  private finishGeminiFillCheck(attemptId: string, status: GeminiFillStatus | FixtureFillStatus | null, now = Date.now()): void {
     const pending = this.geminiFillChecks.get(attemptId);
     if (!pending) return;
     this.geminiFillChecks.delete(attemptId);
@@ -921,7 +927,7 @@ export class PreparedMessageOperations {
     if (!this.geminiFillChecks.size) return;
     for (const [attemptId, pending] of this.geminiFillChecks) {
       const operation = this.geminiContents.get(pending.operationId);
-      const live = operation && this.requests.getGeminiTarget(pending.owner, operation.connectionId, now);
+      const live = operation && this.requests.getRenderedTarget(pending.owner, operation.connectionId, now);
       const approval = this.approvals.get(pending.operationId);
       if (this.hasUnresolvedDispatch(pending.target) || this.isSendRateLimited(pending.target, now)
         || pending.expiresAt <= now || !operation || operation.owner !== pending.owner
@@ -971,7 +977,7 @@ export class PreparedMessageOperations {
     const attemptId = randomUUID();
     const expiresAt = Math.min(deadlineMs, authorization.expiresAt, grantExpiresAt, now + FIXTURE_FILL_TIMEOUT_MS);
     let resolve!: PendingGeminiFill["resolve"];
-    const result = new Promise<GeminiFillStatus | null>((done) => { resolve = done; });
+    const result = new Promise<GeminiFillStatus | FixtureFillStatus | null>((done) => { resolve = done; });
     const timer = setTimeout(() => this.finishGeminiFillCheck(attemptId, null), expiresAt - now);
     this.geminiFillChecks.set(attemptId, { owner, operationId, target: authorization.target,
       text: authorization.text, expiresAt, issued: false, timer, resolve });
@@ -979,9 +985,10 @@ export class PreparedMessageOperations {
     return { attemptId, result };
   }
 
-  listGeminiFillChallenges(now = Date.now(), autonomous = false) {
+  listGeminiFillChallenges(now = Date.now(), autonomous = false, provider: "gemini" | "company_ai" = "gemini") {
     this.discardExpired(now);
     return [...this.geminiFillChecks].filter(([, pending]) => !pending.issued
+      && targetProvider(pending.target) === provider
       && (this.geminiContents.get(pending.operationId)?.autonomous === true) === autonomous).map(([attemptId, pending]) => {
       pending.issued = true;
       return Object.freeze({ attemptId, operationId: pending.operationId, target: pending.target,
@@ -989,11 +996,12 @@ export class PreparedMessageOperations {
     });
   }
 
-  completeGeminiFill(target: GeminiTarget, attemptId: string, observation: GeminiFillResult, now = Date.now()): boolean {
-    const parsed = geminiFillResultSchema.safeParse(observation);
+  completeGeminiFill(target: RenderedChatTarget, attemptId: string, observation: GeminiFillResult | FixtureFillResult, now = Date.now()): boolean {
+    const parsed = (target.provider === "company_ai" ? fixtureFillResultSchema : geminiFillResultSchema).safeParse(observation);
     this.discardExpired(now);
     const pending = this.geminiFillChecks.get(attemptId);
-    if (!parsed.success || !pending?.issued || !this.sameGeminiTarget(pending.target, target)) return false;
+    if (!parsed.success || !pending?.issued || !this.sameGeminiTarget(pending.target, target)
+      || (target.provider === "company_ai" && parsed.data.ok && parsed.data.editor !== "textarea")) return false;
     this.finishGeminiFillCheck(attemptId, { ...parsed.data, operationId: pending.operationId, completedAt: now });
     return true;
   }
@@ -1094,7 +1102,7 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     if (operation?.autonomous) {
       const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "fill", now);
-      return authority && !isGeminiTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
+      return authority && isStableDomTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
     }
     const consent = this.fillApprovals.get(operationId);
     if (!operation || operation.owner !== owner || !consent || consent.expiresAt <= now
@@ -1161,7 +1169,7 @@ export class PreparedMessageOperations {
     const operation = this.contents.get(operationId);
     if (operation?.autonomous) {
       const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
-      return authority && !isGeminiTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
+      return authority && isStableDomTarget(authority.target) ? Object.freeze({ ...authority, target: authority.target }) : null;
     }
     const consent = this.sendApprovals.get(operationId);
     if (!operation || operation.owner !== owner || !consent || consent.expiresAt <= now
@@ -1445,11 +1453,12 @@ export class PreparedMessageOperations {
     return { checkId: check.checkId, result };
   }
 
-  listGeminiDispatchChecks(now = Date.now(), autonomous = false) {
+  listGeminiDispatchChecks(now = Date.now(), autonomous = false, provider: "gemini" | "company_ai" = "gemini") {
     this.discardExpired(now);
     this.discardInvalidGeminiDispatchChecks(now);
-    const offered: Readonly<{ operationId: string; checkId: string; target: GeminiTarget; text: string; expiresAt: number }>[] = [];
+    const offered: Readonly<{ operationId: string; checkId: string; target: RenderedChatTarget; text: string; expiresAt: number }>[] = [];
     for (const [operationId, check] of this.geminiDispatchChecks) {
+      if (targetProvider(check.target) !== provider) continue;
       if (check.checkedAt !== null || check.issued || (this.geminiContents.get(operationId)?.autonomous === true) !== autonomous) continue;
       this.geminiDispatchChecks.set(operationId, Object.freeze({ ...check, issued: true }));
       offered.push(Object.freeze({ operationId, checkId: check.checkId, target: check.target, text: check.text, expiresAt: check.expiresAt }));
@@ -1457,13 +1466,14 @@ export class PreparedMessageOperations {
     return Object.freeze(offered);
   }
 
-  completeGeminiDispatchCheck(target: GeminiTarget, operationId: string, checkId: string,
-    observation: GeminiDispatchCheckResult, now = Date.now()): boolean {
+  completeGeminiDispatchCheck(target: RenderedChatTarget, operationId: string, checkId: string,
+    observation: GeminiDispatchCheckResult | FixtureDispatchCheckResult, now = Date.now()): boolean {
     this.discardExpired(now);
     const check = this.geminiDispatchChecks.get(operationId);
-    const parsed = geminiDispatchCheckResultSchema.safeParse(observation);
+    const parsed = (target.provider === "company_ai" ? fixtureDispatchCheckResultSchema : geminiDispatchCheckResultSchema).safeParse(observation);
     if (!check || check.checkId !== checkId || !check.issued || check.checkedAt !== null || !parsed.success
-      || !this.sameGeminiTarget(check.target, target)) return false;
+      || !this.sameGeminiTarget(check.target, target)
+      || (target.provider === "company_ai" && parsed.data.ok && parsed.data.editor !== "textarea")) return false;
     if (!parsed.data.ok || parsed.data.draftText !== check.text || !this.freshGeminiDispatchCheck(operationId, check, now)) {
       this.discardGeminiDispatchCheck(operationId);
       return false;
@@ -1580,7 +1590,7 @@ export class PreparedMessageOperations {
       .get(operationId)) throw new Error("DISPATCH_UNCERTAIN");
     const operation = this.geminiContents.get(operationId);
     const approval = this.approvals.get(operationId);
-    const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
+    const live = operation && this.requests.getRenderedTarget(owner, operation.connectionId, now);
     const authorized = operation?.autonomous ? this.getAutonomousPhaseAuthorization(owner, operationId, "send", now)
       : approval && approval.expiresAt > now;
     if (!operation || operation.owner !== owner || !authorized || !live
@@ -1708,7 +1718,7 @@ export class PreparedMessageOperations {
 
   private freshGeminiDispatch(pending: PendingGeminiDispatch, now: number): boolean {
     const operation = this.geminiContents.get(pending.operationId);
-    const live = operation && this.requests.getGeminiTarget(pending.owner, operation.connectionId, now);
+    const live = operation && this.requests.getRenderedTarget(pending.owner, operation.connectionId, now);
     const current = operation && this.requests.getGeminiSnapshot(pending.owner, operation.connectionId, now);
     const intent = this.database.prepare("SELECT state, started_at FROM message_dispatch_attempts WHERE operation_id = ?")
       .get(pending.operationId) as { state: string; started_at: number } | undefined;
@@ -1724,10 +1734,11 @@ export class PreparedMessageOperations {
       && !this.database.prepare("SELECT 1 FROM message_dispatch_evidence WHERE operation_id = ?").get(pending.operationId);
   }
 
-  listGeminiDispatchAttempts(now = Date.now()) {
+  listGeminiDispatchAttempts(now = Date.now(), provider: "gemini" | "company_ai" = "gemini") {
     this.discardExpired(now);
-    const attempts: Array<Readonly<{ operationId: string; attemptId: string; target: GeminiTarget; text: string; expiresAt: number }>> = [];
+    const attempts: Array<Readonly<{ operationId: string; attemptId: string; target: RenderedChatTarget; text: string; expiresAt: number }>> = [];
     for (const [operationId, pending] of this.geminiDispatchJobs) {
+      if (targetProvider(pending.target) !== provider) continue;
       if (!this.freshGeminiDispatch(pending, now)) {
         this.finishGeminiDispatch(operationId);
         continue;
@@ -1741,12 +1752,13 @@ export class PreparedMessageOperations {
     return attempts;
   }
 
-  completeGeminiDispatch(target: GeminiTarget, operationId: string, attemptId: string,
-    observation: GeminiDispatchResult, now = Date.now()): boolean {
+  completeGeminiDispatch(target: RenderedChatTarget, operationId: string, attemptId: string,
+    observation: GeminiDispatchResult | FixtureDispatchResult, now = Date.now()): boolean {
     this.discardExpired(now);
     const pending = this.geminiDispatchJobs.get(operationId);
     if (!pending || !pending.issued || attemptId !== operationId || !this.sameGeminiTarget(pending.target, target)
-      || !geminiDispatchResultSchema.safeParse(observation).success) return false;
+      || !(target.provider === "company_ai" ? fixtureDispatchResultSchema : geminiDispatchResultSchema).safeParse(observation).success
+      || (target.provider === "company_ai" && observation.ok && observation.editor !== "textarea")) return false;
     if (!this.freshGeminiDispatch(pending, now)) {
       this.finishGeminiDispatch(operationId);
       return false;
@@ -1758,6 +1770,7 @@ export class PreparedMessageOperations {
 
   private geminiDispatchEvidence(owner: symbol, operationId: string, now: number) {
     const operation = this.geminiContents.get(operationId);
+    if (operation?.target.provider === "company_ai") return null;
     const baseline = this.geminiDispatchBaselines.get(operationId);
     const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
     const status = this.dispatchStatus(operationId);
@@ -1879,7 +1892,7 @@ export class PreparedMessageOperations {
           throw new Error("DISPATCH_UNAVAILABLE");
         }
         failureStage = "read";
-        const reading = operation.target.origin === "https://gemini.google.com"
+        const reading = this.geminiContents.has(operationId)
           ? this.requests.requestFreshGeminiRead(owner, operation.connectionId, Date.now(), expiresAt)
           : this.requests.requestFreshStableRead(owner, operation.connectionId, Date.now(), expiresAt);
         if (!reading || reading === "busy") throw new Error("DISPATCH_UNAVAILABLE");
@@ -1889,7 +1902,7 @@ export class PreparedMessageOperations {
         const inspecting = this.requestChatProof(owner, operationId, Date.now(), expiresAt);
         if (inspecting === "busy" || !await inspecting.result || expiresAt <= Date.now()) throw new Error("DISPATCH_UNAVAILABLE");
         failureStage = "dispatch";
-        const dispatching = operation.target.origin === "https://gemini.google.com"
+        const dispatching = this.geminiContents.has(operationId)
           ? this.requestGeminiDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt)
           : this.requestFixtureDispatch(owner, operationId, inspecting.checkId, Date.now(), expiresAt);
         return await this.settleAutonomousDispatch(owner, operationId, expiresAt, await dispatching.result);
@@ -1916,14 +1929,14 @@ export class PreparedMessageOperations {
       const authorization = this.getAutonomousAuthorization(owner, operationId);
       const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
       if (!authorization || !operation) break;
-      const observed = authorization.target.origin === "https://gemini.google.com"
+      const observed = this.geminiContents.has(operationId)
         ? this.reconcileGeminiObservation(owner, operationId) : this.reconcileFixtureObservation(owner, operationId);
       if (observed.state === "observed_in_ui" || observed.state === "resolved") return observed;
       if (Date.now() >= inspectAfter) this.requestChatSettlement(owner, operationId, expiresAt);
       const terminal = this.settlementChecks.get(operationId);
       if (terminal?.ready && terminal.completedAt !== null && terminal.createdAt >= inspectAfter && terminal.job.expiresAt > Date.now()) {
         terminal.ready = false;
-        const reading = authorization.target.origin === "https://gemini.google.com"
+        const reading = this.geminiContents.has(operationId)
           ? this.requests.requestFreshGeminiRead(owner, operation.connectionId, Date.now(), terminal.job.expiresAt)
           : this.requests.requestFreshStableRead(owner, operation.connectionId, Date.now(), terminal.job.expiresAt);
         const snapshot = reading && reading !== "busy" ? await reading.result : null;
@@ -1982,7 +1995,7 @@ export class PreparedMessageOperations {
     const status = this.getOperation(owner, operationId, now);
     if (status.state === "dispatch_uncertain" || status.state === "observed_in_ui" || status.state === "resolved") return status;
     const operation = this.contents.get(operationId) ?? this.geminiContents.get(operationId);
-    const gemini = operation?.target.origin === "https://gemini.google.com";
+    const gemini = this.geminiContents.has(operationId);
     const adapter = gemini ? {
       authorize: () => this.getGeminiSendAuthorization(owner, operationId, now),
       read: (connectionId: string, expiresAt: number) => this.requests.requestFreshGeminiRead(owner, connectionId, now, expiresAt),
@@ -2007,8 +2020,9 @@ export class PreparedMessageOperations {
     return adapter.dispatch(inspecting.checkId, expiresAt).result;
   }
 
-  listChatSubmitJobs(provider: "fixture" | "gemini" | "databag", now = Date.now()) {
-    const attempts = provider === "gemini" ? this.listGeminiDispatchAttempts(now) : this.listFixtureDispatchAttempts(now, true, provider);
+  listChatSubmitJobs(provider: "fixture" | "gemini" | "databag" | "company_ai", now = Date.now()) {
+    const attempts = provider === "gemini" || provider === "company_ai" ? this.listGeminiDispatchAttempts(now, provider)
+      : this.listFixtureDispatchAttempts(now, true, provider);
     return attempts.map(attempt => Object.freeze(chatSubmitJobSchema.parse({ operationId: attempt.operationId, jobId: attempt.attemptId,
       phase: "submit" as const, target: Object.freeze({ ...attempt.target, provider }),
       text: attempt.text, expiresAt: attempt.expiresAt })));
@@ -2034,14 +2048,14 @@ export class PreparedMessageOperations {
   requestChatFill(owner: symbol, operationId: string, now = Date.now(), deadlineMs = now + FIXTURE_FILL_TIMEOUT_MS) {
     const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "fill", now);
     if (!authority) return null;
-    return authority.target.origin === "https://gemini.google.com" ? this.requestGeminiFill(owner, operationId, now, deadlineMs)
+    return this.geminiContents.has(operationId) ? this.requestGeminiFill(owner, operationId, now, deadlineMs)
       : this.requestFixtureFill(owner, operationId, now, deadlineMs);
   }
 
   requestChatProof(owner: symbol, operationId: string, now = Date.now(), deadlineMs = now + FIXTURE_DISPATCH_CHECK_TIMEOUT_MS) {
     const authority = this.getAutonomousPhaseAuthorization(owner, operationId, "send", now);
     if (!authority) throw new Error("DISPATCH_CHECK_UNAVAILABLE");
-    return authority.target.origin === "https://gemini.google.com" ? this.requestGeminiDispatchInspection(owner, operationId, now, deadlineMs)
+    return this.geminiContents.has(operationId) ? this.requestGeminiDispatchInspection(owner, operationId, now, deadlineMs)
       : this.requestFixtureDispatchInspection(owner, operationId, now, deadlineMs);
   }
 
@@ -2062,7 +2076,7 @@ export class PreparedMessageOperations {
     return job;
   }
 
-  listChatJobs(phase: ChatJob["phase"], provider: "fixture" | "gemini" | "databag", now = Date.now()) {
+  listChatJobs(phase: ChatJob["phase"], provider: "fixture" | "gemini" | "databag" | "company_ai", now = Date.now()) {
     if (phase === "settle") {
       this.discardExpired(now);
       for (const [operationId, pending] of this.settlementChecks) {
@@ -2077,8 +2091,8 @@ export class PreparedMessageOperations {
       return Object.freeze([] as ChatJob[]);
     }
     if (phase === "submit") return this.listChatSubmitJobs(provider, now);
-    const checks = phase === "fill" ? provider === "gemini" ? this.listGeminiFillChallenges(now, true) : this.listFixtureFillChallenges(now, true, provider)
-      : provider === "gemini" ? this.listGeminiDispatchChecks(now, true) : this.listFixtureDispatchChecks(now, true, provider);
+    const checks = phase === "fill" ? provider === "gemini" || provider === "company_ai" ? this.listGeminiFillChallenges(now, true, provider) : this.listFixtureFillChallenges(now, true, provider)
+      : provider === "gemini" || provider === "company_ai" ? this.listGeminiDispatchChecks(now, true, provider) : this.listFixtureDispatchChecks(now, true, provider);
     const jobs: ChatJob[] = [];
     for (const check of checks) {
       const jobId = "attemptId" in check ? check.attemptId : check.checkId;
@@ -2115,18 +2129,18 @@ export class PreparedMessageOperations {
     }
     if (parsed.data.phase === "submit") return this.completeChatSubmitJob(target, operationId, jobId, parsed.data.observation, now);
     if (!this.neutralJobOffers.get(operationId)?.has(`${phase}:${jobId}`)) return false;
-    if (parsed.data.phase === "fill") return target.provider === "gemini"
-      ? this.completeGeminiFill(target, jobId, parsed.data.observation as GeminiFillResult, now)
+    if (parsed.data.phase === "fill") return target.provider === "gemini" || target.provider === "company_ai"
+      ? this.completeGeminiFill(target, jobId, parsed.data.observation as GeminiFillResult | FixtureFillResult, now)
       : this.completeFixtureFill(target, jobId, parsed.data.observation as FixtureFillResult, now);
-    return target.provider === "gemini"
-      ? this.completeGeminiDispatchCheck(target, operationId, jobId, parsed.data.observation as GeminiDispatchCheckResult, now)
+    return target.provider === "gemini" || target.provider === "company_ai"
+      ? this.completeGeminiDispatchCheck(target, operationId, jobId, parsed.data.observation as GeminiDispatchCheckResult | FixtureDispatchCheckResult, now)
       : this.completeFixtureDispatchCheck(target, operationId, jobId, parsed.data.observation as FixtureDispatchCheckResult, now);
   }
 
   completeChatSubmitJob(target: ApprovedTarget, operationId: string, jobId: string,
     observation: FixtureDispatchResult | GeminiDispatchResult, now = Date.now()) {
-    if (isGeminiTarget(target)) {
-      const parsed = geminiDispatchResultSchema.safeParse(observation);
+    if (isGeminiTarget(target) || target.provider === "company_ai") {
+      const parsed = (target.provider === "company_ai" ? fixtureDispatchResultSchema : geminiDispatchResultSchema).safeParse(observation);
       return parsed.success && this.completeGeminiDispatch(target, operationId, jobId, parsed.data, now);
     }
     if (!isStableDomTarget(target)) return false;

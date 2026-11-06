@@ -44,7 +44,7 @@ const requestSchema = z.discriminatedUnion("kind", [
     timeoutMs: z.number().int().min(0).max(20_000)
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("approve_chat_agent"), payload: z.strictObject({
-    target: approvedTarget, agentId: z.uuid()
+    target: approvedTarget, agentId: z.uuid(), send: z.literal(true).optional()
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_chat_agents"), payload: z.strictObject({
     target: approvedTarget
@@ -129,7 +129,7 @@ const requestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...envelope, kind: z.literal("commit_fixture_message"), payload: z.strictObject({ operationId: z.uuid() }) }),
   z.strictObject({ ...envelope, kind: z.literal("commit_prepared_message"), payload: z.strictObject({ operationId: z.uuid() }) }),
   z.strictObject({ ...envelope, kind: z.literal("list_chat_jobs"), payload: z.strictObject({
-    phase: chatJobSchema.shape.phase, provider: z.enum(["fixture", "gemini", "databag"])
+    phase: chatJobSchema.shape.phase, provider: z.enum(["fixture", "gemini", "databag", "company_ai"])
   }) }),
   z.strictObject({ ...envelope, kind: z.literal("complete_chat_job"), payload: chatJobCompletionSchema }),
   z.strictObject({ ...envelope, kind: z.literal("list_fixture_dispatch_attempts"), payload: z.strictObject({}) }),
@@ -271,7 +271,7 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   }
   if (request.kind === "approve_chat_agent") {
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
-    const connection = requests.approveAgent(request.payload.agentId, request.payload.target, now);
+    const connection = requests.approveAgent(request.payload.agentId, request.payload.target, now, request.payload.send === true);
     return connection ? { ...response, kind: "chat_agent_approved" as const,
       payload: { agentId: request.payload.agentId, expiresAt: connection.expiresAt } }
       : { ...response, kind: "error" as const, payload: { code: "APPROVAL_INVALID" } };

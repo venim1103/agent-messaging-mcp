@@ -237,10 +237,10 @@ export function fillFixtureDraft(input: {
   }
 }
 
-export async function reserveFixtureSubmitAttempt(input: { operationId: string; expiresAt: number; provider?: "fixture" | "gemini" | "databag" }): Promise<boolean> {
+export async function reserveFixtureSubmitAttempt(input: { operationId: string; expiresAt: number; provider?: "fixture" | "gemini" | "databag" | "company_ai" }): Promise<boolean> {
   const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   if (!input || typeof input.operationId !== "string" || !identifier.test(input.operationId)
-    || (input.provider !== undefined && input.provider !== "fixture" && input.provider !== "gemini" && input.provider !== "databag")
+    || (input.provider !== undefined && input.provider !== "fixture" && input.provider !== "gemini" && input.provider !== "databag" && input.provider !== "company_ai")
     || !Number.isSafeInteger(input.expiresAt) || input.expiresAt <= Date.now()
     || input.expiresAt > Date.now() + 4_000) return false;
   const scope = globalThis as typeof globalThis & {
@@ -253,7 +253,8 @@ export async function reserveFixtureSubmitAttempt(input: { operationId: string; 
   const storage = scope.chrome?.storage?.local;
   if (!storage || scope.fixtureSubmitReservationPending) return false;
   scope.fixtureSubmitReservationPending = true;
-  const prefixes = { fixture: "fixture-submit-attempt-", gemini: "gemini-submit-attempt-", databag: "databag-submit-attempt-" };
+  const prefixes = { fixture: "fixture-submit-attempt-", gemini: "gemini-submit-attempt-", databag: "databag-submit-attempt-",
+    company_ai: "company-ai-submit-attempt-" };
   const allPrefixes = Object.values(prefixes);
   const prefix = prefixes[input.provider ?? "fixture"];
   const key = `${prefix}${input.operationId}`;

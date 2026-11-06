@@ -138,6 +138,64 @@ export function locateCompanyAIChatReadTargets(input: { expectedUrl: string; dea
   } catch { return null; }
 }
 
+export function locateCompanyAIChatComposer(input: { expectedUrl: string; deadline: number }) {
+  try {
+    const targets = locateCompanyAIChatReadTargets(input);
+    if (!targets) return null;
+    let composer: Element | null = targets.editor.form ?? targets.editor.parentElement;
+    for (let depth = 0; composer && depth < 8; depth++, composer = composer.parentElement) {
+      if (composer === document.body || composer.contains(targets.timeline) || composer.contains(targets.profile)) return null;
+      if (composer.querySelector("button")) break;
+    }
+    if (!composer || composer.contains(targets.timeline) || composer.contains(targets.profile)
+      || targets.editor.closest("[inert],[aria-disabled=true],[aria-readonly=true],fieldset:disabled")) return null;
+    const buttons = new Map<HTMLButtonElement, string>();
+    const pending: { node: Node; depth: number; hidden: boolean }[] = [{ node: composer, depth: 0, hidden: false }];
+    let visited = 0;
+    while (pending.length) {
+      if (Date.now() >= input.deadline || ++visited > 512) return null;
+      const { node, depth, hidden: ancestorHidden } = pending.pop()!;
+      if (depth && node.nextSibling) pending.push({ node: node.nextSibling, depth, hidden: ancestorHidden });
+      let hidden = ancestorHidden;
+      if (node instanceof Element) {
+        if (["script", "style", "template", "noscript"].includes(node.localName)) continue;
+        if (["iframe", "object", "embed"].includes(node.localName)) return null;
+        if (node === targets.editor) continue;
+        if (node instanceof HTMLInputElement && node.type === "file" && node.files?.length !== 0) return null;
+        const style = getComputedStyle(node);
+        hidden ||= node.hasAttribute("hidden") || node.hasAttribute("inert") || node.getAttribute("aria-hidden") === "true"
+          || style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0;
+        if (!hidden) {
+          if (node instanceof HTMLButtonElement) {
+            if (buttons.size >= 16) return null;
+            buttons.set(node, "");
+          } else if (!node.closest("button") && !["div", "span", "form", "section", "label"].includes(node.localName)) return null;
+        }
+      } else if (node.nodeType === Node.TEXT_NODE && !hidden) {
+        const button = node.parentElement?.closest("button");
+        if (!button || !buttons.has(button)) {
+          if ((node as Text).length) return null;
+        } else {
+          const previous = buttons.get(button)!;
+          if ((node as Text).length > 128 - previous.length) return null;
+          const value = node.nodeValue;
+          if (typeof value !== "string") return null;
+          buttons.set(button, previous + value);
+        }
+      }
+      if (node.firstChild) {
+        if (depth >= 32) return null;
+        pending.push({ node: node.firstChild, depth: depth + 1, hidden });
+      }
+    }
+    const sending = [...buttons].filter(([, label]) => label.trim().toLowerCase() === "send");
+    if (sending.length !== 1 || [...buttons.values()].some(label => /\bstop\b/i.test(label))) return null;
+    const send = sending[0]![0];
+    if (send.type === "reset" || send.closest("[inert],[aria-disabled=true]")) return null;
+    return Date.now() < input.deadline && composer.isConnected && send.isConnected ? { ...targets, composer, send } : null;
+  } catch { return null; }
+}
+
 type CompanyIdentityProof = { status: "ok"; sameCommittedRoot: true; conversationMatched: true;
   profileAccountMatched: true; ready: true } | { status: "refused" | "expired" };
 type CompanyIdentitySnapshot = { rootState: object; account: object; conversationId: string;
@@ -456,6 +514,7 @@ export type CompanyRenderedSnapshot = { messages: { direction: "incoming" | "out
 
 export function createCompanyAIChatReadBinding(input: { expectedUrl: string; deadline: number }):
   { status: "ok"; conversationId: string; check: (deadline: number) => boolean;
+    checkEditor: (editor: Element, deadline: number) => boolean;
     capture: (deadline: number) => CompanyRenderedSnapshot | null; dispose: () => void } | { status: "refused" | "expired" } {
   let disposeOnError: (() => void) | undefined;
   try {
@@ -498,7 +557,8 @@ export function createCompanyAIChatReadBinding(input: { expectedUrl: string; dea
       }
       return true;
     };
-    return { status: "ok", conversationId: identity.conversationId, check, dispose, capture: (deadline: number) => {
+    return { status: "ok", conversationId: identity.conversationId, check, dispose,
+      checkEditor: (editor, deadline) => targets?.editor === editor && check(deadline), capture: (deadline: number) => {
       try {
         if (!check(deadline) || !targets) return null;
         const current = locateCompanyAIChatReadTargets({ expectedUrl, deadline });

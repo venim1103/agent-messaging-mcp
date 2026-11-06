@@ -89,11 +89,21 @@ for (const provider of ["databag", "company_ai"] as const) test(`${provider} neu
   assert.deepEqual(roster.payload, { agents: [{ ...agent, connectionCount: 1, autonomous: true }] });
   if (provider === "company_ai") {
     const grant = requests.approveAgent(agent.agentId, target, 1000)!;
+    const writable = { ...message, payload: { ...message.payload, send: true } };
+    assert.deepEqual(handleBrokerRequest(writable, "facade", owner, requests, 1000).payload, { code: "PERMISSION_DENIED" });
+    for (const send of [false, "true", ["read", "send"]]) assert.throws(() => handleBrokerRequest({
+      ...message, payload: { ...message.payload, send } }, "relay", Symbol("relay"), requests, 1000));
+    assert.equal(handleBrokerRequest(writable, "relay", Symbol("relay"), requests, 1000).kind, "chat_agent_approved");
+    assert.equal(requests.getAutonomousWriteTarget(owner, grant.connectionId, 1000), null);
     const gap = { ...envelope, kind: "mark_chat_observation_gap", payload: { target } };
     assert.deepEqual(handleBrokerRequest(gap, "facade", owner, requests, 1001).payload, { code: "PERMISSION_DENIED" });
     assert.deepEqual(handleBrokerRequest(gap, "relay", Symbol("relay"), requests, 1001).payload, { count: 1 });
     assert.deepEqual(requests.listChatAgents(target, 1001), [{ ...agent, connectionCount: 0 }]);
     assert.equal(requests.get(owner, grant.requestId, 1001)?.state, "stale");
+    assert.equal(handleBrokerRequest(writable, "relay", Symbol("relay"), requests, 1001).kind, "chat_agent_approved");
+    const fresh = requests.approveAgent(agent.agentId, target, 1001)!;
+    assert.deepEqual(requests.getAutonomousWriteTarget(owner, fresh.connectionId, 1001), target);
+    assert.equal(requests.getAutonomousWriteTarget(Symbol("foreign owner"), fresh.connectionId, 1001), null);
   }
   requests.disconnect(owner);
 });

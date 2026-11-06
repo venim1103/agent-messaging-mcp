@@ -254,7 +254,7 @@ const chatJobTargetSchema = chatTargetSchema.refine(target => target.provider !=
   || (isValidGeminiTarget(target) && new URL(target.url).pathname === `/app/${target.conversationId}`));
 const chatJobRequestSchema = z.discriminatedUnion("kind", [
   pendingListSchema.extend({ kind: z.literal("list_chat_jobs"), payload: z.strictObject({
-    phase: chatJobSchema.shape.phase, provider: z.enum(["fixture", "gemini", "databag"])
+    phase: chatJobSchema.shape.phase, provider: z.enum(["fixture", "gemini", "databag", "company_ai"])
   }) }),
   pendingListSchema.extend({ kind: z.literal("complete_chat_job"), payload: chatJobCompletionSchema
     .refine(payload => chatJobTargetSchema.safeParse(payload.target).success) })
@@ -280,7 +280,7 @@ const chatAgentRequestSchema = z.discriminatedUnion("kind", [
   }) }),
   pendingListSchema.extend({ kind: z.literal("disconnect_chat"), payload: z.strictObject({ target: chatAgentTargetSchema }) }),
   pendingListSchema.extend({ kind: z.literal("approve_chat_agent"),
-    payload: z.strictObject({ target: chatAgentTargetSchema, agentId: z.uuid() }) }),
+    payload: z.strictObject({ target: chatAgentTargetSchema, agentId: z.uuid(), send: z.literal(true).optional() }) }),
   pendingListSchema.extend({ kind: z.literal("remove_chat_agent"),
     payload: z.strictObject({ target: chatAgentTargetSchema, agentId: z.uuid() }) })
 ]);

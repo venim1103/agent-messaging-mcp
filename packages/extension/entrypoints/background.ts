@@ -9,7 +9,8 @@ import { installDraftOwnershipTracker } from "../lib/draft-ownership";
 import { installDatabagIdentityBridge } from "../lib/databag-identity";
 import { captureDatabagSnapshot, fillDatabagDraft, identifyDatabagConversation, inspectDatabagDraft, installDatabagAdapter,
   observeDatabagMessages, stopDatabagObservation, submitDatabagDraft } from "../lib/databag-observation";
-import { invokeCompanyAIChatReader } from "../lib/company-ai-reader";
+import { fillCompanyAIChatDraft, inspectCompanyAIChatDraft, invokeCompanyAIChatReader,
+  submitCompanyAIChatDraft } from "../lib/company-ai-reader";
 import { databagOrigins, isEligibleCompanyAIChatUrl, isEligibleDatabagUrl } from "../lib/provider-origins";
 
 const nativeHostName = "com.agent_messaging_mcp.bridge";
@@ -51,13 +52,14 @@ type FixtureDispatchChallenge = Omit<FixturePreflightChallenge, "challengeId"> &
 type FixtureSubmitChallenge = FixtureFillChallenge & { dispatch: true };
 type BrowserJobTarget = (Extract<ChatTarget, { origin: "http://127.0.0.1:8787" }> & { provider: "fixture" })
   | (Extract<ChatTarget, { origin: "https://gemini.google.com" }> & { provider: "gemini" })
-  | Extract<ChatTarget, { provider: "databag" }>;
+  | Extract<ChatTarget, { provider: "databag" | "company_ai" }>;
 type ChatBrowserJob = { operationId: string; jobId: string; phase: "fill" | "proof" | "submit" | "settle"; target: BrowserJobTarget;
   text: string; expiresAt: number; leftover?: { operationId: string; text: string } };
 type ChatJobObservation = ReturnType<typeof fillFixtureDraft> | ReturnType<typeof fillGeminiDraft>
-  | Awaited<ReturnType<typeof fillDatabagDraft>> | FixtureDispatchObservation | GeminiDispatchObservation | ChatSubmitObservation;
+  | Awaited<ReturnType<typeof fillDatabagDraft>> | ReturnType<typeof fillCompanyAIChatDraft>
+  | FixtureDispatchObservation | GeminiDispatchObservation | ChatSubmitObservation;
 type ChatSubmitObservation = ReturnType<typeof submitFixtureDraft> | ReturnType<typeof submitGeminiDraft>
-  | Awaited<ReturnType<typeof submitDatabagDraft>>;
+  | Awaited<ReturnType<typeof submitDatabagDraft>> | ReturnType<typeof submitCompanyAIChatDraft>;
 type FixtureDispatchObservation = { ok: true; editor: "textarea" | "rich"; draftText: string;
   selected: true; writable: true; submitReady: true } | { ok: false;
   code: "TARGET_CHANGED" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE" };
@@ -747,8 +749,8 @@ async function chatJobBinding(check: ChatBrowserJob, waitForDatabagReadiness = f
   if (!grant || grant.documentId !== target.documentId || grant.reloadPending || !isLiveStoredExpiry(grant.expiresAt)
     || (!tab.active && grant.expiresAt !== null) || tab.url !== expectedUrl || !expectedUrl
     || (target.provider === "fixture" ? expectedUrl !== "http://127.0.0.1:8787/" && expectedUrl !== richFixtureUrl
-      : grant.url !== target.url || (target.provider === "databag"
-        && (!isEligibleDatabagUrl(expectedUrl) || grant.conversationId !== target.conversationId)))) return null;
+      : grant.url !== target.url || ((target.provider === "databag" || target.provider === "company_ai")
+        && (!isEligibleSavedChatUrl(target.provider, expectedUrl) || grant.conversationId !== target.conversationId)))) return null;
   const validIdentity = target.provider === "gemini"
     ? await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] }, func: identifyGeminiConversation })
       .then(([identity]) => identity?.frameId === 0 && identity.documentId === target.documentId
@@ -759,6 +761,12 @@ async function chatJobBinding(check: ChatBrowserJob, waitForDatabagReadiness = f
             ...(grant.expiresAt === null ? { allowHidden: true as const } : {}) }] } : {}) })
         .then(([identity]) => identity?.frameId === 0 && identity.documentId === target.documentId
           && identity.result?.conversationId === target.conversationId && identity.result.url === expectedUrl)
+    : target.provider === "company_ai"
+      ? await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] }, world: "MAIN",
+        func: invokeCompanyAIChatReader, args: [{ action: "check", url: target.url, conversationId: target.conversationId,
+          deadline: Math.min(check.expiresAt, Date.now() + 4000) }] })
+        .then(([identity]) => identity?.frameId === 0 && identity.documentId === target.documentId
+          && identity.result?.conversationId === target.conversationId && identity.result.url === expectedUrl)
     : await browser.scripting.executeScript({ target: { tabId: target.tabId, documentIds: [target.documentId] }, func: readFixtureIdentity })
       .then(([identity]) => identity?.frameId === 0 && identity.documentId === target.documentId && identity.result === "fixture-alpha");
   const current = await browser.tabs.get(target.tabId);
@@ -766,7 +774,7 @@ async function chatJobBinding(check: ChatBrowserJob, waitForDatabagReadiness = f
   if (!validIdentity || (!current.active && stillGranted?.expiresAt !== null) || current.url !== expectedUrl || check.expiresAt <= Date.now()
     || stillGranted?.documentId !== target.documentId || stillGranted.reloadPending || chatTabUpdates.has(target.tabId)
     || !isLiveStoredExpiry(stillGranted.expiresAt) || stillGranted.url !== grant.url
-    || (target.provider === "databag" && stillGranted.conversationId !== target.conversationId)) return null;
+    || ((target.provider === "databag" || target.provider === "company_ai") && stillGranted.conversationId !== target.conversationId)) return null;
   return { expectedUrl, expiresAt: Math.min(check.expiresAt, stillGranted.expiresAt ?? Infinity), allowHidden: stillGranted.expiresAt === null };
 }
 
@@ -801,10 +809,14 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
           ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
             func: inspectDatabagDraft, args: [{ ...args, conversationId: check.target.conversationId,
               draftState: provePrepared ? "prepared" : "empty" }] })
+        : check.target.provider === "company_ai"
+          ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
+            func: inspectCompanyAIChatDraft, args: [{ ...args, conversationId: check.target.conversationId,
+              deadline: binding.expiresAt, draftState: provePrepared ? "prepared" : "empty" }] })
         : await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
           func: inspectFixturePreflight, args: [{ ...args, draftState: provePrepared ? "prepared" : "empty" }] });
       let checked = result[0];
-      if (check.phase === "fill" && check.leftover && checked?.result && !checked.result.ok
+      if (check.phase === "fill" && check.target.provider !== "company_ai" && check.leftover && checked?.result && !checked.result.ok
         && (checked.result.code === "DRAFT_PRESENT" || checked.result.code === "DRAFT_CHANGED")) {
         const previous = check.target.provider === "gemini"
           ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
@@ -841,6 +853,9 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
             : check.target.provider === "databag"
               ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
                 func: fillDatabagDraft, args: [{ ...input, conversationId: check.target.conversationId }] })
+            : check.target.provider === "company_ai"
+              ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
+                func: fillCompanyAIChatDraft, args: [{ ...input, conversationId: check.target.conversationId, deadline: binding.expiresAt }] })
             : await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
               func: fillFixtureDraft, args: [input] });
           const completed = filled[0];
@@ -880,6 +895,9 @@ async function submitTrackedChatDraft(check: ChatBrowserJob): Promise<void> {
             : check.target.provider === "databag"
               ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
                 func: submitDatabagDraft, args: [{ ...args, conversationId: check.target.conversationId }] })
+            : check.target.provider === "company_ai"
+              ? await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
+                func: submitCompanyAIChatDraft, args: [{ ...args, conversationId: check.target.conversationId, deadline: current.expiresAt }] })
             : await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
               func: submitFixtureDraft, args: [args] });
           const submitted = result[0];
@@ -889,8 +907,11 @@ async function submitTrackedChatDraft(check: ChatBrowserJob): Promise<void> {
               ? await queueGeminiSnapshot(check.target.tabId, current.expectedUrl, check.target.documentId, undefined, check.expiresAt)
               : check.target.provider === "databag"
                 ? await queueSavedChatSnapshot("databag", check.target.tabId, current.expectedUrl, check.target.documentId, undefined, check.expiresAt)
+              : check.target.provider === "company_ai"
+                ? await queueSavedChatSnapshot("company_ai", check.target.tabId, current.expectedUrl, check.target.documentId, undefined, check.expiresAt)
               : await queueFixtureSnapshot(check.target.tabId, check.target.documentId, undefined, check.expiresAt));
-            if (published) observation = submitted.result;
+            if (published) observation = check.target.provider === "company_ai" && !submitted.result.ok
+              && submitted.result.code === "UNSUPPORTED_MESSAGE_TEXT" ? { ok: false, code: "DISPATCH_UNAVAILABLE" } : submitted.result;
           }
         }
       }
@@ -1030,7 +1051,7 @@ function parseFixtureDispatchAttempts(value: unknown, requestId: string, deadlin
   });
 }
 
-function parseChatJobs(value: unknown, requestId: string, deadlineMs: number, provider: "fixture" | "gemini" | "databag",
+function parseChatJobs(value: unknown, requestId: string, deadlineMs: number, provider: "fixture" | "gemini" | "databag" | "company_ai",
   phase: ChatBrowserJob["phase"] = "submit") {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
   const reply = value as Record<string, unknown>;
@@ -1065,6 +1086,8 @@ function parseChatJobs(value: unknown, requestId: string, deadlineMs: number, pr
         || new URL(target.url).pathname.split("/").filter(Boolean)[1] !== target.conversationId
         : provider === "databag" ? !isEligibleDatabagUrl(target.url) || new URL(target.url).origin !== target.origin
           || typeof target.conversationId !== "string" || !/^databag_[a-f0-9]{64}$/.test(target.conversationId)
+        : provider === "company_ai" ? !isEligibleCompanyAIChatUrl(target.url) || new URL(target.url).origin !== target.origin
+          || typeof target.conversationId !== "string" || !/^company_ai_[a-f0-9]{64}$/.test(target.conversationId)
         : target.origin !== "http://127.0.0.1:8787" || target.conversationId !== "fixture-alpha")) throw new Error();
     return entry as ChatBrowserJob;
   });
@@ -1365,8 +1388,7 @@ function startSavedChatReadWatch(provider: SavedProvider): boolean {
     if (!requestId) return stop();
     clearTimeout(responseTimer);
     if (phase !== "read") {
-      if (provider === "company_ai") return stop();
-      if (provider === "databag" && (phase === "fill" || phase === "proof")) return stop();
+      if (provider !== "gemini" && (phase === "fill" || phase === "proof")) return stop();
       const checks = (() => {
         try { return phase === "submit" || phase === "chat_fill" || phase === "chat_proof" || phase === "chat_settle"
           ? parseChatJobs(value, requestId, deadlineMs, provider,
@@ -1425,8 +1447,8 @@ function startSavedChatReadWatch(provider: SavedProvider): boolean {
           }
         }
       }
-      phase = provider === "company_ai" ? "read" : provider === "gemini" ? "fill" : "chat_fill";
-      if (isCurrent()) pollTimer = setTimeout(() => { void poll(); }, provider === "company_ai" ? 250 : 0);
+      phase = provider === "gemini" ? "fill" : "chat_fill";
+      if (isCurrent()) pollTimer = setTimeout(() => { void poll(); }, 0);
     })().catch(stop);
   });
   port.onDisconnect.addListener(() => { void browser.runtime.lastError; stop(); });
@@ -1704,6 +1726,9 @@ async function chatDocumentTarget(tabId: number, expectedUrl: string, documentId
       || !/^company_ai_[a-f0-9]{64}$/.test(identity.result.conversationId)) return null;
     target = { provider: "company_ai", origin: new URL(expectedUrl).origin as `https://${string}`,
       conversationId: identity.result.conversationId, url: expectedUrl, tabId, documentId: identity.documentId };
+    const [writer] = await browser.scripting.executeScript({ target: { tabId, documentIds: [target.documentId] },
+      files: ["/company-ai-writer.js"] });
+    if (writer?.frameId !== 0 || writer.documentId !== target.documentId) return null;
   } else if (isEligibleGeminiUrl(expectedUrl)) {
     const [identity] = await browser.scripting.executeScript({ target: scriptTarget, func: identifyGeminiConversation });
     if (identity?.frameId !== 0 || identity.result?.url !== expectedUrl) return null;
@@ -1820,7 +1845,8 @@ async function manageSelectedChatAgents(tabId: number, expectedUrl: string, agen
     const kind = action === "approve" ? "approve_chat_agent" : action === "disconnect" ? "disconnect_chat"
       : action === "remove" ? "remove_chat_agent" : target ? "list_chat_agents" : "list_available_agents";
     if (action === "approve") attemptedApproval = target;
-    const reply = await sendChatAgentRequest(kind, target ? { target, ...(agentId ? { agentId } : {}) } : {}, deadlineMs);
+    const reply = await sendChatAgentRequest(kind, target ? { target, ...(agentId ? { agentId } : {}),
+      ...(action === "approve" && target.provider === "company_ai" ? { send: true } : {}) } : {}, deadlineMs);
     const payload = reply.payload;
     const current = target ? await selectedChatTarget(tabId, expectedUrl, target.documentId) : null;
     if (Date.now() >= deadlineMs || (target ? !current || current.conversationId !== target.conversationId

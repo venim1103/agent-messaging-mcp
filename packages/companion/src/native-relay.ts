@@ -265,7 +265,7 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               kind = "chat_agent_removed";
               payload = result.payload;
             } else if (request.kind === "approve_chat_agent") {
-              const result = await client.approveChatAgent(request.payload.target, request.payload.agentId);
+              const result = await client.approveChatAgent(request.payload.target, request.payload.agentId, request.payload.send);
               if (result.kind !== "chat_agent_approved") throw new Error("Broker refused agent approval");
               kind = "chat_agent_approved";
               payload = result.payload;

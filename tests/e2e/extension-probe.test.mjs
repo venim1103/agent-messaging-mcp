@@ -24,7 +24,8 @@ import { createNativeRequestChannel, requestNativeGrantCount } from "../../packa
 import { configuredCompanyAIChatOrigins, configuredDatabagOrigins, isEligibleCompanyAIChatUrl,
   isEligibleDatabagUrl, isRecognizedCompanyAIChatUrl, parseDatabagOrigin } from "../../packages/extension/lib/provider-origins.ts";
 import { proveCompanyAIChatIdentity, proveCompanyAIChatIdentityInDocument } from "../../packages/extension/lib/company-ai-observation.ts";
-import { invokeCompanyAIChatReader } from "../../packages/extension/lib/company-ai-reader.ts";
+import { fillCompanyAIChatDraft, inspectCompanyAIChatDraft, invokeCompanyAIChatReader,
+  submitCompanyAIChatDraft } from "../../packages/extension/lib/company-ai-reader.ts";
 import { extensionDirectory, nativeRelayPath, buildTestExtension, brokerSocketReady, trackTestPhase, traceBrowserJobs, installSyntheticGeminiProof } from "./extension-harness.mjs";
 
 const companyProofScript = transpileModule(await readFile(new URL("../../packages/extension/lib/company-ai-observation.ts",
@@ -419,7 +420,7 @@ test("Company AI Chat identity primitive accepts only committed agreeing synthet
   assert.equal(duringProfile.listenerCount(), 0);
   const bound = guardedFixture();
   assert.deepEqual(Object.keys(bound.sandbox.exports).sort(), ["createCompanyAIChatIdentityBinding", "createCompanyAIChatIdentityCheck", "createCompanyAIChatReadBinding",
-    "locateCompanyAIChatReadTargets",
+    "locateCompanyAIChatComposer", "locateCompanyAIChatReadTargets",
     "inspectCompanyAIChatStructure", "proveCompanyAIChatIdentity", "proveCompanyAIChatIdentityInDocument"].sort());
   const binding = bound.sandbox.exports.createCompanyAIChatIdentityCheck(bound.options);
   assert.equal(binding.status, "ok");
@@ -595,6 +596,11 @@ test("Company AI Chat read targets are bounded, structural and text-free", { tim
       Object.defineProperty(HTMLTextAreaElement.prototype, "value", { get: () => { privateReads++; throw new Error("Draft read"); } });
       Object.defineProperty(HTMLElement.prototype, "innerText", { get: () => { privateReads++; throw new Error("Private text read"); } });
       Object.defineProperty(Element.prototype, "innerHTML", { get: () => { privateReads++; throw new Error("Private markup read"); } });
+      const nativeNodeValue = Object.getOwnPropertyDescriptor(Node.prototype, "nodeValue").get;
+      Object.defineProperty(Node.prototype, "nodeValue", { get() {
+        if (!this.parentElement?.closest("button")) { privateReads++; throw new Error("Non-control text read"); }
+        return nativeNodeValue.call(this);
+      } });
       let mutations = 0;
       let inputs = 0;
       let activations = 0;
@@ -612,6 +618,42 @@ test("Company AI Chat read targets are bounded, structural and text-free", { tim
       const targets = locate();
       const accepted = targets?.editor === document.getElementById("editor") && targets.timeline === document.getElementById("timeline")
         && targets.profile === document.getElementById("profile") && targets.rows.length === 2;
+      const composer = () => {
+        observer.takeRecords();
+        const result = globalThis.syntheticCompanyProof.locateCompanyAIChatComposer({ expectedUrl: location.href,
+          deadline: Date.now() + 4000 });
+        mutations += observer.takeRecords().length;
+        return result;
+      };
+      const boundComposer = composer();
+      const composerResolved = boundComposer?.editor === targets.editor && boundComposer.send === targets.editor.nextElementSibling;
+      boundComposer.send.disabled = true;
+      const emptyDisabledSendResolved = composer()?.send === boundComposer.send;
+      boundComposer.send.disabled = false;
+      const otherSend = document.createElement("button"); otherSend.append(document.createTextNode("Send"));
+      boundComposer.composer.append(otherSend);
+      const ambiguousSendRefused = composer() === null;
+      otherSend.remove();
+      const staged = document.createElement("span"); staged.append(document.createTextNode("Invented attachment"));
+      boundComposer.composer.append(staged);
+      const extraContentRefused = composer() === null;
+      staged.remove();
+      const stop = document.createElement("button"); stop.append(document.createTextNode("Stop generating"));
+      boundComposer.composer.append(stop);
+      const stopRefused = composer() === null;
+      stop.remove();
+      const file = document.createElement("input"); file.type = "file"; file.hidden = true;
+      boundComposer.composer.append(file);
+      const emptyFileAllowed = composer() !== null;
+      const transfer = new DataTransfer(); transfer.items.add(new File(["Invented bytes"], "invented.txt"));
+      file.files = transfer.files;
+      const stagedFileRefused = composer() === null;
+      file.remove();
+      const large = document.createElement("div"); large.hidden = true;
+      for (let index = 0; index < 512; index++) large.append(document.createElement("span"));
+      boundComposer.composer.append(large);
+      const oversizedComposerRefused = composer() === null;
+      large.remove();
       const nestedProfile = document.createElement("span");
       nestedProfile.append(document.createTextNode("Invented nested profile"));
       document.getElementById("profile").append(nestedProfile);
@@ -640,11 +682,15 @@ test("Company AI Chat read targets are bounded, structural and text-free", { tim
       const expired = globalThis.syntheticCompanyProof.locateCompanyAIChatReadTargets({ expectedUrl: location.href, deadline: Date.now() }) === null;
       const oversized = globalThis.syntheticCompanyProof.locateCompanyAIChatReadTargets({ expectedUrl: location.href, deadline: Infinity }) === null;
       observer.disconnect();
-      return { accepted, nestedProfileResolved, iconOnlyProfileIgnored, ambiguousProfile, hiddenProfileIgnored, ambiguousTimeline,
+      return { accepted, composerResolved, emptyDisabledSendResolved, ambiguousSendRefused, extraContentRefused, stopRefused,
+        emptyFileAllowed, stagedFileRefused, oversizedComposerRefused,
+        nestedProfileResolved, iconOnlyProfileIgnored, ambiguousProfile, hiddenProfileIgnored, ambiguousTimeline,
         ambiguousEditor, expired, oversized,
         privateReads, mutations, inputs, activations };
     });
-    assert.deepEqual(result, { accepted: true, nestedProfileResolved: true, iconOnlyProfileIgnored: true, ambiguousProfile: true,
+    assert.deepEqual(result, { accepted: true, composerResolved: true, emptyDisabledSendResolved: true, ambiguousSendRefused: true,
+      extraContentRefused: true, stopRefused: true, emptyFileAllowed: true, stagedFileRefused: true, oversizedComposerRefused: true,
+      nestedProfileResolved: true, iconOnlyProfileIgnored: true, ambiguousProfile: true,
       hiddenProfileIgnored: true, ambiguousTimeline: true,
       ambiguousEditor: true, expired: true, oversized: true, privateReads: 0, mutations: 0, inputs: 0, activations: 0 });
   } finally {
@@ -741,6 +787,29 @@ test("Company AI Chat read binding separates identity from bounded sender captur
       const bound = await page.evaluate(invokeCompanyAIChatReader, request);
       assert.ok(bound && /^company_ai_[a-f0-9]{64}$/.test(bound.conversationId));
       assert.equal(bound.snapshot, undefined);
+      const bridge = await page.evaluate(({ conversationId }) => {
+        const editor = document.querySelector("textarea");
+        const check = (target, id, deadline) => {
+          const nonce = crypto.randomUUID(); let valid = false; let received = 0;
+          const listener = event => {
+            const result = JSON.parse(event.detail);
+            if (result.nonce === nonce) { received++; valid = result.valid; }
+          };
+          target.addEventListener("agent-company-identity-response-v1", listener);
+          try { target.dispatchEvent(new CustomEvent("agent-company-identity-v1", { bubbles: true,
+            detail: JSON.stringify({ nonce, conversationId: id, deadline }) })); }
+          finally { target.removeEventListener("agent-company-identity-response-v1", listener); }
+          return received === 1 && valid;
+        };
+        const matched = check(editor, conversationId, Date.now() + 4000);
+        const foreignRefused = !check(editor, `company_ai_${"f".repeat(64)}`, Date.now() + 4000);
+        const expiredRefused = !check(editor, conversationId, Date.now());
+        const clone = editor.cloneNode(true); document.querySelector("main").append(clone);
+        const otherEditorRefused = !check(clone, conversationId, Date.now() + 4000);
+        clone.remove();
+        return { matched, foreignRefused, expiredRefused, otherEditorRefused };
+      }, bound);
+      assert.deepEqual(bridge, { matched: true, foreignRefused: true, expiredRefused: true, otherEditorRefused: true });
       const checking = { ...request, action: "check", conversationId: bound.conversationId };
       assert.deepEqual(await page.evaluate(invokeCompanyAIChatReader, checking), bound);
       const captured = await page.evaluate(invokeCompanyAIChatReader, { ...checking, action: "capture" });
@@ -806,6 +875,84 @@ test("Company AI Chat read binding separates identity from bounded sender captur
     await browser?.close();
     await rm(profile, { recursive: true, force: true });
   }
+});
+
+test("Company isolated writer preserves guarded native input and one-shot submission", { timeout: 15000 }, async testContext => {
+  const home = await mkdtemp(join(tmpdir(), "agent-messaging-company-writer-"));
+  let browser;
+  try {
+    browser = await chromium.launch({ chromiumSandbox: true, executablePath: "/usr/bin/chromium", headless: true,
+      env: { ...process.env, HOME: home } });
+    const page = await browser.newPage();
+    await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
+      body: '<!doctype html><nav><span>synthetic@example.test</span></nav><main><div role="log"><div data-testid="invented-row"><p>Invented previous row</p></div></div><section><textarea></textarea><button type="button" disabled><span>Send</span></button></section></main>' }));
+    await page.goto("https://chat.app.example.com/chat/synthetic-writer");
+    await page.evaluate(() => {
+      const editor = document.querySelector("textarea"), timeline = document.querySelector('[role="log"]');
+      const profile = document.querySelector("nav span");
+      const root = { return: null, child: null, stateNode: null }; root.stateNode = { current: root };
+      const source = { return: root, child: null, sibling: null, memoizedProps: { conversationId: "synthetic-chat" },
+        dependencies: { firstContext: { memoizedValue: { accounts: [{ homeAccountId: "synthetic-home",
+          localAccountId: "synthetic-local", username: "synthetic@example.test" }], inProgress: "none" }, next: null } } };
+      root.child = source; globalThis.syntheticCompanySource = source;
+      let previous;
+      for (const element of [editor, timeline, profile]) {
+        const fiber = { return: source, child: null, sibling: null, stateNode: element, memoizedProps: {}, dependencies: null };
+        Object.defineProperty(element, "__reactFiber$synthetic", { value: fiber });
+        if (previous) previous.sibling = fiber; else source.child = fiber;
+        previous = fiber;
+      }
+      globalThis.syntheticInputs = 0; globalThis.syntheticActivations = 0;
+      editor.addEventListener("input", event => {
+        if (event.isTrusted && event.inputType === "insertText") globalThis.syntheticInputs++;
+        document.querySelector("button").disabled = false;
+        if (globalThis.syntheticLoseFocus) editor.blur();
+      });
+      document.querySelector("button").addEventListener("click", () => globalThis.syntheticActivations++);
+    });
+    const build = await buildTestExtension("", testContext.signal, "https://chat.app.example.com");
+    databagBuildSources.push(build.source);
+    await page.addScriptTag({ content: await readFile(join(build.directory, "company-ai-main.js"), "utf8") });
+    const bound = await page.evaluate(invokeCompanyAIChatReader, { action: "bind", url: page.url(), deadline: Date.now() + 4000 });
+    assert.ok(bound);
+    const session = await page.context().newCDPSession(page);
+    const { frameTree } = await session.send("Page.getFrameTree");
+    const { executionContextId } = await session.send("Page.createIsolatedWorld", { frameId: frameTree.frame.id,
+      worldName: "synthetic-company-writer" });
+    const execute = async expression => {
+      const result = await session.send("Runtime.evaluate", { expression, contextId: executionContextId, returnByValue: true });
+      assert.equal(result.exceptionDetails, undefined, "Isolated Company writer execution failed");
+      return result.result.value;
+    };
+    await execute(await readFile(join(build.directory, "company-ai-writer.js"), "utf8"));
+    const invoke = (method, input) => execute(`(${method.toString()})(${JSON.stringify(input)})`);
+    const draft = () => ({ expectedUrl: page.url(), conversationId: bound.conversationId,
+      text: "Invented Company writer check", deadline: Date.now() + 4000 });
+    const fillInput = () => { const input = draft(); return { ...input, operationId: crypto.randomUUID(),
+      attemptId: crypto.randomUUID(), expiresAt: input.deadline }; };
+    assert.deepEqual(await invoke(inspectCompanyAIChatDraft, draft()), { ok: true, editor: "textarea" });
+    const input = fillInput();
+    assert.deepEqual(await invoke(fillCompanyAIChatDraft, input), { ok: true, editor: "textarea" });
+    assert.deepEqual(await invoke(fillCompanyAIChatDraft, input), { ok: false, code: "FILL_UNAVAILABLE" });
+    assert.deepEqual(await invoke(inspectCompanyAIChatDraft, { ...draft(), draftState: "prepared" }), { ok: true, editor: "textarea" });
+    const submit = { ...input, attemptId: input.operationId, deadline: Date.now() + 4000 };
+    submit.expiresAt = submit.deadline;
+    assert.deepEqual(await invoke(submitCompanyAIChatDraft, submit), { ok: true, editor: "textarea", activated: true });
+    assert.deepEqual(await invoke(submitCompanyAIChatDraft, submit), { ok: false, code: "DISPATCH_UNAVAILABLE" });
+    assert.deepEqual(await page.evaluate(() => [globalThis.syntheticInputs, globalThis.syntheticActivations]), [1, 1]);
+    await page.evaluate(() => { document.querySelector("textarea").value = "Invented human draft"; });
+    assert.deepEqual(await invoke(fillCompanyAIChatDraft, fillInput()), { ok: false, code: "DRAFT_PRESENT" });
+    assert.equal(await page.locator("textarea").inputValue(), "Invented human draft");
+    await page.evaluate(() => { document.querySelector("textarea").value = ""; globalThis.syntheticLoseFocus = true; });
+    const lost = fillInput();
+    assert.deepEqual(await invoke(fillCompanyAIChatDraft, lost), { ok: false, code: "FILL_UNCERTAIN" });
+    assert.equal(await page.locator("textarea").inputValue(), lost.text);
+    assert.deepEqual(await invoke(fillCompanyAIChatDraft, lost), { ok: false, code: "FILL_UNAVAILABLE" });
+    await page.evaluate(() => { document.querySelector("textarea").value = "";
+      globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-other"; });
+    assert.deepEqual(await invoke(fillCompanyAIChatDraft, fillInput()), { ok: false, code: "TARGET_CHANGED" });
+    assert.deepEqual(await page.evaluate(() => [globalThis.syntheticInputs, globalThis.syntheticActivations]), [2, 1]);
+  } finally { await browser?.close(); await rm(home, { recursive: true, force: true }); }
 });
 
 test("Company AI Chat document guard checks native DOM without connection or input", { timeout: 15000 }, async () => {
@@ -995,7 +1142,7 @@ test("Company AI Chat popup exposes document-bound diagnostics without host requ
     const beforeMarkup = await page.content();
     const beforeStorage = await worker.evaluate(() => chrome.storage.session.get(null));
     await popup.evaluate(() => document.getElementById("inspect").click());
-    await popup.getByText("Layout metadata only. Company AI Chat connection and messaging are not enabled.",
+    await popup.getByText("Layout metadata only. No connection or messaging action performed.",
       { exact: true }).waitFor({ timeout: 4000 });
     await assertSharedPopupControls(popup, false);
     assert.equal(await popup.locator("#agent-panel").isHidden(), true);
@@ -3085,8 +3232,9 @@ for (const provider of ["fixture", "gemini"]) {
   });
 }
 
-for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup connection reads through native MCP and revokes exact owners without sending (${scenario})`, { timeout: 20000 }, async testContext => {
+for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result-loss"]) test(`Company popup connection reads through native MCP and preserves exact owners (${scenario})`, { timeout: 20000 }, async testContext => {
   const setPhase = trackTestPhase(testContext, "Company connected read");
+  const sends = scenario === "send" || scenario === "submit-result-loss";
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-company-connected-read-"));
   const clients = [new Client({ name: "Company one", version: "0.0.1" }), new Client({ name: "Company two", version: "0.0.1" })];
   let context;
@@ -3132,6 +3280,13 @@ for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup c
           const result = await execute(options);
           globalThis.syntheticCompanyCalls.push({ phase: options.files ? "install" : options.args?.[0]?.action ?? "other",
             topFrame: result[0]?.frameId === 0, returned: result[0]?.result != null });
+          const input = options.args?.[0];
+          if (globalThis.syntheticCompanyLoseSubmitResult && input?.operationId && input.attemptId === input.operationId
+            && input.conversationId?.startsWith("company_ai_") && input.deadline) {
+            globalThis.syntheticCompanyLoseSubmitResult = false;
+            globalThis.syntheticCompanyLostSubmitResults = (globalThis.syntheticCompanyLostSubmitResults ?? 0) + 1;
+            throw new Error("Synthetic lost Company submit result");
+          }
           return result;
         } catch (error) {
           globalThis.syntheticCompanyCalls.push({ phase: options.files ? "install" : options.args?.[0]?.action ?? "other", threw: true });
@@ -3161,7 +3316,7 @@ for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup c
     const page = await context.newPage();
     const url = "https://chat.app.example.com/chat/synthetic";
     await page.route("https://chat.app.example.com/**", route => route.fulfill({ contentType: "text/html",
-      body: '<!doctype html><nav><span>synthetic@example.test</span></nav><main><div role="log"><div data-testid="invented-first"><p>Synthetic first row</p><button>Excluded control</button></div><div data-testid="invented-second"><p>Synthetic second row</p></div></div><textarea>Synthetic retained draft</textarea><button>Send</button></main>' }));
+      body: '<!doctype html><nav><span>synthetic@example.test</span></nav><main><div role="log"><div data-testid="invented-first"><p>Synthetic first row</p><button>Excluded control</button></div><div data-testid="invented-second"><p>Synthetic second row</p></div></div><section><textarea>Synthetic retained draft</textarea><button>Send</button></section></main>' }));
     await page.goto(url);
     await page.evaluate(() => {
       const editor = document.querySelector("textarea");
@@ -3189,6 +3344,7 @@ for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup c
         if (timeline.contains(this)) globalThis.syntheticCompanyMessageReads++;
         return nativeNodeValue.call(this);
       } });
+      globalThis.syntheticCompanyValueDescriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
       Object.defineProperty(HTMLTextAreaElement.prototype, "value", { get() { throw new Error("Unexpected draft read"); } });
       document.addEventListener("input", () => globalThis.syntheticCompanyInputs++, true);
       document.addEventListener("click", () => globalThis.syntheticCompanyActivations++, true);
@@ -3204,9 +3360,9 @@ for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup c
         throw error;
       });
     await assertSharedPopupControls(popup, false);
-    assert.equal(await popup.locator("#unconfirmed-panel").isHidden(), true);
+    assert.equal(await popup.locator("#unconfirmed-panel").isHidden(), false);
     assert.equal(await popup.locator("#connection-consent").textContent(),
-      "Approval lets that agent read this chat until the connection ends. Sending is unavailable. Experimental: site changes may interrupt access.");
+      "Approval lets that agent read and send in this chat until the connection ends. Experimental: site changes may interrupt access; submitted messages may need outcome review.");
     assert.equal(await page.evaluate(() => globalThis.syntheticCompanyMessageReads), 0);
     await popup.evaluate(() => {
       const request = chrome.permissions.request.bind(chrome.permissions);
@@ -3239,12 +3395,12 @@ for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup c
     const pickup = (await clients[0].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent;
     assert.equal(pickup.connections.length, 1);
     const connection = pickup.connections[0];
-    assert.deepEqual(connection.capabilities, ["read"]);
+    assert.deepEqual(connection.capabilities, ["read", "send"]);
     assert.equal(connection.expiresAt, null);
     assert.equal(connection.origin, "https://chat.app.example.com");
     const state = await clients[0].callTool({ name: "chat_get_connection", arguments: { requestId: connection.requestId } });
     assert.equal(state.isError, undefined);
-    assert.deepEqual(state.structuredContent.capabilities, ["read"]);
+    assert.deepEqual(state.structuredContent.capabilities, ["read", "send"]);
     await page.evaluate(() => {
       const rows = document.querySelector('[role="log"]').children;
       rows[0].className = "Invented_userMessage__alpha";
@@ -3262,6 +3418,57 @@ for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup c
       text: "Synthetic unsupported send", idempotencyKey: crypto.randomUUID() } });
     assert.equal(sending.structuredContent.state, "not_sent");
     assert.equal(sending.structuredContent.retryAllowed, false);
+    if (sends) {
+      setPhase("public guarded Company submission");
+      await page.evaluate(() => {
+        Object.defineProperty(HTMLTextAreaElement.prototype, "value", globalThis.syntheticCompanyValueDescriptor);
+      });
+      await page.evaluate(() => {
+        const editor = document.querySelector("textarea");
+        const send = document.querySelector("section button");
+        editor.value = "";
+        send.disabled = true;
+        editor.addEventListener("input", () => { send.disabled = !editor.value; });
+        send.addEventListener("click", () => {
+          const row = document.createElement("div");
+          row.className = "Invented_userMessage__alpha";
+          const text = document.createElement("p");
+          text.textContent = editor.value;
+          row.append(text);
+          document.querySelector('[role="log"]').append(row);
+          editor.value = "";
+          send.disabled = true;
+        });
+      });
+      const idempotencyKey = crypto.randomUUID();
+      if (scenario === "submit-result-loss") await worker.evaluate(() => { globalThis.syntheticCompanyLoseSubmitResult = true; });
+      const argumentsValue = { connectionId: connection.connectionId, text: "Synthetic guarded Company send", idempotencyKey };
+      const submitted = (await clients[0].callTool({ name: "chat_send_message", arguments: argumentsValue })).structuredContent;
+      assert.equal(submitted?.state, "unresolved", JSON.stringify({ state: submitted?.state, code: submitted?.code,
+        failureStage: submitted?.failureStage }));
+      assert.equal(submitted.code, "DISPATCH_UNCERTAIN");
+      assert.equal(submitted.retryAllowed, false);
+      const replayed = (await clients[0].callTool({ name: "chat_send_message", arguments: argumentsValue })).structuredContent;
+      assert.equal(replayed.operationId, submitted.operationId);
+      assert.equal(replayed.state, "unresolved");
+      assert.deepEqual(await page.evaluate(() => ({ inputs: globalThis.syntheticCompanyInputs,
+        activations: globalThis.syntheticCompanyActivations })), { inputs: 1, activations: 1 });
+      assert.equal(await worker.evaluate(async () => Object.keys(await chrome.storage.local.get(null))
+        .filter(key => key.startsWith("company-ai-submit-attempt-")).length), 1);
+      assert.equal((await clients[1].callTool({ name: "chat_send_message", arguments: argumentsValue })).isError, true);
+      if (scenario === "submit-result-loss") assert.equal(await worker.evaluate(() => globalThis.syntheticCompanyLostSubmitResults), 1);
+      await popup.locator("#refresh-unconfirmed").press("Enter");
+      const uncertain = popup.locator(`#unconfirmed-list li[data-operation-id="${submitted.operationId}"]`);
+      await uncertain.waitFor({ timeout: 4000 });
+      await uncertain.getByRole("button", { name: "Sent", exact: true }).press("Enter");
+      await popup.getByText("Outcome recorded. Nothing was resent.", { exact: true }).waitFor({ timeout: 4000 });
+      const resolved = (await clients[0].callTool({ name: "chat_send_message", arguments: argumentsValue })).structuredContent;
+      assert.equal(resolved.operationId, submitted.operationId);
+      assert.equal(resolved.state, "sent");
+      assert.equal(resolved.code, "PERSON_SENT");
+      assert.deepEqual(await page.evaluate(() => ({ inputs: globalThis.syntheticCompanyInputs,
+        activations: globalThis.syntheticCompanyActivations })), { inputs: 1, activations: 1 });
+    }
     assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } })).isError, true);
     const unsupported = await clients[0].callTool({ name: "chat_wait_for_events", arguments: {
       connectionId: connection.connectionId, cursor: snapshot.structuredContent.cursor, timeoutMs: 0, view: "incoming_changes" } });
@@ -3279,10 +3486,11 @@ for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup c
     assert.equal((await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } })).isError, true);
     assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).isError, undefined);
     assert.deepEqual(await page.evaluate(() => ({ inputs: globalThis.syntheticCompanyInputs, activations: globalThis.syntheticCompanyActivations })),
-      { inputs: 0, activations: 0 });
+      sends ? { inputs: 1, activations: 1 } : { inputs: 0, activations: 0 });
     if (scenario === "identity") await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-other"; });
     else if (scenario === "reload") await page.reload();
-    else await worker.evaluate(() => { globalThis.syntheticCompanyReadGap = true; });
+    else if (scenario === "read-gap") await worker.evaluate(() => { globalThis.syntheticCompanyReadGap = true; });
+    else await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-other"; });
     let revoked = false;
     for (let attempt = 0; attempt < 80; attempt++) {
       testContext.signal.throwIfAborted();

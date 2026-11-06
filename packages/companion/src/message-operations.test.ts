@@ -43,6 +43,64 @@ test("Company admission does not enable legacy message operations or allocate du
   }
 });
 
+test("Company send capability reuses rendered jobs without widening read-only grants or outcome evidence", async () => {
+  const requests = new PendingConnectionRequests();
+  const database = new DatabaseSync(":memory:");
+  const ledger = new PreparedMessageOperations(requests, database);
+  const owner = Symbol("Company writer owner"), other = Symbol("Company foreign owner");
+  const target = { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_${"a".repeat(64)}`,
+    url: "https://chat.app.example.com/chat/synthetic", tabId: 3, documentId: "synthetic-document" } as const;
+  try {
+    const agent = requests.registerAgent(owner);
+    const readOnly = requests.approveAgent(agent.agentId, target)!;
+    assert.deepEqual(requests.approveAgent(agent.agentId, target, Date.now(), true)?.capabilities, ["read"]);
+    assert.equal(requests.getAutonomousWriteTarget(owner, readOnly.connectionId), null);
+    requests.removeChatAgent(agent.agentId, target);
+    const connection = requests.approveAgent(agent.agentId, target, Date.now(), true)!;
+    assert.deepEqual(connection.capabilities, ["read", "send"]);
+    const deadline = Date.now() + 4000, text = "Invented Company guarded message";
+    const prepared = ledger.prepareAutonomous(owner, connection.connectionId, text, randomUUID(), deadline);
+    assert.equal(prepared.preview.target, "company_ai");
+    assert.equal(ledger.getAutonomousAuthorization(other, prepared.operationId), null);
+    assert.equal(requests.getGeminiTarget(owner, connection.connectionId), null);
+    assert.equal(requests.getStableTarget(owner, connection.connectionId), null);
+    assert.throws(() => ledger.prepareGemini(owner, connection.connectionId, 1, text, randomUUID()), /CONNECTION_NOT_FOUND/);
+    assert.equal(await ledger.acquireComposer(owner, prepared.operationId, deadline), true);
+    const filling = ledger.requestChatFill(owner, prepared.operationId, Date.now(), deadline);
+    assert.ok(filling && filling !== "busy");
+    assert.deepEqual(ledger.listGeminiFillChallenges(Date.now(), true), []);
+    assert.deepEqual(ledger.listChatJobs("fill", "gemini"), []);
+    const fill = ledger.listChatJobs("fill", "company_ai")[0]!;
+    assert.ok(fill);
+    assert.deepEqual(ledger.listChatJobs("fill", "company_ai"), []);
+    assert.equal(ledger.completeChatJob(target, fill.operationId, fill.jobId, "fill", { ok: true, editor: "contenteditable" }), false);
+    assert.equal(ledger.completeChatJob(target, fill.operationId, fill.jobId, "fill", { ok: true, editor: "textarea" }), true);
+    assert.equal((await filling.result)?.ok, true);
+    assert.equal(requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Invented previous answer" }],
+      Date.now(), undefined, true), 1);
+    const inspecting = ledger.requestChatProof(owner, prepared.operationId, Date.now(), deadline);
+    assert.ok(inspecting && inspecting !== "busy");
+    assert.deepEqual(ledger.listGeminiDispatchChecks(Date.now(), true), []);
+    const proof = ledger.listChatJobs("proof", "company_ai")[0]!;
+    assert.ok(proof);
+    assert.equal(ledger.completeChatJob(target, proof.operationId, proof.jobId, "proof", { ok: true, editor: "textarea",
+      draftText: text, selected: true, writable: true, submitReady: true }), true);
+    assert.equal(await inspecting.result, true);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()!.count, 0);
+    const dispatch = ledger.requestGeminiDispatch(owner, prepared.operationId, proof.jobId, Date.now(), deadline);
+    assert.deepEqual(ledger.listGeminiDispatchAttempts(), []);
+    const submit = ledger.listChatJobs("submit", "company_ai")[0]!;
+    assert.ok(submit);
+    assert.deepEqual(ledger.listChatJobs("submit", "company_ai"), []);
+    assert.equal(ledger.completeChatSubmitJob(target, submit.operationId, submit.jobId,
+      { ok: true, editor: "textarea", activated: true }), true);
+    assert.equal((await dispatch.result).state, "dispatch_uncertain");
+    assert.equal(ledger.reconcileGeminiObservation(owner, prepared.operationId).state, "dispatch_uncertain");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()!.count, 1);
+    assert.equal(ledger.releaseComposer(owner, prepared.operationId), true);
+  } finally { requests.disconnect(owner); database.close(); }
+});
+
 test("Databag autonomous preparation and composer reservations remain exact, owned and shared", async () => {
   const requests = new PendingConnectionRequests();
   const database = new DatabaseSync(":memory:");

@@ -108,7 +108,9 @@ test("native neutral jobs validate phase, provider, exact target and phase-speci
     { provider: "gemini", origin: "https://gemini.google.com", conversationId: "synthetic-neutral", tabId: 4,
       documentId: "synthetic-neutral", url: "https://gemini.google.com/app/synthetic-neutral?hl=en" },
     { provider: "databag", origin: "https://databag.example", conversationId: `databag_${"a".repeat(64)}`, tabId: 5,
-      documentId: "synthetic-neutral", url: "https://databag.example/#/session" }
+      documentId: "synthetic-neutral", url: "https://databag.example/#/session" },
+    { provider: "company_ai", origin: "https://chat.app.example.com", conversationId: `company_ai_${"a".repeat(64)}`, tabId: 6,
+      documentId: "synthetic-neutral", url: "https://chat.app.example.com/chat/synthetic" }
   ]) {
     for (const phase of ["fill", "proof", "submit", "settle"]) {
       const listing = { ...request, kind: "list_chat_jobs", payload: { phase, provider: target.provider } };
@@ -173,6 +175,13 @@ test("native agent roster and removal accept only bounded exact-target envelopes
       const message = { ...request, kind, payload };
       assert.deepEqual(parseNativeChatAgentRequest(message, now), message);
       if (target.provider === "company_ai") {
+        if (kind === "approve_chat_agent") {
+          const writable = { ...message, payload: { ...payload, send: true } };
+          assert.deepEqual(parseNativeChatAgentRequest(writable, now), writable);
+          for (const send of [false, "true", ["read", "send"]]) assert.throws(() => parseNativeChatAgentRequest({
+            ...message, payload: { ...payload, send } }, now), /Invalid native chat agent request/);
+        } else assert.throws(() => parseNativeChatAgentRequest({ ...message,
+          payload: { ...payload, send: true } }, now), /Invalid native chat agent request/);
         for (const suffix of ["?code=synthetic", "#access_token=synthetic", "?STATE=synthetic"]) {
           assert.throws(() => parseNativeChatAgentRequest({ ...message, payload: { ...payload,
             target: { ...target, url: `${target.url}${suffix}` } } }, now), /Invalid native chat agent request/);

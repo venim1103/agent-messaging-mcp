@@ -65,7 +65,7 @@ const autonomousConnection = z.strictObject({ requestId: z.uuid(), state: z.lite
   ? connection.conversationId === "fixture-alpha" && connection.capabilities.length === 2
   : connection.origin === "https://gemini.google.com" ? connection.capabilities.length === 2
     : /^company_ai_[a-f0-9]{64}$/.test(connection.conversationId)
-      ? isCompanyAIChatOrigin(connection.origin) && connection.capabilities.length === 1
+      ? isCompanyAIChatOrigin(connection.origin)
       : /^databag_[a-f0-9]{64}$/.test(connection.conversationId) && connection.capabilities.length === 2);
 
 const replySchema = z.discriminatedUnion("kind", [
@@ -404,6 +404,7 @@ const replySchema = z.discriminatedUnion("kind", [
     payload: z.strictObject({ operationId: z.uuid(), connectionId: z.uuid(), state: z.literal("prepared"),
       expiresAt: z.number().int().safe(), recoveryToken: z.string().regex(/^[0-9a-f]{64}$/),
       preview: z.union([geminiReview.shape.preview, geminiReview.shape.preview.extend({ target: z.literal("databag") }),
+        geminiReview.shape.preview.extend({ target: z.literal("company_ai") }),
         z.strictObject({ target: z.literal("fixture-alpha"),
         text: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES) })]) })
   }),
@@ -739,7 +740,8 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       disconnectChat: (target: ApprovedTarget) => request("disconnect_chat", { target }),
       beginChatReload: (target: ApprovedTarget) => request("begin_chat_reload", { target }),
       rebindChat: (previous: ApprovedTarget, target: ApprovedTarget) => request("rebind_chat", { previous, target }),
-      approveChatAgent: (target: ApprovedTarget, agentId: string) => request("approve_chat_agent", { target, agentId }),
+      approveChatAgent: (target: ApprovedTarget, agentId: string, send?: true) => request("approve_chat_agent", {
+        target, agentId, ...(send === true ? { send } : {}) }),
       waitForConnection: (timeoutMs = MAX_CONNECTION_WAIT_MS) => request("wait_for_connection", { timeoutMs }),
       requestConnection: () => request("request_connection", {}),
       getConnection: (requestId: string) => request("get_connection", { requestId }),
@@ -781,7 +783,7 @@ export async function connectBroker(role: BrokerRole, runtimeDirectory: string, 
       dispatchFixtureMessage: (operationId: string, checkId: string) => request("dispatch_fixture_message", { operationId, checkId }),
       commitFixtureMessage: (operationId: string) => request("commit_fixture_message", { operationId }),
       commitPreparedMessage: (operationId: string, deadlineMs?: number) => request("commit_prepared_message", { operationId }, deadlineMs),
-      listChatJobs: (phase: ChatJob["phase"], provider: "fixture" | "gemini" | "databag") => request("list_chat_jobs", { phase, provider }),
+      listChatJobs: (phase: ChatJob["phase"], provider: "fixture" | "gemini" | "databag" | "company_ai") => request("list_chat_jobs", { phase, provider }),
       completeChatJob: (target: ChatTarget, operationId: string, jobId: string, phase: ChatJob["phase"],
         observation: ChatJobObservation) => request("complete_chat_job", { target, operationId, jobId, phase, observation }),
       listFixtureDispatchAttempts: () => request("list_fixture_dispatch_attempts", {}),
