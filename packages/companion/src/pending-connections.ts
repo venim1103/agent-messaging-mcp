@@ -544,7 +544,7 @@ export class PendingConnectionRequests {
         || Object.keys(message).some((key) => !["direction", "text", "truncated", "generationState"].includes(key))
         || ("truncated" in message && message.truncated !== true)
         || ("generationState" in message && (!["streaming", "complete"].includes(message.generationState ?? "") || message.direction !== "incoming"))
-        || (target.provider === "company_ai" ? message.direction !== "unknown" || "generationState" in message
+        || (target.provider === "company_ai" ? !["incoming", "outgoing", "unknown"].includes(message.direction) || "generationState" in message
           : message.direction !== "incoming" && message.direction !== "outgoing")
         || typeof message.text !== "string" || !message.text || message.text.length > 16_000)
       || Buffer.byteLength(JSON.stringify({ messages, omittedBefore }), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {

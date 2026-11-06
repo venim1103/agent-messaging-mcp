@@ -80,10 +80,17 @@ test("native neutral observations validate provider, exact target, row model and
         target: { ...target, url: `${target.url}${provider === "databag" ? "?other" : "?code=synthetic"}` } } }, now));
     }
     if (provider === "company_ai") {
-      for (const direction of ["incoming", "outgoing"]) assert.throws(() => parseNativeChatObservationRequest({ ...publication,
-        payload: { ...publication.payload, messages: [{ ...messages[0], direction }] } }, now));
+      for (const direction of ["incoming", "outgoing", "unknown"]) {
+        const messages = [{ direction, text: "Synthetic role-labelled row" }];
+        assert.deepEqual(parseNativeChatObservationRequest({ ...publication,
+          payload: { ...publication.payload, messages } }, now).payload, { target, messages });
+        for (const generationState of ["unknown", "complete", "streaming"]) {
+          assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+            messages: [{ ...messages[0], generationState }] } }, now));
+        }
+      }
       assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
-        messages: [{ ...messages[0], generationState: "complete" }] } }, now));
+        messages: [{ ...messages[0], direction: "sideways" }] } }, now));
       assert.deepEqual(parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
         messages: [messages[0], messages[0]] } }, now).payload, { target, messages: [messages[0], messages[0]] });
       assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,

@@ -452,7 +452,7 @@ export function createCompanyAIChatIdentityBinding(input: CompanyDocumentInput):
   }
 }
 
-export type CompanyRenderedSnapshot = { messages: { direction: "unknown"; text: string; truncated?: true }[]; omittedBefore: true };
+export type CompanyRenderedSnapshot = { messages: { direction: "incoming" | "outgoing" | "unknown"; text: string; truncated?: true }[]; omittedBefore: true };
 
 export function createCompanyAIChatReadBinding(input: { expectedUrl: string; deadline: number }):
   { status: "ok"; conversationId: string; check: (deadline: number) => boolean;
@@ -509,6 +509,10 @@ export function createCompanyAIChatReadBinding(input: { expectedUrl: string; dea
         let visited = 0;
         for (const row of [...current.rows].reverse()) {
           if (!bytesLeft) break;
+          const classes = row.getAttribute("class") ?? "";
+          const roles = classes.length <= 256 ? new Set(classes.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()
+            .split(/[^a-z]+/).filter(token => token === "user" || token === "assistant")) : new Set<string>();
+          const direction = roles.size === 1 ? roles.has("user") ? "outgoing" : "incoming" : "unknown";
           let text = "";
           let truncated = false;
           const pending: { node: Node; depth: number }[] = [{ node: row, depth: 0 }];
@@ -540,7 +544,7 @@ export function createCompanyAIChatReadBinding(input: { expectedUrl: string; dea
             }
           }
           text = text.trim();
-          const cost = (value: string) => encoder.encode(JSON.stringify({ direction: "unknown", text: value,
+          const cost = (value: string) => encoder.encode(JSON.stringify({ direction, text: value,
             ...(truncated ? { truncated: true } : {}) })).length + (messages.length ? 1 : 0);
           if (cost(text) > bytesLeft) {
             truncated = true;
@@ -556,7 +560,7 @@ export function createCompanyAIChatReadBinding(input: { expectedUrl: string; dea
           }
           if (!text) continue;
           bytesLeft -= cost(text);
-          messages.unshift({ direction: "unknown", text, ...(truncated ? { truncated: true as const } : {}) });
+          messages.unshift({ direction, text, ...(truncated ? { truncated: true as const } : {}) });
         }
         return check(deadline) && messages.length ? { messages, omittedBefore: true } : null;
       } catch { return null; }

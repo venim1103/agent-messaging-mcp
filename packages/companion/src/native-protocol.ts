@@ -501,7 +501,7 @@ export const chatSnapshotPayloadSchema = z.union([
   geminiSnapshotSchema.shape.payload.refine(payload => isValidGeminiTarget(payload.target)),
   fixtureSnapshotSchema.shape.payload.extend({ target: databagTargetSchema }),
   geminiSnapshotSchema.shape.payload.extend({ target: companyAIChatTargetSchema,
-    messages: z.array(z.strictObject({ direction: z.literal("unknown"), text: z.string().min(1).max(16_000),
+    messages: z.array(z.strictObject({ direction: z.enum(["incoming", "outgoing", "unknown"]), text: z.string().min(1).max(16_000),
       truncated: z.literal(true).optional() })).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES) })
 ]).refine(payload => Buffer.byteLength(JSON.stringify({ messages: payload.messages,
   omittedBefore: payload.omittedBefore ?? false }), "utf8") <= MAX_FIXTURE_SNAPSHOT_BYTES

@@ -6,7 +6,7 @@ import { FIXTURE_READ_TIMEOUT_MS, GEMINI_READ_TIMEOUT_MS, MAX_FIXTURE_SNAPSHOT_A
   type FixtureMessage }
   from "./pending-connections.js";
 
-for (const provider of ["fixture", "gemini"]) {
+for (const provider of ["fixture", "gemini", "company_ai"]) {
   const messages = provider === "fixture"
     ? [{ id: "synthetic-reply", direction: "incoming" as const, text: "Synthetic reply" }]
     : [{ direction: "incoming" as const, text: "Synthetic reply", identityQuality: "uncertain" as const, generationState: "unknown" as const }];
@@ -42,6 +42,12 @@ for (const provider of ["fixture", "gemini"]) {
     assert.equal(observation.observe(snapshot(16001), 16000), null);
     assert.equal(observation.observe(snapshot(18000), 18000), null);
     assert.equal(observation.observe(snapshot(17000), 17000), null);
+    if (provider === "company_ai") {
+      assert.equal(observation.observe({ ...snapshot(20000), messages: [{ direction: "unknown", text: "Synthetic unlabelled row",
+        identityQuality: "uncertain", generationState: "unknown" }] }, 20000), null);
+      assert.equal(observation.observe(snapshot(22000), 22000), null);
+      assert.equal(observation.observe(snapshot(24000), 24000)?.generationState, "settled_heuristic");
+    }
   });
   if (provider === "gemini") test("Gemini streaming evidence resets quiet time even when text and cursor stay unchanged", () => {
     const observation = new ReplyObservation();
@@ -134,16 +140,22 @@ test("Company rendered reads are owner-bound and never enter stable-row getters"
     assert.deepEqual(requests.listGeminiReadChallenges(now), []);
     assert.deepEqual(requests.listChatReadChallenges("company_ai", now), [{ challengeId: challenge.challengeId,
       target, expiresAt: now + GEMINI_READ_TIMEOUT_MS }]);
-    const messages = [{ direction: "unknown" as const, text: "Synthetic Company reply" }];
-    assert.throws(() => requests.publishGeminiSnapshot(target, [{ ...messages[0]!, direction: "incoming" }], now));
-    assert.throws(() => requests.publishGeminiSnapshot(target, [{ ...messages[0]!, generationState: "complete" }], now));
+    const messages = [{ direction: "outgoing" as const, text: "Synthetic Company question" },
+      { direction: "incoming" as const, text: "Synthetic Company reply" },
+      { direction: "unknown" as const, text: "Synthetic unidentified row" }];
+    assert.throws(() => requests.publishGeminiSnapshot(target,
+      [{ ...messages[0]!, direction: "sideways" } as unknown as typeof messages[number]], now));
+    for (const message of messages) {
+      assert.throws(() => requests.publishGeminiSnapshot(target, [{ ...message, generationState: "complete" }], now));
+    }
     assert.equal(requests.publishGeminiSnapshot({ ...target, documentId: "foreign-document" }, messages,
       now + 1, challenge.challengeId), 0);
     assert.equal(requests.publishGeminiSnapshot(target, messages, now + 1, challenge.challengeId), 1);
     const snapshot = await challenge.result;
     assert.ok(snapshot && snapshot !== "not_ready");
     assert.equal(snapshot.coverage, "rendered_only");
-    assert.deepEqual(snapshot.messages, [{ ...messages[0], identityQuality: "uncertain", generationState: "unknown" }]);
+    assert.deepEqual(snapshot.messages, messages.map(message => ({ ...message,
+      identityQuality: "uncertain", generationState: "unknown" })));
     assert.equal(new ReplyObservation().observe(snapshot, now + 1), null);
     assert.equal(requests.getGeminiSnapshot(stranger, grant.connectionId, now + 1), null);
     assert.equal(requests.getGeminiSnapshot(owner, grant.connectionId, now + MAX_GEMINI_SNAPSHOT_AGE_MS + 2), "not_ready");

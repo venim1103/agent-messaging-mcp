@@ -653,7 +653,7 @@ test("Company AI Chat read targets are bounded, structural and text-free", { tim
   }
 });
 
-test("Company AI Chat read binding separates identity from bounded unknown-sender capture", { timeout: 15000 }, async testContext => {
+test("Company AI Chat read binding separates identity from bounded sender capture", { timeout: 15000 }, async testContext => {
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-company-read-binding-"));
   let browser;
   try {
@@ -707,17 +707,35 @@ test("Company AI Chat read binding separates identity from bounded unknown-sende
       const snapshot = binding.capture(deadline);
       const privateOutput = !JSON.stringify({ binding, snapshot }).includes("synthetic@example.test")
         && !JSON.stringify({ binding, snapshot }).includes("synthetic-chat");
+      const rows = [...timeline.children];
+      rows[0].className = "Invented_userMessage__alpha";
+      rows[1].className = "Invented_assistantMessage__beta";
+      const senderMapping = binding.capture(deadline).messages.map(message => message.direction);
+      rows[0].className += " Invented_assistantMessage__gamma";
+      const ambiguousSenderUnknown = binding.capture(deadline).messages[0].direction === "unknown";
+      rows[0].removeAttribute("class"); rows[1].removeAttribute("class");
+      const spoof = document.createElement("code"); spoof.className = "assistant"; rows[0].append(spoof);
+      const descendantSenderIgnored = binding.capture(deadline).messages[0].direction === "unknown";
+      spoof.remove();
+      rows[0].className = "superuser assistantish";
+      const partialTokenIgnored = binding.capture(deadline).messages[0].direction === "unknown";
+      rows[0].className = `${"x".repeat(257)} user`;
+      const oversizedClassIgnored = binding.capture(deadline).messages[0].direction === "unknown";
+      rows[0].removeAttribute("class");
       source.memoizedProps.conversationId = "synthetic-other";
       const terminal = !binding.check(deadline);
       const reads = messageReads;
       const refusedCapture = binding.capture(deadline) === null && messageReads === reads;
       binding.dispose();
       return { status: binding.status, identityReadFree, initialCheck, checkReadFree, snapshot, privateOutput,
+        senderMapping, ambiguousSenderUnknown, descendantSenderIgnored, partialTokenIgnored, oversizedClassIgnored,
         terminal, refusedCapture, draftReads, inputs, activations };
     });
     assert.deepEqual(result, { status: "ok", identityReadFree: true, initialCheck: true, checkReadFree: true,
       snapshot: { messages: [{ direction: "unknown", text: "Synthetic first row" }, { direction: "unknown", text: "Synthetic second row" }],
-        omittedBefore: true }, privateOutput: true, terminal: true, refusedCapture: true, draftReads: 0, inputs: 0, activations: 0 });
+        omittedBefore: true }, privateOutput: true, senderMapping: ["outgoing", "incoming"], ambiguousSenderUnknown: true,
+      descendantSenderIgnored: true, partialTokenIgnored: true, oversizedClassIgnored: true,
+      terminal: true, refusedCapture: true, draftReads: 0, inputs: 0, activations: 0 });
       await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-chat"; });
       const request = { action: "bind", url: page.url(), deadline: Date.now() + 4000 };
       const bound = await page.evaluate(invokeCompanyAIChatReader, request);
@@ -3227,12 +3245,19 @@ for (const scenario of ["identity", "reload", "read-gap"]) test(`Company popup c
     const state = await clients[0].callTool({ name: "chat_get_connection", arguments: { requestId: connection.requestId } });
     assert.equal(state.isError, undefined);
     assert.deepEqual(state.structuredContent.capabilities, ["read"]);
+    await page.evaluate(() => {
+      const rows = document.querySelector('[role="log"]').children;
+      rows[0].className = "Invented_userMessage__alpha";
+      rows[1].className = "Invented_assistantMessage__beta";
+    });
     const snapshot = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
     assert.equal(snapshot.isError, undefined);
     assert.equal(snapshot.structuredContent.coverage, "rendered_only");
     assert.equal(snapshot.structuredContent.omittedBefore, true);
-    assert.deepEqual(snapshot.structuredContent.messages, ["Synthetic first row", "Synthetic second row"].map(text =>
-      ({ direction: "unknown", text, identityQuality: "uncertain", generationState: "unknown" })));
+    assert.deepEqual(snapshot.structuredContent.messages, [
+      { direction: "outgoing", text: "Synthetic first row", identityQuality: "uncertain", generationState: "unknown" },
+      { direction: "incoming", text: "Synthetic second row", identityQuality: "uncertain", generationState: "unknown" }
+    ]);
     const sending = await clients[0].callTool({ name: "chat_send_message", arguments: { connectionId: connection.connectionId,
       text: "Synthetic unsupported send", idempotencyKey: crypto.randomUUID() } });
     assert.equal(sending.structuredContent.state, "not_sent");

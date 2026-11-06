@@ -120,7 +120,8 @@ for (const provider of ["databag", "company_ai"] as const) test(`${provider} neu
   assert.ok(read && read !== "busy");
   const list = { ...envelope, kind: "list_chat_read_challenges", payload: { provider } };
   const messages = provider === "databag" ? [{ id: "synthetic-row", direction: "incoming", text: "Synthetic reply" }]
-    : [{ direction: "unknown", text: "Synthetic reply" }];
+    : [{ direction: "outgoing", text: "Synthetic question" }, { direction: "incoming", text: "Synthetic reply" },
+      { direction: "unknown", text: "Synthetic unidentified row" }];
   const publish = { ...envelope, kind: "publish_chat_snapshot", payload: { target,
     messages, challengeId: read.challengeId } };
   const gap = { ...envelope, kind: "mark_chat_observation_gap", payload: { target } };
