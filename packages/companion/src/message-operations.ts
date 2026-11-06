@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as z from "zod/v4";
 import { MAX_RETURNED_EVENTS } from "./observation-buffer.js";
-import { isCompanyAIChatOrigin, isCompanyAIChatTargetUrl, isDatabagOrigin, isGeminiTarget, isStableDomTarget, targetProvider, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_GEMINI_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget, type StableDomTarget,
+import { isCompanyAIChatOrigin, isCompanyAIChatTargetUrl, isDatabagOrigin, isGeminiTarget, isStableDomTarget, targetProvider, MAX_FIXTURE_SNAPSHOT_MESSAGES, MAX_RENDERED_SNAPSHOT_MESSAGES, PendingConnectionRequests, type ApprovedTarget, type FixtureTarget, type GeminiTarget, type StableDomTarget,
   type CompanyAIChatTarget, type FixtureSnapshot, type GeminiSnapshot } from "./pending-connections.js";
 
 type RenderedChatTarget = GeminiTarget | CompanyAIChatTarget;
@@ -169,6 +169,59 @@ const geminiObservationSchema = z.strictObject({
     truncated: z.literal(true).optional(), identityQuality: z.literal("uncertain"), generationState: z.enum(["unknown", "streaming", "complete"])
   }).refine(message => message.direction === "incoming" || message.generationState === "unknown")).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
 });
+
+const renderedChatModes = {
+  gemini: { editor: "contenteditable", fill: geminiFillResultSchema, proof: geminiDispatchCheckResultSchema,
+    submit: geminiDispatchResultSchema, sendEvidence: "exact_append" },
+  company_ai: { editor: "textarea", fill: fixtureFillResultSchema, proof: fixtureDispatchCheckResultSchema,
+    submit: fixtureDispatchResultSchema, sendEvidence: "unavailable" }
+} as const;
+
+function renderedChatMode(target: RenderedChatTarget) {
+  return target.provider === "company_ai" ? renderedChatModes.company_ai : renderedChatModes.gemini;
+}
+
+type RenderedDispatchCapture = Readonly<{
+  omittedBefore: boolean;
+  messages: ReadonlyArray<Readonly<{ direction: "incoming" | "outgoing" | "unknown"; text: string; truncated?: true }>>;
+}>;
+
+export function evaluateRenderedDispatchAppend(baseline: RenderedDispatchCapture,
+  captures: ReadonlyArray<RenderedDispatchCapture>, text: string): "sent" | "unchanged" | "ambiguous" | null {
+  if (!captures.length) return null;
+  if (baseline.messages.some(message => message.truncated || message.direction === "unknown")) return "ambiguous";
+  let appended = false;
+  let droppedRows = 0;
+  for (const capture of captures) {
+    if (capture.messages.some(message => message.truncated || message.direction === "unknown")) return "ambiguous";
+    let offset = 0;
+    if (baseline.omittedBefore || capture.omittedBefore) {
+      if (baseline.messages.length !== MAX_RENDERED_SNAPSHOT_MESSAGES
+        || capture.messages.length !== MAX_RENDERED_SNAPSHOT_MESSAGES || !capture.omittedBefore) return "ambiguous";
+      const offsets = baseline.messages.flatMap((_, start) => baseline.messages.slice(start).every((message, index) =>
+        message.direction === capture.messages[index]?.direction && message.text === capture.messages[index]?.text)
+        ? [start] : []);
+      const matched = offsets[0];
+      if (offsets.length !== 1 || matched === undefined || matched > 2 || matched < droppedRows
+        || (matched === 0 && !baseline.omittedBefore)) return "ambiguous";
+      offset = matched;
+    } else if (droppedRows > 0 || baseline.messages.some((message, index) =>
+      message.direction !== capture.messages[index]?.direction || message.text !== capture.messages[index]?.text)) {
+      return "ambiguous";
+    }
+    droppedRows = offset;
+    const added = capture.messages.slice(baseline.messages.length - offset);
+    if (!added.length) {
+      if (appended) return "ambiguous";
+      continue;
+    }
+    if (added[0]?.direction !== "outgoing" || added[0].text !== text
+      || added.slice(1).some(message => message.direction !== "incoming")) return "ambiguous";
+    appended = true;
+  }
+  if (!appended && (baseline.omittedBefore || captures.at(-1)!.omittedBefore)) return null;
+  return appended ? "sent" : "unchanged";
+}
 
 export function openPrivateOperationDatabase(directory: string): DatabaseSync {
   const owner = process.getuid?.();
@@ -1015,11 +1068,12 @@ export class PreparedMessageOperations {
   }
 
   completeGeminiFill(target: RenderedChatTarget, attemptId: string, observation: GeminiFillResult | FixtureFillResult, now = Date.now()): boolean {
-    const parsed = (target.provider === "company_ai" ? fixtureFillResultSchema : geminiFillResultSchema).safeParse(observation);
+    const mode = renderedChatMode(target);
+    const parsed = mode.fill.safeParse(observation);
     this.discardExpired(now);
     const pending = this.geminiFillChecks.get(attemptId);
     if (!parsed.success || !pending?.issued || !this.sameGeminiTarget(pending.target, target)
-      || (target.provider === "company_ai" && parsed.data.ok && parsed.data.editor !== "textarea")) return false;
+      || (parsed.data.ok && parsed.data.editor !== mode.editor)) return false;
     this.finishGeminiFillCheck(attemptId, { ...parsed.data, operationId: pending.operationId, completedAt: now });
     return true;
   }
@@ -1488,10 +1542,11 @@ export class PreparedMessageOperations {
     observation: GeminiDispatchCheckResult | FixtureDispatchCheckResult, now = Date.now()): boolean {
     this.discardExpired(now);
     const check = this.geminiDispatchChecks.get(operationId);
-    const parsed = (target.provider === "company_ai" ? fixtureDispatchCheckResultSchema : geminiDispatchCheckResultSchema).safeParse(observation);
+    const mode = renderedChatMode(target);
+    const parsed = mode.proof.safeParse(observation);
     if (!check || check.checkId !== checkId || !check.issued || check.checkedAt !== null || !parsed.success
       || !this.sameGeminiTarget(check.target, target)
-      || (target.provider === "company_ai" && parsed.data.ok && parsed.data.editor !== "textarea")) return false;
+      || (parsed.data.ok && parsed.data.editor !== mode.editor)) return false;
     if (!parsed.data.ok || parsed.data.draftText !== check.text || !this.freshGeminiDispatchCheck(operationId, check, now)) {
       this.discardGeminiDispatchCheck(operationId);
       return false;
@@ -1784,9 +1839,10 @@ export class PreparedMessageOperations {
     observation: GeminiDispatchResult | FixtureDispatchResult, now = Date.now()): boolean {
     this.discardExpired(now);
     const pending = this.geminiDispatchJobs.get(operationId);
+    const mode = renderedChatMode(target);
     if (!pending || !pending.issued || attemptId !== operationId || !this.sameGeminiTarget(pending.target, target)
-      || !(target.provider === "company_ai" ? fixtureDispatchResultSchema : geminiDispatchResultSchema).safeParse(observation).success
-      || (target.provider === "company_ai" && observation.ok && observation.editor !== "textarea")) return false;
+      || !mode.submit.safeParse(observation).success
+      || (observation.ok && observation.editor !== mode.editor)) return false;
     if (!this.freshGeminiDispatch(pending, now)) {
       this.finishGeminiDispatch(operationId);
       return false;
@@ -1796,13 +1852,13 @@ export class PreparedMessageOperations {
     return true;
   }
 
-  private geminiDispatchEvidence(owner: symbol, operationId: string, now: number) {
+  private renderedDispatchEvidence(owner: symbol, operationId: string, now: number) {
     const operation = this.geminiContents.get(operationId);
-    if (operation?.target.provider === "company_ai") return null;
+    if (!operation || renderedChatMode(operation.target).sendEvidence !== "exact_append") return null;
     const baseline = this.geminiDispatchBaselines.get(operationId);
-    const live = operation && this.requests.getGeminiTarget(owner, operation.connectionId, now);
+    const live = this.requests.getRenderedTarget(owner, operation.connectionId, now);
     const status = this.dispatchStatus(operationId);
-    if (!operation || operation.owner !== owner || !baseline
+    if (operation.owner !== owner || !baseline
       || baseline.messages.some(message => message.truncated) || !live || !this.sameGeminiTarget(operation.target, live)
       || status?.state !== "dispatch_uncertain" || this.ambiguousEvidence.has(operationId)) return null;
     const snapshot = this.requests.getGeminiSnapshot(owner, operation.connectionId, now);
@@ -1812,60 +1868,24 @@ export class PreparedMessageOperations {
     const events = this.requests.readGeminiEvents(owner, operation.connectionId, baseline.cursor, MAX_RETURNED_EVENTS, now);
     if (!events || events === "not_ready" || events.state !== "ok"
       || events.cursor.sequence !== snapshot.cursor.sequence) return null;
-    let appended = false;
-    let droppedRows = 0;
+    const captures: RenderedDispatchCapture[] = [];
     for (const capture of [...events.events.map(event => geminiObservationSchema.safeParse(event.payload)),
       geminiObservationSchema.safeParse({ kind: "gemini_snapshot", omittedBefore: snapshot.omittedBefore, messages: snapshot.messages })]) {
-      if (!capture.success || capture.data.messages.some(message => message.truncated)) {
+      if (!capture.success) {
         this.ambiguousEvidence.add(operationId);
         return null;
       }
-      let offset = 0;
-      if (baseline.omittedBefore || capture.data.omittedBefore) {
-        if (baseline.messages.length !== MAX_GEMINI_SNAPSHOT_MESSAGES
-          || capture.data.messages.length !== MAX_GEMINI_SNAPSHOT_MESSAGES || !capture.data.omittedBefore) {
-          this.ambiguousEvidence.add(operationId);
-          return null;
-        }
-        const offsets = baseline.messages.flatMap((_, start) => baseline.messages.slice(start).every((message, index) =>
-          message.direction === capture.data.messages[index]?.direction && message.text === capture.data.messages[index]?.text)
-          ? [start] : []);
-        const matched = offsets[0];
-        if (offsets.length !== 1 || matched === undefined || matched > 2 || matched < droppedRows
-          || (matched === 0 && !baseline.omittedBefore)) {
-          this.ambiguousEvidence.add(operationId);
-          return null;
-        }
-        offset = matched;
-      } else if (droppedRows > 0 || baseline.messages.some((message, index) =>
-        message.direction !== capture.data.messages[index]?.direction || message.text !== capture.data.messages[index]?.text)) {
-        this.ambiguousEvidence.add(operationId);
-        return null;
-      }
-      droppedRows = offset;
-      const added = capture.data.messages.slice(baseline.messages.length - offset);
-      if (!added.length) {
-        if (appended) {
-          this.ambiguousEvidence.add(operationId);
-          return null;
-        }
-        continue;
-      }
-      if (added[0]?.direction !== "outgoing" || added[0].text !== operation.text
-        || added.slice(1).some(message => message.direction !== "incoming")) {
-        this.ambiguousEvidence.add(operationId);
-        return null;
-      }
-      appended = true;
+      captures.push(capture.data);
     }
-    if (!appended && (baseline.omittedBefore || snapshot.omittedBefore)) return null;
-    return Object.freeze({ outcome: appended ? "sent" as const : "unchanged" as const, observedAt: snapshot.capturedAt });
+    const outcome = evaluateRenderedDispatchAppend(baseline, captures, operation.text);
+    if (outcome === "ambiguous") this.ambiguousEvidence.add(operationId);
+    return outcome === "sent" || outcome === "unchanged" ? Object.freeze({ outcome, observedAt: snapshot.capturedAt }) : null;
   }
 
   reconcileGeminiObservation(owner: symbol, operationId: string, now = Date.now()) {
     const status = this.getOperation(owner, operationId, now);
     if (status.state !== "dispatch_uncertain") return status;
-    const evidence = this.geminiDispatchEvidence(owner, operationId, now);
+    const evidence = this.renderedDispatchEvidence(owner, operationId, now);
     if (evidence?.outcome !== "sent") return status;
     this.database.prepare(`INSERT INTO message_dispatch_resolutions (operation_id, resolved_at, outcome, source)
       VALUES (?, ?, 'sent', 'page') ON CONFLICT (operation_id) DO NOTHING`).run(operationId, evidence.observedAt);
@@ -1975,7 +1995,7 @@ export class PreparedMessageOperations {
             ? this.reconcileGeminiObservation(owner, operationId, now) : this.reconcileFixtureObservation(owner, operationId, now);
           if (evidenced.state === "observed_in_ui" || evidenced.state === "resolved") return evidenced;
           const unchangedAt = authorization.target.origin === "https://gemini.google.com"
-            ? this.geminiDispatchEvidence(owner, operationId, now) : this.fixtureUnchangedDispatchEvidence(owner, operationId, now);
+            ? this.renderedDispatchEvidence(owner, operationId, now) : this.fixtureUnchangedDispatchEvidence(owner, operationId, now);
           if (unchangedAt?.outcome === "unchanged" && unchangedAt.observedAt >= terminal.completedAt) {
             this.database.prepare(`INSERT INTO message_dispatch_resolutions (operation_id, resolved_at, outcome, source)
               VALUES (?, ?, 'not_sent', 'page') ON CONFLICT (operation_id) DO NOTHING`).run(operationId, unchangedAt.observedAt);
@@ -2168,7 +2188,7 @@ export class PreparedMessageOperations {
   completeChatSubmitJob(target: ApprovedTarget, operationId: string, jobId: string,
     observation: FixtureDispatchResult | GeminiDispatchResult, now = Date.now()) {
     if (isGeminiTarget(target) || target.provider === "company_ai") {
-      const parsed = (target.provider === "company_ai" ? fixtureDispatchResultSchema : geminiDispatchResultSchema).safeParse(observation);
+      const parsed = renderedChatMode(target).submit.safeParse(observation);
       return parsed.success && this.completeGeminiDispatch(target, operationId, jobId, parsed.data, now);
     }
     if (!isStableDomTarget(target)) return false;

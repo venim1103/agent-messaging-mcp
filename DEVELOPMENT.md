@@ -207,6 +207,14 @@ Owned `chat_disconnect` bypasses an in-flight read/send in both private client a
 
 Shared supervised/autonomous commit and fixture dispatch execution end 25 ms before the original broker reply deadline, retaining the existing response reserve. Browser leases are clipped to that earlier execution deadline; wire deadlines, uncertainty/no-retry handling and grant authority do not change.
 
+### Shared Chat Operation Core (D61)
+
+- Chat modes share trusted approval, composer serialization, original deadlines, durable intent, one-offer jobs, status-only replay and settlement. Site adapters supply reviewed identity, DOM/input behavior and supported evidence, never approval. Stable-ID evidence and rendered-only evidence retain their necessary distinction.
+- Rendered Gemini/Company operation handlers use one `renderedChatModes` descriptor in [message operations](packages/companion/src/message-operations.ts) for native editor, fill/proof/submit schema and supported send evidence. Adding an editor or adapter is not permission to copy a private command family, grant send access or assume confirmation support. Existing public/native wire contracts and legacy exports are preserved.
+- The same module's pure `evaluateRenderedDispatchAppend` checks normalized capture direction/text/truncation/coverage, exact unique append and conservative 32-row rollover. Ownership, current target/document, durable attempt, freshness, cursor continuity and sticky ambiguity checks remain in the shared ledger. Unknown roles, duplicates, changed retained rows, truncation and unsupported omissions refuse evidence. This is page observation, not provider delivery.
+- Gemini keeps its existing automatic positive evidence. Company declares it unavailable: current captures always mark earlier content omitted and do not establish equivalent outgoing-window coverage or explicit completion. Generic refactoring does not enable its automatic confirmation, upgrade a grant or resolve older attempts. Installed calibration/multi-turn acceptance need a separate bounded scope; native click, cleared composer and incoming reply alone are insufficient.
+- Focus the core with `npm run build:companion && node --test packages/companion/dist/message-operations.test.js`; use the exact full gate in [AGENTS.md](AGENTS.md#verification-and-commits) before a source checkpoint. The same existing tests cover neutral repeated turns, unknown/partial/duplicate evidence, all modes' ledger/writer isolation and no-replay safeguards. No live/browser restart is part of this source check.
+
 ### Company AI Chat diagnostic
 
 Hosts shaped like `https://chat.app.example.com/` are recognized for the shared **Inspect this chat** diagnostic. Recognition adds no host permission or chat authority. After agreeing a bounded installed diagnostic scope, inspect the selected tab once through the trusted toolbar using temporary `activeTab` access. Connection requires the separate exact-origin setup below.

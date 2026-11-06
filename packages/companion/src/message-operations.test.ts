@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { AutonomousCommitFailure, MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
+import { AutonomousCommitFailure, evaluateRenderedDispatchAppend, MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
   MAX_PREPARED_REVIEWS, MAX_RECORDED_PREPARED_MESSAGES, openPrivateOperationDatabase, PreparedMessageOperations,
   PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS, FIXTURE_REVIEW_APPROVAL_TTL_MS,
   FIXTURE_PREFLIGHT_TIMEOUT_MS, FIXTURE_FILL_TIMEOUT_MS, MAX_PENDING_FIXTURE_PREFLIGHTS, MAX_PENDING_FIXTURE_DISPATCH_CHECKS,
@@ -15,6 +15,33 @@ import { AutonomousCommitFailure, MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MES
   geminiDispatchCheckResultSchema, geminiDispatchResultSchema, chatJobSchema, chatJobCompletionSchema }
   from "./message-operations.js";
 import { isGeminiTarget, PendingConnectionRequests, type FixtureSnapshot, type FixtureTarget, type GeminiTarget } from "./pending-connections.js";
+
+test("Rendered dispatch append policy is provider-neutral and preserves ambiguity across turns", () => {
+  const baseline = { omittedBefore: false, messages: [{ direction: "incoming" as const, text: "Synthetic previous reply" }] };
+  const outgoing = { direction: "outgoing" as const, text: "Synthetic first request" };
+  const first = { omittedBefore: false, messages: [...baseline.messages, outgoing,
+    { direction: "incoming" as const, text: "Synthetic first answer" }] };
+  const nextOutgoing = { direction: "outgoing" as const, text: "Synthetic second request" };
+  const second = { omittedBefore: false, messages: [...first.messages, nextOutgoing,
+    { direction: "incoming" as const, text: "Synthetic second answer" }] };
+  const before = JSON.stringify([baseline, first, second]);
+  assert.equal(evaluateRenderedDispatchAppend(baseline, [first], outgoing.text), "sent");
+  assert.equal(evaluateRenderedDispatchAppend(first, [second], nextOutgoing.text), "sent");
+  assert.equal(evaluateRenderedDispatchAppend(first, [first], outgoing.text), "unchanged");
+  assert.equal(evaluateRenderedDispatchAppend(baseline, [], outgoing.text), null);
+  for (const capture of [
+    { ...first, omittedBefore: true },
+    { ...first, messages: [...baseline.messages, { ...outgoing, direction: "unknown" as const }] },
+    { ...first, messages: [...baseline.messages, { ...outgoing, truncated: true as const }] },
+    { ...first, messages: [...baseline.messages, outgoing, outgoing] },
+    { ...first, messages: [...baseline.messages, { direction: "incoming" as const, text: outgoing.text }] }
+  ]) assert.equal(evaluateRenderedDispatchAppend(baseline, [capture], outgoing.text), "ambiguous");
+  assert.equal(evaluateRenderedDispatchAppend({ ...baseline, omittedBefore: true }, [first], outgoing.text), "ambiguous");
+  assert.equal(evaluateRenderedDispatchAppend({ ...baseline,
+    messages: [{ ...baseline.messages[0]!, direction: "unknown" }] }, [first], outgoing.text), "ambiguous");
+  assert.equal(evaluateRenderedDispatchAppend(baseline, [first, baseline], outgoing.text), "ambiguous");
+  assert.equal(JSON.stringify([baseline, first, second]), before);
+});
 
 test("Company admission does not enable legacy message operations or allocate durable intent", () => {
   const requests = new PendingConnectionRequests();
