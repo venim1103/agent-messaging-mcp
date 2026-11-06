@@ -43,6 +43,10 @@ export function installCompanyAIChatReader(origins: readonly string[]): boolean 
       return null;
     }
     if (!binding?.check(input.deadline)) return null;
+    if (input.action === "bind") {
+      window.addEventListener("agent-company-identity-v1", receive, true);
+      window.addEventListener("pagehide", pageHidden, { once: true });
+    }
     const snapshot = input.action === "capture" ? binding.capture(input.deadline) : undefined;
     if (input.action === "capture" && !snapshot) return null;
     return { url: input.url, conversationId: binding.conversationId, ...(snapshot ? { snapshot } : {}) };
@@ -65,8 +69,9 @@ export function installCompanyAIChatReader(origins: readonly string[]): boolean 
         detail: JSON.stringify({ nonce, valid: valid === true }) }));
     } catch {}
   };
+  const pageHidden = () => window.removeEventListener("agent-company-identity-v1", receive, true);
   window.addEventListener("agent-company-identity-v1", receive, true);
-  window.addEventListener("pagehide", () => window.removeEventListener("agent-company-identity-v1", receive, true), { once: true });
+  window.addEventListener("pagehide", pageHidden, { once: true });
   return true;
 }
 

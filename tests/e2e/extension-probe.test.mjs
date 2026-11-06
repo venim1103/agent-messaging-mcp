@@ -811,7 +811,7 @@ test("Company AI Chat read binding separates identity from bounded sender captur
       const bound = await page.evaluate(invokeCompanyAIChatReader, request);
       assert.ok(bound && /^company_ai_v2_[a-f0-9]{64}$/.test(bound.conversationId));
       assert.equal(bound.snapshot, undefined);
-      const bridge = await page.evaluate(({ conversationId }) => {
+      const probeBridge = ({ conversationId }) => {
         const editor = document.querySelector("textarea");
         const check = (target, id, deadline) => {
           const nonce = crypto.randomUUID(); let valid = false; let received = 0;
@@ -832,7 +832,8 @@ test("Company AI Chat read binding separates identity from bounded sender captur
         const otherEditorRefused = !check(clone, conversationId, Date.now() + 4000);
         clone.remove();
         return { matched, foreignRefused, expiredRefused, otherEditorRefused };
-      }, bound);
+      };
+      const bridge = await page.evaluate(probeBridge, bound);
       assert.deepEqual(bridge, { matched: true, foreignRefused: true, expiredRefused: true, otherEditorRefused: true });
       const checking = { ...request, action: "check", conversationId: bound.conversationId };
       assert.deepEqual(await page.evaluate(invokeCompanyAIChatReader, checking), bound);
@@ -874,10 +875,23 @@ test("Company AI Chat read binding separates identity from bounded sender captur
         } finally { timeline.replaceChildren(...original); }
       });
       assert.deepEqual(bounds, { charactersBounded: true, bytesBounded: true, bytesTruncated: true, nodesRefused: true, terminal: true });
+      assert.equal(await page.evaluate(invokeCompanyAIChatReader, { ...checking, deadline: Date.now() + 4000 }), null);
+      assert.deepEqual(await page.evaluate(probeBridge, bound),
+        { matched: false, foreignRefused: true, expiredRefused: true, otherEditorRefused: true });
+      const sameChatRebound = await page.evaluate(invokeCompanyAIChatReader, { ...request, deadline: Date.now() + 4000 });
+      assert.deepEqual(sameChatRebound, bound);
+      assert.deepEqual(await page.evaluate(probeBridge, sameChatRebound),
+        { matched: true, foreignRefused: true, expiredRefused: true, otherEditorRefused: true });
       assert.equal(await page.evaluate(invokeCompanyAIChatReader, { ...checking, conversationId: `company_ai_v2_${"f".repeat(64)}` }), null);
+      await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
       await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-other"; });
       assert.equal(await page.evaluate(invokeCompanyAIChatReader, checking), null);
       assert.equal(await page.evaluate(invokeCompanyAIChatReader, { ...checking, action: "capture" }), null);
+      const rebound = await page.evaluate(invokeCompanyAIChatReader, { ...request, deadline: Date.now() + 4000 });
+      assert.ok(rebound && rebound.conversationId !== bound.conversationId);
+      assert.equal(rebound.snapshot, undefined);
+      assert.deepEqual(await page.evaluate(probeBridge, rebound),
+        { matched: true, foreignRefused: true, expiredRefused: true, otherEditorRefused: true });
       for (const property of ["version", "origin", "request"]) {
         const poisonedPage = await browser.newPage();
         try {
