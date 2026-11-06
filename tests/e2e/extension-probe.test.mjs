@@ -2873,7 +2873,7 @@ test("trusted fixture popup separates consent from one-shot exact-document draft
 });
 
 for (const provider of ["fixture", "gemini"]) {
-  test(`${provider} trusted popup resolves uncertainty without composer or authority changes`, { timeout: 20000 }, async (testContext) => {
+  for (const diagnostic of [false, true]) test(`${provider} trusted popup ${diagnostic ? "reports unresolved guard" : "resolves uncertainty"} without composer or authority changes`, { timeout: 20000 }, async (testContext) => {
     const setPhase = trackTestPhase(testContext, `${provider} uncertainty resolution`);
     const profile = await mkdtemp(join(tmpdir(), "agent-messaging-resolution-popup-"));
     const nativeEnvironment = { ...process.env, HOME: profile, NODE_COMPILE_CACHE: join(profile, "compile-cache") };
@@ -2906,9 +2906,14 @@ for (const provider of ["fixture", "gemini"]) {
               globalThis.holdResolutionListing = false;
               globalThis.releaseResolutionListing = () => listener(reply);
             } else {
-              const payload = reply.kind === "unconfirmed_dispatches" && globalThis.syntheticResolutionPreview !== undefined
+              let payload = reply.kind === "unconfirmed_dispatches" && globalThis.syntheticResolutionPreview !== undefined
                 ? { ...reply.payload, attempts: reply.payload.attempts.map((attempt, index) => index === 0
                   ? { ...attempt, messageText: globalThis.syntheticResolutionPreview } : attempt) } : reply.payload;
+              if (reply.kind === "unconfirmed_dispatches" && globalThis.syntheticUnresolvedGuard !== undefined) {
+                payload = { ...payload };
+                if (globalThis.syntheticUnresolvedGuard === "missing") delete payload.blockedByUnresolvedDispatch;
+                else payload.blockedByUnresolvedDispatch = globalThis.syntheticUnresolvedGuard;
+              }
               listener({ ...reply, payload: reply.kind === "unconfirmed_dispatches" && globalThis.malformedResolutionListing
                 ? { ...payload, retryAllowed: true } : payload });
             }
@@ -2943,11 +2948,12 @@ for (const provider of ["fixture", "gemini"]) {
         VALUES (?, 'synthetic-owner', 'synthetic-connection', ?, ?, ?, ?, 'awaiting_approval')`);
       const insert = journal.prepare(`INSERT INTO message_dispatch_attempts (operation_id, started_at, conversation_key, correlation_version, state)
         VALUES (?, ?, ?, 1, 'unknown')`);
-      operationIds.forEach((operationId, index) => {
+      const seedAttempt = (operationId, index) => {
         prepare.run(operationId, crypto.randomUUID(), "0".repeat(64), "1".repeat(64), startedAt);
         insert.run(operationId, index === 3 ? Date.now() + 60000 : startedAt,
           digest(index === 2 ? `${conversationId}-other` : conversationId));
-      });
+      };
+      if (!diagnostic) operationIds.forEach(seedAttempt);
       const page = await context.newPage();
       const url = provider === "fixture" ? `${origin}/` : `${origin}/app/${conversationId}`;
       const html = provider === "fixture" ? await readFile(fileURLToPath(new URL("../fixtures/chat.html", import.meta.url)), "utf8")
@@ -2980,11 +2986,50 @@ for (const provider of ["fixture", "gemini"]) {
       };
       await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Not checked",
         undefined, { timeout: 4000 });
+      if (diagnostic) {
+        await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
+        await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "No applicable unresolved attempts",
+          undefined, { timeout: 4000 });
+        assert.equal(await popup.locator("#unconfirmed-list li").count(), 0);
+        assert.equal(await popup.locator("#unconfirmed-status").evaluate(element => element.scrollWidth <= element.clientWidth), true);
+        seedAttempt(operationIds[2], 2);
+        seedAttempt(operationIds[3], 3);
+        await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
+        await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Sending paused: no reviewable attempt",
+          undefined, { timeout: 4000 });
+        assert.equal(await popup.locator("#unconfirmed-list li").count(), 0);
+        assert.equal(await popup.locator("#unconfirmed-status").evaluate(element => element.scrollWidth <= element.clientWidth), true);
+        await popup.locator("main").screenshot({ path: join(tmpdir(), `agent-messaging-${provider}-guard-diagnostics.png`) });
+        seedAttempt(operationIds[0], 0);
+        seedAttempt(operationIds[1], 1);
+      }
       await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
       await popup.waitForFunction(() => document.querySelectorAll("#unconfirmed-list li[data-operation-id]").length === 2,
         undefined, { timeout: 4000 });
       assert.deepEqual(await popup.locator("#unconfirmed-list pre").allTextContents(),
         ["Message text unavailable", "Message text unavailable"]);
+      if (diagnostic) {
+        const storageBefore = await worker.evaluate(() => chrome.storage.session.get(null));
+        const attemptsBefore = journal.prepare("SELECT * FROM message_dispatch_attempts").all();
+        for (const malformed of ["missing", null, 37, "false", false]) {
+          await worker.evaluate(value => { globalThis.syntheticUnresolvedGuard = value; }, malformed);
+          await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
+          await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Unavailable",
+            undefined, { timeout: 4000 });
+          assert.equal(await popup.locator("#unconfirmed-list li").count(), 0);
+        }
+        await worker.evaluate(() => { globalThis.syntheticUnresolvedGuard = undefined; });
+        await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
+        await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Sending paused",
+          undefined, { timeout: 4000 });
+        assert.equal(await popup.locator("#unconfirmed-list li").count(), 2);
+        assert.equal(journal.prepare("SELECT COUNT(*) AS count FROM message_dispatch_resolutions").get().count, 0);
+        assert.deepEqual(journal.prepare("SELECT * FROM message_dispatch_attempts").all(), attemptsBefore);
+        assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), storageBefore);
+        assert.equal(await editor.evaluate(element => element.value ?? element.textContent), "A person's synthetic unsent draft");
+        assert.deepEqual(await page.evaluate(() => globalThis.resolutionEvents), { input: 0, click: 0, submit: 0 });
+        return;
+      }
       for (const malformed of [37, "", "x".repeat(4001), "\u{1f600}".repeat(1001)]) {
         await worker.evaluate(value => { globalThis.syntheticResolutionPreview = value; }, malformed);
         await activateControl(popup.getByRole("button", { name: "Refresh status", exact: true }));
@@ -3037,7 +3082,7 @@ for (const provider of ["fixture", "gemini"]) {
         assert.equal(replay.ok, true);
         assert.deepEqual(journal.prepare("SELECT outcome, source, resolved_at FROM message_dispatch_resolutions WHERE operation_id = ?").get(operationIds[index]), resolution);
       }
-      assert.equal(await popup.locator("#unconfirmed-status").textContent(), "Nothing to resolve");
+      assert.equal(await popup.locator("#unconfirmed-status").textContent(), "Sending paused: no reviewable attempt");
       const conflict = await popup.evaluate(args => chrome.runtime.sendMessage(args), {
         ...selected, kind: "resolve_unconfirmed_dispatch", operationId: operationIds[0], outcome: "sent" });
       assert.equal(conflict.ok, false);
@@ -3091,7 +3136,7 @@ for (const provider of ["fixture", "gemini"]) {
       assert.equal(await popup.locator("#unconfirmed-status").textContent(), "Unavailable");
       await page.bringToFront();
       await popup.getByRole("button", { name: "Refresh status", exact: true }).click();
-      await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Nothing to resolve",
+      await popup.waitForFunction(() => document.querySelector("#unconfirmed-status")?.textContent === "Sending paused: no reviewable attempt",
         undefined, { timeout: 4000 });
       assert.deepEqual(await worker.evaluate(() => chrome.storage.session.get(null)), storageBefore);
       assert.deepEqual(await page.evaluate(() => globalThis.resolutionEvents), { input: 0, click: 0, submit: 0 });

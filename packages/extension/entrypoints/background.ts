@@ -1777,8 +1777,10 @@ async function manageSelectedUnconfirmedDispatches(tabId: number, expectedUrl: s
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     if (!operationId) {
       const attempts = payload.attempts;
-      if (reply.kind !== "unconfirmed_dispatches" || Object.keys(payload).length !== 2
+      if (reply.kind !== "unconfirmed_dispatches" || Object.keys(payload).length !== 3
+        || typeof payload.blockedByUnresolvedDispatch !== "boolean"
         || typeof payload.hasMore !== "boolean" || !Array.isArray(attempts) || attempts.length > 8
+        || (attempts.length > 0 && !payload.blockedByUnresolvedDispatch)
         || !attempts.every((item: unknown) => {
           if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
           const attempt = item as Record<string, unknown>;
@@ -1792,7 +1794,7 @@ async function manageSelectedUnconfirmedDispatches(tabId: number, expectedUrl: s
         }) || new Set(attempts.map(item => item.operationId)).size !== attempts.length) throw new Error();
       return { ok: true as const, attempts: attempts as { operationId: string; startedAt: number; messageText: string | null;
         scope: "chat" | "unlinked" }[],
-        hasMore: payload.hasMore };
+        hasMore: payload.hasMore, blockedByUnresolvedDispatch: payload.blockedByUnresolvedDispatch };
     }
     const resolution = payload.resolution;
     if (reply.kind !== "dispatch_resolved" || Object.keys(payload).length !== 4 || payload.operationId !== operationId

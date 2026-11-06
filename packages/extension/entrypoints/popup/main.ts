@@ -27,7 +27,7 @@ type ChatAgentsResult = { ok: true; agents: ChatAgent[]; countsKnown: boolean } 
 type ChatAgentApprovalResult = { ok: true; agentId: string; expiresAt: null } | { ok: false; error: string };
 type ChatAgentRemovalResult = { ok: true; revoked: number; remainingAgents: number } | { ok: false; error: string };
 type UnconfirmedDispatchesResult = { ok: true; attempts: { operationId: string; startedAt: number; messageText: string | null;
-  scope: "chat" | "unlinked" }[]; hasMore: boolean }
+  scope: "chat" | "unlinked" }[]; hasMore: boolean; blockedByUnresolvedDispatch: boolean }
   | { ok: false; error: string };
 type ChatApprovalResult = { ok: true; requestId: string; expiresAt: number }
   | { ok: false; error: string };
@@ -310,7 +310,9 @@ async function refreshUnconfirmedDispatches(): Promise<void> {
       expectedUrl: selected.url }) as UnconfirmedDispatchesResult;
     if (generation !== unconfirmedGeneration) return;
     if (!response?.ok) { unconfirmedStatus.textContent = "Unavailable"; return; }
-    unconfirmedStatus.textContent = response.attempts.length ? "Sending paused" : "Nothing to resolve";
+    unconfirmedStatus.textContent = response.blockedByUnresolvedDispatch
+      ? response.attempts.length ? "Sending paused" : "Sending paused: no reviewable attempt"
+      : "No applicable unresolved attempts";
     for (const attempt of response.attempts) {
       const row = document.createElement("li");
       row.dataset.operationId = attempt.operationId;

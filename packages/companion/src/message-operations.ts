@@ -447,7 +447,8 @@ export class PreparedMessageOperations {
         ? operation.text : null;
       return Object.freeze({ operationId: row.operation_id, startedAt: row.started_at, messageText, scope });
     });
-    return Object.freeze({ attempts: Object.freeze(attempts), hasMore: rows.length > MAX_PREPARED_REVIEWS });
+    return Object.freeze({ attempts: Object.freeze(attempts), hasMore: rows.length > MAX_PREPARED_REVIEWS,
+      blockedByUnresolvedDispatch: this.hasUnresolvedDispatch(target) });
   }
 
   resolveUnconfirmedDispatch(target: ApprovedTarget, operationId: string, outcome: "sent" | "not_sent", now = Date.now()) {

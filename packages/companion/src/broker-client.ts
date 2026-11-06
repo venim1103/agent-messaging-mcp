@@ -249,7 +249,8 @@ const replySchema = z.discriminatedUnion("kind", [
       messageText: z.string().min(1).max(MAX_PREPARED_MESSAGE_BYTES)
         .refine(text => Buffer.byteLength(text, "utf8") <= MAX_PREPARED_MESSAGE_BYTES).nullable(),
       scope: z.enum(["chat", "unlinked"])
-    })).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean() })
+    })).max(MAX_PREPARED_REVIEWS), hasMore: z.boolean(), blockedByUnresolvedDispatch: z.boolean() })
+      .refine(payload => payload.blockedByUnresolvedDispatch || payload.attempts.length === 0)
   }),
   z.strictObject({
     kind: z.literal("dispatch_resolved"), protocolVersion: z.literal(PROTOCOL_VERSION),

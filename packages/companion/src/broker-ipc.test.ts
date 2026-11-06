@@ -1315,7 +1315,7 @@ test("resolved dispatch status IPC preserves owner and receipt boundaries withou
     const listed = await relay.listUnconfirmedDispatches(target);
     assert.equal(listed.kind, "unconfirmed_dispatches");
     assert.deepEqual(listed.payload, { attempts: [{ operationId, startedAt,
-      messageText: "Synthetic resolved IPC operation", scope: "chat" }], hasMore: false });
+      messageText: "Synthetic resolved IPC operation", scope: "chat" }], hasMore: false, blockedByUnresolvedDispatch: true });
     assert.equal(JSON.stringify(listed.payload).includes(target.documentId), false);
     const foreign = { origin: "https://gemini.google.com" as const, conversationId: "fixture-alpha",
       url: "https://gemini.google.com/app/fixture-alpha", tabId: 4, documentId: "synthetic-foreign-document" };
@@ -1327,7 +1327,8 @@ test("resolved dispatch status IPC preserves owner and receipt boundaries withou
     const expected = { operationId, state: "resolved", startedAt,
       resolution: { outcome: "not_sent", source: "person", resolvedAt } };
     assert.deepEqual(resolution.payload, expected);
-    assert.deepEqual((await relay.listUnconfirmedDispatches(target)).payload, { attempts: [], hasMore: false });
+    assert.deepEqual((await relay.listUnconfirmedDispatches(target)).payload, { attempts: [], hasMore: false,
+      blockedByUnresolvedDispatch: false });
     assert.deepEqual((await facade.getPreparedOperation(operationId)).payload, expected);
     assert.deepEqual((await stranger.getPreparedOperation(operationId)).payload, { state: "unknown" });
     assert.deepEqual((await stranger.getPreparedOperation(operationId, recoveryToken)).payload, expected);
