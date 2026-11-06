@@ -1991,10 +1991,10 @@ export class PreparedMessageOperations {
         const now = Date.now();
         if (snapshot && snapshot !== "not_ready" && snapshot.capturedAt >= terminal.completedAt && now < terminal.job.expiresAt
           && this.getAutonomousAuthorization(owner, operationId, now)) {
-          const evidenced = authorization.target.origin === "https://gemini.google.com"
+          const evidenced = this.geminiContents.has(operationId)
             ? this.reconcileGeminiObservation(owner, operationId, now) : this.reconcileFixtureObservation(owner, operationId, now);
           if (evidenced.state === "observed_in_ui" || evidenced.state === "resolved") return evidenced;
-          const unchangedAt = authorization.target.origin === "https://gemini.google.com"
+          const unchangedAt = this.geminiContents.has(operationId)
             ? this.renderedDispatchEvidence(owner, operationId, now) : this.fixtureUnchangedDispatchEvidence(owner, operationId, now);
           if (unchangedAt?.outcome === "unchanged" && unchangedAt.observedAt >= terminal.completedAt) {
             this.database.prepare(`INSERT INTO message_dispatch_resolutions (operation_id, resolved_at, outcome, source)
