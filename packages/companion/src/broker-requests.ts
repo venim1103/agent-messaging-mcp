@@ -297,6 +297,7 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
     const count = isRenderedChatTarget(target)
       ? requests.publishGeminiSnapshot(target, messages as ReadonlyArray<GeminiRenderedMessage>, now, challengeId, omittedBefore)
       : requests.publishStableSnapshot(target, messages as ReadonlyArray<FixtureMessage>, now, challengeId, omittedBefore);
+    if (count > 0 && !isRenderedChatTarget(target)) operations?.reconcileStableObservations(target, now);
     return { ...response, kind: "chat_snapshot_published" as const, payload: { count } };
   }
   if (request.kind === "mark_chat_observation_gap") {

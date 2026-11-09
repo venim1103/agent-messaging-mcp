@@ -46,8 +46,11 @@ export const answerWaitAnchorSchema = z.strictObject({ connectionId: z.uuid(),
 export const resolvedDispatchStatusSchema = z.strictObject({ operationId: z.uuid(), state: z.literal("resolved"),
   startedAt: z.number().int().safe(), resolution: z.strictObject({ outcome: z.enum(["sent", "not_sent"]),
     source: z.enum(["page", "person"]), resolvedAt: z.number().int().safe() }) });
+export const dispatchEvidenceFailureReasonSchema = z.enum(["observation_gap", "partial_window", "truncated_message",
+  "duplicate_row", "window_alignment", "observed_row_changed", "outgoing_ambiguous", "outgoing_disappeared", "ambiguous_evidence"]);
 export const fixtureDispatchStatusSchema = z.discriminatedUnion("state", [
-  z.strictObject({ operationId: z.uuid(), state: z.literal("dispatch_uncertain"), startedAt: z.number().int().safe() }),
+  z.strictObject({ operationId: z.uuid(), state: z.literal("dispatch_uncertain"), startedAt: z.number().int().safe(),
+    evidenceFailureReason: dispatchEvidenceFailureReasonSchema.optional() }),
   z.strictObject({ operationId: z.uuid(), state: z.literal("observed_in_ui"), startedAt: z.number().int().safe(),
     observedAt: z.number().int().safe(), messageId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/) }),
   resolvedDispatchStatusSchema
@@ -343,6 +346,7 @@ export class PreparedMessageOperations {
   private readonly dispatchJobs = new Map<string, PendingFixtureDispatch>();
   private readonly geminiDispatchJobs = new Map<string, PendingGeminiDispatch>();
   private readonly ambiguousEvidence = new Set<string>();
+  private readonly evidenceFailures = new Map<string, z.infer<typeof dispatchEvidenceFailureReasonSchema>>();
   private readonly preflightChecks = new Map<string, PendingFixturePreflight>();
   private readonly fillChecks = new Map<string, PendingFixtureFill>();
   private readonly geminiFillChecks = new Map<string, PendingGeminiFill>();
@@ -563,6 +567,7 @@ export class PreparedMessageOperations {
     this.discardGeminiDispatchCheck(operationId);
     this.dispatchAuthorizations.delete(operationId);
     this.ambiguousEvidence.delete(operationId);
+    this.evidenceFailures.delete(operationId);
     this.neutralJobOffers.delete(operationId);
     this.autonomousCommits.delete(operationId);
     this.settlementChecks.delete(operationId);
@@ -2268,6 +2273,14 @@ export class PreparedMessageOperations {
     return true;
   }
 
+  reconcileStableObservations(target: StableDomTarget, now = Date.now()): void {
+    for (const [operationId, operation] of this.contents) {
+      if (operation.autonomous && this.sameComposerTarget(operation.target, target)) {
+        this.reconcileFixtureObservation(operation.owner, operationId, now);
+      }
+    }
+  }
+
   reconcileFixtureObservation(owner: symbol, operationId: string, now = Date.now()) {
     const status = this.getOperation(owner, operationId, now);
     if (status.state !== "dispatch_uncertain") return status;
@@ -2288,44 +2301,49 @@ export class PreparedMessageOperations {
       || captures.some(capture => capture.success && capture.data.omittedBefore);
     if (omitted || (targetProvider(operation.target) === "databag" && baseline.messages.length === MAX_FIXTURE_SNAPSHOT_MESSAGES)) {
       if (targetProvider(operation.target) !== "databag") return status;
-      const refuse = () => { this.ambiguousEvidence.add(operationId); return status; };
+      const refuse = (reason: z.infer<typeof dispatchEvidenceFailureReasonSchema>) => {
+        this.evidenceFailures.set(operationId, reason);
+        this.ambiguousEvidence.add(operationId);
+        return status;
+      };
       const continuity = this.requests.readStableIncomingChanges(owner, operation.connectionId,
         baseline.cursor, MAX_RETURNED_EVENTS, now);
       if (!continuity || continuity === "not_ready" || continuity.state !== "ok"
-        || continuity.cursor.sequence !== snapshot.cursor.sequence
-        || baseline.messages.length !== MAX_FIXTURE_SNAPSHOT_MESSAGES
-        || new Set(baseline.messageIds).size !== baseline.messages.length
-        || baseline.messages.some(message => message.truncated)) return refuse();
+        || continuity.cursor.sequence !== snapshot.cursor.sequence) return refuse("observation_gap");
+      if (baseline.messages.length !== MAX_FIXTURE_SNAPSHOT_MESSAGES) return refuse("partial_window");
+      if (new Set(baseline.messageIds).size !== baseline.messages.length) return refuse("duplicate_row");
+      if (baseline.messages.some(message => message.truncated)) return refuse("truncated_message");
       const seen = new Map(baseline.messages.map(message => [message.id, message]));
       let droppedRows = 0;
       let outgoingId: string | undefined;
       for (const capture of [...captures,
         fixtureObservationSchema.safeParse({ kind: "fixture_snapshot", omittedBefore: snapshot.omittedBefore, messages: snapshot.messages })]) {
-        if (!capture.success || capture.data.messages.length !== MAX_FIXTURE_SNAPSHOT_MESSAGES
-          || capture.data.messages.some(message => message.truncated)
-          || new Set(capture.data.messages.map(message => message.id)).size !== capture.data.messages.length) return refuse();
+        if (!capture.success) return refuse("ambiguous_evidence");
+        if (capture.data.messages.length !== MAX_FIXTURE_SNAPSHOT_MESSAGES) return refuse("partial_window");
+        if (capture.data.messages.some(message => message.truncated)) return refuse("truncated_message");
+        if (new Set(capture.data.messages.map(message => message.id)).size !== capture.data.messages.length) return refuse("duplicate_row");
         const rows = capture.data.messages;
         const offset = baseline.messages.findIndex(message => message.id === rows[0]?.id);
         if (offset < droppedRows || offset > 2 || offset < 0
           || (offset > 0 && !capture.data.omittedBefore)
-          || (baseline.omittedBefore && !capture.data.omittedBefore)
-          || baseline.messages.slice(offset).some((message, index) => message.id !== rows[index]?.id
-            || message.direction !== rows[index]?.direction || message.text !== rows[index]?.text)) return refuse();
+          || (baseline.omittedBefore && !capture.data.omittedBefore)) return refuse("window_alignment");
+        if (baseline.messages.slice(offset).some((message, index) => message.id !== rows[index]?.id
+          || message.direction !== rows[index]?.direction || message.text !== rows[index]?.text)) return refuse("observed_row_changed");
         for (const message of rows) {
           const previous = seen.get(message.id);
           if (previous && (previous.direction !== message.direction || previous.text !== message.text
-            || previous.truncated !== message.truncated)) return refuse();
+            || previous.truncated !== message.truncated)) return refuse("observed_row_changed");
           seen.set(message.id, message);
         }
         droppedRows = offset;
         const added = rows.slice(baseline.messages.length - offset);
         if (!added.length) {
-          if (outgoingId) return refuse();
+          if (outgoingId) return refuse("outgoing_disappeared");
           continue;
         }
         const outgoing = added[0]!;
         if (outgoing.direction !== "outgoing" || outgoing.text !== operation.text || baseline.messageIds.includes(outgoing.id)
-          || (outgoingId && outgoingId !== outgoing.id) || added.slice(1).some(message => message.direction !== "incoming")) return refuse();
+          || (outgoingId && outgoingId !== outgoing.id) || added.slice(1).some(message => message.direction !== "incoming")) return refuse("outgoing_ambiguous");
         outgoingId = outgoing.id;
       }
       if (!outgoingId) return status;
@@ -2368,6 +2386,8 @@ export class PreparedMessageOperations {
     if (!record || record.owner_id !== ownerId) return { state: "unknown" as const };
     const dispatch = this.dispatchStatus(operationId);
     if (dispatch) {
+      const evidenceFailureReason = this.evidenceFailures.get(operationId);
+      if (dispatch.state === "dispatch_uncertain" && evidenceFailureReason) return { ...dispatch, evidenceFailureReason };
       const anchor = this.answerWaitAnchors.get(record.connection_id);
       return includeAnswerWaitAnchor && anchor?.owner === owner && anchor.operationId === operationId
         && this.requests.getStableTarget(owner, record.connection_id, now)

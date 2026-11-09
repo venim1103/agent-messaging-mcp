@@ -379,6 +379,11 @@ test("Databag full-window dispatch evidence requires unique unchanged stable-ID 
         const anchored = ledger.getOperation(owner, prepared.operationId, now + 9, true);
         const anchor = "answerWaitAnchor" in anchored ? anchored.answerWaitAnchor : undefined;
         assert.equal(Boolean(anchor), positive, context);
+        if (mode === "short-window") {
+          assert.equal("evidenceFailureReason" in anchored && anchored.evidenceFailureReason,
+            "partial_window", context);
+          assert.equal("evidenceFailureReason" in ledger.recoverOperationStatus(prepared.operationId, prepared.recoveryToken), false);
+        }
         if (positive) {
           assert.equal(anchor?.connectionId, connection.connectionId);
           assert.equal(anchor?.cursor.sequence, 1);

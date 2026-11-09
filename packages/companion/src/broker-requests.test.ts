@@ -840,7 +840,8 @@ test("only an owning facade prepares immutable fixture text without approval or 
 });
 
 test("owning facade status reconciles fresh Databag evidence without restoring writes", async () => {
-  for (const mode of ["fresh", "wrong-text", "expired"] as const) {
+  for (const mode of ["fresh", "wrong-text", "expired", "relay-fresh", "relay-full-window", "relay-wrong-text",
+    "relay-gap", "relay-revoked", "relay-expired", "relay-foreign-target", "relay-partial-window"] as const) {
     const database = new DatabaseSync(":memory:");
     const requests = new PendingConnectionRequests();
     const operations = new PreparedMessageOperations(requests, database);
@@ -861,7 +862,10 @@ test("owning facade status reconciles fresh Databag evidence without restoring w
         { ok: true, editor: "textarea" }, now + 3), true);
       await filling.result;
       const baseline = { id: "synthetic-baseline", direction: "incoming" as const, text: "Synthetic baseline" };
-      requests.publishStableSnapshot(target, [baseline], now + 4);
+      const fullWindow = mode === "relay-full-window" || mode === "relay-partial-window";
+      const baselineRows = fullWindow ? Array.from({ length: 32 }, (_, index) => ({
+        ...baseline, id: `synthetic-baseline-${index}`, text: `Synthetic baseline ${index}` })) : [baseline];
+      requests.publishStableSnapshot(target, baselineRows, now + 4);
       const inspecting = operations.requestChatProof(owner, prepared.operationId, now + 5, prepared.expiresAt);
       assert.ok(inspecting && inspecting !== "busy");
       const proof = operations.listChatJobs("proof", "databag", now + 5)[0]!;
@@ -873,22 +877,45 @@ test("owning facade status reconciles fresh Databag evidence without restoring w
       assert.equal(operations.completeChatJob(target, prepared.operationId, submit.jobId, "submit",
         { ok: true, editor: "textarea", activated: true }, now + 8), true);
       assert.equal((await dispatch.result).state, "dispatch_uncertain");
-      requests.publishStableSnapshot(target, [baseline, { id: "synthetic-late-outgoing", direction: "outgoing",
-        text: mode === "wrong-text" ? "Synthetic different text" : prepared.preview.text }], now + 9);
-      const checkedAt = mode === "expired" ? prepared.expiresAt + 1 : now + 10;
+      const messages = [...(fullWindow ? baselineRows.slice(mode === "relay-partial-window" ? 2 : 1) : baselineRows), {
+        id: "synthetic-late-outgoing", direction: "outgoing" as const,
+        text: mode === "wrong-text" || mode === "relay-wrong-text" ? "Synthetic different text" : prepared.preview.text }];
+      const automatic = mode === "relay-fresh" || mode === "relay-full-window";
+      const throughRelay = mode.startsWith("relay-");
+      const observedAt = throughRelay ? mode === "relay-expired" ? prepared.expiresAt + 1 : now + 6000 : now + 9;
+      if (throughRelay) {
+        if (mode === "relay-gap") requests.markStableObservationGap(target, observedAt - 1);
+        if (mode === "relay-revoked") requests.disconnect(owner);
+        const publication = { protocolVersion: PROTOCOL_VERSION,
+          requestId: "c783ef76-d6cd-4898-8c43-204543943bac", connectionGeneration: 0, deadlineMs: observedAt + 1000,
+          kind: "publish_chat_snapshot", payload: { target: mode === "relay-foreign-target"
+            ? { ...target, documentId: "synthetic-other-document" } : target, messages, omittedBefore: fullWindow } };
+        assert.deepEqual(handleBrokerRequest(publication, "facade", owner, requests, observedAt, operations).payload,
+          { code: "PERMISSION_DENIED" });
+        const published = handleBrokerRequest(publication,
+          "relay", Symbol("Synthetic observer relay"), requests, observedAt, operations);
+        assert.deepEqual(published.payload, { count: mode === "relay-foreign-target" || mode === "relay-revoked" ? 0 : 1 });
+        assert.equal(operations.getOperation(owner, prepared.operationId, observedAt + 1).state,
+          automatic ? "observed_in_ui" : "dispatch_uncertain", `${mode}: relay evidence must settle only a proven owned dispatch`);
+      } else requests.publishStableSnapshot(target, messages, now + 9);
+      const checkedAt = mode === "expired" ? prepared.expiresAt + 1 : observedAt + 1;
       const query = { protocolVersion: PROTOCOL_VERSION, requestId: "c783ef76-d6cd-4898-8c43-204543943bac",
         connectionGeneration: 0, deadlineMs: checkedAt + 1000, kind: "get_prepared_operation",
         payload: { operationId: prepared.operationId } };
       const recovered = handleBrokerRequest({ ...query, payload: { ...query.payload, recoveryToken: prepared.recoveryToken } },
         "facade", owner, requests, checkedAt, operations);
-      assert.equal("state" in recovered.payload && recovered.payload.state, "dispatch_uncertain");
+      assert.equal("state" in recovered.payload && recovered.payload.state, automatic ? "observed_in_ui" : "dispatch_uncertain");
+      assert.equal("evidenceFailureReason" in recovered.payload, false);
       assert.deepEqual(handleBrokerRequest(query, "facade", Symbol("foreign owner"), requests, checkedAt, operations).payload,
         { state: "unknown" });
-      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, 0);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, automatic ? 1 : 0);
       const result = handleBrokerRequest(query, "facade", owner, requests, checkedAt, operations);
       assert.equal(result.kind, "prepared_operation_state");
-      assert.equal("state" in result.payload && result.payload.state, mode === "fresh" ? "observed_in_ui" : "dispatch_uncertain");
-      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, mode === "fresh" ? 1 : 0);
+      assert.equal("state" in result.payload && result.payload.state, mode === "fresh" || automatic ? "observed_in_ui" : "dispatch_uncertain");
+      if (mode === "relay-partial-window") assert.equal("evidenceFailureReason" in result.payload
+        && result.payload.evidenceFailureReason, "partial_window");
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_evidence").get()?.count, mode === "fresh" || automatic ? 1 : 0);
+      assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()?.count, 0);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 1);
       for (const phase of ["fill", "proof", "submit"] as const) assert.deepEqual(operations.listChatJobs(phase, "databag", checkedAt), []);
     } finally {
