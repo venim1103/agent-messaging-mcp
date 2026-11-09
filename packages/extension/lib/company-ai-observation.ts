@@ -127,12 +127,12 @@ export function locateCompanyAIChatReadTargets(input: { expectedUrl: string; dea
     }
     for (let ancestor = editor.parentElement; ancestor && ancestor !== document.body; ancestor = ancestor.parentElement) {
       if (Date.now() >= deadline) return null;
-      const candidates = [...groups].filter(([timeline, rows]) => ancestor.contains(timeline)
-        && !timeline.contains(editor) && !timeline.contains(profile) && rows.length <= 32);
+      const candidates = [...groups].filter(([timeline]) => ancestor.contains(timeline)
+        && !timeline.contains(editor) && !timeline.contains(profile));
       if (candidates.length > 1) return null;
       if (candidates.length === 1) {
         const [timeline, rows] = candidates[0]!;
-        return { editor, timeline, profile, rows };
+        return { editor, timeline, profile, rows: rows.slice(-32) };
       }
     }
     return null;

@@ -695,6 +695,18 @@ test("Company AI Chat read targets are bounded, structural and text-free", { tim
       duplicateProfile.hidden = true;
       const hiddenProfileIgnored = locate() !== null;
       duplicateProfile.remove();
+      const originalRows = [...targets.timeline.children];
+      const longRows = Array.from({ length: 33 }, () => {
+        const row = document.createElement("div"); row.setAttribute("data-testid", "invented-long");
+        const paragraph = document.createElement("p"); paragraph.append(document.createTextNode("Synthetic bounded row"));
+        row.append(paragraph); return row;
+      });
+      targets.timeline.replaceChildren(...longRows);
+      const longTargets = locate();
+      const longTimelineResolved = longTargets?.timeline === targets.timeline && longTargets.rows.length === 32
+        && longTargets.rows.every((row, index) => row === longRows[index + 1]);
+      const longComposerResolved = composer()?.editor === targets.editor;
+      targets.timeline.replaceChildren(...originalRows);
       const secondTimeline = document.getElementById("timeline").cloneNode(true);
       document.querySelector("section").prepend(secondTimeline);
       const ambiguousTimeline = locate() === null;
@@ -709,6 +721,7 @@ test("Company AI Chat read targets are bounded, structural and text-free", { tim
       return { accepted, composerResolved, emptyDisabledSendResolved, ambiguousSendRefused, extraContentRefused, stopRefused,
         emptyFileAllowed, stagedFileRefused, oversizedComposerRefused,
         nestedProfileResolved, iconOnlyProfileIgnored, ambiguousProfile, hiddenProfileIgnored, ambiguousTimeline,
+        longTimelineResolved, longComposerResolved,
         ambiguousEditor, expired, oversized,
         privateReads, mutations, inputs, activations };
     });
@@ -716,6 +729,7 @@ test("Company AI Chat read targets are bounded, structural and text-free", { tim
       extraContentRefused: true, stopRefused: true, emptyFileAllowed: true, stagedFileRefused: true, oversizedComposerRefused: true,
       nestedProfileResolved: true, iconOnlyProfileIgnored: true, ambiguousProfile: true,
       hiddenProfileIgnored: true, ambiguousTimeline: true,
+      longTimelineResolved: true, longComposerResolved: true,
       ambiguousEditor: true, expired: true, oversized: true, privateReads: 0, mutations: 0, inputs: 0, activations: 0 });
   } finally {
     await browser?.close();
@@ -861,6 +875,26 @@ test("Company AI Chat read binding separates identity from bounded sender captur
         const create = () => globalThis.syntheticCompanyProof.createCompanyAIChatReadBinding({ expectedUrl: location.href,
           deadline: Date.now() + 4000 });
         try {
+          timeline.replaceChildren(...Array.from({ length: 32 }, (_, index) => createRow(`Synthetic mounted row ${index}`)));
+          const rollingBinding = create();
+          const initialWindow = rollingBinding.capture(Date.now() + 4000);
+          timeline.append(createRow("Synthetic mounted row 32"));
+          let discardedReads = 0;
+          Object.defineProperty(timeline.firstChild.firstChild.firstChild, "nodeValue", {
+            get() { discardedReads++; throw new Error("Discarded row plaintext read"); }
+          });
+          const mountedBindingRetained = rollingBinding.check(Date.now() + 4000);
+          const rollingWindow = rollingBinding.capture(Date.now() + 4000);
+          const mountedRowsBounded = initialWindow?.messages.length === 32
+            && JSON.stringify(rollingWindow?.messages.map(message => message.text))
+              === JSON.stringify(Array.from({ length: 32 }, (_, index) => `Synthetic mounted row ${index + 1}`));
+          timeline.append(createRow("Synthetic mounted row 33"));
+          const repeatedWindow = rollingBinding.capture(Date.now() + 4000);
+          const repeatedRolloverBounded = rollingBinding.check(Date.now() + 4000)
+            && JSON.stringify(repeatedWindow?.messages.map(message => message.text))
+              === JSON.stringify(Array.from({ length: 32 }, (_, index) => `Synthetic mounted row ${index + 2}`));
+          const discardedRowsUnread = discardedReads === 0;
+          rollingBinding.dispose();
           timeline.replaceChildren(createRow("x".repeat(16000)));
           const extra = document.createElement("p"); extra.append(document.createTextNode("Overflow")); timeline.firstChild.append(extra);
           const characterBinding = create();
@@ -880,12 +914,15 @@ test("Company AI Chat read binding separates identity from bounded sender captur
           const ended = create();
           window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
           const terminal = !ended.check(Date.now() + 4000) && ended.capture(Date.now() + 4000) === null;
-          return { charactersBounded: characters.messages[0].text.length === 16000 && characters.messages[0].truncated === true,
+          return { mountedBindingRetained, mountedRowsBounded, repeatedRolloverBounded, discardedRowsUnread,
+            charactersBounded: characters.messages[0].text.length === 16000 && characters.messages[0].truncated === true,
             bytesBounded: new TextEncoder().encode(JSON.stringify(bytes)).length <= 96 * 1024,
             bytesTruncated: bytes.messages.some(message => message.truncated === true), nodesRefused, terminal };
         } finally { timeline.replaceChildren(...original); }
       });
-      assert.deepEqual(bounds, { charactersBounded: true, bytesBounded: true, bytesTruncated: true, nodesRefused: true, terminal: true });
+      assert.deepEqual(bounds, { mountedBindingRetained: true, mountedRowsBounded: true,
+        repeatedRolloverBounded: true, discardedRowsUnread: true,
+        charactersBounded: true, bytesBounded: true, bytesTruncated: true, nodesRefused: true, terminal: true });
       assert.equal(await page.evaluate(invokeCompanyAIChatReader, { ...checking, deadline: Date.now() + 4000 }), null);
       assert.deepEqual(await page.evaluate(probeBridge, bound),
         { matched: false, foreignRefused: true, expiredRefused: true, otherEditorRefused: true });
