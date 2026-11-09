@@ -1,5 +1,10 @@
 # Implementation Handoff
 
+## Company Capture Plan Published: New Question Unconfirmed (2026-11-09)
+
+- Documentation-only D64 checkpoint `fdab580` is committed/pushed and actual remote main matches; worktree clean after publication before this handoff-only evidence update. Exactly DEVELOPMENT, DESIGN and HANDOFF comprise that checkpoint, with scoped content/privacy/history/links/ASCII/reader/whitespace and editor checks passing. No source/test/build/gate or Company live action is added; accepted D63 evidence remains unchanged.
+- The first follow-up history check catches publication evidence inserted into the just-published dated planning block. Move it to this new dated entry instead, preserving that prior block byte-for-byte; this is a documentation repair, not a product or source-gate failure. D64 remains unapproved/unstarted, latest question unresolved, no finish permission or replay. Incoming reads remain usable; await explicit input as described below.
+
 ## Company Installed Capture Check Planned: Approval Pending (2026-11-09)
 
 - Source `cac94a3` and final publication handoff `e36298f` are published/remote-verified with gated/private inputs unchanged. The actual checkpoint-specific Databag finish-versus-planning question is confirmed sent, and a genuinely new explicit answer chooses planning only. No finish permission, additional Company read/send, installed reload, inspection or new live budget follows that answer.
@@ -1270,7 +1275,7 @@ Controlled completion (2026-10-29, D23; routing amended 2026-10-30): before an i
 
 ### Repository state
 
-- D64 planning (2026-11-09): `cac94a3`/`e36298f` published/remote-verified, accepted D63 gate and all 69 source/private inputs unchanged. New explicit continue authorizes planning only; DEVELOPMENT/DESIGN/HANDOFF notes local, D64 approval/window/reload/diagnostic still pending. Installed qualification/automatic evidence unavailable; see [current plan](#company-installed-capture-check-planned-approval-pending-2026-11-09).
+- D64 planning (2026-11-09): documentation-only `fdab580` committed/pushed/actual remote-verified; `cac94a3`/`e36298f` and accepted D63 gate remain unchanged. Three-file planning checkpoint published; only this handoff evidence update follows. D64 approval/window/reload/diagnostic still pending; latest question dispatch-uncertain, incoming reads usable, no finish permission. Installed qualification/automatic evidence unavailable; see [current plan](#company-installed-capture-check-planned-approval-pending-2026-11-09).
 - Repairs `f0ac34b`/`b6ed426` and handoffs `b0ff0fb`/`8627ea8` are published/remote-verified, gates/source/private bytes unchanged and environment discrepancies explicit. Person reports full loaded Build match; bounded installed exchange and trusted person outcome pass. No automatic confirmation or broad reliability acceptance. See [source publication](#company-lifecycle-repairs-published-installed-loading-pending-2026-11-06).
 - Earlier repair source `3340abd` is committed/pushed/remote-verified after its own 271-unit/151-independent/7-composite gate and verified repaired disk Build. D57 source `dba6b7a`/recovery docs `645a40b` remain earlier published evidence; that publication follow-up was docs-only. Old read grants cannot upgrade in place; Company outcomes remain uncertain until trusted review. [Accepted repair](#company-empty-composer-fill-refusal-and-disabled-send-repair-2026-11-06).
 - Question routing (2026-10-30, D21/D23 amendment): [canonical rule](AGENTS.md#databag-work-channel), portable skill, operating reference and design agree on direct Databag questions, never agent-controlled questionnaire dialogs. An unavailable/unsafe channel permits only a plain Copilot blocker/question, not fabricated permission or another uncertain send. Required host/tool and browser consent remain unchanged; [checkpoint](#databag-first-questions-without-questionnaire-dialogs-2026-10-30).
