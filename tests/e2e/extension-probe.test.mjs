@@ -3714,8 +3714,9 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
 
 for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].flatMap(provider =>
   ["failure", "lifetime", "reload", "reload-failure", ...(provider === "databag"
-    ? ["fill-result-loss", "submit-result-loss", "fill-result-readiness"] : [])]
-    .flatMap(scenario => (provider === "databag" ? scenario === "fill-result-readiness" ? [true] : [false, true] : [false])
+    ? ["fill-result-loss", "submit-result-loss", "fill-result-readiness", "fill-focus-loss"] : [])]
+    .flatMap(scenario => (provider === "databag"
+      ? scenario === "fill-result-readiness" || scenario === "fill-focus-loss" ? [true] : [false, true] : [false])
       .map(native => ({ provider, scenario, native }))))) {
   test(`${provider}${native ? " native" : ""} popup autonomous admission (${scenario}) is per agent and preserves other owners`, { timeout: 20000 }, async (testContext) => {
     const setPhase = trackTestPhase(testContext, `${provider} admission ${scenario}`);
@@ -3970,22 +3971,44 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
           assert.equal(await page.locator("textarea").inputValue(), "Synthetic Databag human draft");
           assert.equal(await page.evaluate(() => window.syntheticActivations), 1);
         }
-        if (scenario === "fill-result-loss" || scenario === "submit-result-loss" || scenario === "fill-result-readiness") {
+        if (scenario === "fill-result-loss" || scenario === "submit-result-loss" || scenario === "fill-result-readiness"
+          || scenario === "fill-focus-loss") {
           setPhase(`public Databag ${scenario}`);
           const fillLoss = scenario === "fill-result-loss";
           const readiness = scenario === "fill-result-readiness";
-          await worker.evaluate(({ fillLoss, readiness }) => {
+          const focusLoss = scenario === "fill-focus-loss";
+          const refusedFill = fillLoss || focusLoss;
+          await worker.evaluate(({ fillLoss, readiness, focusLoss }) => {
             globalThis.syntheticDatabagJobCalls = 0;
             globalThis.syntheticDatabagDroppedResults = 0;
             globalThis.syntheticDatabagPendingChecks = 0;
             globalThis.syntheticDatabagPending = false;
             const execute = chrome.scripting.executeScript.bind(chrome.scripting);
             chrome.scripting.executeScript = async options => {
-              const results = await execute(options);
               const source = options.func?.toString() ?? "";
-              if (source.includes("agentDatabagAdapter") && source.includes(fillLoss || readiness ? ".fill(" : ".submit(")) {
+              if (focusLoss && source.includes("agentDatabagAdapter") && source.includes(".fill(")) {
+                await execute({ target: options.target, world: "MAIN", func: () => {
+                  document.querySelector("textarea").addEventListener("input", () => {
+                    const root = document.querySelector("._conversation_synthetic_1");
+                    const host = Object.getOwnPropertyDescriptor(root, "__reactFiber$synthetic").value;
+                    host.return.return.stateNode.pendingLanes = 1;
+                    root.querySelector("button").focus();
+                  }, { once: true });
+                } });
+              }
+              const results = await execute(options);
+              if (focusLoss && globalThis.syntheticDatabagPending && source.includes("agentDatabagAdapter") && source.includes(".identify(")) {
+                await execute({ target: options.target, world: "MAIN", func: () => {
+                  const root = document.querySelector("._conversation_synthetic_1");
+                  const host = Object.getOwnPropertyDescriptor(root, "__reactFiber$synthetic").value;
+                  host.return.return.stateNode.pendingLanes = 0;
+                } });
+                globalThis.syntheticDatabagPending = false;
+              }
+              if (source.includes("agentDatabagAdapter") && source.includes(fillLoss || readiness || focusLoss ? ".fill(" : ".submit(")) {
                 globalThis.syntheticDatabagJobCalls++;
-                if (readiness && results[0]?.result?.ok) {
+                if (focusLoss) globalThis.syntheticDatabagPending = true;
+                else if (readiness && results[0]?.result?.ok) {
                   await execute({ target: options.target, world: "MAIN", func: () => {
                     const root = document.querySelector("._conversation_synthetic_1");
                     const host = Object.getOwnPropertyDescriptor(root, "__reactFiber$synthetic").value;
@@ -4012,32 +4035,38 @@ for (const { provider, scenario, native } of ["fixture", "gemini", "databag"].fl
               }
               return results;
             };
-          }, { fillLoss, readiness });
-          const text = "Synthetic Databag lost-result message";
+          }, { fillLoss, readiness, focusLoss });
+          const text = focusLoss ? "Synthetic Databag diagnostic draft ".repeat(32).trim() : "Synthetic Databag lost-result message";
           const sendArguments = { connectionId: first.connectionId, text, idempotencyKey: crypto.randomUUID() };
           const result = await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
           if (readiness) assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagPendingChecks), 1);
-          assert.equal(result.isError, fillLoss, JSON.stringify({ state: result.structuredContent.state,
+          assert.equal(result.isError, refusedFill, JSON.stringify({ state: result.structuredContent.state,
             code: result.structuredContent.code, failureStage: result.structuredContent.failureStage }));
-          assert.equal(result.structuredContent.state, fillLoss ? "not_sent" : "sent");
+          assert.equal(result.structuredContent.state, refusedFill ? "not_sent" : "sent");
           assert.equal(result.structuredContent.retryAllowed, false);
-          if (fillLoss) assert.equal(result.structuredContent.failureStage, "fill");
-          assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagDroppedResults), readiness ? 0 : 1);
+          if (refusedFill) {
+            assert.equal(result.structuredContent.failureStage, "fill");
+            const statusResult = await clients[0].callTool({ name: "chat_get_operation",
+              arguments: { operationId: result.structuredContent.operationId } });
+            assert.equal(statusResult.structuredContent.draftFill?.state, "uncertain");
+            assert.equal(statusResult.structuredContent.draftFill.failureReason, focusLoss ? "focus_changed" : "result_unconfirmed");
+          }
+          assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagDroppedResults), readiness || focusLoss ? 0 : 1);
           assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagJobCalls), 1);
           assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 1);
-          assert.equal(await page.evaluate(() => window.syntheticActivations), fillLoss ? 0 : 1);
-          assert.equal(await page.locator("textarea").inputValue(), fillLoss ? text : "");
+          assert.equal(await page.evaluate(() => window.syntheticActivations), refusedFill ? 0 : 1);
+          assert.equal(await page.locator("textarea").inputValue(), refusedFill ? text : "");
           const { recoveryToken, ...status } = result.structuredContent;
           assert.equal(typeof recoveryToken === "string" && /^[0-9a-f]{64}$/.test(recoveryToken), true);
           const replay = await clients[0].callTool({ name: "chat_send_message", arguments: sendArguments });
           const { recoveryToken: replayToken, ...replayedStatus } = replay.structuredContent;
           assert.deepEqual(replayedStatus, status);
-          assert.equal(replayToken === (fillLoss ? recoveryToken : undefined), true);
+          assert.equal(replayToken === (refusedFill ? recoveryToken : undefined), true);
           assert.equal(await worker.evaluate(() => globalThis.syntheticDatabagJobCalls), 1);
-          assert.equal(await page.evaluate(() => window.syntheticActivations), fillLoss ? 0 : 1);
+          assert.equal(await page.evaluate(() => window.syntheticActivations), refusedFill ? 0 : 1);
           const reservations = await worker.evaluate(async () => Object.keys(await chrome.storage.local.get(null))
             .filter(key => key.startsWith("databag-submit-attempt-")).length);
-          assert.equal(reservations, fillLoss ? 0 : 1);
+          assert.equal(reservations, refusedFill ? 0 : 1);
           const relay = await connectBroker("relay", directory);
           try {
             for (const phase of ["fill", "proof", "submit", "settle"]) {

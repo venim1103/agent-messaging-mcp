@@ -10,7 +10,10 @@ export type DatabagPreflight = { ok: true; editor: "textarea" } | { ok: false;
   code: "TARGET_CHANGED" | "UNSUPPORTED_MESSAGE_TEXT" | "COMPOSER_UNAVAILABLE" | "DRAFT_PRESENT" | "SUBMIT_UNAVAILABLE" };
 export type DatabagFillInput = Omit<DatabagDraftInput, "draftState"> & { operationId: string; attemptId: string; expiresAt: number;
   leftover?: { operationId: string; text: string } };
-export type DatabagFill = DatabagPreflight | { ok: false; code: "FILL_UNAVAILABLE" | "FILL_UNCERTAIN" };
+export type DatabagFillFailureReason = "insertion_unconfirmed" | "target_changed" | "composer_changed" | "editor_changed"
+  | "submit_changed" | "focus_changed" | "draft_changed" | "deadline_expired" | "execution_failed" | "result_unconfirmed" | "binding_changed";
+export type DatabagFill = DatabagPreflight | { ok: false; code: "FILL_UNAVAILABLE" }
+  | { ok: false; code: "FILL_UNCERTAIN"; failureReason?: DatabagFillFailureReason };
 export type DatabagSubmitInput = Omit<DatabagFillInput, "leftover">;
 export type DatabagSubmit = { ok: true; editor: "textarea"; activated: true } | { ok: false;
   code: "TARGET_CHANGED" | "COMPOSER_UNAVAILABLE" | "DRAFT_CHANGED" | "SUBMIT_UNAVAILABLE" | "DISPATCH_UNAVAILABLE" | "DISPATCH_UNCERTAIN" };
@@ -411,6 +414,7 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
         input.leftover.text, input.expectedUrl, found.editor, found.root))) return { ok: false as const, code: "DRAFT_PRESENT" as const };
       return { ...found, replacing };
     };
+    const uncertain = (failureReason: DatabagFillFailureReason): DatabagFill => ({ ok: false, code: "FILL_UNCERTAIN", failureReason });
     try {
       const before = inspectFill();
       if (!before.ok) return before;
@@ -430,18 +434,24 @@ export function installDatabagAdapter(origins: readonly string[]): boolean {
       const recorded = ownership?.begin(input.operationId, input.text, input.expectedUrl, ready.editor, ready.root,
         ready.replacing ? input.leftover : undefined);
       if (ready.replacing && !recorded) return { ok: false, code: "FILL_UNAVAILABLE" };
-      if (!Document.prototype.execCommand.call(document, "insertText", false, input.text)) return { ok: false, code: "FILL_UNCERTAIN" };
+      if (!Document.prototype.execCommand.call(document, "insertText", false, input.text)) return uncertain("insertion_unconfirmed");
       for (;;) {
         const after = composer(binding, input.allowHidden, true);
-        if (!after.ok || after.root !== ready.root || after.region !== ready.region || after.editor !== ready.editor
-          || after.button !== ready.button || document.activeElement !== ready.editor || ready.editor.value !== input.text
-          || Date.now() >= input.expiresAt) return { ok: false, code: "FILL_UNCERTAIN" };
+        if (!after.ok) return uncertain(after.code === "TARGET_CHANGED" ? "target_changed"
+          : after.code === "DRAFT_PRESENT" ? "draft_changed" : after.code === "SUBMIT_UNAVAILABLE" ? "submit_changed" : "composer_changed");
+        if (after.root !== ready.root) return uncertain("target_changed");
+        if (after.region !== ready.region) return uncertain("composer_changed");
+        if (after.editor !== ready.editor) return uncertain("editor_changed");
+        if (after.button !== ready.button) return uncertain("submit_changed");
+        if (document.activeElement !== ready.editor) return uncertain("focus_changed");
+        if (ready.editor.value !== input.text) return uncertain("draft_changed");
+        if (Date.now() >= input.expiresAt) return uncertain("deadline_expired");
         if (after.ready) break;
         await new Promise<void>(resolve => setTimeout(resolve, 16));
       }
       ownership?.confirm(input.operationId);
       return { ok: true, editor: "textarea" };
-    } catch { return { ok: false, code: "FILL_UNCERTAIN" }; }
+    } catch { return uncertain("execution_failed"); }
   };
   const submitAttempts = new Set<string>();
   const submit = async (input: DatabagSubmitInput): Promise<DatabagSubmit> => {

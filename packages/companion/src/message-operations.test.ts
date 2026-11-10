@@ -1513,8 +1513,18 @@ test("autonomous pre-intent refusals retain bounded failure stages without submi
       await Promise.resolve();
       const fill = ledger.listChatJobs("fill", provider)[0]!;
       assert.ok(fill);
+      const diagnosedFill = provider === "databag" && stage === "fill";
+      if (diagnosedFill) {
+        assert.equal(ledger.completeChatJob(fill.target, prepared.operationId, fill.jobId, "fill",
+          { ok: false, code: "FILL_UNCERTAIN", failureReason: "not_allowlisted" } as never), false);
+        assert.equal(ledger.completeChatJob(fill.target, prepared.operationId, fill.jobId, "fill",
+          { ok: false, code: "FILL_UNAVAILABLE", failureReason: "focus_changed" }), false);
+        assert.equal(ledger.completeChatJob(fill.target, prepared.operationId, fill.jobId, "fill",
+          { ok: true, editor: "textarea", failureReason: "focus_changed" } as never), false);
+      }
       assert.equal(ledger.completeChatJob(fill.target, prepared.operationId, fill.jobId, "fill", stage === "fill"
-        ? { ok: false, code: "FILL_UNAVAILABLE" }
+        ? diagnosedFill ? { ok: false, code: "FILL_UNCERTAIN", failureReason: "focus_changed" }
+          : { ok: false, code: "FILL_UNAVAILABLE" }
         : provider === "gemini" ? { ok: true, editor: "contenteditable" } : { ok: true, editor: "textarea" }), true);
       if (stage === "read") requests.disconnect(owner);
       if (stage === "proof") {
@@ -1537,10 +1547,24 @@ test("autonomous pre-intent refusals retain bounded failure stages without submi
           { ok: false, code: "DRAFT_CHANGED" }), false);
       }
       await rejected;
+      if (diagnosedFill) {
+        const status = ledger.getOperation(owner, prepared.operationId);
+        assert.ok("draftFill" in status);
+        assert.equal(status.draftFill?.state, "uncertain");
+        assert.ok(status.draftFill?.state === "uncertain");
+        assert.equal(status.draftFill.failureReason, "focus_changed");
+        assert.deepEqual(ledger.getOperation(Symbol("synthetic foreign owner"), prepared.operationId), { state: "unknown" });
+        assert.deepEqual(ledger.recoverOperationStatus(prepared.operationId, prepared.recoveryToken), { state: "unknown" });
+      }
       assert.equal(ledger.getAutonomousAuthorization(owner, prepared.operationId) !== null, stage !== "read");
       await assert.rejects(ledger.commitAutonomousMessage(owner, prepared.operationId, deadlineMs), checkFailure);
       assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()?.count, 0);
       for (const phase of ["fill", "proof", "submit"] as const) assert.deepEqual(ledger.listChatJobs(phase, provider), []);
+      if (diagnosedFill) {
+        const expired = ledger.getOperation(owner, prepared.operationId, prepared.expiresAt);
+        assert.equal(expired.state, "expired");
+        assert.equal("draftFill" in expired, false);
+      }
     } finally {
       ledger.disconnect(owner);
       requests.disconnect(owner);

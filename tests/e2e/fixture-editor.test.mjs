@@ -495,7 +495,7 @@ test("Databag React identity bridge is read-only, bounded and rejects stale or f
     const interruptedResult = page.evaluate(fillDatabagDraft, interruptedFill);
     await page.waitForFunction(() => window.syntheticBridge.root.stateNode.pendingLanes === 1);
     await page.locator("button").focus();
-    assert.deepEqual(await interruptedResult, { ok: false, code: "FILL_UNCERTAIN" });
+    assert.deepEqual(await interruptedResult, { ok: false, code: "FILL_UNCERTAIN", failureReason: "focus_changed" });
     assert.equal(await page.locator("textarea").inputValue(), draft.text);
     assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
     assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...interruptedFill, expiresAt: Date.now() + 4000 }),
@@ -506,13 +506,45 @@ test("Databag React identity bridge is read-only, bounded and rejects stale or f
       window.syntheticBridge.root.stateNode.pendingLanes = 1;
     }, { once: true }));
     const expiredRenderFill = { ...filling, operationId: randomUUID(), attemptId: randomUUID(), expiresAt: Date.now() + 500 };
-    assert.deepEqual(await page.evaluate(fillDatabagDraft, expiredRenderFill), { ok: false, code: "FILL_UNCERTAIN" });
+    assert.deepEqual(await page.evaluate(fillDatabagDraft, expiredRenderFill),
+      { ok: false, code: "FILL_UNCERTAIN", failureReason: "deadline_expired" });
     assert.ok(Date.now() >= expiredRenderFill.expiresAt);
     assert.equal(await page.locator("textarea").inputValue(), draft.text);
     assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
     assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...expiredRenderFill, expiresAt: Date.now() + 4000 }),
       { ok: false, code: "FILL_UNAVAILABLE" });
     await page.evaluate(() => { window.syntheticBridge.root.stateNode.pendingLanes = 0; });
+    for (const restoreGeometry of [true, false]) {
+      await page.locator("textarea").fill("");
+      await page.evaluate(() => {
+        window.syntheticBridge.geometryFillResult = undefined;
+        window.syntheticBridge.geometryChanged = false;
+        document.querySelector("textarea").addEventListener("input", () => {
+          document.querySelector("button").style.transform = "translateY(2000px)";
+          window.syntheticBridge.geometryChanged = true;
+        }, { once: true });
+      });
+      const geometryFill = { ...filling, operationId: randomUUID(), attemptId: randomUUID(),
+        expiresAt: Date.now() + (restoreGeometry ? 4000 : 500) };
+      const geometryResult = page.evaluate(async input => {
+        const result = await globalThis.agentDatabagAdapter.fill(input);
+        window.syntheticBridge.geometryFillResult = result;
+        return result;
+      }, geometryFill);
+      await page.waitForFunction(() => window.syntheticBridge.geometryChanged);
+      assert.equal(await page.evaluate(() => window.syntheticBridge.geometryFillResult), undefined);
+      if (restoreGeometry) await page.locator("button").evaluate(button => { button.style.transform = ""; });
+      assert.deepEqual(await geometryResult, restoreGeometry ? { ok: true, editor: "textarea" }
+        : { ok: false, code: "FILL_UNCERTAIN", failureReason: "deadline_expired" });
+      assert.equal(await page.locator("textarea").inputValue(), draft.text);
+      assert.equal(await page.evaluate(() => window.syntheticBridge.activations), 1);
+      if (!restoreGeometry) {
+        assert.ok(Date.now() >= geometryFill.expiresAt);
+        assert.deepEqual(await page.evaluate(fillDatabagDraft, { ...geometryFill, expiresAt: Date.now() + 4000 }),
+          { ok: false, code: "FILL_UNAVAILABLE" });
+      }
+      await page.locator("button").evaluate(button => { button.style.transform = ""; });
+    }
     assert.deepEqual(await page.evaluate(inspectDatabagDraft, { ...draft, draftState: "prepared" }), { ok: true, editor: "textarea" });
     await page.evaluate(() => {
       window.syntheticBridge.events = [];
@@ -949,8 +981,10 @@ test("Databag guarded fills insert once and preserve human or changed-identity d
           }, 333);
         }, { once: true });
       }, outcome);
+      const failureReason = { focus: "focus_changed", draft: "draft_changed", identity: "target_changed",
+        button: "submit_changed", disabled: "composer_changed", expired: "deadline_expired" }[outcome];
       assert.deepEqual(await page.evaluate(fillDatabagDraft, input), outcome === "settled"
-        ? { ok: true, editor: "textarea" } : { ok: false, code: "FILL_UNCERTAIN" });
+        ? { ok: true, editor: "textarea" } : { ok: false, code: "FILL_UNCERTAIN", failureReason });
       assert.equal(await page.locator("textarea").inputValue(), outcome === "draft" ? `${input.text} edited` : input.text);
       assert.equal(await page.evaluate(() => window.syntheticTrustedInputs), 1);
       assert.equal(await page.evaluate(() => window.syntheticActivations), 0);

@@ -844,7 +844,8 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
                 ? checked.result.code : "COMPOSER_UNAVAILABLE" };
         } else if (!checked.result.ok) observation = checked.result;
         else {
-          observation = { ok: false, code: "FILL_UNCERTAIN" };
+          observation = { ok: false, code: "FILL_UNCERTAIN",
+            ...(check.target.provider === "databag" ? { failureReason: "result_unconfirmed" as const } : {}) };
           const input = { ...args, operationId: check.operationId, attemptId: check.jobId, expiresAt: binding.expiresAt,
             ...(check.leftover ? { leftover: check.leftover } : {}) };
           const filled = check.target.provider === "gemini"
@@ -859,8 +860,15 @@ async function executeTrackedChatJob(check: ChatBrowserJob): Promise<void> {
             : await browser.scripting.executeScript({ target: { tabId: check.target.tabId, documentIds: [check.target.documentId] },
               func: fillFixtureDraft, args: [input] });
           const completed = filled[0];
-          if (completed?.frameId === 0 && completed.documentId === check.target.documentId && completed.result
-            && await chatJobBinding(check, completed.result.ok && check.target.provider === "databag")) observation = completed.result;
+          if (completed?.frameId === 0 && completed.documentId === check.target.documentId && completed.result) {
+            const diagnosed = check.target.provider === "databag" && !completed.result.ok
+              && completed.result.code === "FILL_UNCERTAIN" && "failureReason" in completed.result && completed.result.failureReason;
+            if (diagnosed) observation = completed.result;
+            if (await chatJobBinding(check, completed.result.ok && check.target.provider === "databag")) observation = completed.result;
+            else if (check.target.provider === "databag" && !diagnosed) {
+              observation = { ok: false, code: "FILL_UNCERTAIN", failureReason: "binding_changed" };
+            }
+          }
         }
       }
     }

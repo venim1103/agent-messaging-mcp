@@ -118,10 +118,13 @@ export const fixturePreflightStatusSchema = z.discriminatedUnion("ok", [
   fixturePreflightResultSchema.options[0].extend({ operationId: z.uuid(), checkedAt: z.number().int().safe() }),
   fixturePreflightResultSchema.options[1].extend({ operationId: z.uuid(), checkedAt: z.number().int().safe() })
 ]);
+export const fillFailureReasonSchema = z.enum(["insertion_unconfirmed", "target_changed", "composer_changed", "editor_changed",
+  "submit_changed", "focus_changed", "draft_changed", "deadline_expired", "execution_failed", "result_unconfirmed", "binding_changed"]);
 export const fixtureFillResultSchema = z.discriminatedUnion("ok", [
   fixturePreflightResultSchema.options[0],
   z.strictObject({ ok: z.literal(false), code: z.enum(["TARGET_CHANGED", "UNSUPPORTED_MESSAGE_TEXT",
-    "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "SUBMIT_UNAVAILABLE", "FILL_UNAVAILABLE", "FILL_UNCERTAIN"]) })
+    "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "SUBMIT_UNAVAILABLE", "FILL_UNAVAILABLE", "FILL_UNCERTAIN"]),
+    failureReason: fillFailureReasonSchema.optional() }).refine(result => !result.failureReason || result.code === "FILL_UNCERTAIN")
 ]);
 export type FixtureFillResult = z.infer<typeof fixtureFillResultSchema>;
 export const geminiFillResultSchema = z.discriminatedUnion("ok", [
@@ -149,7 +152,7 @@ export const geminiFillStatusSchema = z.discriminatedUnion("ok", [
 ]);
 export const fixtureFillStatusSchema = z.discriminatedUnion("ok", [
   fixtureFillResultSchema.options[0].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() }),
-  fixtureFillResultSchema.options[1].extend({ operationId: z.uuid(), completedAt: z.number().int().safe() })
+  fixtureFillResultSchema.options[1].safeExtend({ operationId: z.uuid(), completedAt: z.number().int().safe() })
 ]);
 export const fixtureDraftFillStateSchema = z.discriminatedUnion("state", [
   z.strictObject({ state: z.literal("fill_approved"), expiresAt: z.number().int().safe() }),
@@ -157,7 +160,7 @@ export const fixtureDraftFillStateSchema = z.discriminatedUnion("state", [
   z.strictObject({ state: z.literal("filled"), completedAt: z.number().int().safe(), editor: z.enum(["textarea", "rich", "contenteditable"]) }),
   z.strictObject({ state: z.literal("failed"), completedAt: z.number().int().safe(), code: z.enum(["TARGET_CHANGED",
     "UNSUPPORTED_MESSAGE_TEXT", "COMPOSER_UNAVAILABLE", "DRAFT_PRESENT", "SUBMIT_UNAVAILABLE", "FILL_UNAVAILABLE"]) }),
-  z.strictObject({ state: z.literal("uncertain"), completedAt: z.number().int().safe() })
+  z.strictObject({ state: z.literal("uncertain"), completedAt: z.number().int().safe(), failureReason: fillFailureReasonSchema.optional() })
 ]);
 const fixtureObservationSchema = z.strictObject({
   kind: z.literal("fixture_snapshot"),
@@ -1366,7 +1369,10 @@ export class PreparedMessageOperations {
     const state: FixtureDraftFillState = status?.ok
       ? { state: "filled", completedAt: status.completedAt, editor: status.editor }
       : !status || status.code === "FILL_UNCERTAIN"
-        ? { state: "uncertain", completedAt: status?.completedAt ?? now }
+        ? { state: "uncertain", completedAt: status?.completedAt ?? now,
+          ...(status?.failureReason ? { failureReason: status.failureReason }
+            : !status && "provider" in pending.target && pending.target.provider === "databag"
+              ? { failureReason: "result_unconfirmed" as const } : {}) }
         : { state: "failed", completedAt: status.completedAt, code: status.code };
     this.fillStates.set(pending.operationId, Object.freeze(state));
     pending.resolve(status);
