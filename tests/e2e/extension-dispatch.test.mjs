@@ -1039,6 +1039,8 @@ async function exerciseChatDispatch(outcome, provider = "fixture", testContext, 
         const status = result.structuredContent;
         if (hiddenSettlement) testContext.diagnostic(`Hidden settlement trace: ${JSON.stringify(
           await worker.evaluate(() => globalThis.browserJobTrace))}`);
+        if (provider === "fixture" && outcome === "not_sent") testContext.diagnostic(`Synthetic settlement trace: ${JSON.stringify(
+          await worker.evaluate(() => globalThis.browserJobTrace))}`);
         if (inactive) {
           assert.equal(await fixture.evaluate(() => document.visibilityState), "hidden");
           assert.deepEqual(await worker.evaluate(async tabId => ({ active: (await chrome.tabs.get(tabId)).active,

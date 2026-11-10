@@ -795,6 +795,21 @@ test("Company AI Chat read binding separates identity from bounded sender captur
       rows[0].className = "Invented_userMessage__alpha";
       rows[1].className = "Invented_assistantMessage__beta";
       const senderMapping = binding.capture(deadline).messages.map(message => message.direction);
+      const hintedSnapshot = binding.capture(deadline);
+      timeline.replaceChildren(...rows.map(row => row.cloneNode(true)));
+      const remountedSnapshot = binding.capture(deadline);
+      const remountDoesNotQualifyWindow = [...timeline.children].every((row, index) => row !== rows[index])
+        && remountedSnapshot?.omittedBefore === true
+        && JSON.stringify(remountedSnapshot) === JSON.stringify(hintedSnapshot);
+      timeline.replaceChildren(...rows);
+      const originalStyle = timeline.getAttribute("style");
+      timeline.style.display = "flex";
+      timeline.style.flexDirection = "column-reverse";
+      const reversedSnapshot = binding.capture(deadline);
+      const visualOrderDoesNotQualifyChronology = rows[0].getBoundingClientRect().top > rows[1].getBoundingClientRect().top
+        && reversedSnapshot?.omittedBefore === true
+        && JSON.stringify(reversedSnapshot) === JSON.stringify(hintedSnapshot);
+      if (originalStyle === null) timeline.removeAttribute("style"); else timeline.setAttribute("style", originalStyle);
       rows[0].className += " Invented_assistantMessage__gamma";
       const ambiguousSenderUnknown = binding.capture(deadline).messages[0].direction === "unknown";
       rows[0].removeAttribute("class"); rows[1].removeAttribute("class");
@@ -812,12 +827,14 @@ test("Company AI Chat read binding separates identity from bounded sender captur
       const refusedCapture = binding.capture(deadline) === null && messageReads === reads;
       binding.dispose();
       return { status: binding.status, identityReadFree, initialCheck, checkReadFree, snapshot, privateOutput,
-        senderMapping, ambiguousSenderUnknown, descendantSenderIgnored, partialTokenIgnored, oversizedClassIgnored,
+        senderMapping, remountDoesNotQualifyWindow, visualOrderDoesNotQualifyChronology,
+        ambiguousSenderUnknown, descendantSenderIgnored, partialTokenIgnored, oversizedClassIgnored,
         terminal, refusedCapture, draftReads, inputs, activations };
     });
     assert.deepEqual(result, { status: "ok", identityReadFree: true, initialCheck: true, checkReadFree: true,
       snapshot: { messages: [{ direction: "unknown", text: "Synthetic first row" }, { direction: "unknown", text: "Synthetic second row" }],
         omittedBefore: true }, privateOutput: true, senderMapping: ["outgoing", "incoming"], ambiguousSenderUnknown: true,
+      remountDoesNotQualifyWindow: true, visualOrderDoesNotQualifyChronology: true,
       descendantSenderIgnored: true, partialTokenIgnored: true, oversizedClassIgnored: true,
       terminal: true, refusedCapture: true, draftReads: 0, inputs: 0, activations: 0 });
       await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-chat"; });
@@ -3433,6 +3450,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
   const setPhase = trackTestPhase(testContext, "Company connected read");
   const sends = scenario === "send" || scenario === "submit-result-loss";
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-company-connected-read-"));
+  const nativeEnvironment = { ...process.env, HOME: profile, NODE_COMPILE_CACHE: join(profile, "compile-cache") };
   const clients = [new Client({ name: "Company one", version: "0.0.1" }), new Client({ name: "Company two", version: "0.0.1" })];
   let context;
   let broker;
@@ -3449,7 +3467,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
     manifest.host_permissions = ["https://chat.app.example.com/*"];
     await writeFile(manifestPath, JSON.stringify(manifest));
     context = await chromium.launchPersistentContext(profile, { chromiumSandbox: true, executablePath: "/usr/bin/chromium",
-      headless: true, env: { ...process.env, HOME: profile },
+      headless: true, env: nativeEnvironment,
       args: [`--disable-extensions-except=${unpacked}`, `--load-extension=${unpacked}`] });
     const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 5000 });
     const extensionId = new URL(worker.url()).hostname;
@@ -3494,7 +3512,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
     await registerNative(planNativeRegistration(profile, extensionId, process.execPath, nativeRelayPath, profile));
     const brokerEntry = fileURLToPath(new URL("../../packages/companion/dist/broker-process.js", import.meta.url));
     const mcpEntry = fileURLToPath(new URL("../../packages/companion/dist/mcp-stdio.js", import.meta.url));
-    broker = spawn(process.execPath, [brokerEntry], { env: { ...process.env, HOME: profile }, stdio: "ignore" });
+    broker = spawn(process.execPath, [brokerEntry], { env: nativeEnvironment, stdio: "ignore" });
     brokerExit = once(broker, "exit");
     let ready = false;
     for (let attempt = 0; attempt < 80; attempt++) {
@@ -3504,7 +3522,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
       await setTimeout(25);
     }
     assert.equal(ready, true);
-    const environment = { ...process.env, HOME: profile, BROWSER_CHAT_AUTO_START_BROKER: "0" };
+    const environment = { ...nativeEnvironment, BROWSER_CHAT_AUTO_START_BROKER: "0" };
     delete environment.BROWSER_CHAT_AGENT_LABEL;
     await Promise.all(clients.map(client => client.connect(new StdioClientTransport({ command: process.execPath,
       args: [mcpEntry], env: environment }))));
@@ -3678,10 +3696,14 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
     setPhase("multiple owners and identity revocation");
     await activate(row("Company two").getByRole("button", { name: "Connect this chat" }));
     await count(2);
+    setPhase("second owner pickup");
     const second = (await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent.connections[0];
+    setPhase("first owner removal");
     await activate(row("Company one").getByRole("button", { name: "Remove access" }));
     await count(1);
+    setPhase("removed owner read refusal");
     assert.equal((await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } })).isError, true);
+    setPhase("remaining owner challenged read");
     assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).isError, undefined);
     assert.deepEqual(await page.evaluate(() => ({ inputs: globalThis.syntheticCompanyInputs, activations: globalThis.syntheticCompanyActivations })),
       sends ? { inputs: 1, activations: 1 } : { inputs: 0, activations: 0 });
@@ -3689,6 +3711,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
     else if (scenario === "reload") await page.reload();
     else if (scenario === "read-gap") await worker.evaluate(() => { globalThis.syntheticCompanyReadGap = true; });
     else await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-other"; });
+    setPhase("stored grant revocation");
     let revoked = false;
     for (let attempt = 0; attempt < 80; attempt++) {
       testContext.signal.throwIfAborted();
@@ -3699,6 +3722,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
     }
     assert.equal(revoked, true, `Company ${scenario} must remove the stored grant`);
     if (scenario === "read-gap") assert.equal(await worker.evaluate(() => globalThis.syntheticCompanyCorruptions), 1);
+    setPhase("revoked owner pickup and read refusal");
     assert.deepEqual((await clients[1].callTool({ name: "chat_wait_for_connection", arguments: { timeoutMs: 0 } })).structuredContent,
       { connections: [], timedOut: true });
     assert.equal((await clients[1].callTool({ name: "chat_read_messages", arguments: { connectionId: second.connectionId } })).isError, true);

@@ -105,6 +105,9 @@ test("Company send capability reuses rendered jobs without widening read-only gr
     assert.equal((await filling.result)?.ok, true);
     assert.equal(requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Invented previous answer" }],
       Date.now(), undefined, true), 1);
+    const baseline = Array.from({ length: 32 }, (_, index) => ({ direction: "incoming" as const,
+      text: `Invented Company retained answer ${index}` }));
+    assert.equal(requests.publishGeminiSnapshot(target, baseline, Date.now(), undefined, true), 1);
     const inspecting = ledger.requestChatProof(owner, prepared.operationId, Date.now(), deadline);
     assert.ok(inspecting && inspecting !== "busy");
     assert.deepEqual(ledger.listGeminiDispatchChecks(Date.now(), true), []);
@@ -122,8 +125,15 @@ test("Company send capability reuses rendered jobs without widening read-only gr
     assert.equal(ledger.completeChatSubmitJob(target, submit.operationId, submit.jobId,
       { ok: true, editor: "textarea", activated: true }), true);
     assert.equal((await dispatch.result).state, "dispatch_uncertain");
+    const appended = [...baseline.slice(2), { direction: "outgoing" as const, text },
+      { direction: "incoming" as const, text: "Invented Company new answer" }];
+    assert.equal(evaluateRenderedDispatchAppend({ omittedBefore: true, messages: baseline },
+      [{ omittedBefore: true, messages: appended }], text), "sent");
+    assert.equal(requests.publishGeminiSnapshot(target, appended, Date.now(), undefined, true), 1);
     assert.equal(ledger.reconcileGeminiObservation(owner, prepared.operationId).state, "dispatch_uncertain");
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()!.count, 1);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()!.count, 0);
+    assert.deepEqual(ledger.listChatJobs("submit", "company_ai"), []);
     assert.equal(ledger.releaseComposer(owner, prepared.operationId), true);
   } finally { requests.disconnect(owner); database.close(); }
 });
