@@ -1,142 +1,219 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 
-export function inspectCompanyAIChatStructure(input: { expectedUrl: string }) {
-  if (!input || typeof input.expectedUrl !== "string" || input.expectedUrl.length > 512
-    || window.top !== window || document.visibilityState !== "visible" || location.href !== input.expectedUrl) return null;
-  const url = new URL(input.expectedUrl);
-  if (url.protocol !== "https:" || url.port || url.username || url.password
-    || !/^chat\.app\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.com$/.test(url.hostname) || !document.body) return null;
+type CompanyReadTargets = { editor: HTMLTextAreaElement; timeline: Element; profile: Element; rows: Element[];
+  region: Element; rowCount: number };
+type CompanyNativeMetadata = { status: "unavailable" } | { status: "available"; candidateRows: number;
+  inspectedRows: number; rowsOmitted: boolean; ancestors: number; ancestorsOmitted: boolean;
+  scrollState: "unknown" | "start" | "interior" | "end";
+  roleHints: { userOnly: number; assistantOnly: number; both: number; neither: number } | null;
+  attributeNames: string[]; attributeNamesOmitted: boolean };
+type CompanyStructure = { visitedElements: number; limited: boolean;
+  counts: { mainRegions: number; timelines: number; articles: number; forms: number; lists: number;
+    textareas: number; contenteditables: number; buttons: number; links: number; iframes: number };
+  editors: { kind: "textarea" | "contenteditable" | "textbox"; disabled: boolean; readOnly: boolean }[];
+  editorsOmitted: boolean; structure: { tag: string; role: string | null; parent: number | null; attributeNames: string[] }[];
+  structureOmitted: boolean; nativeMetadata: CompanyNativeMetadata };
 
-  const counts = { mainRegions: 0, timelines: 0, articles: 0, forms: 0, lists: 0,
-    textareas: 0, contenteditables: 0, buttons: 0, links: 0, iframes: 0 };
-  const editors: { kind: "textarea" | "contenteditable" | "textbox"; disabled: boolean; readOnly: boolean }[] = [];
-  const tags = new Set(["body", "main", "section", "article", "aside", "header", "footer", "nav", "div", "span", "p",
-    "form", "textarea", "input", "button", "a", "label", "select", "option", "ol", "ul", "li", "pre", "code",
-    "blockquote", "table", "thead", "tbody", "tr", "th", "td", "h1", "h2", "h3", "h4", "h5", "h6", "img", "svg", "iframe"]);
-  const roles = new Set(["main", "log", "feed", "article", "form", "list", "listitem", "button", "link", "textbox",
-    "region", "group", "tab", "tablist", "tabpanel", "status", "alert", "navigation", "banner", "contentinfo",
-    "complementary", "heading", "presentation", "none", "dialog", "menu", "menuitem", "progressbar"]);
-  const identityAttributeNames = ["id", "data-account-id", "data-user-id", "data-conversation-id", "data-chat-id",
-    "data-message-id", "data-testid", "aria-selected", "aria-current"];
-  const structure: { tag: string; role: string | null; parent: number | null; attributeNames: string[] }[] = [];
-  const pending: { element: Element; depth: number; parent: number | null }[] = [{ element: document.body, depth: 0, parent: null }];
-  let visitedElements = 0;
-  let limited = false;
-  let editorsOmitted = false;
-  let structureOmitted = false;
-  while (pending.length && visitedElements < 4096) {
-    const entry = pending.pop()!;
-    const element = entry.element;
-    visitedElements++;
-    if (entry.depth > 0 && element.nextElementSibling) {
-      pending.push({ element: element.nextElementSibling, depth: entry.depth, parent: entry.parent });
-    }
-    const tag = element.localName;
-    if (["script", "style", "template", "noscript"].includes(tag)) continue;
-    const style = getComputedStyle(element);
-    if (element.hasAttribute("hidden") || element.hasAttribute("inert") || element.getAttribute("aria-hidden") === "true"
-      || style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0) continue;
-    let childParent = entry.parent;
-    if (element.getClientRects().length > 0) {
-      const role = element.getAttribute("role");
-      if (structure.length < 512) {
-        childParent = structure.length;
-        structure.push({ tag: tags.has(tag) ? tag : "other", role: role !== null && roles.has(role) ? role : null,
-          parent: entry.parent, attributeNames: identityAttributeNames.filter(name => element.hasAttribute(name)) });
-      } else structureOmitted = true;
-      if (tag === "main" || role === "main") counts.mainRegions++;
-      if (role === "log" || role === "feed") counts.timelines++;
-      if (tag === "article" || role === "article") counts.articles++;
-      if (tag === "form" || role === "form") counts.forms++;
-      if (tag === "ol" || tag === "ul" || role === "list") counts.lists++;
-      if (tag === "button" || role === "button") counts.buttons++;
-      if (tag === "a" || role === "link") counts.links++;
-      if (tag === "iframe") counts.iframes++;
-      const editable = element.getAttribute("contenteditable");
-      const contenteditable = editable === "" || editable === "true" || editable === "plaintext-only";
-      if (tag === "textarea") counts.textareas++;
-      if (contenteditable) counts.contenteditables++;
-      const kind = tag === "textarea" ? "textarea" : contenteditable ? "contenteditable"
-        : role === "textbox" && tag !== "input" ? "textbox" : null;
-      if (kind) {
-        if (editors.length < 8) editors.push({ kind,
-          disabled: element.matches(":disabled") || element.getAttribute("aria-disabled") === "true",
-          readOnly: element.hasAttribute("readonly") || element.getAttribute("aria-readonly") === "true" });
-        else editorsOmitted = true;
-      }
-    }
-    if (tag !== "iframe" && element.firstElementChild) {
-      if (entry.depth >= 64) limited = true;
-      else pending.push({ element: element.firstElementChild, depth: entry.depth + 1, parent: childParent });
-    }
-  }
-  return { visitedElements, limited: limited || pending.length > 0, counts, editors, editorsOmitted,
-    structure, structureOmitted: structureOmitted || limited || pending.length > 0 };
-}
-
-export function locateCompanyAIChatReadTargets(input: { expectedUrl: string; deadline: number }) {
+export function inspectCompanyAIChatStructure(input: { expectedUrl: string; deadline: number }, targetsOnly: true): CompanyReadTargets | null;
+export function inspectCompanyAIChatStructure(input: { expectedUrl: string; deadline?: number }): CompanyStructure | null;
+export function inspectCompanyAIChatStructure(input: { expectedUrl: string; deadline?: number }, targetsOnly = false) {
   try {
-    const { expectedUrl, deadline } = input;
     const now = Date.now();
-    if (!Number.isFinite(deadline) || deadline <= now || deadline > now + 4000
-      || typeof expectedUrl !== "string" || expectedUrl.length > 512
-      || window.top !== window || document.visibilityState !== "visible" || location.href !== expectedUrl) return null;
-    const url = new URL(expectedUrl);
+    const deadline = input?.deadline ?? now + 4000;
+    if (!input || typeof input.expectedUrl !== "string" || input.expectedUrl.length > 512
+      || !Number.isFinite(deadline) || deadline <= now || deadline > now + 4000
+      || window.top !== window || document.visibilityState !== "visible" || location.href !== input.expectedUrl) return null;
+    const url = new URL(input.expectedUrl);
     if (url.protocol !== "https:" || url.port || url.username || url.password
       || !/^chat\.app\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.com$/.test(url.hostname)
       || [...url.searchParams.keys(), ...new URLSearchParams(url.hash.slice(1)).keys()]
-        .some(name => /^(code|access_token|id_token|client_info|state|session_state)$/i.test(name))) return null;
-    if (!document.body) return null;
+        .some(name => /^(code|access_token|id_token|client_info|state|session_state)$/i.test(name)) || !document.body) return null;
+    const body = document.body;
+
+    const counts = { mainRegions: 0, timelines: 0, articles: 0, forms: 0, lists: 0,
+      textareas: 0, contenteditables: 0, buttons: 0, links: 0, iframes: 0 };
+    const editors: { kind: "textarea" | "contenteditable" | "textbox"; disabled: boolean; readOnly: boolean }[] = [];
+    const tags = new Set(["body", "main", "section", "article", "aside", "header", "footer", "nav", "div", "span", "p",
+      "form", "textarea", "input", "button", "a", "label", "select", "option", "ol", "ul", "li", "pre", "code",
+      "blockquote", "table", "thead", "tbody", "tr", "th", "td", "h1", "h2", "h3", "h4", "h5", "h6", "img", "svg", "iframe"]);
+    const roles = new Set(["main", "log", "feed", "article", "form", "list", "listitem", "button", "link", "textbox",
+      "region", "group", "tab", "tablist", "tabpanel", "status", "alert", "navigation", "banner", "contentinfo",
+      "complementary", "heading", "presentation", "none", "dialog", "menu", "menuitem", "progressbar"]);
+    const identityAttributeNames = ["id", "data-account-id", "data-user-id", "data-conversation-id", "data-chat-id",
+      "data-message-id", "data-testid", "aria-selected", "aria-current"];
+    const structure: { tag: string; role: string | null; parent: number | null; attributeNames: string[] }[] = [];
+    const pending: { element: Element; depth: number; parent: number | null }[] = [{ element: document.body, depth: 0, parent: null }];
+    let visitedElements = 0;
+    let limited = false;
+    let editorsOmitted = false;
+    let structureOmitted = false;
     const visible: Element[] = [];
-    const pending: { element: Element; depth: number }[] = [{ element: document.body, depth: 0 }];
-    let visited = 0;
-    while (pending.length) {
-      if (Date.now() >= deadline || ++visited > 4096) return null;
-      const { element, depth } = pending.pop()!;
-      if (depth && element.nextElementSibling) pending.push({ element: element.nextElementSibling, depth });
-      if (["script", "style", "template", "noscript", "iframe"].includes(element.localName)) continue;
+    while (pending.length && visitedElements < 4096) {
+      if (Date.now() >= deadline) return null;
+      const entry = pending.pop()!;
+      const element = entry.element;
+      visitedElements++;
+      if (entry.depth > 0 && element.nextElementSibling) {
+        pending.push({ element: element.nextElementSibling, depth: entry.depth, parent: entry.parent });
+      }
+      const tag = element.localName;
+      if (["script", "style", "template", "noscript"].includes(tag)) continue;
       const style = getComputedStyle(element);
       if (element.hasAttribute("hidden") || element.hasAttribute("inert") || element.getAttribute("aria-hidden") === "true"
         || style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0) continue;
-      if (element.getClientRects().length) visible.push(element);
-      if (element.firstElementChild) {
-        if (depth >= 64) return null;
-        pending.push({ element: element.firstElementChild, depth: depth + 1 });
+      let childParent = entry.parent;
+      if (element.getClientRects().length > 0) {
+        if (tag !== "iframe") visible.push(element);
+        if (!targetsOnly) {
+          const role = element.getAttribute("role");
+          if (structure.length < 512) {
+            childParent = structure.length;
+            structure.push({ tag: tags.has(tag) ? tag : "other", role: role !== null && roles.has(role) ? role : null,
+              parent: entry.parent, attributeNames: identityAttributeNames.filter(name => element.hasAttribute(name)) });
+          } else structureOmitted = true;
+          if (tag === "main" || role === "main") counts.mainRegions++;
+          if (role === "log" || role === "feed") counts.timelines++;
+          if (tag === "article" || role === "article") counts.articles++;
+          if (tag === "form" || role === "form") counts.forms++;
+          if (tag === "ol" || tag === "ul" || role === "list") counts.lists++;
+          if (tag === "button" || role === "button") counts.buttons++;
+          if (tag === "a" || role === "link") counts.links++;
+          if (tag === "iframe") counts.iframes++;
+          const editable = element.getAttribute("contenteditable");
+          const contenteditable = editable === "" || editable === "true" || editable === "plaintext-only";
+          if (tag === "textarea") counts.textareas++;
+          if (contenteditable) counts.contenteditables++;
+          const kind = tag === "textarea" ? "textarea" : contenteditable ? "contenteditable"
+            : role === "textbox" && tag !== "input" ? "textbox" : null;
+          if (kind) {
+            if (editors.length < 8) editors.push({ kind,
+              disabled: element.matches(":disabled") || element.getAttribute("aria-disabled") === "true",
+              readOnly: element.hasAttribute("readonly") || element.getAttribute("aria-readonly") === "true" });
+            else editorsOmitted = true;
+          }
+        }
+      }
+      if (tag !== "iframe" && element.firstElementChild) {
+        if (entry.depth >= 64) limited = true;
+        else pending.push({ element: element.firstElementChild, depth: entry.depth + 1, parent: childParent });
       }
     }
-    const editors = visible.filter(element => element.localName === "textarea");
-    if (editors.length !== 1 || !(editors[0] instanceof HTMLTextAreaElement)) return null;
-    const editor = editors[0];
-    const profileSpans = visible.filter(element => element.localName === "span" && element.closest("nav")
-      && !element.closest("a,button,[role=button]"));
-    const profiles = profileSpans.filter(element => !profileSpans.some(child => child !== element && element.contains(child))
-      && element.childNodes.length <= 32 && [...element.childNodes].some(child => child.nodeType === Node.TEXT_NODE));
-    if (profiles.length !== 1) return null;
-    const profile = profiles[0]!;
-    const textContainers = visible.filter(element => ["p", "pre", "blockquote", "table", "ol", "ul"].includes(element.localName));
-    const groups = new Map<Element, Element[]>();
-    for (const element of visible) {
-      if (Date.now() >= deadline) return null;
-      const parent = element.parentElement;
-      if (element.localName !== "div" || !element.hasAttribute("data-testid") || !parent
-        || element.closest("nav") || element.contains(editor) || element.contains(profile)
-        || !textContainers.some(text => element.contains(text))) continue;
-      const rows = groups.get(parent) ?? [];
-      rows.push(element);
-      groups.set(parent, rows);
-    }
-    for (let ancestor = editor.parentElement; ancestor && ancestor !== document.body; ancestor = ancestor.parentElement) {
-      if (Date.now() >= deadline) return null;
-      const candidates = [...groups].filter(([timeline]) => ancestor.contains(timeline)
-        && !timeline.contains(editor) && !timeline.contains(profile));
-      if (candidates.length > 1) return null;
-      if (candidates.length === 1) {
-        const [timeline, rows] = candidates[0]!;
-        return { editor, timeline, profile, rows: rows.slice(-32) };
+    limited ||= pending.length > 0;
+    const locate = (): CompanyReadTargets | null => {
+      if (limited) return null;
+      const editors = visible.filter(element => element.localName === "textarea");
+      if (editors.length !== 1 || !(editors[0] instanceof HTMLTextAreaElement)) return null;
+      const editor = editors[0];
+      const profileSpans = visible.filter(element => element.localName === "span" && element.closest("nav")
+        && !element.closest("a,button,[role=button]"));
+      const profiles = profileSpans.filter(element => !profileSpans.some(child => child !== element && element.contains(child))
+        && element.childNodes.length <= 32 && [...element.childNodes].some(child => child.nodeType === Node.TEXT_NODE));
+      if (profiles.length !== 1) return null;
+      const profile = profiles[0]!;
+      const textContainers = visible.filter(element => ["p", "pre", "blockquote", "table", "ol", "ul"].includes(element.localName));
+      const groups = new Map<Element, Element[]>();
+      for (const element of visible) {
+        if (Date.now() >= deadline) return null;
+        const parent = element.parentElement;
+        if (element.localName !== "div" || !element.hasAttribute("data-testid") || !parent
+          || element.closest("nav") || element.contains(editor) || element.contains(profile)
+          || !textContainers.some(text => element.contains(text))) continue;
+        const rows = groups.get(parent) ?? [];
+        rows.push(element);
+        groups.set(parent, rows);
+      }
+      for (let ancestor = editor.parentElement; ancestor && ancestor !== document.body; ancestor = ancestor.parentElement) {
+        if (Date.now() >= deadline) return null;
+        const candidates = [...groups].filter(([timeline]) => ancestor.contains(timeline)
+          && !timeline.contains(editor) && !timeline.contains(profile));
+        if (candidates.length > 1) return null;
+        if (candidates.length === 1) {
+          const [timeline, rows] = candidates[0]!;
+          return { editor, timeline, profile, rows: rows.slice(-32), rowCount: rows.length, region: ancestor };
+        }
+      }
+      return null;
+    };
+    const targets = locate();
+    let nativeMetadata: CompanyNativeMetadata = { status: "unavailable" };
+    if (!targetsOnly && targets && !structureOmitted && !editorsOmitted) {
+      const excluded = "nav,aside,header,footer,[role=navigation],[role=complementary]";
+      const ancestors: Element[] = [];
+      let ancestor = targets.timeline.parentElement;
+      while (ancestor && targets.region.contains(ancestor) && ancestors.length < 8) {
+        ancestors.push(ancestor);
+        if (ancestor === targets.region) { ancestor = null; break; }
+        ancestor = ancestor.parentElement;
+      }
+      if (![targets.timeline, ...targets.rows, ...ancestors].some(element => element.closest(excluded))) {
+        const selected = [targets.timeline, ...targets.rows, ...ancestors];
+        const names = new Set<string>();
+        let attributeNamesOmitted = false;
+        for (const element of selected) {
+          if (Date.now() >= deadline) return null;
+          const attributes = element.getAttributeNames();
+          if (attributes.length > 64) attributeNamesOmitted = true;
+          for (const name of attributes.slice(0, 64)) {
+            if (!/^(data|aria)-/.test(name)) continue;
+            if (name.length > 64 || !/^(data|aria)-[a-z][a-z0-9_.:-]*$/.test(name)) { attributeNamesOmitted = true; continue; }
+            if (!names.has(name) && names.size >= 32) attributeNamesOmitted = true;
+            else names.add(name);
+          }
+        }
+        const roleHints = { userOnly: 0, assistantOnly: 0, both: 0, neither: 0 };
+        let rolesLimited = false;
+        for (const row of targets.rows) {
+          const classes = row.getAttribute("class") ?? "";
+          if (classes.length > 256) { rolesLimited = true; continue; }
+          const roles = new Set(classes.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()
+            .split(/[^a-z]+/).filter(token => token === "user" || token === "assistant"));
+          if (roles.size === 2) roleHints.both++;
+          else if (roles.has("user")) roleHints.userOnly++;
+          else if (roles.has("assistant")) roleHints.assistantOnly++;
+          else roleHints.neither++;
+        }
+        const scrollContainers = [targets.timeline, ...ancestors].filter(element => {
+          const style = getComputedStyle(element);
+          return /^(auto|scroll)$/.test(style.overflowY) && element.clientHeight > 0
+            && element.scrollHeight > element.clientHeight;
+        });
+        let scrollState: "unknown" | "start" | "interior" | "end" = "unknown";
+        const ancestorsOmitted = ancestor !== null && targets.region.contains(ancestor);
+        if (!ancestorsOmitted && scrollContainers.length === 1) {
+          const container = scrollContainers[0]!;
+          const top = container.scrollTop;
+          const remaining = container.scrollHeight - container.clientHeight - top;
+          const style = getComputedStyle(container);
+          if (Number.isFinite(top) && Number.isFinite(remaining) && top >= 0 && remaining >= 0
+            && style.flexDirection !== "column-reverse" && style.writingMode === "horizontal-tb") {
+            scrollState = top === 0 ? "start" : remaining <= 1 ? "end" : "interior";
+          }
+        }
+        nativeMetadata = { status: "available", candidateRows: targets.rowCount, inspectedRows: targets.rows.length,
+          rowsOmitted: targets.rowCount > targets.rows.length, ancestors: ancestors.length, ancestorsOmitted,
+          scrollState, roleHints: rolesLimited ? null : roleHints, attributeNames: [...names], attributeNamesOmitted };
       }
     }
-    return null;
+    if (Date.now() >= deadline || document.body !== body || location.href !== input.expectedUrl
+      || window.top !== window || document.visibilityState !== "visible"
+      || targets && (!targets.editor.isConnected || !targets.profile.isConnected || !targets.region.isConnected
+        || !targets.timeline.isConnected || !targets.rows.every(row => row.isConnected && row.parentElement === targets.timeline)
+        || [targets.editor, targets.profile, targets.region, targets.timeline, ...targets.rows].some(element => {
+          const style = getComputedStyle(element);
+          return element.closest("[hidden],[inert],[aria-hidden=true]") !== null || !element.getClientRects().length
+            || style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0;
+        }))) return null;
+    if (Date.now() >= deadline) return null;
+    if (targetsOnly) return targets;
+    return { visitedElements, limited: limited || pending.length > 0, counts, editors, editorsOmitted,
+      structure, structureOmitted: structureOmitted || limited || pending.length > 0,
+      nativeMetadata };
   } catch { return null; }
+}
+
+export function locateCompanyAIChatReadTargets(input: { expectedUrl: string; deadline: number }) {
+  if (!input || !Number.isFinite(input.deadline)) return null;
+  return inspectCompanyAIChatStructure(input, true);
 }
 
 export function locateCompanyAIChatComposer(input: { expectedUrl: string; deadline: number }) {

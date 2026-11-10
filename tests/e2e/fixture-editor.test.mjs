@@ -78,6 +78,7 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
     assert.equal(shape.limited, false);
     assert.equal(shape.editorsOmitted, false);
     assert.equal(shape.structureOmitted, false);
+    assert.deepEqual(shape.nativeMetadata, { status: "unavailable" });
     assert.deepEqual(shape.counts, { mainRegions: 1, timelines: 1, articles: 1, forms: 1, lists: 0,
       textareas: 1, contenteditables: 1, buttons: 1, links: 1, iframes: 1 });
     assert.deepEqual(shape.editors, [{ kind: "textarea", disabled: false, readOnly: true },
@@ -113,6 +114,7 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
     assert.equal(structureClipped.limited, false);
     assert.equal(structureClipped.structure.length, 512);
     assert.equal(structureClipped.structureOmitted, true);
+    assert.deepEqual(structureClipped.nativeMetadata, { status: "unavailable" });
     assert.ok(structureClipped.structure.slice(1).every(node => node.attributeNames.length === 1
       && node.attributeNames[0] === "data-user-id"));
     assert.doesNotMatch(JSON.stringify(structureClipped), /Synthetic|private/);
@@ -124,6 +126,7 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
     assert.equal(clipped.limited, true);
     assert.equal(clipped.structure.length, 512);
     assert.equal(clipped.structureOmitted, true);
+    assert.deepEqual(clipped.nativeMetadata, { status: "unavailable" });
     assert.ok(clipped.structure.slice(1).every(node => node.parent === 0 && node.tag === "button"));
     await page.evaluate(() => {
       document.body.replaceChildren();
@@ -134,7 +137,149 @@ test("Company AI Chat inspection is bounded, metadata-only and leaves private co
     assert.equal(deep.visitedElements, 65);
     assert.equal(deep.limited, true);
     assert.equal(deep.structureOmitted, true);
+    assert.deepEqual(deep.nativeMetadata, { status: "unavailable" });
     assert.ok(deep.structure.length <= 65);
+    await page.goto(input.expectedUrl);
+    await page.evaluate(() => {
+      document.body.innerHTML = '<nav><a><span>Synthetic brand</span></a><span>Synthetic private account</span></nav>'
+        + '<aside data-private-sidebar="Synthetic sidebar value"><div data-testid="Synthetic history"><p>Synthetic history</p></div></aside>'
+        + '<section data-region-marker="Synthetic region value"><div data-tail-marker="Synthetic tail value" aria-relevant="additions"'
+        + ' style="height:128px;overflow-y:auto"></div><form><textarea>Synthetic human draft</textarea><button>Send</button></form></section>';
+      const region = document.querySelector("section");
+      const timeline = region.firstElementChild;
+      for (let index = 0; index < 34; index++) {
+        const row = document.createElement("div");
+        row.setAttribute("data-testid", "Synthetic private marker");
+        row.setAttribute("aria-posinset", String(index));
+        row.className = ["SyntheticUser", "SyntheticAssistant", "SyntheticUserAssistant", "SyntheticOther"][index % 4];
+        row.innerHTML = '<p style="height:40px">Synthetic private message</p>';
+        timeline.append(row);
+      }
+      const hidden = document.createElement("div");
+      hidden.hidden = true;
+      hidden.innerHTML = '<div data-testid="Synthetic hidden"><p>Synthetic hidden message</p></div>';
+      timeline.append(hidden);
+      const frame = document.createElement("iframe");
+      frame.srcdoc = '<p>Synthetic framed message</p>';
+      region.append(frame);
+      const rows = [...timeline.children].slice(0, 34);
+      const selected = new Set([region, timeline, ...rows.slice(-32)]);
+      const nativeNames = Element.prototype.getAttributeNames;
+      const nativeAttribute = Element.prototype.getAttribute;
+      const nativeHtml = Object.getOwnPropertyDescriptor(Element.prototype, "outerHTML").get;
+      const nativeValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").get;
+      const editor = document.querySelector("textarea");
+      const before = nativeHtml.call(document.body);
+      const observer = new MutationObserver(() => {});
+      observer.observe(document.body, { childList: true, attributes: true, characterData: true, subtree: true });
+      let interactions = 0;
+      for (const kind of ["input", "change", "focus", "click"]) document.addEventListener(kind, () => { interactions++; }, true);
+      window.syntheticNativeMetadata = { region, timeline, rows, selected,
+        nativeNames, nativeAttribute, reset: () => observer.takeRecords(),
+        state: () => ({ interactions, mutations: observer.takeRecords().length,
+          draftUnchanged: nativeValue.call(editor) === "Synthetic human draft",
+          htmlUnchanged: nativeHtml.call(document.body) === before, top: timeline.scrollTop }) };
+      Element.prototype.getAttributeNames = function () {
+        if (!selected.has(this)) throw new Error("Synthetic out-of-scope attribute names");
+        return nativeNames.call(this);
+      };
+      Element.prototype.getAttribute = function (name) {
+        if (name === "class" && !rows.slice(-32).includes(this)) throw new Error("Synthetic out-of-scope role hint");
+        if (!["role", "class", "aria-hidden", "contenteditable", "aria-disabled", "aria-readonly"].includes(name)) {
+          throw new Error("Synthetic private attribute value");
+        }
+        return nativeAttribute.call(this, name);
+      };
+      for (const [prototype, property] of [[Node.prototype, "textContent"], [Node.prototype, "nodeValue"],
+        [HTMLElement.prototype, "innerText"], [Element.prototype, "innerHTML"], [Element.prototype, "outerHTML"],
+        [HTMLTextAreaElement.prototype, "value"], [HTMLInputElement.prototype, "value"], [HTMLInputElement.prototype, "files"],
+        [Element.prototype, "attributes"], [Element.prototype, "id"], [HTMLElement.prototype, "dataset"],
+        [Element.prototype, "shadowRoot"], [HTMLIFrameElement.prototype, "contentDocument"], [HTMLIFrameElement.prototype, "contentWindow"]]) {
+        Object.defineProperty(prototype, property, { configurable: true, get() { throw new Error("Synthetic private getter"); } });
+      }
+    });
+    const selected = await page.evaluate(inspectCompanyAIChatStructure, input);
+    assert.deepEqual(selected.nativeMetadata, { status: "available", candidateRows: 34, inspectedRows: 32,
+      rowsOmitted: true, ancestors: 1, ancestorsOmitted: false, scrollState: "start",
+      roleHints: { userOnly: 8, assistantOnly: 8, both: 8, neither: 8 },
+      attributeNames: ["data-tail-marker", "aria-relevant", "data-testid", "aria-posinset", "data-region-marker"],
+      attributeNamesOmitted: false });
+    assert.deepEqual(await page.evaluate(() => window.syntheticNativeMetadata.state()),
+      { interactions: 0, mutations: 0, draftUnchanged: true, htmlUnchanged: true, top: 0 });
+    assert.doesNotMatch(JSON.stringify(selected), /Synthetic|private-sidebar|https:/);
+    assert.equal(await page.evaluate(inspectCompanyAIChatStructure, { ...input, deadline: 0 }), null);
+    assert.equal(await page.evaluate(inspectCompanyAIChatStructure, { ...input, deadline: Infinity }), null);
+    for (const position of [40, Number.MAX_SAFE_INTEGER]) {
+      await page.evaluate(position => { window.syntheticNativeMetadata.timeline.scrollTop = position; }, position);
+      const metadata = (await page.evaluate(inspectCompanyAIChatStructure, input)).nativeMetadata;
+      assert.equal(metadata.scrollState, position === 40 ? "interior" : "end");
+    }
+    await page.evaluate(() => {
+      const { timeline } = window.syntheticNativeMetadata;
+      timeline.style.overflowY = "visible";
+    });
+    assert.equal((await page.evaluate(inspectCompanyAIChatStructure, input)).nativeMetadata.scrollState, "unknown");
+    await page.evaluate(() => {
+      const { region, timeline } = window.syntheticNativeMetadata;
+      timeline.style.overflowY = "auto";
+      region.style.height = "64px";
+      region.style.overflowY = "auto";
+    });
+    assert.equal((await page.evaluate(inspectCompanyAIChatStructure, input)).nativeMetadata.scrollState, "unknown");
+    await page.evaluate(() => {
+      const { rows, region } = window.syntheticNativeMetadata;
+      region.style.overflowY = "visible";
+      rows[2].className = "user" + "x".repeat(300);
+      for (let index = 0; index < 70; index++) rows[2].setAttribute(`data-field-${index}`, "Synthetic private value");
+      rows[3].setAttribute("data-" + "x".repeat(65), "Synthetic private value");
+    });
+    const omitted = (await page.evaluate(inspectCompanyAIChatStructure, input)).nativeMetadata;
+    assert.equal(omitted.roleHints, null);
+    assert.equal(omitted.attributeNamesOmitted, true);
+    assert.equal(omitted.attributeNames.length, 32);
+    assert.ok(omitted.attributeNames.every(name => name.length <= 64));
+    assert.deepEqual((await page.evaluate(inspectCompanyAIChatStructure, input)).nativeMetadata, omitted);
+    await page.evaluate(() => {
+      const state = window.syntheticNativeMetadata;
+      let parent = state.timeline;
+      for (let depth = 0; depth < 9; depth++) {
+        const wrapper = document.createElement("div");
+        parent.replaceWith(wrapper);
+        wrapper.append(parent);
+        state.selected.add(wrapper);
+        parent = wrapper;
+      }
+    });
+    const ancestors = (await page.evaluate(inspectCompanyAIChatStructure, input)).nativeMetadata;
+    assert.equal(ancestors.ancestors, 8);
+    assert.equal(ancestors.ancestorsOmitted, true);
+    assert.equal(ancestors.scrollState, "unknown");
+    await page.evaluate(() => {
+      const now = Date.now;
+      let calls = 0;
+      Date.now = () => now() + (++calls > 4 ? 4000 : 0);
+      window.syntheticNativeMetadata.restoreClock = () => { Date.now = now; };
+    });
+    assert.equal(await page.evaluate(inspectCompanyAIChatStructure, input), null);
+    await page.evaluate(() => window.syntheticNativeMetadata.restoreClock());
+    await page.evaluate(() => {
+      const state = window.syntheticNativeMetadata;
+      Element.prototype.getAttributeNames = function () {
+        const result = state.nativeNames.call(this);
+        state.timeline.style.visibility = "hidden";
+        return result;
+      };
+    });
+    assert.equal(await page.evaluate(inspectCompanyAIChatStructure, input), null);
+    await page.evaluate(() => {
+      const state = window.syntheticNativeMetadata;
+      state.timeline.style.visibility = "visible";
+      Element.prototype.getAttributeNames = function () {
+        history.replaceState(null, "", "/chat/synthetic-changed");
+        return state.nativeNames.call(this);
+      };
+    });
+    assert.equal(await page.evaluate(inspectCompanyAIChatStructure, input), null);
   } finally {
     await browser.close();
   }

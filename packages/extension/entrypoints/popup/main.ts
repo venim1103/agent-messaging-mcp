@@ -245,15 +245,25 @@ async function inspectDatabagTab(target: InspectionTarget): Promise<InspectionRe
 }
 
 async function inspectCompanyAIChatTab(target: InspectionTarget): Promise<InspectionResult | null> {
-  const shape = await inspectPage(target, inspectCompanyAIChatStructure, [{ expectedUrl: target.url }]);
+  const shape = await inspectPage(target, inspectCompanyAIChatStructure, [{ expectedUrl: target.url, deadline: Date.now() + 4000 }]);
   if (!shape) return null;
   const counts = shape.counts;
+  const metadata = shape.nativeMetadata;
   return { title: "Company AI Chat (diagnostic)", details: [
     ["Bounds", `${shape.visitedElements} visited elements; ${shape.limited ? "limit reached" : "within limits"}`],
     ["Regions", `${counts.mainRegions} main; ${counts.timelines} log/feed; ${counts.articles} article; ${counts.forms} form; ${counts.lists} list`],
     ["Controls", `${counts.textareas} textarea; ${counts.contenteditables} contenteditable; ${counts.buttons} button; ${counts.links} link; ${counts.iframes} iframe`],
     ["Editors", shape.editors.map(editor => `${editor.kind}; ${editor.disabled ? "disabled" : "enabled"}; `
       + `${editor.readOnly ? "read-only" : "writable"}`).concat(shape.editorsOmitted ? ["Additional editors omitted"] : []).join("\n") || "None visible"],
+    ["Candidate window", metadata.status === "available"
+      ? `${metadata.inspectedRows} of ${metadata.candidateRows} row candidates; earlier candidates omitted ${metadata.rowsOmitted}; `
+        + `${metadata.ancestors} ancestors; additional ancestors omitted ${metadata.ancestorsOmitted}` : "Unavailable"],
+    ["Native scroll hint", metadata.status === "available" ? metadata.scrollState : "Unavailable"],
+    ["Role-token hints", metadata.status === "available" && metadata.roleHints
+      ? `${metadata.roleHints.userOnly} user-only; ${metadata.roleHints.assistantOnly} assistant-only; `
+        + `${metadata.roleHints.both} both; ${metadata.roleHints.neither} neither` : "Unknown"],
+    ["Native attribute names", metadata.status === "available"
+      ? [...metadata.attributeNames, ...(metadata.attributeNamesOmitted ? ["Additional names omitted"] : [])].join("\n") || "None" : "Unavailable"],
     ["Structure", [`${shape.structure.length} rows; ${shape.structureOmitted ? "additional structure omitted" : "within limits"}`,
       ...shape.structure.map((node, index) => `${index}: parent ${node.parent ?? "none"}; ${node.tag}; role ${node.role ?? "none"}; `
         + `attributes ${node.attributeNames.join(", ") || "none"}`)
