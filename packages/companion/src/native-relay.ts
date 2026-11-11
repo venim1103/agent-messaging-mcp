@@ -219,7 +219,8 @@ if (!isNativeCaller(expectedOrigin, callerOrigin)) {
               payload = result.payload;
             } else if (request.kind === "publish_chat_snapshot") {
               const result = await client.publishChatSnapshot(request.payload.target, request.payload.messages,
-                request.payload.challengeId, request.payload.omittedBefore);
+                request.payload.challengeId, request.payload.omittedBefore,
+                "renderedWindow" in request.payload ? request.payload.renderedWindow : undefined);
               if (result.kind !== "chat_snapshot_published" && result.kind !== "error") throw new Error("Broker refused chat snapshot");
               kind = result.kind;
               payload = result.payload;

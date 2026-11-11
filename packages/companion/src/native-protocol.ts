@@ -502,9 +502,13 @@ export const chatSnapshotPayloadSchema = z.union([
   fixtureSnapshotSchema.shape.payload.extend({ target: databagTargetSchema }),
   geminiSnapshotSchema.shape.payload.extend({ target: companyAIChatTargetSchema,
     messages: z.array(z.strictObject({ direction: z.enum(["incoming", "outgoing", "unknown"]), text: z.string().min(1).max(16_000),
-      truncated: z.literal(true).optional() })).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES) })
+      truncated: z.literal(true).optional() })).min(1).max(MAX_GEMINI_SNAPSHOT_MESSAGES),
+    renderedWindow: z.strictObject({ continuityToken: z.uuid() }).optional()
+  }).refine(payload => !payload.renderedWindow || (payload.omittedBefore === true
+    && payload.messages.every(message => message.direction !== "unknown" && !message.truncated)))
 ]).refine(payload => Buffer.byteLength(JSON.stringify({ messages: payload.messages,
-  omittedBefore: payload.omittedBefore ?? false }), "utf8") <= MAX_FIXTURE_SNAPSHOT_BYTES
+  omittedBefore: payload.omittedBefore ?? false,
+  ...("renderedWindow" in payload && payload.renderedWindow ? { renderedWindow: payload.renderedWindow } : {}) }), "utf8") <= MAX_FIXTURE_SNAPSHOT_BYTES
   && (isRenderedChatTarget(payload.target)
     || new Set(payload.messages.map(message => "id" in message ? message.id : null)).size === payload.messages.length));
 export const chatGapPayloadSchema = z.strictObject({ target: chatAgentTargetSchema });

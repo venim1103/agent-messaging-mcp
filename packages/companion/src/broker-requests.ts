@@ -293,11 +293,15 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
   if (request.kind === "publish_chat_snapshot") {
     if (role !== "relay") return { ...response, kind: "error" as const, payload: { code: "PERMISSION_DENIED" } };
     const { messages, challengeId, omittedBefore } = request.payload;
+    const renderedWindow = "renderedWindow" in request.payload ? request.payload.renderedWindow : undefined;
     const target: ApprovedTarget = request.payload.target;
     const count = isRenderedChatTarget(target)
-      ? requests.publishGeminiSnapshot(target, messages as ReadonlyArray<GeminiRenderedMessage>, now, challengeId, omittedBefore)
+      ? requests.publishGeminiSnapshot(target, messages as ReadonlyArray<GeminiRenderedMessage>, now, challengeId, omittedBefore, renderedWindow)
       : requests.publishStableSnapshot(target, messages as ReadonlyArray<FixtureMessage>, now, challengeId, omittedBefore);
-    if (count > 0 && !isRenderedChatTarget(target)) operations?.reconcileStableObservations(target, now);
+    if (count > 0) {
+      if (isRenderedChatTarget(target)) operations?.reconcileRenderedObservations(target, now);
+      else operations?.reconcileStableObservations(target, now);
+    }
     return { ...response, kind: "chat_snapshot_published" as const, payload: { count } };
   }
   if (request.kind === "mark_chat_observation_gap") {
@@ -762,10 +766,18 @@ export function handleBrokerRequest(message: unknown, role: BrokerRole, owner: s
       : request.payload.view === "incoming_changes"
       ? requests.readStableIncomingChanges(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now)
       : requests.readStableEvents(owner, request.payload.connectionId, request.payload.cursor, request.payload.limit ?? 2, now);
-    return events && events !== "not_ready"
-      ? { ...response, kind: target && isRenderedChatTarget(target) ? "gemini_events" as const : "fixture_events" as const, payload: events }
-      : { ...response, kind: "error" as const,
+    if (!events || events === "not_ready") {
+      return { ...response, kind: "error" as const,
         payload: { code: events === "not_ready" ? "OBSERVATION_UNAVAILABLE" : "CONNECTION_NOT_FOUND" } };
+    }
+    const publicEvents = target && isRenderedChatTarget(target) && events.state === "ok"
+      ? { ...events, events: events.events.map(event => {
+        if (typeof event.payload !== "object" || event.payload === null || Array.isArray(event.payload)) return event;
+        const payload: Record<string, unknown> = { ...event.payload }; delete payload.renderedWindow;
+        return { ...event, payload };
+      }) } : events;
+    return { ...response, kind: target && isRenderedChatTarget(target) ? "gemini_events" as const : "fixture_events" as const,
+      payload: publicEvents };
   }
   if (request.kind === "disconnect_fixture") {
     return { ...response, kind: "fixture_disconnected" as const,

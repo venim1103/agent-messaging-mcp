@@ -810,6 +810,65 @@ test("Company AI Chat read binding separates identity from bounded sender captur
         && reversedSnapshot?.omittedBefore === true
         && JSON.stringify(reversedSnapshot) === JSON.stringify(hintedSnapshot);
       if (originalStyle === null) timeline.removeAttribute("style"); else timeline.setAttribute("style", originalStyle);
+      const windowHost = document.createElement("div");
+      windowHost.style.cssText = "height:24px;overflow-y:auto";
+      timeline.before(windowHost); windowHost.append(timeline);
+      windowHost.scrollTop = windowHost.scrollHeight;
+      const qualifiedWindow = binding.capture(deadline);
+      const repeatedWindow = binding.capture(deadline);
+      const shortWindowQualified = qualifiedWindow?.omittedBefore === true
+        && /^[0-9a-f-]{36}$/.test(qualifiedWindow?.renderedWindow?.continuityToken ?? "")
+        && repeatedWindow?.renderedWindow?.continuityToken === qualifiedWindow.renderedWindow.continuityToken;
+      const added = rows[0].cloneNode(true);
+      added.querySelector("p").textContent = "Synthetic new outgoing";
+      timeline.append(added); windowHost.scrollTop = windowHost.scrollHeight;
+      const appendRetainsContinuity = binding.capture(deadline)?.renderedWindow?.continuityToken
+        === qualifiedWindow.renderedWindow.continuityToken;
+      added.remove(); binding.capture(deadline); binding.capture(deadline);
+      windowHost.scrollTop = 0;
+      const scrollBoundaryRefusesEvidence = binding.capture(deadline)?.renderedWindow === undefined;
+      windowHost.scrollTop = windowHost.scrollHeight;
+      binding.capture(deadline);
+      const outerHost = document.createElement("div");
+      outerHost.style.cssText = "height:12px;overflow-y:auto";
+      windowHost.before(outerHost); outerHost.append(windowHost); outerHost.scrollTop = outerHost.scrollHeight;
+      const ambiguousScrollerRefusesEvidence = binding.capture(deadline)?.renderedWindow === undefined;
+      outerHost.replaceWith(windowHost);
+      binding.capture(deadline);
+      rows[0].querySelector("p").textContent = "Synthetic changed retained row";
+      const retainedEditRefusesEvidence = binding.capture(deadline)?.renderedWindow === undefined;
+      rows[0].querySelector("p").textContent = "Synthetic first row";
+      binding.capture(deadline); binding.capture(deadline);
+      rows[0].className = "unknown";
+      const unknownRoleRefusesEvidence = binding.capture(deadline)?.renderedWindow === undefined;
+      rows[0].className = "Invented_userMessage__alpha";
+      rows[0].querySelector("p").textContent = "x".repeat(16001);
+      const truncationRefusesEvidence = binding.capture(deadline)?.renderedWindow === undefined;
+      rows[0].querySelector("p").textContent = "Synthetic first row";
+      windowHost.scrollTop = windowHost.scrollHeight;
+      binding.capture(deadline); binding.capture(deadline);
+      timeline.replaceChildren(...rows.map(row => row.cloneNode(true)));
+      const remountRefusesEvidence = binding.capture(deadline)?.renderedWindow === undefined;
+      timeline.replaceChildren(...rows);
+      binding.capture(deadline); binding.capture(deadline);
+      timeline.style.display = "flex"; timeline.style.flexDirection = "column-reverse";
+      const reversedWindowRefusesEvidence = binding.capture(deadline)?.renderedWindow === undefined;
+      if (originalStyle === null) timeline.removeAttribute("style"); else timeline.setAttribute("style", originalStyle);
+      timeline.append(...Array.from({ length: 30 }, (_, index) => {
+        const row = rows[1].cloneNode(true);
+        row.querySelector("p").textContent = `Synthetic full-window retained ${index}`;
+        return row;
+      }));
+      windowHost.scrollTop = windowHost.scrollHeight;
+      binding.capture(deadline);
+      const fullWindow = binding.capture(deadline);
+      timeline.append(added); windowHost.scrollTop = windowHost.scrollHeight;
+      const rolledWindow = binding.capture(deadline);
+      const fullWindowRolloverRetainsContinuity = fullWindow?.messages.length === 32
+        && rolledWindow?.messages.length === 32 && !!fullWindow.renderedWindow
+        && rolledWindow.renderedWindow?.continuityToken === fullWindow.renderedWindow.continuityToken;
+      timeline.replaceChildren(...rows);
+      windowHost.replaceWith(timeline);
       rows[0].className += " Invented_assistantMessage__gamma";
       const ambiguousSenderUnknown = binding.capture(deadline).messages[0].direction === "unknown";
       rows[0].removeAttribute("class"); rows[1].removeAttribute("class");
@@ -821,13 +880,23 @@ test("Company AI Chat read binding separates identity from bounded sender captur
       rows[0].className = `${"x".repeat(257)} user`;
       const oversizedClassIgnored = binding.capture(deadline).messages[0].direction === "unknown";
       rows[0].removeAttribute("class");
-      source.memoizedProps.conversationId = "synthetic-other";
+      const rectangle = rows[0].getBoundingClientRect.bind(rows[0]);
+      rows[0].getBoundingClientRect = () => {
+        source.memoizedProps.conversationId = "synthetic-other";
+        return rectangle();
+      };
+      const finalIdentityRefusesCapture = binding.capture(deadline) === null;
       const terminal = !binding.check(deadline);
       const reads = messageReads;
       const refusedCapture = binding.capture(deadline) === null && messageReads === reads;
+      delete rows[0].getBoundingClientRect;
       binding.dispose();
       return { status: binding.status, identityReadFree, initialCheck, checkReadFree, snapshot, privateOutput,
         senderMapping, remountDoesNotQualifyWindow, visualOrderDoesNotQualifyChronology,
+        shortWindowQualified, remountRefusesEvidence, reversedWindowRefusesEvidence,
+        appendRetainsContinuity, scrollBoundaryRefusesEvidence, ambiguousScrollerRefusesEvidence,
+        retainedEditRefusesEvidence, unknownRoleRefusesEvidence, truncationRefusesEvidence,
+        fullWindowRolloverRetainsContinuity, finalIdentityRefusesCapture,
         ambiguousSenderUnknown, descendantSenderIgnored, partialTokenIgnored, oversizedClassIgnored,
         terminal, refusedCapture, draftReads, inputs, activations };
     });
@@ -835,6 +904,10 @@ test("Company AI Chat read binding separates identity from bounded sender captur
       snapshot: { messages: [{ direction: "unknown", text: "Synthetic first row" }, { direction: "unknown", text: "Synthetic second row" }],
         omittedBefore: true }, privateOutput: true, senderMapping: ["outgoing", "incoming"], ambiguousSenderUnknown: true,
       remountDoesNotQualifyWindow: true, visualOrderDoesNotQualifyChronology: true,
+      shortWindowQualified: true, remountRefusesEvidence: true, reversedWindowRefusesEvidence: true,
+      appendRetainsContinuity: true, scrollBoundaryRefusesEvidence: true, ambiguousScrollerRefusesEvidence: true,
+      retainedEditRefusesEvidence: true, unknownRoleRefusesEvidence: true, truncationRefusesEvidence: true,
+      fullWindowRolloverRetainsContinuity: true, finalIdentityRefusesCapture: true,
       descendantSenderIgnored: true, partialTokenIgnored: true, oversizedClassIgnored: true,
       terminal: true, refusedCapture: true, draftReads: 0, inputs: 0, activations: 0 });
       await page.evaluate(() => { globalThis.syntheticCompanySource.memoizedProps.conversationId = "synthetic-chat"; });
@@ -3446,9 +3519,10 @@ for (const provider of ["fixture", "gemini"]) {
   });
 }
 
-for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result-loss"]) test(`Company popup connection reads through native MCP and preserves exact owners (${scenario})`, { timeout: 20000 }, async testContext => {
+for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result-loss", "qualified-send"]) test(`Company popup connection reads through native MCP and preserves exact owners (${scenario})`, { timeout: 20000 }, async testContext => {
   const setPhase = trackTestPhase(testContext, "Company connected read");
-  const sends = scenario === "send" || scenario === "submit-result-loss";
+  const qualified = scenario === "qualified-send";
+  const sends = scenario === "send" || scenario === "submit-result-loss" || qualified;
   const profile = await mkdtemp(join(tmpdir(), "agent-messaging-company-connected-read-"));
   const nativeEnvironment = { ...process.env, HOME: profile, NODE_COMPILE_CACHE: join(profile, "compile-cache") };
   const clients = [new Client({ name: "Company one", version: "0.0.1" }), new Client({ name: "Company two", version: "0.0.1" })];
@@ -3494,7 +3568,13 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
         try {
           const result = await execute(options);
           globalThis.syntheticCompanyCalls.push({ phase: options.files ? "install" : options.args?.[0]?.action ?? "other",
-            topFrame: result[0]?.frameId === 0, returned: result[0]?.result != null });
+            topFrame: result[0]?.frameId === 0, returned: result[0]?.result != null,
+            ...(options.args?.[0]?.action === "capture" ? {
+              qualified: !!result[0]?.result?.snapshot?.renderedWindow,
+              rows: result[0]?.result?.snapshot?.messages?.length ?? 0 } : {}),
+            ...(options.args?.[0]?.operationId ? { ok: result[0]?.result?.ok,
+              code: result[0]?.result?.code, activated: result[0]?.result?.activated,
+              remainingMs: options.args[0].deadline - Date.now() } : {}) });
           const input = options.args?.[0];
           if (globalThis.syntheticCompanyLoseSubmitResult && input?.operationId && input.attemptId === input.operationId
             && input.conversationId?.startsWith("company_ai_") && input.deadline) {
@@ -3621,10 +3701,20 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
       rows[0].className = "Invented_userMessage__alpha";
       rows[1].className = "Invented_assistantMessage__beta";
     });
+    if (qualified) await page.evaluate(() => {
+      const timeline = document.querySelector('[role="log"]');
+      const scroller = document.createElement("div");
+      scroller.id = "synthetic-company-scroller";
+      scroller.style.cssText = "height:24px;overflow-y:auto";
+      timeline.before(scroller); scroller.append(timeline);
+      scroller.scrollTop = scroller.scrollHeight;
+    });
     const snapshot = await clients[0].callTool({ name: "chat_read_messages", arguments: { connectionId: connection.connectionId } });
     assert.equal(snapshot.isError, undefined);
     assert.equal(snapshot.structuredContent.coverage, "rendered_only");
     assert.equal(snapshot.structuredContent.omittedBefore, true);
+    assert.equal(JSON.stringify(snapshot.structuredContent).includes("renderedWindow"), false);
+    assert.equal(JSON.stringify(snapshot.structuredContent).includes("continuityToken"), false);
     assert.deepEqual(snapshot.structuredContent.messages, [
       { direction: "outgoing", text: "Synthetic first row", identityQuality: "uncertain", generationState: "unknown" },
       { direction: "incoming", text: "Synthetic second row", identityQuality: "uncertain", generationState: "unknown" }
@@ -3638,7 +3728,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
       await page.evaluate(() => {
         Object.defineProperty(HTMLTextAreaElement.prototype, "value", globalThis.syntheticCompanyValueDescriptor);
       });
-      await page.evaluate(() => {
+      await page.evaluate(qualified => {
         const editor = document.querySelector("textarea");
         const send = document.querySelector("section button");
         editor.value = "";
@@ -3647,31 +3737,52 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
         send.addEventListener("click", () => {
           const row = document.createElement("div");
           row.className = "Invented_userMessage__alpha";
+          if (qualified) row.dataset.testid = "invented-new-outgoing";
           const text = document.createElement("p");
           text.textContent = editor.value;
           row.append(text);
           document.querySelector('[role="log"]').append(row);
+          if (qualified) {
+            const answer = row.cloneNode(true);
+            answer.className = "Invented_assistantMessage__beta";
+            answer.dataset.testid = "invented-new-incoming";
+            answer.querySelector("p").textContent = "Synthetic new Company answer";
+            document.querySelector('[role="log"]').append(answer);
+            const scroller = document.querySelector("#synthetic-company-scroller");
+            scroller.scrollTop = scroller.scrollHeight;
+          }
           editor.value = "";
           send.disabled = true;
         });
-      });
+      }, qualified);
       const idempotencyKey = crypto.randomUUID();
       if (scenario === "submit-result-loss") await worker.evaluate(() => { globalThis.syntheticCompanyLoseSubmitResult = true; });
       const argumentsValue = { connectionId: connection.connectionId, text: "Synthetic guarded Company send", idempotencyKey };
       const submitted = (await clients[0].callTool({ name: "chat_send_message", arguments: argumentsValue })).structuredContent;
-      assert.equal(submitted?.state, "unresolved", JSON.stringify({ state: submitted?.state, code: submitted?.code,
+      if (qualified && submitted?.state !== "sent") testContext.diagnostic(JSON.stringify({
+        readerCalls: await worker.evaluate(() => globalThis.syntheticCompanyCalls) }));
+      assert.equal(submitted?.state, qualified ? "sent" : "unresolved", JSON.stringify({ state: submitted?.state, code: submitted?.code,
         failureStage: submitted?.failureStage }));
-      assert.equal(submitted.code, "DISPATCH_UNCERTAIN");
+      assert.equal(submitted.code, qualified ? "PAGE_SENT" : "DISPATCH_UNCERTAIN");
       assert.equal(submitted.retryAllowed, false);
       const replayed = (await clients[0].callTool({ name: "chat_send_message", arguments: argumentsValue })).structuredContent;
       assert.equal(replayed.operationId, submitted.operationId);
-      assert.equal(replayed.state, "unresolved");
+      assert.equal(replayed.state, qualified ? "sent" : "unresolved");
       assert.deepEqual(await page.evaluate(() => ({ inputs: globalThis.syntheticCompanyInputs,
         activations: globalThis.syntheticCompanyActivations })), { inputs: 1, activations: 1 });
       assert.equal(await worker.evaluate(async () => Object.keys(await chrome.storage.local.get(null))
         .filter(key => key.startsWith("company-ai-submit-attempt-")).length), 1);
       assert.equal((await clients[1].callTool({ name: "chat_send_message", arguments: argumentsValue })).isError, true);
       if (scenario === "submit-result-loss") assert.equal(await worker.evaluate(() => globalThis.syntheticCompanyLostSubmitResults), 1);
+      if (qualified) {
+        const reply = await clients[0].callTool({ name: "chat_wait_for_reply", arguments: {
+          connectionId: connection.connectionId, timeoutMs: 4000 } });
+        assert.equal(reply.isError, undefined);
+        assert.equal(reply.structuredContent.timedOut, false);
+        assert.equal(reply.structuredContent.reply.text, "Synthetic new Company answer");
+        assert.equal(reply.structuredContent.reply.generationState, "settled_heuristic");
+        assert.equal(JSON.stringify(reply.structuredContent).includes("renderedWindow"), false);
+      } else {
       await popup.locator("#refresh-unconfirmed").press("Enter");
       const uncertain = popup.locator(`#unconfirmed-list li[data-operation-id="${submitted.operationId}"]`);
       await uncertain.waitFor({ timeout: 4000 });
@@ -3682,6 +3793,7 @@ for (const scenario of ["identity", "reload", "read-gap", "send", "submit-result
       assert.equal(resolved.operationId, submitted.operationId);
       assert.equal(resolved.state, "sent");
       assert.equal(resolved.code, "PERSON_SENT");
+      }
       assert.deepEqual(await page.evaluate(() => ({ inputs: globalThis.syntheticCompanyInputs,
         activations: globalThis.syntheticCompanyActivations })), { inputs: 1, activations: 1 });
     }

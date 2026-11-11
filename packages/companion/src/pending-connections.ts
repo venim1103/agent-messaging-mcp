@@ -153,6 +153,7 @@ export type GeminiSnapshot = Readonly<{
   messages: ReadonlyArray<Readonly<Omit<GeminiRenderedMessage, "generationState"> & {
     identityQuality: "uncertain"; generationState: "unknown" | "streaming" | "complete"
   }>>;
+  renderedWindow?: Readonly<{ continuityToken: string }>;
 }>;
 
 export const REPLY_QUIET_PERIOD_MS = 2_000;
@@ -550,9 +551,14 @@ export class PendingConnectionRequests {
   }
 
   publishGeminiSnapshot(target: RenderedChatTarget, messages: ReadonlyArray<GeminiRenderedMessage>,
-    now = Date.now(), challengeId?: string, omittedBefore = false): number {
+    now = Date.now(), challengeId?: string, omittedBefore = false, renderedWindow?: GeminiSnapshot["renderedWindow"]): number {
     if (!messages.length || messages.length > MAX_GEMINI_SNAPSHOT_MESSAGES
       || typeof omittedBefore !== "boolean"
+      || (renderedWindow !== undefined && (target.provider !== "company_ai" || omittedBefore !== true
+        || typeof renderedWindow !== "object" || renderedWindow === null || Object.keys(renderedWindow).length !== 1
+        || typeof renderedWindow.continuityToken !== "string"
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(renderedWindow.continuityToken)
+        || messages.some(message => message.direction === "unknown" || message.truncated)))
       || messages.some((message) => typeof message !== "object" || message === null
         || Object.keys(message).some((key) => !["direction", "text", "truncated", "generationState"].includes(key))
         || ("truncated" in message && message.truncated !== true)
@@ -560,7 +566,8 @@ export class PendingConnectionRequests {
         || (target.provider === "company_ai" ? !["incoming", "outgoing", "unknown"].includes(message.direction) || "generationState" in message
           : message.direction !== "incoming" && message.direction !== "outgoing")
         || typeof message.text !== "string" || !message.text || message.text.length > 16_000)
-      || Buffer.byteLength(JSON.stringify({ messages, omittedBefore }), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
+      || Buffer.byteLength(JSON.stringify({ messages, omittedBefore,
+        ...(renderedWindow ? { renderedWindow } : {}) }), "utf8") > MAX_GEMINI_SNAPSHOT_BYTES) {
       throw new Error("Invalid Gemini snapshot");
     }
     const pending = challengeId ? this.geminiReads.get(challengeId) : undefined;
@@ -572,6 +579,7 @@ export class PendingConnectionRequests {
     const normalized = messages.map((message) => Object.freeze({ direction: message.direction, text: message.text,
       ...(message.truncated ? { truncated: true as const } : {}),
       identityQuality: "uncertain" as const, generationState: message.generationState ?? "unknown" as const }));
+    const windowEvidence = renderedWindow ? { renderedWindow: Object.freeze({ ...renderedWindow }) } : {};
     let published = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;
@@ -580,13 +588,14 @@ export class PendingConnectionRequests {
       grant.geminiObservations ??= new ObservationBuffer(observationLimits);
       const previous = grant.geminiSnapshot?.messages;
       if (!previous || grant.geminiSnapshot?.omittedBefore !== omittedBefore
+        || grant.geminiSnapshot?.renderedWindow?.continuityToken !== renderedWindow?.continuityToken
         || previous.length !== normalized.length || normalized.some((message, index) =>
         message.direction !== previous[index]?.direction || message.text !== previous[index]?.text
           || message.truncated !== previous[index]?.truncated || message.generationState !== previous[index]?.generationState)) {
-        grant.geminiObservations.append({ kind: "gemini_snapshot", messages: normalized, omittedBefore });
+        grant.geminiObservations.append({ kind: "gemini_snapshot", messages: normalized, omittedBefore, ...windowEvidence });
       }
       grant.geminiSnapshot = Object.freeze({ coverage: "rendered_only", generation: 1, capturedAt: now,
-        cursor: grant.geminiObservations.bookmark(), messages: Object.freeze(normalized), omittedBefore });
+        cursor: grant.geminiObservations.bookmark(), messages: Object.freeze(normalized), omittedBefore, ...windowEvidence });
       published++;
     }
     if (pending && challengeId) {
@@ -750,7 +759,7 @@ export class PendingConnectionRequests {
     return target.origin === "http://127.0.0.1:8787" ? this.markStableObservationGap(target, now) : 0;
   }
 
-  markGeminiObservationGap(target: GeminiTarget, now = Date.now()): number {
+  markGeminiObservationGap(target: RenderedChatTarget, now = Date.now()): number {
     let marked = 0;
     for (const request of this.requests.values()) {
       const grant = request.grant;

@@ -596,7 +596,8 @@ export function createCompanyAIChatIdentityBinding(input: CompanyDocumentInput):
   }
 }
 
-export type CompanyRenderedSnapshot = { messages: { direction: "incoming" | "outgoing" | "unknown"; text: string; truncated?: true }[]; omittedBefore: true };
+export type CompanyRenderedSnapshot = { messages: { direction: "incoming" | "outgoing" | "unknown"; text: string; truncated?: true }[];
+  omittedBefore: true; renderedWindow?: { continuityToken: string } };
 
 export function createCompanyAIChatReadBinding(input: { expectedUrl: string; deadline: number }):
   { status: "ok"; conversationId: string; check: (deadline: number) => boolean;
@@ -623,8 +624,11 @@ export function createCompanyAIChatReadBinding(input: { expectedUrl: string; dea
     if (identity.status !== "ok") return identity;
     let listenerWindow: Window | undefined = window;
     let listenerDocument: Document | undefined = document;
+    let continuityToken = crypto.randomUUID();
+    let previousWindow: { rows: Element[]; directions: string[]; texts: string[]; scroller: Element } | undefined;
+    const resetWindow = () => { previousWindow = undefined; continuityToken = crypto.randomUUID(); };
     const dispose = () => {
-      identity.dispose(); targets = undefined;
+      identity.dispose(); targets = undefined; resetWindow();
       try { listenerWindow?.removeEventListener("pagehide", dispose); } catch {}
       try { listenerDocument?.removeEventListener("visibilitychange", visibilityChanged); } catch {}
       listenerWindow = undefined; listenerDocument = undefined;
@@ -651,7 +655,8 @@ export function createCompanyAIChatReadBinding(input: { expectedUrl: string; dea
         if (!current) return null;
         const messages: CompanyRenderedSnapshot["messages"] = [];
         const encoder = new TextEncoder();
-        let bytesLeft = 96 * 1024 - encoder.encode(JSON.stringify({ messages: [], omittedBefore: true })).length;
+        let bytesLeft = 96 * 1024 - encoder.encode(JSON.stringify({ messages: [], omittedBefore: true,
+          renderedWindow: { continuityToken } })).length;
         let visited = 0;
         for (const row of [...current.rows].reverse()) {
           if (!bytesLeft) break;
@@ -708,8 +713,45 @@ export function createCompanyAIChatReadBinding(input: { expectedUrl: string; dea
           bytesLeft -= cost(text);
           messages.unshift({ direction, text, ...(truncated ? { truncated: true as const } : {}) });
         }
-        return check(deadline) && messages.length ? { messages, omittedBefore: true } : null;
-      } catch { return null; }
+        if (!check(deadline) || !messages.length) { resetWindow(); return null; }
+        const snapshot: CompanyRenderedSnapshot = { messages, omittedBefore: true };
+        const scrollers: Element[] = [];
+        let ancestor: Element | null = current.timeline;
+        for (let depth = 0; ancestor && depth < 8; depth++, ancestor = ancestor.parentElement) {
+          if (Date.now() >= deadline) { resetWindow(); return null; }
+          const style = getComputedStyle(ancestor);
+          if (!ancestor.contains(current.editor) && ["auto", "scroll"].includes(style.overflowY)
+            && ancestor.clientHeight > 0 && ancestor.scrollHeight > ancestor.clientHeight) scrollers.push(ancestor);
+        }
+        const scroller = scrollers.length === 1 ? scrollers[0] : undefined;
+        const rectangles = current.rows.map(row => row.getBoundingClientRect());
+        const ordered = rectangles.every((rectangle, index) => Number.isFinite(rectangle.top)
+          && Number.isFinite(rectangle.bottom) && rectangle.height > 0
+          && (index === 0 || rectangle.top >= rectangles[index - 1]!.bottom));
+        if (!check(deadline)) { resetWindow(); return null; }
+        if (!scroller || scroller.scrollTop < 0
+          || Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) > 1
+          || !ordered || messages.length !== current.rows.length
+          || messages.some(message => message.truncated || message.direction === "unknown")) {
+          resetWindow(); return snapshot;
+        }
+        const directions = messages.map(message => message.direction);
+        const texts = messages.map(message => message.text);
+        const prior = previousWindow;
+        previousWindow = { rows: [...current.rows], directions, texts, scroller };
+        if (prior) {
+          const offsets = prior.rows.flatMap((_, offset) => prior.rows.slice(offset).every((row, index) =>
+            row === current.rows[index] && prior.directions[offset + index] === directions[index]
+              && prior.texts[offset + index] === texts[index]) ? [offset] : []);
+          const offset = offsets[0];
+          if (prior.scroller !== scroller || offsets.length !== 1 || offset === undefined || offset > 2
+            || (offset > 0 && (prior.rows.length !== 32 || current.rows.length !== 32))) {
+            continuityToken = crypto.randomUUID(); return snapshot;
+          }
+        }
+        snapshot.renderedWindow = { continuityToken };
+        return snapshot;
+      } catch { resetWindow(); return null; }
     } };
   } catch { disposeOnError?.(); return { status: "refused" }; }
 }

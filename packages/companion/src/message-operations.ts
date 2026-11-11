@@ -171,6 +171,7 @@ const fixtureObservationSchema = z.strictObject({
 });
 const geminiObservationSchema = z.strictObject({
   kind: z.literal("gemini_snapshot"), omittedBefore: z.boolean(),
+  renderedWindow: z.strictObject({ continuityToken: z.uuid() }).optional(),
   messages: z.array(z.strictObject({ direction: z.enum(["incoming", "outgoing"]), text: z.string().max(16_000),
     truncated: z.literal(true).optional(), identityQuality: z.literal("uncertain"), generationState: z.enum(["unknown", "streaming", "complete"])
   }).refine(message => message.direction === "incoming" || message.generationState === "unknown")).max(MAX_FIXTURE_SNAPSHOT_MESSAGES)
@@ -180,7 +181,7 @@ const renderedChatModes = {
   gemini: { editor: "contenteditable", fill: geminiFillResultSchema, proof: geminiDispatchCheckResultSchema,
     submit: geminiDispatchResultSchema, sendEvidence: "exact_append" },
   company_ai: { editor: "textarea", fill: fixtureFillResultSchema, proof: fixtureDispatchCheckResultSchema,
-    submit: fixtureDispatchResultSchema, sendEvidence: "unavailable" }
+    submit: fixtureDispatchResultSchema, sendEvidence: "qualified_rendered_window" }
 } as const;
 
 function renderedChatMode(target: RenderedChatTarget) {
@@ -190,18 +191,28 @@ function renderedChatMode(target: RenderedChatTarget) {
 type RenderedDispatchCapture = Readonly<{
   omittedBefore: boolean;
   messages: ReadonlyArray<Readonly<{ direction: "incoming" | "outgoing" | "unknown"; text: string; truncated?: true }>>;
+  renderedWindow?: Readonly<{ continuityToken: string }>;
 }>;
 
 export function evaluateRenderedDispatchAppend(baseline: RenderedDispatchCapture,
-  captures: ReadonlyArray<RenderedDispatchCapture>, text: string): "sent" | "unchanged" | "ambiguous" | null {
+  captures: ReadonlyArray<RenderedDispatchCapture>, text: string,
+  mode: "exact_append" | "qualified_rendered_window" = "exact_append"): "sent" | "unchanged" | "ambiguous" | null {
   if (!captures.length) return null;
+  const qualified = mode === "qualified_rendered_window";
+  if (qualified && (!baseline.messages.length || !baseline.omittedBefore || !baseline.renderedWindow
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(baseline.renderedWindow.continuityToken)
+    || captures.some(capture => !capture.omittedBefore
+      || capture.renderedWindow?.continuityToken !== baseline.renderedWindow!.continuityToken))) return "ambiguous";
   if (baseline.messages.some(message => message.truncated || message.direction === "unknown")) return "ambiguous";
   let appended = false;
   let droppedRows = 0;
   for (const capture of captures) {
     if (capture.messages.some(message => message.truncated || message.direction === "unknown")) return "ambiguous";
     let offset = 0;
-    if (baseline.omittedBefore || capture.omittedBefore) {
+    if (qualified && baseline.messages.length < MAX_RENDERED_SNAPSHOT_MESSAGES) {
+      if (capture.messages.length > MAX_RENDERED_SNAPSHOT_MESSAGES || baseline.messages.some((message, index) =>
+        message.direction !== capture.messages[index]?.direction || message.text !== capture.messages[index]?.text)) return "ambiguous";
+    } else if (baseline.omittedBefore || capture.omittedBefore) {
       if (baseline.messages.length !== MAX_RENDERED_SNAPSHOT_MESSAGES
         || capture.messages.length !== MAX_RENDERED_SNAPSHOT_MESSAGES || !capture.omittedBefore) return "ambiguous";
       const offsets = baseline.messages.flatMap((_, start) => baseline.messages.slice(start).every((message, index) =>
@@ -1865,11 +1876,12 @@ export class PreparedMessageOperations {
 
   private renderedDispatchEvidence(owner: symbol, operationId: string, now: number) {
     const operation = this.geminiContents.get(operationId);
-    if (!operation || renderedChatMode(operation.target).sendEvidence !== "exact_append") return null;
+    if (!operation) return null;
+    const mode = renderedChatMode(operation.target).sendEvidence;
     const baseline = this.geminiDispatchBaselines.get(operationId);
     const live = this.requests.getRenderedTarget(owner, operation.connectionId, now);
     const status = this.dispatchStatus(operationId);
-    if (operation.owner !== owner || !baseline
+    if (operation.owner !== owner || !baseline || (mode === "qualified_rendered_window" && !baseline.renderedWindow)
       || baseline.messages.some(message => message.truncated) || !live || !this.sameGeminiTarget(operation.target, live)
       || status?.state !== "dispatch_uncertain" || this.ambiguousEvidence.has(operationId)) return null;
     const snapshot = this.requests.getGeminiSnapshot(owner, operation.connectionId, now);
@@ -1881,14 +1893,15 @@ export class PreparedMessageOperations {
       || events.cursor.sequence !== snapshot.cursor.sequence) return null;
     const captures: RenderedDispatchCapture[] = [];
     for (const capture of [...events.events.map(event => geminiObservationSchema.safeParse(event.payload)),
-      geminiObservationSchema.safeParse({ kind: "gemini_snapshot", omittedBefore: snapshot.omittedBefore, messages: snapshot.messages })]) {
+      geminiObservationSchema.safeParse({ kind: "gemini_snapshot", omittedBefore: snapshot.omittedBefore, messages: snapshot.messages,
+        ...(snapshot.renderedWindow ? { renderedWindow: snapshot.renderedWindow } : {}) })]) {
       if (!capture.success) {
         this.ambiguousEvidence.add(operationId);
         return null;
       }
       captures.push(capture.data);
     }
-    const outcome = evaluateRenderedDispatchAppend(baseline, captures, operation.text);
+    const outcome = evaluateRenderedDispatchAppend(baseline, captures, operation.text, mode);
     if (outcome === "ambiguous") this.ambiguousEvidence.add(operationId);
     return outcome === "sent" || outcome === "unchanged" ? Object.freeze({ outcome, observedAt: snapshot.capturedAt }) : null;
   }
@@ -1901,6 +1914,14 @@ export class PreparedMessageOperations {
     this.database.prepare(`INSERT INTO message_dispatch_resolutions (operation_id, resolved_at, outcome, source)
       VALUES (?, ?, 'sent', 'page') ON CONFLICT (operation_id) DO NOTHING`).run(operationId, evidence.observedAt);
     return this.dispatchStatus(operationId) ?? status;
+  }
+
+  reconcileRenderedObservations(target: RenderedChatTarget, now = Date.now()): void {
+    for (const [operationId, operation] of this.geminiContents) {
+      if (operation.autonomous && this.sameGeminiTarget(operation.target, target)) {
+        this.reconcileGeminiObservation(operation.owner, operationId, now);
+      }
+    }
   }
 
   private finishFixtureDispatch(operationId: string): void {

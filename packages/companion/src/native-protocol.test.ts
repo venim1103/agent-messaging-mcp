@@ -80,6 +80,17 @@ test("native neutral observations validate provider, exact target, row model and
         target: { ...target, url: `${target.url}${provider === "databag" ? "?other" : "?code=synthetic"}` } } }, now));
     }
     if (provider === "company_ai") {
+      const qualified = { ...publication, payload: { ...publication.payload, omittedBefore: true,
+        messages: [{ direction: "incoming", text: "Synthetic qualified row" }],
+        renderedWindow: { continuityToken: request.requestId } } };
+      assert.deepEqual(parseNativeChatObservationRequest(qualified, now), qualified);
+      for (const payload of [{ ...qualified.payload, omittedBefore: false },
+        { ...qualified.payload, messages: [{ direction: "unknown", text: "Synthetic unknown role" }] },
+        { ...qualified.payload, messages: [{ direction: "incoming", text: "Synthetic truncated", truncated: true }] },
+        { ...qualified.payload, renderedWindow: { continuityToken: "invented-invalid" } },
+        { ...qualified.payload, renderedWindow: { continuityToken: request.requestId, complete: true } }]) {
+        assert.throws(() => parseNativeChatObservationRequest({ ...qualified, payload }, now));
+      }
       for (const direction of ["incoming", "outgoing", "unknown"]) {
         const messages = [{ direction, text: "Synthetic role-labelled row" }];
         assert.deepEqual(parseNativeChatObservationRequest({ ...publication,
@@ -96,6 +107,8 @@ test("native neutral observations validate provider, exact target, row model and
       assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
         messages: [{ ...messages[0], id: "invented-stable-id" }] } }, now));
     } else {
+      assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
+        renderedWindow: { continuityToken: request.requestId } } }, now));
       assert.throws(() => parseNativeChatObservationRequest({ ...publication, payload: { ...publication.payload,
         messages: [{ ...messages[0], direction: "unknown" }] } }, now));
     }

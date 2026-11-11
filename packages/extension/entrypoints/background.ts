@@ -395,6 +395,8 @@ async function publishSavedChatSnapshot(provider: SavedProvider, tabId: number, 
     const deadlineMs = Math.min(Date.now() + 10_000, expiresAt);
     const reply = await sendNativeRequest(provider === "gemini" ? "publish_gemini_snapshot" : "publish_chat_snapshot", {
       target, messages, omittedBefore: snapshot.omittedBefore,
+      ...(provider === "company_ai" && "renderedWindow" in snapshot && snapshot.renderedWindow
+        ? { renderedWindow: snapshot.renderedWindow } : {}),
     ...(challengeId === undefined ? {} : { challengeId }) }, deadlineMs);
     const payload = reply.payload;
     if (reply.kind !== (provider === "gemini" ? "gemini_snapshot_published" : "chat_snapshot_published") || Object.keys(payload).length !== 1

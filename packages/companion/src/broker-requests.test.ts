@@ -152,6 +152,18 @@ for (const provider of ["databag", "company_ai"] as const) test(`${provider} neu
   const events = { ...envelope, kind: "read_approved_events", payload: { connectionId: grant.connectionId, cursor: snapshot.cursor } };
   assert.equal(handleBrokerRequest(events, "facade", owner, requests, 1001).kind,
     provider === "databag" ? "fixture_events" : "gemini_events");
+  if (provider === "company_ai") {
+    const renderedWindow = { continuityToken: envelope.requestId };
+    const qualified = { ...publish, payload: { target, messages: messages.slice(0, 2), omittedBefore: true, renderedWindow } };
+    assert.deepEqual(handleBrokerRequest(qualified, "facade", owner, requests, 1001).payload, { code: "PERMISSION_DENIED" });
+    assert.deepEqual(handleBrokerRequest(qualified, "relay", Symbol("relay"), requests, 1001).payload, { count: 1 });
+    const internal = requests.getGeminiSnapshot(owner, grant.connectionId, 1001);
+    assert.ok(internal && internal !== "not_ready");
+    assert.deepEqual(internal.renderedWindow, renderedWindow);
+    const publicEvents = handleBrokerRequest(events, "facade", owner, requests, 1001);
+    assert.equal(publicEvents.kind, "gemini_events");
+    assert.equal(JSON.stringify(publicEvents.payload).includes("renderedWindow"), false);
+  }
   assert.deepEqual(handleBrokerRequest(gap, "relay", Symbol("relay"), requests, 1002).payload, { count: 1 });
   assert.equal(requests.getStableSnapshot(owner, grant.connectionId, 1002), provider === "databag" ? "not_ready" : null);
   requests.disconnect(owner);

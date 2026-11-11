@@ -127,11 +127,13 @@ test("official SDK stdio client discovers and calls the diagnostic tool", async 
     assert.equal(sendTool?.annotations?.destructiveHint, true);
     assert.equal(sendTool?.annotations?.idempotentHint, true);
     assert.equal(sendTool?.inputSchema.additionalProperties, false);
+    assert.match(sendTool?.description ?? "", /only qualified retained-window outgoing evidence confirms page-sent/);
     const replyTool = tools.find(tool => tool.name === "chat_wait_for_reply");
     assert.equal(replyTool?.annotations?.readOnlyHint, true);
     assert.equal(replyTool?.inputSchema.additionalProperties, false);
     assert.match(replyTool?.description ?? "", /UI signal may yield complete/);
     assert.match(replyTool?.description ?? "", /settled_heuristic/);
+    assert.match(replyTool?.description ?? "", /Databag and Company AI use that heuristic/);
 
     const result = await client.callTool({ name: "browser_chat_feasibility", arguments: {} });
     assert.equal(result.isError, undefined);

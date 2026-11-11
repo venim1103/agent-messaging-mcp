@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
+import { handleBrokerRequest } from "./broker-requests.js";
 import { AutonomousCommitFailure, evaluateRenderedDispatchAppend, MAX_ACTIVE_PREPARED_MESSAGES, MAX_PREPARED_MESSAGE_BYTES,
   MAX_PREPARED_REVIEWS, MAX_RECORDED_PREPARED_MESSAGES, openPrivateOperationDatabase, PreparedMessageOperations,
   PREPARED_KEY_RETENTION_MS, PREPARED_MESSAGE_TTL_MS, FIXTURE_REVIEW_APPROVAL_TTL_MS,
@@ -70,7 +71,13 @@ test("Company admission does not enable legacy message operations or allocate du
   }
 });
 
-test("Company send capability reuses rendered jobs without widening read-only grants or outcome evidence", async () => {
+for (const scenario of ["unqualified", "short", "full", "missing", "changed", "incoming", "duplicate", "edit", "gap", "unchanged"] as const)
+  test(scenario === "unqualified"
+    ? "Company send capability reuses rendered jobs without widening read-only grants or outcome evidence"
+    : scenario === "short" ? "Company qualified short rendered windows resolve only one owned outgoing append"
+      : `Company qualified rendered evidence ${scenario} preserves exact confirmation and no retry`, async () => {
+  const qualified = scenario !== "unqualified";
+  const expectedSent = scenario === "short" || scenario === "full";
   const requests = new PendingConnectionRequests();
   const database = new DatabaseSync(":memory:");
   const ledger = new PreparedMessageOperations(requests, database);
@@ -105,9 +112,10 @@ test("Company send capability reuses rendered jobs without widening read-only gr
     assert.equal((await filling.result)?.ok, true);
     assert.equal(requests.publishGeminiSnapshot(target, [{ direction: "incoming", text: "Invented previous answer" }],
       Date.now(), undefined, true), 1);
-    const baseline = Array.from({ length: 32 }, (_, index) => ({ direction: "incoming" as const,
+    const baseline = Array.from({ length: !qualified || scenario === "full" ? 32 : 2 }, (_, index) => ({ direction: "incoming" as const,
       text: `Invented Company retained answer ${index}` }));
-    assert.equal(requests.publishGeminiSnapshot(target, baseline, Date.now(), undefined, true), 1);
+    const renderedWindow = qualified ? { continuityToken: randomUUID() } : undefined;
+    assert.equal(requests.publishGeminiSnapshot(target, baseline, Date.now(), undefined, true, renderedWindow), 1);
     const inspecting = ledger.requestChatProof(owner, prepared.operationId, Date.now(), deadline);
     assert.ok(inspecting && inspecting !== "busy");
     assert.deepEqual(ledger.listGeminiDispatchChecks(Date.now(), true), []);
@@ -125,14 +133,39 @@ test("Company send capability reuses rendered jobs without widening read-only gr
     assert.equal(ledger.completeChatSubmitJob(target, submit.operationId, submit.jobId,
       { ok: true, editor: "textarea", activated: true }), true);
     assert.equal((await dispatch.result).state, "dispatch_uncertain");
-    const appended = [...baseline.slice(2), { direction: "outgoing" as const, text },
+    let appended = [...baseline.slice(!qualified || scenario === "full" ? 2 : 0), { direction: "outgoing" as const, text },
       { direction: "incoming" as const, text: "Invented Company new answer" }];
-    assert.equal(evaluateRenderedDispatchAppend({ omittedBefore: true, messages: baseline },
+    if (scenario === "incoming") appended = [...baseline, { direction: "incoming", text }];
+    if (scenario === "duplicate") appended.push({ direction: "outgoing", text });
+    if (scenario === "edit") appended[0] = { ...appended[0]!, text: "Invented retained edit" };
+    if (scenario === "unchanged") appended = [...baseline];
+    if (scenario === "gap") assert.equal(requests.markGeminiObservationGap(target), 1);
+    const captureWindow = scenario === "missing" ? undefined
+      : scenario === "changed" ? { continuityToken: randomUUID() } : renderedWindow;
+    if (!qualified) assert.equal(evaluateRenderedDispatchAppend({ omittedBefore: true, messages: baseline },
       [{ omittedBefore: true, messages: appended }], text), "sent");
-    assert.equal(requests.publishGeminiSnapshot(target, appended, Date.now(), undefined, true), 1);
-    assert.equal(ledger.reconcileGeminiObservation(owner, prepared.operationId).state, "dispatch_uncertain");
+    const now = Date.now();
+    const published = handleBrokerRequest({ protocolVersion: 1, requestId: randomUUID(), connectionGeneration: 0,
+      deadlineMs: deadline, kind: "publish_chat_snapshot", payload: { target, messages: appended, omittedBefore: true,
+        ...(captureWindow ? { renderedWindow: captureWindow } : {}) } }, "relay", Symbol("relay"), requests, now, ledger);
+    assert.deepEqual(published.payload, { count: 1 });
+    assert.equal(ledger.getOperation(owner, prepared.operationId).state, expectedSent ? "resolved" : "dispatch_uncertain");
+    assert.equal(ledger.reconcileGeminiObservation(other, prepared.operationId).state, "unknown");
+    const reconciled = ledger.reconcileGeminiObservation(owner, prepared.operationId);
+    assert.equal(reconciled.state, expectedSent ? "resolved" : "dispatch_uncertain");
+    if (expectedSent) {
+      assert.equal(reconciled.state === "resolved" && reconciled.resolution.outcome, "sent");
+      assert.equal(reconciled.state === "resolved" && reconciled.resolution.source, "page");
+    }
+    if (qualified && scenario !== "unchanged") {
+      const later = [...baseline.slice(scenario === "full" ? 2 : 0), { direction: "outgoing" as const, text },
+        { direction: "incoming" as const, text: "Invented later answer" }];
+      assert.equal(requests.publishGeminiSnapshot(target, later, Date.now(), undefined, true, renderedWindow), 1);
+      assert.equal(ledger.reconcileGeminiObservation(owner, prepared.operationId).state,
+        expectedSent ? "resolved" : "dispatch_uncertain");
+    }
     assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_attempts").get()!.count, 1);
-    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()!.count, 0);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM message_dispatch_resolutions").get()!.count, expectedSent ? 1 : 0);
     assert.deepEqual(ledger.listChatJobs("submit", "company_ai"), []);
     assert.equal(ledger.releaseComposer(owner, prepared.operationId), true);
   } finally { requests.disconnect(owner); database.close(); }

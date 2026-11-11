@@ -160,6 +160,18 @@ test("Company rendered reads are owner-bound and never enter stable-row getters"
     assert.equal(requests.getGeminiSnapshot(stranger, grant.connectionId, now + 1), null);
     assert.equal(requests.getGeminiSnapshot(owner, grant.connectionId, now + MAX_GEMINI_SNAPSHOT_AGE_MS + 2), "not_ready");
     assert.deepEqual(requests.listChatReadChallenges("company_ai", now + 1), []);
+    const renderedWindow = { continuityToken: challenge.challengeId };
+    assert.throws(() => requests.publishGeminiSnapshot(target, messages, now + 1, undefined, true, renderedWindow));
+    assert.equal(requests.publishGeminiSnapshot(target, messages.slice(0, 2), now + 1, undefined, true, renderedWindow), 1);
+    const qualified = requests.getGeminiSnapshot(owner, grant.connectionId, now + 1);
+    assert.ok(qualified && qualified !== "not_ready");
+    assert.deepEqual(qualified.renderedWindow, renderedWindow);
+    assert.ok(qualified.cursor.sequence > snapshot.cursor.sequence);
+    assert.equal(requests.publishGeminiSnapshot(target, messages.slice(0, 2), now + 1, undefined, true), 1);
+    const unqualified = requests.getGeminiSnapshot(owner, grant.connectionId, now + 1);
+    assert.ok(unqualified && unqualified !== "not_ready");
+    assert.equal(unqualified.renderedWindow, undefined);
+    assert.ok(unqualified.cursor.sequence > qualified.cursor.sequence);
     const pending = requests.requestFreshGeminiRead(owner, grant.connectionId, now + 2);
     assert.ok(pending && pending !== "busy");
     requests.disconnectChat(target, now + 3);
